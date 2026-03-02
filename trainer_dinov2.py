@@ -1,21 +1,24 @@
+# Copyright © Niantic, Inc. 2022.
+# DINOv2 variant: same logic as ace_trainer.py, only backbone and dataset swapped.
+
 import logging
 import random
 import time
+
 import numpy as np
-import math
+from tqdm import tqdm
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
-from torch.cuda.amp import GradScaler
-from torch.amp import autocast
-from torch.utils.data import DataLoader, sampler
-import os
-from datetime import datetime
+import torchvision.transforms.functional as TF
+from torch.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
+from torch.utils.data import sampler
 
 from ace_util import get_pixel_grid, to_homogeneous
 from ace_loss import ReproLoss
 from ace_network_dinov2 import Regressor
 from dataset_dinov2 import CamLocDatasetDINOv2
+from dataset_wai_dinov2 import CamLocDatasetWAIDINOv2
 
 _logger = logging.getLogger(__name__)
 
@@ -27,45 +30,55 @@ def set_seed(seed):
 
 
 class TrainerACEDINOv2:
+    """ACE trainer with DINOv2 backbone. Same flow as TrainerACE: buffer of features then train head only."""
+
     def __init__(self, options):
         self.options = options
-        self.device = torch.device('cuda:0')
+        self.device = torch.device('cuda')
         self.base_seed = 2089
         set_seed(self.base_seed)
 
-        # Generators (randperm on CPU requires CPU generator)
         self.batch_generator = torch.Generator().manual_seed(self.base_seed + 1023)
         self.loader_generator = torch.Generator().manual_seed(self.base_seed + 511)
-        self.sampling_generator_cpu = torch.Generator().manual_seed(self.base_seed + 4095)
+        self.sampling_generator = torch.Generator(device=self.device).manual_seed(self.base_seed + 4095)
         self.training_generator = torch.Generator().manual_seed(self.base_seed + 8191)
 
         self.iteration = 0
+        self.epoch = 0
+        self.training_start = None
         self.num_data_loader_workers = 12
 
-        # Dataset with DINOv2 support
-        self.dataset = CamLocDatasetDINOv2(
-            root_dir=self.options.scene / "train",
-            mode=0,
-            use_half=self.options.use_half,
-            image_height=self.options.image_resolution,
+        # Dataset (DINOv2: RGB, resolution multiple of 14)
+        self.dataset = self._build_train_dataset(
+            image_width=None,
             augment=self.options.use_aug,
             aug_rotation=self.options.aug_rotation,
             aug_scale_max=self.options.aug_scale,
             aug_scale_min=1 / self.options.aug_scale,
         )
 
-        # Regressor with DINOv2 encoder
+        _logger.info("Loaded training scan from: {} [backend={}] -- {} images, mean: {:.2f} {:.2f} {:.2f}".format(
+            self._get_train_root(),
+            getattr(self.options, "data_backend", "ace"),
+            len(self.dataset),
+            self.dataset.mean_cam_center[0],
+            self.dataset.mean_cam_center[1],
+            self.dataset.mean_cam_center[2]))
+
+        # Regressor with DINOv2 encoder (only difference from ACE: create_from_encoder args)
         self.regressor = Regressor.create_from_encoder(
             dinov2_path=self.options.dinov2_path,
             mean=self.dataset.mean_cam_center,
             num_head_blocks=self.options.num_head_blocks,
             use_homogeneous=self.options.use_homogeneous,
-            num_encoder_features=1024,  # ViT-L/14 output dimension
-            freeze_backbone=self.options.freeze_backbone
-        ).to(self.device)
+            num_encoder_features=1024,
+            freeze_backbone=self.options.freeze_backbone,
+        )
+        _logger.info("Loaded DINOv2 encoder from: {}".format(self.options.dinov2_path))
+
+        self.regressor = self.regressor.to(self.device)
         self.regressor.train()
 
-        # Optimizer & Scheduler
         self.optimizer = optim.AdamW(self.regressor.parameters(), lr=self.options.learning_rate_min)
         steps_per_epoch = self.options.training_buffer_size // self.options.batch_size
         self.scheduler = optim.lr_scheduler.OneCycleLR(
@@ -73,14 +86,10 @@ class TrainerACEDINOv2:
             max_lr=self.options.learning_rate_max,
             epochs=self.options.epochs,
             steps_per_epoch=steps_per_epoch,
-            cycle_momentum=False
+            cycle_momentum=False,
         )
-        try:
-            self.scaler = torch.amp.GradScaler('cuda', enabled=self.options.use_half)
-        except AttributeError:
-            self.scaler = GradScaler(enabled=self.options.use_half)
+        self.scaler = GradScaler("cuda", enabled=self.options.use_half)
 
-        # Misc
         self.pixel_grid_2HW = get_pixel_grid(self.regressor.OUTPUT_SUBSAMPLE).to(self.device)
         self.iterations = self.options.epochs * self.options.training_buffer_size // self.options.batch_size
         self.iterations_output = 100
@@ -90,203 +99,306 @@ class TrainerACEDINOv2:
             soft_clamp=self.options.repro_loss_soft_clamp,
             soft_clamp_min=self.options.repro_loss_soft_clamp_min,
             type=self.options.repro_loss_type,
-            circle_schedule=(self.options.repro_loss_schedule == 'circle')
+            circle_schedule=(self.options.repro_loss_schedule == 'circle'),
         )
 
         self.training_buffer = None
-        self.ace_visualizer = None
+
+    def _get_train_root(self):
+        backend = getattr(self.options, "data_backend", "ace")
+        if backend == "wai":
+            # WAI uses a scene folder with scene_meta.json (e.g. .../indoor6/scene1_train).
+            return self.options.scene
+        return self.options.scene / "train"
+
+    def _build_train_dataset(self, image_width=None, augment=False, aug_rotation=0, aug_scale_max=1.0, aug_scale_min=1.0):
+        backend = getattr(self.options, "data_backend", "ace")
+        root_dir = self._get_train_root()
+        common = dict(
+            root_dir=root_dir,
+            mode=0,
+            use_half=self.options.use_half,
+            image_height=self.options.image_resolution,
+            image_width=image_width,
+            augment=augment,
+            aug_rotation=aug_rotation,
+            aug_scale_max=aug_scale_max,
+            aug_scale_min=aug_scale_min,
+        )
+        if backend == "wai":
+            return CamLocDatasetWAIDINOv2(
+                **common,
+                wai_repo_root=getattr(self.options, "wai_repo_root", None),
+                wai_image_modality=getattr(self.options, "wai_image_modality", "image"),
+            )
+        return CamLocDatasetDINOv2(**common)
 
     def create_training_buffer(self):
-        """Create training buffer by sampling features from training images."""
-        _logger.info("Creating training buffer...")
+        """Same as ace_trainer: fill GPU buffer with (features, target_px, gt_poses_inv, intrinsics, intrinsics_inv).
+        When buffer_batch_size > 1, use a dataset with fixed (H,W) so that encoder runs on batches of images.
+        """
+        torch.backends.cudnn.benchmark = False
 
-        buffer_size = self.options.training_buffer_size
-        samples_per_image = self.options.samples_per_image
+        buffer_batch_size = getattr(self.options, 'buffer_batch_size', 10)
+        if buffer_batch_size > 1:
+            # Fixed size so we can batch multiple images in one forward
+            buffer_image_width = getattr(self.options, 'buffer_image_width', None)
+            if buffer_image_width is None:
+                buffer_image_width = (self.options.image_resolution * 4 // 3 + 13) // 14 * 14
+            buffer_dataset = self._build_train_dataset(
+                image_width=buffer_image_width,
+                augment=False,
+                aug_rotation=0,
+                aug_scale_max=1.0,
+                aug_scale_min=1.0,
+            )
+        else:
+            buffer_dataset = self.dataset
 
-        # Create dataloader
-        dataloader = DataLoader(
-            self.dataset,
-            batch_size=1,
-            shuffle=True,
-            num_workers=self.num_data_loader_workers,
-            generator=self.loader_generator,
-            pin_memory=True
+        batch_sampler = sampler.BatchSampler(
+            sampler.RandomSampler(buffer_dataset, generator=self.batch_generator),
+            batch_size=buffer_batch_size,
+            drop_last=False,
         )
 
-        # Initialize buffer
-        buffer_features = torch.zeros(buffer_size, self.regressor.feature_dim)
-        buffer_coords = torch.zeros(buffer_size, 3)
-        buffer_count = 0
+        def seed_worker(worker_id):
+            worker_seed = torch.initial_seed() % 2**32
+            np.random.seed(worker_seed)
+            random.seed(worker_seed)
+
+        training_dataloader = DataLoader(
+            dataset=buffer_dataset,
+            sampler=batch_sampler,
+            batch_size=None,
+            worker_init_fn=seed_worker,
+            generator=self.loader_generator,
+            pin_memory=True,
+            num_workers=self.num_data_loader_workers,
+            persistent_workers=self.num_data_loader_workers > 0,
+            timeout=60 if self.num_data_loader_workers > 0 else 0,
+        )
+
+        _logger.info("Starting creation of the training buffer.")
+
+        buffer_on_cpu = getattr(self.options, "buffer_on_cpu", False)
+        buffer_device = torch.device("cpu") if buffer_on_cpu else self.device
+        if buffer_on_cpu:
+            _logger.info("Buffer will be allocated on CPU (buffer_on_cpu=True) to avoid GPU OOM.")
+
+        self.training_buffer = {
+            'features': torch.empty(
+                (self.options.training_buffer_size, self.regressor.feature_dim),
+                dtype=(torch.float32, torch.float16)[self.options.use_half],
+                device=buffer_device,
+            ),
+            'target_px': torch.empty((self.options.training_buffer_size, 2), dtype=torch.float32, device=buffer_device),
+            'gt_poses_inv': torch.empty((self.options.training_buffer_size, 3, 4), dtype=torch.float32, device=buffer_device),
+            'intrinsics': torch.empty((self.options.training_buffer_size, 3, 3), dtype=torch.float32, device=buffer_device),
+            'intrinsics_inv': torch.empty((self.options.training_buffer_size, 3, 3), dtype=torch.float32, device=buffer_device),
+        }
 
         self.regressor.eval()
-
         with torch.no_grad():
-            for batch_idx, batch in enumerate(dataloader):
-                if buffer_count >= buffer_size:
-                    break
+            buffer_idx = 0
+            dataset_passes = 0
+            pbar = tqdm(
+                total=self.options.training_buffer_size,
+                unit="samples",
+                unit_scale=True,
+                desc="Buffer",
+                dynamic_ncols=True,
+            )
 
-                image = batch[0].to(self.device)
-                pose_inv = batch[3].to(self.device)
-                intrinsics_inv = batch[5].to(self.device)
+            while buffer_idx < self.options.training_buffer_size:
+                dataset_passes += 1
+                for batch in training_dataloader:
+                    # Dataset returns: image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords
+                    image_BCHW, image_mask_B1HW, _, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ = batch
 
-                # Buffer creation: run encoder in float32 to avoid Half/float mismatch (no autocast here)
-                if image.dtype == torch.float16:
-                    image = image.float()
-                # Extract features
-                features = self.regressor.get_features(image)
-                B, C, H, W = features.shape
+                    image_BCHW = image_BCHW.to(self.device, non_blocking=True)
+                    image_mask_B1HW = image_mask_B1HW.to(self.device, non_blocking=True)
+                    gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True)
+                    intrinsics_B33 = intrinsics_B33.to(self.device, non_blocking=True)
+                    intrinsics_inv_B33 = intrinsics_inv_B33.to(self.device, non_blocking=True)
 
-                # Sample random pixels
-                num_samples = min(samples_per_image, H * W)
-                indices = torch.randperm(H * W, generator=self.sampling_generator_cpu)[:num_samples]
+                    # 4x4 -> 3x4 (same as ACE)
+                    if gt_pose_inv_B44.shape[1] == 4:
+                        gt_pose_inv_B34 = gt_pose_inv_B44[:, :3, :]
+                    else:
+                        gt_pose_inv_B34 = gt_pose_inv_B44
 
-                # Convert to 2D coordinates
-                y_coords = indices // W
-                x_coords = indices % W
+                    if image_BCHW.dtype == torch.float16:
+                        image_BCHW = image_BCHW.float()
 
-                # Get features at sampled locations
-                sampled_features = features[0, :, y_coords, x_coords].T  # [num_samples, C]
+                    with autocast("cuda", enabled=self.options.use_half):
+                        features_BCHW = self.regressor.get_features(image_BCHW)
 
-                # Compute 3D scene coordinates (on device for matmul with intrinsics_inv)
-                pixel_coords = torch.stack([
-                    x_coords * self.regressor.OUTPUT_SUBSAMPLE,
-                    y_coords * self.regressor.OUTPUT_SUBSAMPLE
-                ], dim=1).float().to(self.device)
+                    B, C, H, W = features_BCHW.shape
+                    image_mask_B1HW = TF.resize(image_mask_B1HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
+                    image_mask_B1HW = image_mask_B1HW.bool()
 
-                # Backproject to 3D (homogeneous: [1, num_samples, 3] for matmul with intrinsics_inv [3,3])
-                pixel_coords_homo = to_homogeneous(pixel_coords.unsqueeze(0), dim=2)
-                cam_coords = torch.matmul(intrinsics_inv, pixel_coords_homo.transpose(1, 2))
-                cam_coords = cam_coords.transpose(1, 2)
+                    if image_mask_B1HW.sum() == 0:
+                        continue
 
-                # Transform to world coordinates (placeholder - actual coords from network)
-                scene_coords_pred = self.regressor.get_scene_coordinates(features)
-                sampled_coords = scene_coords_pred[0, :, y_coords, x_coords].T  # [num_samples, 3]
+                    pixel_positions_B2HW = self.pixel_grid_2HW[:, :H, :W].clone().unsqueeze(0).expand(B, 2, H, W)
+                    gt_pose_inv = gt_pose_inv_B34.unsqueeze(1).expand(B, H * W, 3, 4).reshape(-1, 3, 4)
+                    intrinsics = intrinsics_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
+                    intrinsics_inv = intrinsics_inv_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
 
-                # Add to buffer
-                space_left = buffer_size - buffer_count
-                num_to_add = min(num_samples, space_left)
+                    def normalize_shape(tensor_in):
+                        return tensor_in.transpose(0, 1).flatten(1).transpose(0, 1)
 
-                buffer_features[buffer_count:buffer_count + num_to_add] = sampled_features[:num_to_add].cpu()
-                buffer_coords[buffer_count:buffer_count + num_to_add] = sampled_coords[:num_to_add].cpu()
-                buffer_count += num_to_add
+                    batch_data = {
+                        'features': normalize_shape(features_BCHW),
+                        'target_px': normalize_shape(pixel_positions_B2HW),
+                        'gt_poses_inv': gt_pose_inv,
+                        'intrinsics': intrinsics,
+                        'intrinsics_inv': intrinsics_inv,
+                    }
 
-                # Log every 10 batches: 10 images × samples_per_image (e.g. 1024) = 10240 samples per log line
-                if (batch_idx + 1) % 10 == 0:
-                    _logger.info(f"Buffer progress: {buffer_count}/{buffer_size}")
+                    image_mask_B1HW = image_mask_B1HW.float()
+                    image_mask_N1 = normalize_shape(image_mask_B1HW)
+                    features_to_select = min(
+                        self.options.samples_per_image * B,
+                        self.options.training_buffer_size - buffer_idx,
+                    )
+                    sample_idxs = torch.multinomial(
+                        image_mask_N1.view(-1),
+                        features_to_select,
+                        replacement=True,
+                        generator=self.sampling_generator,
+                    )
 
+                    for k in batch_data:
+                        batch_data[k] = batch_data[k][sample_idxs].to(buffer_device, non_blocking=True)
+                    buffer_offset = buffer_idx + features_to_select
+                    for k in batch_data:
+                        self.training_buffer[k][buffer_idx:buffer_offset] = batch_data[k]
+
+                    buffer_idx = buffer_offset
+                    pbar.update(features_to_select)
+                    pbar.set_postfix(n_pass=dataset_passes)
+                    if buffer_idx >= self.options.training_buffer_size:
+                        break
+
+            pbar.close()
+
+        buffer_memory = sum(v.element_size() * v.nelement() for v in self.training_buffer.values()) / (1024**3)
+        _logger.info("Created buffer of {:.2f}GB with {} passes (buffer_batch_size={}).".format(
+            buffer_memory, dataset_passes, buffer_batch_size))
         self.regressor.train()
 
-        _logger.info(f"Training buffer created with {buffer_count} samples")
-        self.training_buffer = (buffer_features[:buffer_count], buffer_coords[:buffer_count])
+    def run_epoch(self):
+        """Same as ace_trainer: shuffle buffer, iterate batches, training_step from buffer."""
+        torch.backends.cudnn.benchmark = True
+        random_indices = torch.randperm(self.options.training_buffer_size, generator=self.training_generator)
 
-    def training_step(self, batch):
-        """Single training step."""
-        image = batch[0].to(self.device)
-        # Dataset returns 4x4 pose_inv; use 3x4 [R|t] for projection (same as verify_buffer_dinov2)
-        pose_inv = batch[3].to(self.device)
-        if pose_inv.shape[1] == 4 and pose_inv.shape[2] == 4:
-            pose_inv = pose_inv[:, :3, :]  # [B, 3, 4]
-        intrinsics = batch[4].to(self.device)
-        intrinsics_inv = batch[5].to(self.device)
+        for batch_start in range(0, self.options.training_buffer_size, self.options.batch_size):
+            batch_end = batch_start + self.options.batch_size
+            if batch_end > self.options.training_buffer_size:
+                continue
 
-        depth_min = getattr(self.options, 'depth_min', 0.01)
-        depth_max = getattr(self.options, 'depth_max', 1e6)
-        repro_hard_clamp = getattr(self.options, 'repro_loss_hard_clamp', 1000.0)
-        depth_target = getattr(self.options, 'depth_target', 1.0)
+            random_batch_indices = random_indices[batch_start:batch_end]
+            buf_dev = next(iter(self.training_buffer.values())).device
+            to_dev = self.device if buf_dev.type == "cpu" else buf_dev
+            self.training_step(
+                self.training_buffer['features'][random_batch_indices].contiguous().to(to_dev, non_blocking=True),
+                self.training_buffer['target_px'][random_batch_indices].contiguous().to(to_dev, non_blocking=True),
+                self.training_buffer['gt_poses_inv'][random_batch_indices].contiguous().to(to_dev, non_blocking=True),
+                self.training_buffer['intrinsics'][random_batch_indices].contiguous().to(to_dev, non_blocking=True),
+                self.training_buffer['intrinsics_inv'][random_batch_indices].contiguous().to(to_dev, non_blocking=True),
+            )
+            self.iteration += 1
 
-        with autocast('cuda', enabled=self.options.use_half):
-            # Forward pass
-            scene_coords = self.regressor(image)
+    def training_step(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33):
+        """Same as ace_trainer: head-only forward, reprojection loss, invalid proxy loss."""
+        batch_size = features_bC.shape[0]
+        channels = features_bC.shape[1]
+        # Reshape to fake BCHW for head (same as ACE: 16x32 for 1x1 conv; use 16 x (batch_size//16))
+        h, w = 16, batch_size // 16
+        if h * w != batch_size:
+            batch_size = h * w
+            features_bC = features_bC[:batch_size]
+            target_px_b2 = target_px_b2[:batch_size]
+            gt_inv_poses_b34 = gt_inv_poses_b34[:batch_size]
+            Ks_b33 = Ks_b33[:batch_size]
+            invKs_b33 = invKs_b33[:batch_size]
+        features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
 
-            B, _, H, W = scene_coords.shape
-            N = H * W
-            pixel_grid_crop = self.pixel_grid_2HW[:, :H, :W].to(scene_coords.device)  # [2, H, W]
+        with autocast("cuda", enabled=self.options.use_half):
+            pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(features_bCHW)
 
-            # Scene coords to camera coords and project
-            pred_scene = scene_coords.view(B, 3, -1)
-            pred_scene_homo = to_homogeneous(pred_scene, dim=1)  # [B, 4, N]
-            pred_cam = torch.bmm(pose_inv, pred_scene_homo)  # [B, 3, N]
-            pred_px = torch.bmm(intrinsics, pred_cam)  # [B, 3, N]
-            pred_px[:, 2].clamp_(min=depth_min)
-            pred_px_2 = pred_px[:, :2] / pred_px[:, 2:3]  # [B, 2, N]
+        pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
+        pred_scene_coords_b41 = to_homogeneous(pred_scene_coords_b31)
+        pred_cam_coords_b31 = torch.bmm(gt_inv_poses_b34, pred_scene_coords_b41)
+        pred_px_b31 = torch.bmm(Ks_b33, pred_cam_coords_b31)
+        pred_px_b31[:, 2].clamp_(min=self.options.depth_min)
+        pred_px_b21 = pred_px_b31[:, :2] / pred_px_b31[:, 2, None]
 
-            target_px = pixel_grid_crop.reshape(2, -1).unsqueeze(0).expand(B, 2, -1)  # [B, 2, N]
-            repro_err_b1N = torch.norm(pred_px_2 - target_px, dim=1, p=1)  # [B, N]
+        reprojection_error_b2 = pred_px_b21.squeeze() - target_px_b2
+        reprojection_error_b1 = torch.norm(reprojection_error_b2, dim=1, keepdim=True, p=1)
 
-            invalid_min_depth = pred_cam[:, 2] < depth_min
-            invalid_max_depth = pred_cam[:, 2] > depth_max
-            invalid_repro = repro_err_b1N > repro_hard_clamp
-            valid_mask = ~(invalid_min_depth | invalid_max_depth | invalid_repro)
+        invalid_min_depth_b1 = pred_cam_coords_b31[:, 2] < self.options.depth_min
+        invalid_repro_b1 = reprojection_error_b1 > self.options.repro_loss_hard_clamp
+        invalid_max_depth_b1 = pred_cam_coords_b31[:, 2] > self.options.depth_max
+        invalid_mask_b1 = invalid_min_depth_b1 | invalid_repro_b1 | invalid_max_depth_b1
+        valid_mask_b1 = ~invalid_mask_b1
 
-            valid_repro_err = repro_err_b1N[valid_mask]
-            loss_valid = self.repro_loss.compute(valid_repro_err, self.iteration) if valid_repro_err.numel() > 0 else scene_coords.sum() * 0.0
+        valid_reprojection_error_b1 = reprojection_error_b1[valid_mask_b1]
+        loss_valid = self.repro_loss.compute(valid_reprojection_error_b1, self.iteration)
 
-            invalid_mask_expand = invalid_min_depth | invalid_max_depth | invalid_repro
-            target_px_homo = torch.cat([
-                pixel_grid_crop.reshape(2, -1),
-                torch.ones(1, N, device=scene_coords.device, dtype=scene_coords.dtype)
-            ], dim=0).unsqueeze(0).expand(B, 3, N)
-            target_cam = depth_target * torch.bmm(intrinsics_inv, target_px_homo)
-            loss_invalid = torch.abs(target_cam - pred_cam).masked_select(invalid_mask_expand.unsqueeze(1)).sum()
+        pixel_grid_crop_b31 = to_homogeneous(target_px_b2.unsqueeze(2))
+        target_camera_coords_b31 = self.options.depth_target * torch.bmm(invKs_b33, pixel_grid_crop_b31)
+        invalid_mask_b11 = invalid_mask_b1.unsqueeze(2)
+        loss_invalid = torch.abs(target_camera_coords_b31 - pred_cam_coords_b31).masked_select(invalid_mask_b11).sum()
 
-            loss = loss_valid + loss_invalid
-            loss = loss / (B * N)
+        loss = loss_valid + loss_invalid
+        loss /= batch_size
 
-        # Backward pass
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         self.scaler.scale(loss).backward()
         self.scaler.step(self.optimizer)
         self.scaler.update()
-        self.scheduler.step()
 
-        return loss.item()
+        if self.iteration % self.iterations_output == 0:
+            time_since_start = time.time() - self.training_start
+            fraction_valid = float(valid_mask_b1.sum() / batch_size)
+            _logger.info(
+                'Iteration: {:6d} / Epoch {:03d}|{:03d}, Loss: {:.1f}, Valid: {:.1f}%, Time: {:.2f}s'.format(
+                    self.iteration,
+                    self.epoch,
+                    self.options.epochs,
+                    loss.item(),
+                    fraction_valid * 100,
+                    time_since_start,
+                )
+            )
+
+        if hasattr(self.scheduler, 'total_steps') and self.iteration < self.scheduler.total_steps:
+            self.scheduler.step()
+        else:
+            self.scheduler.step()
+
+        return loss
 
     def train(self):
-        """Main training loop."""
-        _logger.info("Starting training...")
+        """Same as ace_trainer: create buffer, run_epoch loop, save_model."""
+        self.training_start = time.time()
 
-        # Create training buffer
+        buffer_start = time.time()
         self.create_training_buffer()
+        _logger.info("Filled training buffer in {:.1f}s.".format(time.time() - buffer_start))
 
-        # Training dataloader
-        dataloader = DataLoader(
-            self.dataset,
-            batch_size=self.options.batch_size,
-            shuffle=True,
-            num_workers=self.num_data_loader_workers,
-            generator=self.training_generator,
-            pin_memory=True
-        )
+        for self.epoch in range(self.options.epochs):
+            self.run_epoch()
 
-        # Training loop
-        epoch_losses = []
-        for epoch in range(self.options.epochs):
-            epoch_loss = 0
-            num_batches = 0
-
-            for batch in dataloader:
-                loss = self.training_step(batch)
-                epoch_loss += loss
-                num_batches += 1
-                self.iteration += 1
-
-                if self.iteration % self.iterations_output == 0:
-                    avg_loss = epoch_loss / num_batches
-                    lr = self.scheduler.get_last_lr()[0]
-                    _logger.info(f"Iter {self.iteration}/{self.iterations}, "
-                               f"Epoch {epoch+1}/{self.options.epochs}, "
-                               f"Loss: {avg_loss:.4f}, LR: {lr:.6f}")
-
-            avg_epoch_loss = epoch_loss / num_batches
-            epoch_losses.append(avg_epoch_loss)
-            _logger.info(f"Epoch {epoch+1} completed, Avg Loss: {avg_epoch_loss:.4f}")
-
-        _logger.info("Training completed!")
-        return epoch_losses
+        self.save_model(self.options.output_map)
+        _logger.info("Done. Total time: {:.1f}s.".format(time.time() - self.training_start))
 
     def save_model(self, output_path):
-        """Save trained model."""
-        _logger.info(f"Saving model to {output_path}")
-        # Save only the head network (scene-specific)
-        torch.save(self.regressor.heads.state_dict(), output_path)
-        _logger.info("Model saved successfully")
+        """Same as ace_trainer: save head state_dict as half."""
+        head_state_dict = self.regressor.heads.state_dict()
+        for k in list(head_state_dict.keys()):
+            head_state_dict[k] = head_state_dict[k].half()
+        torch.save(head_state_dict, output_path)
+        _logger.info("Saved trained head weights to: {}".format(output_path))

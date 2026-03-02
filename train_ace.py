@@ -31,7 +31,7 @@ if __name__ == '__main__':
     parser.add_argument('--encoder_path', type=Path, default=Path(__file__).parent / "ace_encoder_pretrained.pt",
                         help='file containing pre-trained encoder weights')
 
-    parser.add_argument('--num_head_blocks', type=int, default=8,
+    parser.add_argument('--num_head_blocks', type=int, default=4,
                         help='depth of the regression head, defines the map size')
 
     parser.add_argument('--learning_rate_min', type=float, default=0.0005,
@@ -40,7 +40,7 @@ if __name__ == '__main__':
     parser.add_argument('--learning_rate_max', type=float, default=0.005,
                         help='highest learning rate of 1 cycle scheduler')
 
-    parser.add_argument('--training_buffer_size', type=int, default=16000000,
+    parser.add_argument('--training_buffer_size', type=int, default=8000000,
                         help='number of patches in the training buffer')
 
     parser.add_argument('--samples_per_image', type=int, default=1024,
@@ -49,7 +49,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=5120,
                         help='number of patches for each parameter update (has to be a multiple of 512)')
 
-    parser.add_argument('--epochs', type=int, default=28,
+    parser.add_argument('--epochs', type=int, default=24,
                         help='number of runs through the training buffer')
 
     parser.add_argument('--repro_loss_hard_clamp', type=int, default=1000,

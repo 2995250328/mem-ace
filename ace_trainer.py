@@ -3,6 +3,7 @@
 import logging
 import random
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -483,5 +484,7 @@ class TrainerACE:
         head_state_dict = self.regressor.heads.state_dict()
         for k, v in head_state_dict.items():
             head_state_dict[k] = head_state_dict[k].half()
+        out_path = Path(self.options.output_map_file)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(head_state_dict, self.options.output_map_file)
         _logger.info(f"Saved trained head weights to: {self.options.output_map_file}")

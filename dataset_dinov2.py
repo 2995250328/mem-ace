@@ -41,6 +41,7 @@ class CamLocDatasetDINOv2(Dataset):
                  aug_black_white=0.1,
                  aug_color=0.3,
                  image_height=518,  # Changed default to 518 (37*14) for DINOv2
+                 image_width=None,  # If set, all images resized to (image_height, image_width) for batching
                  use_half=True,
                  num_clusters=None,
                  cluster_idx=None,
@@ -77,6 +78,7 @@ class CamLocDatasetDINOv2(Dataset):
         if self.image_height != image_height:
             _logger.warning(f"Image height adjusted from {image_height} to {self.image_height} "
                           f"(must be multiple of {self.patch_size})")
+        self.image_width = self._round_to_patch_size(image_width) if image_width is not None else None
 
         self.augment = augment
         self.aug_rotation = aug_rotation
@@ -321,9 +323,12 @@ class CamLocDatasetDINOv2(Dataset):
         # Resize image
         image = self._resize_image(image, image_height)
 
-        # Ensure width is also multiple of 14
+        # Ensure width is also multiple of 14 (or use fixed image_width for batching)
         current_width = image.size[0]
-        target_width = self._round_to_patch_size(current_width)
+        if self.image_width is not None:
+            target_width = self.image_width
+        else:
+            target_width = self._round_to_patch_size(current_width)
         if target_width != current_width:
             image = TF.resize(image, (image_height, target_width))
             # Adjust focal length and center point for width change
@@ -434,10 +439,26 @@ class CamLocDatasetDINOv2(Dataset):
 
         intrinsics_inv = intrinsics.inverse()
 
-        return image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords
+        # Match dataset_origin: return filename as 8th element for test script compatibility.
+        return image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, str(self.rgb_files[idx])
 
     def __len__(self):
         return len(self.valid_file_indices)
 
     def __getitem__(self, idx):
+        """Support single index (int) or batch of indices (list/tuple) for DataLoader with BatchSampler."""
+        if isinstance(idx, (list, tuple)):
+            items = [self._get_single_item(int(i), self.image_height) for i in idx]
+            coords_list = [x[6] for x in items]
+            coords_out = torch.stack(coords_list) if isinstance(coords_list[0], torch.Tensor) else coords_list[0]
+            return (
+                torch.stack([x[0] for x in items]),
+                torch.stack([x[1] for x in items]),
+                torch.stack([x[2] for x in items]),
+                torch.stack([x[3] for x in items]),
+                torch.stack([x[4] for x in items]),
+                torch.stack([x[5] for x in items]),
+                coords_out,
+                [x[7] for x in items],
+            )
         return self._get_single_item(idx, self.image_height)

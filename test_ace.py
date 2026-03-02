@@ -150,6 +150,7 @@ if __name__ == '__main__':
     tErrs = []
 
     # Percentage of frames predicted within certain thresholds from their GT pose.
+    pct25_5 = 0
     pct10_5 = 0
     pct5 = 0
     pct2 = 0
@@ -206,11 +207,11 @@ if __name__ == '__main__':
                     zip(scene_coordinates_B3HW, gt_pose_B44, intrinsics_B33, filenames)):
 
                 # Extract focal length and principal point from the intrinsics matrix.
-                focal_length = intrinsics_33[0, 0].item()
+                # Use mean of fx/fy when they differ (e.g. indoor6).
+                fx, fy = intrinsics_33[0, 0].item(), intrinsics_33[1, 1].item()
+                focal_length = (fx + fy) / 2.0
                 ppX = intrinsics_33[0, 2].item()
                 ppY = intrinsics_33[1, 2].item()
-                # We support a single focal length.
-                assert torch.allclose(intrinsics_33[0, 0], intrinsics_33[1, 1])
 
                 # Remove path from file name
                 frame_name = Path(frame_path).name
@@ -260,6 +261,8 @@ if __name__ == '__main__':
                 tErrs.append(t_err * 100)
 
                 # Check various thresholds.
+                if r_err < 5 and t_err < 0.25:  # 25cm/5deg
+                    pct25_5 += 1
                 if r_err < 5 and t_err < 0.1:  # 10cm/5deg
                     pct10_5 += 1
                 if r_err < 5 and t_err < 0.05:  # 5cm/5deg
@@ -307,6 +310,7 @@ if __name__ == '__main__':
     avg_time = avg_batch_time / num_batches
 
     # Compute final metrics.
+    pct25_5 = pct25_5 / total_frames * 100
     pct10_5 = pct10_5 / total_frames * 100
     pct5 = pct5 / total_frames * 100
     pct2 = pct2 / total_frames * 100
@@ -316,6 +320,7 @@ if __name__ == '__main__':
     _logger.info("Test complete.")
 
     _logger.info('Accuracy:')
+    _logger.info(f'\t25cm/5deg: {pct25_5:.1f}%')
     _logger.info(f'\t10cm/5deg: {pct10_5:.1f}%')
     _logger.info(f'\t5cm/5deg: {pct5:.1f}%')
     _logger.info(f'\t2cm/2deg: {pct2:.1f}%')

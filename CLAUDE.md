@@ -4,12 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an extended implementation of ACE (Accelerated Coordinate Encoding) for visual camera relocalization. The codebase contains four variants:
+This is an extended implementation of ACE (Accelerated Coordinate Encoding) for visual camera relocalization. The codebase contains five variants:
 
 1. **Basic ACE**: Original implementation from the CVPR 2023 paper
 2. **ACE Depth**: Extended version integrating Depth Anything V2 for depth-aware coordinate regression
 3. **ACE Full**: Complete version combining depth estimation, SuperPoint features, and camera intrinsic fusion
-4. **ACE DINOv2**: Uses DINOv2 ViT-L/14 as backbone instead of FCN encoder (NEW)
+4. **ACE DINOv2**: Uses DINOv2 ViT-L/14 as backbone instead of FCN encoder
+5. **ACE DINOv2 LMC**: DINOv2 with Latent Memory Compression and configurable degradation switches for ablation studies (NEW)
 
 The system learns to predict dense 3D scene coordinates from RGB images, then uses RANSAC-based pose estimation to determine 6DoF camera poses.
 
@@ -306,3 +307,247 @@ For detailed DINOv2 usage instructions, see `DINOV2_USAGE.md`.
 - DSAC* C++ bindings must be compiled before running any pose estimation
 - Default training time: ~5 minutes per scene on a single GPU
 - Output head networks are stored as half-precision (FP16) for ~4MB file size
+
+## ACE DINOv2 with Latent Memory Compression (LMC)
+
+### Overview
+
+The LMC variant extends ACE DINOv2 with:
+- **Latent Memory Compression**: Autoencoder-based feature compression to reduce memory footprint
+- **Degradation Switches**: Configurable feature toggles for ablation studies
+- **Two-Stage Iterative Training**: Separate buffer filling and head training stages
+- **Modular Architecture**: Clean separation of concerns in `tasks/ace/` module
+
+### Training Commands
+
+#### Basic Training (RGB-only with compression)
+```bash
+./train_ace_dinov2_lmc.py \
+    datasets/7scenes_chess \
+    output/chess_lmc.pt \
+    --device cuda:0 \
+    --enable_compression True \
+    --compression_ratio 0.5
+```
+
+#### Training with All Features
+```bash
+./train_ace_dinov2_lmc.py \
+    datasets/7scenes_chess \
+    output/chess_lmc_full.pt \
+    --device cuda:0 \
+    --use_depth True \
+    --use_superpoint True \
+    --use_intrinsics True \
+    --enable_compression True \
+    --compression_ratio 0.5
+```
+
+#### Training without Compression (Ablation)
+```bash
+./train_ace_dinov2_lmc.py \
+    datasets/7scenes_chess \
+    output/chess_no_comp.pt \
+    --device cuda:0 \
+    --enable_compression False
+```
+
+### Testing Commands
+
+```bash
+./test_ace_dinov2_lmc.py \
+    datasets/7scenes_chess \
+    output/chess_lmc.pt \
+    --device cuda:0 \
+    --session lmc_test
+```
+
+### Degradation Switches
+
+Control which features are enabled during training:
+
+| Switch | Description | Default |
+|--------|-------------|---------|
+| `--use_depth` | Enable depth branch in multi-modal fusion | False |
+| `--use_superpoint` | Enable SuperPoint features | False |
+| `--use_intrinsics` | Enable camera intrinsics fusion | False |
+| `--enable_compression` | Enable latent memory compression | True |
+| `--compression_ratio` | Compression ratio (0.0-1.0) | 0.5 |
+
+### Ablation Study Scripts
+
+Located in `scripts/lmc/` directory:
+
+#### 1. Compression Ratio Ablation
+```bash
+./scripts/lmc/ablation_compression_ratio.sh datasets/7scenes_chess output/ablation cuda:0
+```
+Tests compression ratios: 0.25, 0.5, 0.75, 1.0
+
+#### 2. Multi-Modal Feature Ablation
+```bash
+./scripts/lmc/ablation_multimodal.sh datasets/7scenes_chess output/ablation cuda:0
+```
+Tests 8 configurations: RGB-only, RGB+Depth, RGB+SuperPoint, RGB+Intrinsics, and combinations
+
+#### 3. Compression On/Off Ablation
+```bash
+./scripts/lmc/ablation_compression_onoff.sh datasets/7scenes_chess output/ablation cuda:0
+```
+Compares performance with and without compression
+
+#### 4. Example Workflow
+```bash
+./scripts/lmc/example_workflow.sh datasets/7scenes_chess output/example cuda:0
+```
+Complete pipeline demonstrating typical usage
+
+### Architecture Components
+
+The LMC system is organized in `tasks/ace/` module:
+
+```
+tasks/ace/
+├── buffer.py              # GPU-based training buffer management
+├── checkpoint.py          # Checkpoint saving/loading utilities
+├── common.py              # Configuration dataclasses (DegradationConfig, TrainingConfig)
+├── compressor.py          # Latent memory compression (autoencoder)
+├── fusion.py              # Multi-modal feature fusion
+├── loss_utils.py          # Loss computation functions
+├── regression_head.py     # Scene coordinate regression head
+├── training_utils.py      # Optimizer/scheduler creation
+└── utils.py               # General utilities (set_seed, log_metrics)
+```
+
+### Two-Stage Training Process
+
+**Stage 1: Buffer Filling**
+- Encode all training images with frozen DINOv2
+- Apply multi-modal fusion (if enabled)
+- Sample features and store in GPU buffer
+- Fast: ~2-3 minutes for 5.76M samples
+
+**Stage 2: Head Training**
+- Sample batches from buffer
+- Apply compression (if enabled)
+- Train regression head on scene coordinates
+- Compute reprojection + compression loss
+- Iterate for N epochs
+
+This approach decouples feature extraction from head training, enabling:
+- Faster experimentation with different head architectures
+- Memory-efficient training through compression
+- Easy ablation studies via degradation switches
+
+### Latent Memory Compressor
+
+The compressor uses an autoencoder architecture:
+- **Encoder**: Linear layer compressing features to lower dimension
+- **Decoder**: Linear layer reconstructing original features
+- **Loss**: MSE reconstruction loss (weighted 0.1x in total loss)
+
+Compression ratio controls bottleneck dimension:
+- `ratio=0.25`: 1024 → 256 → 1024 (75% compression)
+- `ratio=0.5`: 1024 → 512 → 1024 (50% compression)
+- `ratio=0.75`: 1024 → 768 → 1024 (25% compression)
+- `ratio=1.0`: No compression (passthrough)
+
+### Multi-Modal Fusion
+
+When degradation switches are enabled, the fusion module combines:
+- **RGB features**: From DINOv2 encoder (1024-dim)
+- **Depth features**: From depth estimation branch (optional)
+- **SuperPoint features**: From keypoint detector (optional)
+- **Camera intrinsics**: Fused into feature representation (optional)
+
+Fusion strategy: Concatenation + learned projection
+
+### Performance Considerations
+
+**Memory Usage:**
+- DINOv2 ViT-L/14: ~6GB VRAM (frozen), ~12GB (fine-tuning)
+- Training buffer: ~22GB for 5.76M samples × 1024 features (FP16)
+- Compression: Reduces buffer by compression_ratio
+- Example: ratio=0.5 → ~11GB buffer
+
+**Speed:**
+- Buffer filling: ~2-3 min for 5.76M samples (batch_size=10)
+- Training epoch: ~5-10 min depending on batch_size
+- Inference: ~10-15 FPS (518×518 images)
+
+**Recommendations:**
+- 24GB GPU: Use default settings
+- 16GB GPU: `--batch_size 2048`, `--buffer_batch_size 5`
+- 12GB GPU: `--batch_size 1024`, `--buffer_batch_size 3`, `--compression_ratio 0.25`
+
+### Key Parameters
+
+**Training:**
+- `--epochs`: Training epochs (default: 16)
+- `--batch_size`: Batch size for training (default: 3840)
+- `--training_buffer_size`: Size of training buffer (default: 5760000)
+- `--buffer_batch_size`: Images per forward when filling buffer (default: 10)
+- `--samples_per_image`: Features sampled per image (default: 384)
+- `--checkpoint_interval`: Save checkpoint every N epochs (default: 4)
+
+**Network:**
+- `--num_head_blocks`: Depth of regression head (default: 1)
+- `--freeze_backbone`: Freeze DINOv2 backbone (default: True)
+
+**Degradation:**
+- `--use_depth`: Enable depth branch (default: False)
+- `--use_superpoint`: Enable SuperPoint features (default: False)
+- `--use_intrinsics`: Enable intrinsics fusion (default: False)
+- `--enable_compression`: Enable compression (default: True)
+- `--compression_ratio`: Compression ratio 0.0-1.0 (default: 0.5)
+
+### Checkpoint Format
+
+LMC checkpoints contain:
+```python
+{
+    'encoder_state_dict': ...,      # DINOv2 weights (if fine-tuned)
+    'fusion_state_dict': ...,       # Multi-modal fusion weights
+    'compressor_state_dict': ...,   # Compressor weights
+    'head_state_dict': ...,         # Regression head weights
+    'optimizer_state_dict': ...,    # Optimizer state
+    'scheduler_state_dict': ...,    # Scheduler state
+    'epoch': ...,                   # Current epoch
+    'iteration': ...,               # Current iteration
+    'degradation_config': {...},    # Degradation switches
+    'training_config': {...},       # Training configuration
+    'mean_cam_center': [...],       # Scene mean camera center
+}
+```
+
+### Troubleshooting
+
+**Out of Memory:**
+```bash
+# Reduce batch size
+--batch_size 2048
+
+# Reduce buffer batch size
+--buffer_batch_size 5
+
+# Increase compression
+--compression_ratio 0.25
+
+# Ensure backbone is frozen
+--freeze_backbone True
+```
+
+**Slow Training:**
+- Increase `--buffer_batch_size` (if memory allows)
+- Increase `--batch_size` (if memory allows)
+- Reduce `--training_buffer_size`
+
+**Module Import Errors:**
+```bash
+# Ensure tasks/ace/ is in Python path
+export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+```
+
+For detailed LMC usage instructions, see `LMC_USAGE.md`.
+For ablation script documentation, see `scripts/lmc/README.md`.
+
