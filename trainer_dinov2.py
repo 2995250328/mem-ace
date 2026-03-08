@@ -201,6 +201,8 @@ class TrainerACEDINOv2:
         with torch.no_grad():
             buffer_idx = 0
             dataset_passes = 0
+            sampled_total = 0
+            sampled_duplicates = 0
             pbar = tqdm(
                 total=self.options.training_buffer_size,
                 unit="samples",
@@ -258,16 +260,25 @@ class TrainerACEDINOv2:
 
                     image_mask_B1HW = image_mask_B1HW.float()
                     image_mask_N1 = normalize_shape(image_mask_B1HW)
+                    replacement_cfg = getattr(self.options, "buffer_sampling_replacement", None)
+                    use_replacement = True if replacement_cfg is None else bool(replacement_cfg)
                     features_to_select = min(
                         self.options.samples_per_image * B,
                         self.options.training_buffer_size - buffer_idx,
                     )
+                    if not use_replacement:
+                        valid_count = int((image_mask_N1.view(-1) > 0).sum().item())
+                        features_to_select = min(features_to_select, valid_count)
+                    if features_to_select <= 0:
+                        continue
                     sample_idxs = torch.multinomial(
                         image_mask_N1.view(-1),
                         features_to_select,
-                        replacement=True,
+                        replacement=use_replacement,
                         generator=self.sampling_generator,
                     )
+                    sampled_total += int(sample_idxs.numel())
+                    sampled_duplicates += int(sample_idxs.numel() - torch.unique(sample_idxs).numel())
 
                     for k in batch_data:
                         batch_data[k] = batch_data[k][sample_idxs].to(buffer_device, non_blocking=True)
@@ -284,8 +295,18 @@ class TrainerACEDINOv2:
             pbar.close()
 
         buffer_memory = sum(v.element_size() * v.nelement() for v in self.training_buffer.values()) / (1024**3)
+        dup_ratio = (sampled_duplicates / sampled_total) if sampled_total > 0 else 0.0
+        replacement_cfg = getattr(self.options, "buffer_sampling_replacement", None)
+        use_replacement = True if replacement_cfg is None else bool(replacement_cfg)
         _logger.info("Created buffer of {:.2f}GB with {} passes (buffer_batch_size={}).".format(
             buffer_memory, dataset_passes, buffer_batch_size))
+        _logger.info(
+            "Buffer sampling stats: replacement=%s, duplicate_ratio=%.4f (%d/%d).",
+            use_replacement,
+            dup_ratio,
+            sampled_duplicates,
+            sampled_total,
+        )
         self.regressor.train()
 
     def run_epoch(self):

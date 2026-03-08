@@ -216,6 +216,15 @@ if __name__ == '__main__':
             else:
                 _logger.info("Running post-train evaluation in subprocess on %s.", eval_device)
 
+            # 子进程使用独立 GPU，避免与父进程争用同一块卡导致 OOM
+            eval_env = os.environ.copy()
+            if eval_device.startswith("cuda"):
+                gpu_id = eval_device.split(":")[-1]
+                eval_env["CUDA_VISIBLE_DEVICES"] = gpu_id
+                device_for_cmd = "cuda:0"  # 子进程内只看到一块卡，即物理 GPU gpu_id
+            else:
+                device_for_cmd = eval_device
+
             output_dir = Path(args.output_map).parent
             scene_name = getattr(args, "_scene_display_name", None) or Path(args.scene).parent.name if args.scene.parts and args.scene.name in ("train", "test", "val") else Path(args.scene).name
             eval_session = getattr(args, "eval_session", "post_train")
@@ -230,10 +239,10 @@ if __name__ == '__main__':
                 "--dinov2_path", str(args.dinov2_path),
                 "--session", str(eval_session),
                 "--image_resolution", str(args.image_resolution),
-                "--device", eval_device,
+                "--device", device_for_cmd,
             ]
             _logger.info("Eval command: %s", " ".join(cmd))
-            result = subprocess.run(cmd, cwd=os.getcwd(), env=os.environ.copy())
+            result = subprocess.run(cmd, cwd=os.getcwd(), env=eval_env)
             if result.returncode != 0:
                 raise RuntimeError(f"test_ace_dinov2.py exited with code {result.returncode}")
 

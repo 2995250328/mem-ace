@@ -3,10 +3,13 @@
 # Ported from map-anything/mapanything/tasks/ace/compressor.py
 # Self-contained — no dependency on mapanything package.
 
+import logging
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+_logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -17,8 +20,9 @@ class FourierPositionEncoding(nn.Module):
     """3D Positional Encoding using Random Fourier Features."""
 
     def __init__(self, input_dim=3, hidden_dim=256, output_dim=1024,
-                 num_frequencies=10, sigma=1.0):
+                 num_frequencies=10, sigma=1.0, normalize_input=False):
         super().__init__()
+        self.normalize_input = normalize_input
         self.register_buffer(
             "B_gauss", torch.randn(input_dim, num_frequencies) * sigma)
         self.mlp = nn.Sequential(
@@ -28,6 +32,8 @@ class FourierPositionEncoding(nn.Module):
         )
 
     def forward(self, coords):
+        if self.normalize_input:
+            coords = coords / (coords.std(dim=1, keepdim=True).clamp(min=1e-6))
         projected = torch.matmul(coords, self.B_gauss)
         fourier = torch.cat([torch.sin(2 * math.pi * projected),
                              torch.cos(2 * math.pi * projected)], dim=-1)
@@ -240,7 +246,8 @@ class GeoLMC(nn.Module):
                  mode='global',
                  use_scale_token=True,
                  scale_token_dim=None,
-                 num_attn_layers=2):
+                 num_attn_layers=2,
+                 pe_normalize_input=False):
         super().__init__()
 
         self.mode = mode
@@ -253,7 +260,7 @@ class GeoLMC(nn.Module):
         # --- Input Projection ---
         self.total_input_dim = input_dim * num_layers
         self.pe_encoder = FourierPositionEncoding(
-            input_dim=3, output_dim=compress_dim)
+            input_dim=3, output_dim=compress_dim, normalize_input=pe_normalize_input)
         self.k_proj = nn.Linear(input_dim, compress_dim)
         self.v_proj = nn.Sequential(
             nn.Linear(self.total_input_dim, compress_dim * 2),
@@ -396,6 +403,15 @@ class GeoLMC(nn.Module):
 
         norm_coords = latent_coords - scene_center.unsqueeze(1)
         q = self.pe_encoder(norm_coords)
+
+        # One-time PE diagnostic log
+        if not hasattr(self, '_pe_logged'):
+            _logger.info(
+                "[PE] input range: %.3f~%.3f, output range: %.3f~%.3f",
+                float(norm_coords.min()), float(norm_coords.max()),
+                float(q.min()), float(q.max()),
+            )
+            self._pe_logged = True
 
         dist_sq = torch.cdist(latent_coords, pooled_points, p=2) ** 2
         if self.mode == 'local':

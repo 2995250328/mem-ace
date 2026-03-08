@@ -8,7 +8,6 @@ import logging
 import math
 import os
 import time
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
 
@@ -23,121 +22,14 @@ from trainer_dinov2 import TrainerACEDINOv2, set_seed
 from ace_compressor import GeoLMC
 from ace_fusion import LMCFeatureFusion
 from ace_loss import ReproLoss
+from utils_lmc import (
+    _normalize_scene_tag,
+    estimate_memory_front_visibility,
+    load_memory_features,
+    preflight_memory_features,
+)
 
 _logger = logging.getLogger(__name__)
-
-
-def estimate_memory_front_visibility(
-    pooled_points: torch.Tensor,
-    all_poses: torch.Tensor,
-    max_points: int = 4096,
-) -> Dict[str, float] | None:
-    """Estimate how many memory points lie in front of cameras (z>0 in camera frame).
-
-    A very low ratio means global memory tokens are weakly co-visible across views,
-    which often destabilizes global-mode LMC on wide-baseline scenes.
-    """
-    if pooled_points is None or all_poses is None:
-        return None
-    if not isinstance(pooled_points, torch.Tensor) or not isinstance(all_poses, torch.Tensor):
-        return None
-    if pooled_points.numel() == 0 or all_poses.numel() == 0:
-        return None
-
-    pts = pooled_points.detach().float().cpu()
-    poses = all_poses.detach().float().cpu()
-    if poses.ndim == 4 and poses.shape[1:] == (1, 4, 4):
-        poses = poses[:, 0]
-    if poses.ndim != 3 or poses.shape[1:] != (4, 4):
-        return None
-
-    n_pts = pts.shape[0]
-    if n_pts > max_points:
-        perm = torch.randperm(n_pts)[:max_points]
-        pts = pts[perm]
-        n_pts = pts.shape[0]
-
-    pts_h = torch.cat([pts, torch.ones(n_pts, 1)], dim=1).t()  # (4, N)
-    ratios = []
-    for p in poses:
-        try:
-            w2c = torch.linalg.inv(p)
-        except RuntimeError:
-            continue
-        cam = (w2c @ pts_h)[:3]
-        z = cam[2]
-        ratios.append(float((z > 0).float().mean().item()))
-
-    if len(ratios) == 0:
-        return None
-    return {
-        "mean_front_ratio": float(sum(ratios) / len(ratios)),
-        "min_front_ratio": float(min(ratios)),
-        "median_front_ratio": float(torch.tensor(ratios).median().item()),
-        "max_front_ratio": float(max(ratios)),
-        "num_points_sampled": int(n_pts),
-        "num_poses": int(len(ratios)),
-    }
-
-
-def load_memory_features(path: str, device: torch.device) -> Dict[str, Any]:
-    """
-    Load memory tensors from disk (same contract as map-anything load_memory_features).
-    Supports POOLED memory bank format; unknown format raises with available keys.
-    """
-    payload = torch.load(path, map_location=device, weights_only=False)
-
-    def safe_to_device(key: str):
-        val = payload.get(key)
-        if isinstance(val, torch.Tensor):
-            return val.to(device)
-        return val
-
-    if "pooled_points" in payload and "pooled_features" in payload:
-        _logger.info("[LMC] Detected POOLED memory bank at %s", path)
-        def _to_tensor(x):
-            if isinstance(x, torch.Tensor):
-                return x.to(device)
-            return torch.tensor(x, device=device)
-        return {
-            "type": "pooled",
-            "pooled_points": _to_tensor(payload["pooled_points"]),
-            "pooled_features": _to_tensor(payload["pooled_features"]),
-            "pooled_colors": safe_to_device("pooled_colors"),
-            "all_poses": safe_to_device("all_poses"),
-            "all_intrinsics": safe_to_device("all_intrinsics"),
-            "all_scale_tokens": safe_to_device("all_scale_tokens"),
-            "scene_center": safe_to_device("scene_center"),
-            "ref_pose": safe_to_device("ref_pose"),
-            "patch_stride": payload.get("patch_stride", 14.0),
-            "voxel_size": payload.get("voxel_size", 0.05),
-            "original_views": payload.get("original_views", 0),
-            "scene": payload.get("scene", "unknown"),
-            "layers_idx": payload.get("layers_idx", []),
-        }
-    if "intermediate" in payload or "final" in payload:
-        raise ValueError(
-            f"Memory file at {path} is FULL intermediate format. "
-            "ace_depth LMC only supports POOLED memory bank (pooled_points, pooled_features)."
-        )
-    available = list(payload.keys()) if isinstance(payload, dict) else "Not a dict"
-    raise ValueError(f"Unknown memory file format at {path}. Keys: {available}")
-
-
-def _normalize_scene_tag(scene: str | Path | None) -> str:
-    """Normalize scene identifiers for robust memory-vs-train matching."""
-    if scene is None:
-        return ""
-    s = str(scene).strip()
-    if not s:
-        return ""
-    p = Path(s)
-    name = p.name
-    if name in ("train", "val", "test"):
-        name = p.parent.name
-    if name.endswith(("_train", "_val", "_test")):
-        name = name.rsplit("_", 1)[0]
-    return name
 
 
 class TrainerACEDINOv2LMC(TrainerACEDINOv2):
@@ -146,6 +38,29 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     When ``use_lmc`` is False (or memory_path is None), the trainer
     degrades to the vanilla single-stage TrainerACEDINOv2.
     """
+
+    BUFFER_SCHEMA_SPECS = {
+        "fused_buffer": {
+            "description": "S2 iterative fused feature buffer",
+            "fields": {
+                "features": {"rank": 2, "shape_suffix": ("feature_dim",), "dtype": "feature"},
+                "target_px": {"rank": 2, "shape_suffix": (2,), "dtype": torch.float32},
+                "gt_poses_inv": {"rank": 3, "shape_suffix": (3, 4), "dtype": torch.float32},
+                "intrinsics": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
+                "intrinsics_inv": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
+            },
+        },
+        "raw_buffer": {
+            "description": "ACE-G and S1 raw backbone feature buffer",
+            "fields": {
+                "features": {"rank": 2, "shape_suffix": ("feature_dim",), "dtype": "feature"},
+                "target_px": {"rank": 2, "shape_suffix": (2,), "dtype": torch.float32},
+                "gt_poses_inv": {"rank": 3, "shape_suffix": (3, 4), "dtype": torch.float32},
+                "intrinsics": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
+                "intrinsics_inv": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
+            },
+        },
+    }
 
     def __init__(self, options):
         # Determine if LMC is active *before* parent __init__
@@ -159,6 +74,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         # Common iteration/eval policy (used by both LMC and vanilla-iterative mode)
         self.vanilla_iterations = max(1, int(getattr(options, 'vanilla_iterations', 1)))
+        self.lmc_flow = str(getattr(options, 'lmc_flow', 'iterative'))
         self.eval_each_iteration = getattr(options, 'eval_each_iteration', True)
         self.keep_best_only = getattr(options, 'keep_best_only', True)
         self.best_metric = getattr(options, 'best_metric', 'pct5')
@@ -179,6 +95,21 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         # --- Load pre-saved memory (same as map-anything train_ace + load_memory_features) ---
         _logger.info("[LMC] Loading memory from %s", memory_path)
         bank_data = load_memory_features(str(memory_path), self.device)
+        if bool(getattr(options, "lmc_memory_preflight", True)):
+            preflight_report = preflight_memory_features(
+                bank_data,
+                strict=bool(getattr(options, "lmc_memory_preflight_strict", False)),
+                expect_scale_tokens=bool(getattr(options, "use_scale_token", True)),
+                scene_center_tol=float(getattr(options, "lmc_memory_preflight_center_tol", 1.0)),
+            )
+            self.memory_preflight_report = preflight_report
+            _logger.info(
+                "[LMC preflight] done: ok=%s, issues=%d",
+                preflight_report["ok"],
+                len(preflight_report["issues"]),
+            )
+        else:
+            self.memory_preflight_report = None
 
         # Build memory_dict with batch dim, like map-anything train_ace.py
         def _unsqueeze0(t):
@@ -293,6 +224,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         }
 
         # --- Build compressor (same as map-anything: input_dim/compress_dim = per-layer feature_dim) ---
+        pe_normalize_input = bool(getattr(options, 'pe_normalize_input', False))
         self.compressor = GeoLMC(
             input_dim=feature_dim,
             compress_dim=feature_dim,
@@ -305,6 +237,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             use_scale_token=use_scale_token,
             scale_token_dim=scale_token_dim,
             num_attn_layers=num_attn_layers,
+            pe_normalize_input=pe_normalize_input,
         ).to(self.device)
 
         # --- Build fusion (query=backbone 1024, memory=compressor output feature_dim) ---
@@ -332,13 +265,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.s2_repro_rewind_first_ratio = getattr(options, 's2_repro_rewind_first_ratio', 0.20)
         self.s2_repro_rewind_later_ratio = getattr(options, 's2_repro_rewind_later_ratio', 0.08)
         self.s2_repro_rewind_tau = getattr(options, 's2_repro_rewind_tau', 300.0)
-        self.s2_lr_boost_first = getattr(options, 's2_lr_boost_first', 1.5)
-        self.s2_lr_boost_later = getattr(options, 's2_lr_boost_later', 1.2)
+        self.s2_lr_boost_first = getattr(options, 's2_lr_boost_first', 1.2)
+        self.s2_lr_boost_later = getattr(options, 's2_lr_boost_later', 1.0)
         self.s2_lr_warmup_steps = getattr(options, 's2_lr_warmup_steps', 0)
-        self.s1_early_stop_enable = getattr(options, 's1_early_stop_enable', True)
-        self.s1_early_stop_min_steps = getattr(options, 's1_early_stop_min_steps', 400)
-        self.s1_early_stop_patience = getattr(options, 's1_early_stop_patience', 200)
-        self.s1_early_stop_min_delta = getattr(options, 's1_early_stop_min_delta', 1.0)
+        self.lmc_profile = str(getattr(options, 'lmc_profile', 'legacy'))
+        self.mapany_flow_profile = (self.lmc_profile == 'mapany_flow_v1')
+        self.s1_use_buffer = bool(getattr(options, 's1_use_buffer', False))
+        self.s1_buffer_refill_mode = str(getattr(options, 's1_buffer_refill_mode', 'full'))
+        if self.s1_use_buffer and str(getattr(options, 's1_loss_mode', 'full_map')) == 'full_map':
+            raise ValueError("S1 buffer mode requires s1_loss_mode != 'full_map'.")
 
         # Iteration-level evaluation and checkpoint policy
         self.eval_each_iteration = getattr(options, 'eval_each_iteration', True)
@@ -351,13 +286,22 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.eval_log_path = self.options.output_map.parent / f"{self.options.output_map.stem}_eval_log.txt"
         self.training_log_path = self.options.output_map.parent / f"{self.options.output_map.stem}_training_log.txt"
 
-        # ReproLoss 使用 S2 总步数作为 total_iterations，S1 传 0（早期权重大），S2 传 step_eff
+        # ReproLoss time axis:
+        # - legacy: keep S2-only timeline + step rewind behavior.
+        # - mapany_flow_v1: use monotonic global step across S1+S2 (map-anything style).
         buf_per_it = self.options.training_buffer_size // self.options.batch_size
         buf_final = self.buffer_size_final // self.options.batch_size
         total_s2_steps = (self.lmc_iterations - 1) * self.options.epochs * buf_per_it + self.options.epochs * buf_final
         total_s2_steps = max(total_s2_steps, 1)
+        total_s1_steps = self.lmc_warmup_steps + max(0, self.lmc_iterations - 1) * self.lmc_train_steps
+        if self.mapany_flow_profile:
+            repro_total_iterations = max(total_s1_steps + total_s2_steps, 1)
+            self.repro_step_mode = "global_monotonic"
+        else:
+            repro_total_iterations = total_s2_steps
+            self.repro_step_mode = "legacy_rewind"
         self.repro_loss = ReproLoss(
-            total_iterations=total_s2_steps,
+            total_iterations=repro_total_iterations,
             soft_clamp=self.options.repro_loss_soft_clamp,
             soft_clamp_min=self.options.repro_loss_soft_clamp_min,
             type=self.options.repro_loss_type,
@@ -370,12 +314,186 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.s2_rewind_amount = 0.0
         self.optimizer_head = None
         self.scheduler_head = None
+        self._s2_compressor_out = None  # Cached compressor output for ACE-G S2
+        self._s2_update_applied_last = True
 
         # Rebuild optimizer to include compressor + fusion params (used only when not in LMC; S1/S2 use their own)
         self._rebuild_optimizer()
 
-        _logger.info(f"[LMC] mode={lmc_mode}, tokens={num_latent_tokens}, "
-                     f"attn_layers={num_attn_layers}, iterations={self.lmc_iterations}")
+        _logger.info(
+            f"[LMC] mode={lmc_mode}, tokens={num_latent_tokens}, "
+            f"attn_layers={num_attn_layers}, iterations={self.lmc_iterations}, "
+            f"profile={self.lmc_profile}, repro_step_mode={self.repro_step_mode}, "
+            f"repro_total_iterations={self.repro_loss.total_iterations}"
+        )
+
+    def _resolve_buffer_schema_dim(self, dim_spec):
+        if dim_spec == "feature_dim":
+            return int(self.regressor.feature_dim)
+        return int(dim_spec)
+
+    def _expected_training_buffer_feature_dtype(self):
+        return torch.float16 if bool(getattr(self.options, "use_half", False)) else torch.float32
+
+    def _expected_training_buffer_device_type(self):
+        if bool(getattr(self.options, "buffer_on_cpu", True)):
+            return "cpu"
+        return self.device.type
+
+    def _get_s1_early_stop_cfg(self):
+        return {
+            "enabled": bool(getattr(self.options, "s1_early_stop", True)),
+            "min_updates": max(1, int(getattr(self.options, "s1_early_stop_min_updates", 400))),
+            "patience": max(1, int(getattr(self.options, "s1_early_stop_patience", 180))),
+            "rel_improve": float(getattr(self.options, "s1_early_stop_rel_improve", 0.01)),
+            "ema_beta": min(0.999, max(0.0, float(getattr(self.options, "s1_early_stop_ema_beta", 0.90)))),
+        }
+
+    def _trim_batch_for_head_grid(self, stage_tag, features_bC, *aligned_tensors):
+        """Reshape sampled points into the fixed 16 x W head grid, trimming tail samples if needed."""
+        batch_size = int(features_bC.shape[0])
+        h, w = 16, batch_size // 16
+        trimmed_batch = h * w
+        if trimmed_batch <= 0:
+            return None, None, None, (None,) * len(aligned_tensors)
+        if trimmed_batch != batch_size:
+            if not hasattr(self, "_logged_grid_trim_stages"):
+                self._logged_grid_trim_stages = set()
+            if stage_tag not in self._logged_grid_trim_stages:
+                _logger.warning(
+                    "[%s] batch_size=%d is not divisible by 16; trimming tail samples to %d (=16x%d).",
+                    stage_tag,
+                    batch_size,
+                    trimmed_batch,
+                    w,
+                )
+                self._logged_grid_trim_stages.add(stage_tag)
+            features_bC = features_bC[:trimmed_batch]
+            aligned_tensors = tuple(t[:trimmed_batch] for t in aligned_tensors)
+        return features_bC, trimmed_batch, h, w, aligned_tensors
+
+    def _validate_training_buffer_schema(self, buffer_dict, schema_name, expected_size=None):
+        schema = self.BUFFER_SCHEMA_SPECS.get(schema_name)
+        if schema is None:
+            raise ValueError(f"Unknown training buffer schema: {schema_name!r}")
+        if not isinstance(buffer_dict, dict):
+            raise ValueError(f"{schema_name} must be a dict, got {type(buffer_dict).__name__}.")
+
+        field_specs = schema["fields"]
+        missing_keys = [key for key in field_specs if key not in buffer_dict]
+        if missing_keys:
+            raise ValueError(f"{schema_name} missing keys: {missing_keys}")
+
+        expected_device_type = self._expected_training_buffer_device_type()
+        batch_size = None
+        for key, spec in field_specs.items():
+            tensor = buffer_dict[key]
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError(f"{schema_name}.{key} must be a torch.Tensor, got {type(tensor).__name__}.")
+            if tensor.dim() != spec["rank"]:
+                raise ValueError(
+                    f"{schema_name}.{key} has wrong rank: got {tensor.dim()}, expected {spec['rank']}."
+                )
+
+            current_batch = int(tensor.shape[0])
+            if batch_size is None:
+                batch_size = current_batch
+            elif current_batch != batch_size:
+                raise ValueError(
+                    f"{schema_name}.{key} has inconsistent batch size: got {current_batch}, expected {batch_size}."
+                )
+
+            expected_shape = tuple(self._resolve_buffer_schema_dim(dim) for dim in spec["shape_suffix"])
+            actual_shape = tuple(int(dim) for dim in tensor.shape[1:])
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"{schema_name}.{key} has wrong shape suffix: got {actual_shape}, expected {expected_shape}."
+                )
+
+            expected_dtype = (
+                self._expected_training_buffer_feature_dtype()
+                if spec["dtype"] == "feature"
+                else spec["dtype"]
+            )
+            if tensor.dtype != expected_dtype:
+                raise ValueError(
+                    f"{schema_name}.{key} has wrong dtype: got {tensor.dtype}, expected {expected_dtype}."
+                )
+            if tensor.device.type != expected_device_type:
+                raise ValueError(
+                    f"{schema_name}.{key} has wrong device: got {tensor.device.type}, expected {expected_device_type}."
+                )
+
+        if batch_size is None:
+            raise ValueError(f"{schema_name} is empty.")
+        if expected_size is not None and batch_size != int(expected_size):
+            raise ValueError(
+                f"{schema_name} has wrong batch size: got {batch_size}, expected {int(expected_size)}."
+            )
+        return batch_size
+
+    def _resolve_s1_partial_refill_counts(self, total_size):
+        total_size = int(total_size)
+        if total_size <= 0:
+            raise ValueError(f"total_size must be > 0, got {total_size}.")
+
+        keep_ratio = float(getattr(self.options, "s1_buffer_keep_ratio", 0.5))
+        refill_ratio = getattr(self.options, "s1_buffer_refill_ratio", None)
+        if keep_ratio < 0.0 or keep_ratio > 1.0:
+            raise ValueError(f"s1_buffer_keep_ratio must be in [0, 1], got {keep_ratio}.")
+        if refill_ratio is not None:
+            refill_ratio = float(refill_ratio)
+            if refill_ratio < 0.0 or refill_ratio > 1.0:
+                raise ValueError(f"s1_buffer_refill_ratio must be in [0, 1], got {refill_ratio}.")
+            if not math.isclose(keep_ratio + refill_ratio, 1.0, rel_tol=0.0, abs_tol=1e-6):
+                raise ValueError(
+                    f"s1_buffer_keep_ratio + s1_buffer_refill_ratio must sum to 1, got {keep_ratio + refill_ratio:.6f}."
+                )
+        else:
+            refill_ratio = 1.0 - keep_ratio
+
+        keep_count = int(round(total_size * keep_ratio))
+        keep_count = min(max(keep_count, 0), total_size)
+        refill_count = total_size - keep_count
+        if keep_count <= 0 or refill_count <= 0:
+            raise ValueError(
+                f"partial refill requires both keep/refill counts > 0, got keep={keep_count}, refill={refill_count}."
+            )
+        return keep_count, refill_count
+
+    def _slice_training_buffer_rows(self, buffer_dict, schema_name, row_indices):
+        self._validate_training_buffer_schema(
+            buffer_dict=buffer_dict,
+            schema_name=schema_name,
+            expected_size=buffer_dict["features"].shape[0],
+        )
+        row_indices = row_indices.to(buffer_dict["features"].device)
+        return {
+            key: value[row_indices].contiguous()
+            for key, value in buffer_dict.items()
+        }
+
+    def _merge_training_buffers(self, schema_name, buffers, expected_size=None):
+        buffers = [buf for buf in buffers if buf is not None]
+        if not buffers:
+            raise ValueError("buffers must contain at least one buffer dict.")
+
+        merged = {}
+        expected_keys = tuple(self.BUFFER_SCHEMA_SPECS[schema_name]["fields"].keys())
+        for buf in buffers:
+            self._validate_training_buffer_schema(
+                buffer_dict=buf,
+                schema_name=schema_name,
+                expected_size=buf["features"].shape[0],
+            )
+        for key in expected_keys:
+            merged[key] = torch.cat([buf[key] for buf in buffers], dim=0).contiguous()
+        self._validate_training_buffer_schema(
+            buffer_dict=merged,
+            schema_name=schema_name,
+            expected_size=expected_size,
+        )
+        return merged
 
     def _validate_memory_scene_consistency(self, bank_data: Dict[str, Any], scene_center: torch.Tensor):
         """Fail fast when memory and training scene geometry look inconsistent."""
@@ -475,6 +593,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             total_steps=total_steps,
             cycle_momentum=False,
         )
+
+    def _monotonic_repro_step(self):
+        """Monotonic repro-loss step used by mapany_flow_v1 profile."""
+        return min(int(self.iteration), self.repro_loss.total_iterations - 1)
 
     # ------------------------------------------------------------------
     # Head reset
@@ -600,6 +722,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         # Temporarily override buffer size if requested (for final iteration)
         orig_buf_size = self.options.training_buffer_size
+        target_buf_size = int(buffer_size_override if buffer_size_override is not None else orig_buf_size)
         if buffer_size_override is not None:
             self.options.training_buffer_size = buffer_size_override
 
@@ -630,6 +753,51 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             _logger.info("[LMC] Buffer moved to CPU (buffer_on_cpu=True) to save GPU memory.")
+        if self.training_buffer is not None:
+            self._validate_training_buffer_schema(
+                buffer_dict=self.training_buffer,
+                schema_name="fused_buffer",
+                expected_size=target_buf_size,
+            )
+
+    # ------------------------------------------------------------------
+    # Override: create_training_buffer_ace_g (raw backbone features, no fusion)
+    # ------------------------------------------------------------------
+
+    def create_training_buffer_ace_g(self, buffer_size_override=None):
+        """Fill buffer with raw backbone features (no fusion).
+
+        ACE-G path: fusion is applied per-batch in S2 training_step.
+        This directly calls the base class buffer fill without injecting fusion,
+        then moves the buffer to CPU if buffer_on_cpu is True.
+        """
+        orig_buf_size = self.options.training_buffer_size
+        target_buf_size = int(buffer_size_override if buffer_size_override is not None else orig_buf_size)
+        if buffer_size_override is not None:
+            self.options.training_buffer_size = buffer_size_override
+
+        try:
+            # Backbone should be in eval mode for deterministic feature extraction.
+            self.regressor.eval()
+            super().create_training_buffer()
+        finally:
+            self.options.training_buffer_size = orig_buf_size
+            self.regressor.train()
+
+        # Move buffer to CPU to save GPU memory (same as LMC iterative path).
+        buffer_on_cpu = getattr(self.options, "buffer_on_cpu", True)
+        if buffer_on_cpu and self.training_buffer is not None:
+            for k in list(self.training_buffer.keys()):
+                self.training_buffer[k] = self.training_buffer[k].cpu()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            _logger.info("[ACE-G] Buffer moved to CPU (raw backbone features, no fusion).")
+        if self.training_buffer is not None:
+            self._validate_training_buffer_schema(
+                buffer_dict=self.training_buffer,
+                schema_name="raw_buffer",
+                expected_size=target_buf_size,
+            )
 
     # ------------------------------------------------------------------
     # S1: Train compressor for a few steps
@@ -705,7 +873,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         else:
             valid_repro_err = repro_l1_b1[valid_flat]
         if valid_repro_err.numel() > 0:
-            loss_valid = self.repro_loss.compute(valid_repro_err, s1_step)
+            loss_step = self._monotonic_repro_step() if self.mapany_flow_profile else int(s1_step)
+            loss_valid = self.repro_loss.compute(valid_repro_err, loss_step)
         else:
             loss_valid = torch.zeros((), device=fused_feats_BCHW.device, dtype=fused_feats_BCHW.dtype)
 
@@ -733,20 +902,20 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
     def _s1_compute_loss_from_features(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33):
         """Compute ace_depth reprojection loss from sampled fused features (same formula as TrainerACEDINOv2.training_step)."""
-        batch_size = features_bC.shape[0]
         channels = features_bC.shape[1]
 
         # Keep same head input reshaping logic as ace_depth training_step.
-        h, w = 16, batch_size // 16
-        if h * w != batch_size:
-            batch_size = h * w
-            if batch_size <= 0:
-                return None, None
-            features_bC = features_bC[:batch_size]
-            target_px_b2 = target_px_b2[:batch_size]
-            gt_inv_poses_b34 = gt_inv_poses_b34[:batch_size]
-            Ks_b33 = Ks_b33[:batch_size]
-            invKs_b33 = invKs_b33[:batch_size]
+        features_bC, batch_size, h, w, trimmed = self._trim_batch_for_head_grid(
+            "S1",
+            features_bC,
+            target_px_b2,
+            gt_inv_poses_b34,
+            Ks_b33,
+            invKs_b33,
+        )
+        if batch_size is None:
+            return None, None
+        target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33 = trimmed
 
         features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
         pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(features_bCHW)
@@ -773,8 +942,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         valid_mask_b1 = ~invalid_mask_b1
 
         valid_reprojection_error_b1 = reprojection_error_l1_b1[valid_mask_b1]
-        # S1 使用早期 schedule（传 0），保持较大 repro 权重
-        iter_for_loss = 0
+        # legacy: use early schedule(0); mapany_flow_v1: use monotonic global step.
+        iter_for_loss = self._monotonic_repro_step() if self.mapany_flow_profile else 0
         if valid_reprojection_error_b1.numel() > 0:
             loss_valid = self.repro_loss.compute(valid_reprojection_error_b1, iter_for_loss)
         else:
@@ -891,8 +1060,330 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             optimizer_s1, max_lr=base_lr, total_steps=target_steps, pct_start=pct,
         )
 
+    def _prepare_s1_buffer_for_iteration(self, iteration_idx):
+        """Build S1 raw-feature buffer once per iteration."""
+        total_size = int(self.options.training_buffer_size)
+        mode = self.s1_buffer_refill_mode
+
+        if mode == 'full':
+            _logger.info(
+                "[S1-Buffer] Iteration %d: rebuilding raw feature buffer (mode=%s, size=%d).",
+                iteration_idx + 1,
+                mode,
+                total_size,
+            )
+            t0 = time.time()
+            self.create_training_buffer_ace_g()
+            elapsed = time.time() - t0
+            buf_len = int(self.training_buffer['features'].shape[0]) if self.training_buffer is not None else 0
+            _logger.info(
+                "[S1-Buffer] Ready: %d samples built in %.1fs.",
+                buf_len,
+                elapsed,
+            )
+            return
+
+        if mode != 'partial':
+            raise NotImplementedError(
+                f"S1 buffer refill mode {mode!r} is not implemented yet."
+            )
+
+        if self.training_buffer is None or iteration_idx == 0:
+            _logger.info(
+                "[S1-Buffer] Iteration %d: partial refill requested but no previous buffer is available; fallback to full rebuild.",
+                iteration_idx + 1,
+            )
+            t0 = time.time()
+            self.create_training_buffer_ace_g()
+            elapsed = time.time() - t0
+            buf_len = int(self.training_buffer['features'].shape[0]) if self.training_buffer is not None else 0
+            _logger.info(
+                "[S1-Buffer] Ready: %d samples built in %.1fs (fallback_full).",
+                buf_len,
+                elapsed,
+            )
+            return
+
+        previous_buffer = self.training_buffer
+        previous_size = int(previous_buffer["features"].shape[0])
+        self._validate_training_buffer_schema(
+            buffer_dict=previous_buffer,
+            schema_name="raw_buffer",
+            expected_size=previous_size,
+        )
+        keep_count, refill_count = self._resolve_s1_partial_refill_counts(total_size=total_size)
+        if previous_size < keep_count:
+            raise ValueError(
+                f"S1 partial refill needs keep_count={keep_count}, but previous buffer only has {previous_size} rows."
+            )
+
+        _logger.info(
+            "[S1-Buffer] Iteration %d: partial refill keep=%d refill=%d (target=%d, prev=%d).",
+            iteration_idx + 1,
+            keep_count,
+            refill_count,
+            total_size,
+            previous_size,
+        )
+        if not bool(getattr(self.options, "buffer_on_cpu", True)):
+            _logger.warning(
+                "[S1-Buffer] partial refill with buffer_on_cpu=False may transiently increase GPU memory usage."
+            )
+        t0 = time.time()
+
+        prev_device = previous_buffer["features"].device
+        keep_indices = torch.randperm(previous_size, generator=self.training_generator, device=prev_device)[:keep_count]
+        kept_buffer = self._slice_training_buffer_rows(previous_buffer, "raw_buffer", keep_indices)
+        self.training_buffer = None
+        del previous_buffer
+
+        self.create_training_buffer_ace_g(buffer_size_override=refill_count)
+        refill_buffer = self.training_buffer
+        merged_buffer = self._merge_training_buffers(
+            schema_name="raw_buffer",
+            buffers=[kept_buffer, refill_buffer],
+            expected_size=total_size,
+        )
+        self.training_buffer = merged_buffer
+
+        elapsed = time.time() - t0
+        _logger.info(
+            "[S1-Buffer] Ready: %d samples built in %.1fs (partial keep=%d refill=%d).",
+            int(self.training_buffer["features"].shape[0]),
+            elapsed,
+            keep_count,
+            refill_count,
+        )
+
+    def _train_compressor_steps_from_buffer(self, iteration_idx, n_steps):
+        """Stage 1 buffer mode: train compressor/fusion/head from raw feature buffer."""
+        self.compressor.train()
+        self.fusion.train()
+        self.regressor.heads.train()
+        self.regressor.encoder.eval()
+
+        if self.training_buffer is None or 'features' not in self.training_buffer:
+            raise RuntimeError("[S1-Buffer] training_buffer is empty; call _prepare_s1_buffer_for_iteration first.")
+        buffer_len = int(self.training_buffer['features'].shape[0])
+        self._validate_training_buffer_schema(
+            buffer_dict=self.training_buffer,
+            schema_name="raw_buffer",
+            expected_size=buffer_len,
+        )
+        if buffer_len < 16:
+            raise RuntimeError(f"[S1-Buffer] training_buffer too small: {buffer_len}.")
+
+        s1_lr_scale_later = float(getattr(self.options, 's1_lr_scale_later', 0.4))
+        base_lr_s1 = self.s1_learning_rate_max * (s1_lr_scale_later if iteration_idx > 0 else 1.0)
+        if iteration_idx > 0:
+            _logger.info("  [S1 LR] iter>0: base_lr scaled by %.2f -> %.2e", s1_lr_scale_later, base_lr_s1)
+
+        comp_optimizer = optim.AdamW([
+            {'params': self.compressor.parameters()},
+            {'params': self.fusion.parameters()},
+            {'params': self.regressor.heads.parameters(), 'lr': base_lr_s1 * 0.1},
+        ], lr=base_lr_s1)
+        sched_lmc = self._build_s1_scheduler(comp_optimizer, n_steps, iteration_idx, base_lr=base_lr_s1)
+
+        log_interval = 10
+        skipped_nonfinite = 0
+        skipped_sample = 0
+        consecutive_unstable = 0
+        max_consecutive_unstable = int(getattr(self.options, 's1_max_consecutive_unstable', 300))
+        s1_lr_cap = base_lr_s1
+        s1_lr_floor_ratio = float(getattr(self.options, 's1_lr_floor_ratio', 0.05))
+        s1_lr_floor = base_lr_s1 * s1_lr_floor_ratio
+        update_step = 0
+        raw_step = 0
+        max_attempts = max(n_steps * 20, n_steps + 1)
+        s1_early_stop_cfg = self._get_s1_early_stop_cfg()
+        ema_px_err = None
+        best_ema_px_err = float('inf')
+        no_improve_updates = 0
+
+        _logger.info(
+            "  [S1-Buffer] source=raw_buffer, target_updates=%d, s1_loss_mode=%s",
+            n_steps,
+            getattr(self.options, 's1_loss_mode', 'sample_per_image'),
+        )
+        if s1_early_stop_cfg["enabled"]:
+            _logger.info(
+                "  [S1] early-stop ON (min_updates=%d, patience=%d, rel_improve=%.4f, ema_beta=%.2f)",
+                s1_early_stop_cfg["min_updates"],
+                s1_early_stop_cfg["patience"],
+                s1_early_stop_cfg["rel_improve"],
+                s1_early_stop_cfg["ema_beta"],
+            )
+
+        buf = self.training_buffer
+        buf_device = buf['features'].device
+        while update_step < n_steps:
+            raw_step += 1
+            if raw_step > max_attempts:
+                _logger.warning(
+                    "  [S1-Buffer] reached max attempts (%d) before target updates (%d). updates=%d",
+                    max_attempts, n_steps, update_step
+                )
+                break
+
+            draw_bs = min(self.options.batch_size, buffer_len)
+            if draw_bs < 16:
+                skipped_sample += 1
+                continue
+            sample_idxs = torch.randint(
+                0, buffer_len, (draw_bs,), generator=self.training_generator, device=buf_device
+            )
+
+            def _to_dev(t):
+                out = t[sample_idxs].contiguous()
+                if out.device != self.device:
+                    out = out.to(self.device, non_blocking=True)
+                return out
+
+            raw_features_bC = _to_dev(buf['features'])
+            target_px_b2 = _to_dev(buf['target_px'])
+            gt_inv_poses_b34 = _to_dev(buf['gt_poses_inv'])
+            Ks_b33 = _to_dev(buf['intrinsics'])
+            invKs_b33 = _to_dev(buf['intrinsics_inv'])
+
+            channels = raw_features_bC.shape[1]
+            raw_features_bC, batch_size, h, w, trimmed = self._trim_batch_for_head_grid(
+                "S1-Buffer",
+                raw_features_bC,
+                target_px_b2,
+                gt_inv_poses_b34,
+                Ks_b33,
+                invKs_b33,
+            )
+            if batch_size is None:
+                skipped_sample += 1
+                continue
+            target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33 = trimmed
+
+            with autocast("cuda", enabled=self.options.use_half):
+                comp_out = self.compressor(self.memory_dict)
+                raw_features_bCHW = raw_features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
+                fused_bCHW = self._fuse_features(raw_features_bCHW, comp_out)
+            fused_features_bC = fused_bCHW.permute(0, 2, 3, 1).reshape(-1, channels)
+
+            loss, s1_stats = self._s1_compute_loss_from_features(
+                fused_features_bC.contiguous(),
+                target_px_b2.contiguous(),
+                gt_inv_poses_b34.contiguous(),
+                Ks_b33.contiguous(),
+                invKs_b33.contiguous(),
+            )
+
+            if loss is None:
+                continue
+
+            if s1_stats["nonfinite_ratio"] > 0.10:
+                skipped_nonfinite += 1
+                consecutive_unstable += 1
+                s1_lr_cap = max(s1_lr_floor, s1_lr_cap * 0.7)
+                for pg in comp_optimizer.param_groups:
+                    pg["lr"] = min(pg["lr"], s1_lr_cap)
+                # Skip this noisy update entirely: no optimizer/scheduler step, no update counter increment.
+                comp_optimizer.zero_grad(set_to_none=True)
+                if consecutive_unstable >= max_consecutive_unstable:
+                    _logger.warning(
+                        "  [S1-Buffer] stopping early: %d consecutive unstable batches (nonFinite=%.2f%%). updates=%d/%d.",
+                        consecutive_unstable, s1_stats["nonfinite_ratio"] * 100.0, update_step, n_steps
+                    )
+                    break
+                continue
+
+            if not torch.isfinite(loss):
+                skipped_nonfinite += 1
+                consecutive_unstable += 1
+                s1_lr_cap = max(s1_lr_floor, s1_lr_cap * 0.7)
+                for pg in comp_optimizer.param_groups:
+                    pg["lr"] = min(pg["lr"], s1_lr_cap)
+                # Keep update-count semantics strict: non-finite loss must not advance optimizer/scheduler/step.
+                comp_optimizer.zero_grad(set_to_none=True)
+                if consecutive_unstable >= max_consecutive_unstable:
+                    _logger.warning(
+                        "  [S1-Buffer] stopping early: %d consecutive unstable/non-finite. updates=%d/%d.",
+                        consecutive_unstable, update_step, n_steps
+                    )
+                    break
+                continue
+
+            consecutive_unstable = 0
+            comp_optimizer.zero_grad(set_to_none=True)
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(comp_optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                list(self.compressor.parameters()) +
+                list(self.fusion.parameters()) +
+                list(self.regressor.heads.parameters()),
+                max_norm=1.0
+            )
+            self.scaler.step(comp_optimizer)
+            self.scaler.update()
+            sched_lmc.step()
+            for pg in comp_optimizer.param_groups:
+                pg["lr"] = min(pg["lr"], s1_lr_cap)
+
+            update_step += 1
+            self.iteration += 1
+            px_err = s1_stats["pxerr_l2"] if math.isfinite(s1_stats["pxerr_l2"]) else s1_stats["pxerr_l1"]
+            if not math.isfinite(px_err):
+                px_err = 0.0
+
+            if s1_early_stop_cfg["enabled"]:
+                if ema_px_err is None:
+                    ema_px_err = px_err
+                else:
+                    ema_px_err = (
+                        s1_early_stop_cfg["ema_beta"] * ema_px_err
+                        + (1.0 - s1_early_stop_cfg["ema_beta"]) * px_err
+                    )
+                if update_step >= s1_early_stop_cfg["min_updates"]:
+                    if ema_px_err < best_ema_px_err * (1.0 - s1_early_stop_cfg["rel_improve"]):
+                        best_ema_px_err = ema_px_err
+                        no_improve_updates = 0
+                    else:
+                        no_improve_updates += 1
+                    if no_improve_updates >= s1_early_stop_cfg["patience"]:
+                        _logger.info(
+                            "  [S1-Buffer] early-stop at update %d/%d (ema_pxErr=%.2f, best=%.2f, patience=%d)",
+                            update_step, n_steps, ema_px_err, best_ema_px_err, s1_early_stop_cfg["patience"]
+                        )
+                        break
+
+            if update_step % log_interval == 0 or update_step == 1 or update_step == n_steps:
+                self._append_step_log(
+                    iter_idx=iteration_idx,
+                    step=self.iteration,
+                    stage="S1-BUF",
+                    loss=float(loss.item()),
+                    px_err=float(px_err),
+                    lr=float(comp_optimizer.param_groups[0]["lr"]),
+                    mode="reproj",
+                    med3d=-1.0,
+                )
+                _logger.info(
+                    "  [S1-Buffer] update %d/%d (attempt=%d), samples=%d, loss=%.4f, valid=%.1f%%, pxErrL1=%.2f, pxErrL2=%.2f, nonFinite=%.2f%%, lr=%.2e",
+                    update_step, n_steps, raw_step, batch_size, loss.item(),
+                    s1_stats["fraction_valid"] * 100.0, s1_stats["pxerr_l1"], s1_stats["pxerr_l2"],
+                    s1_stats["nonfinite_ratio"] * 100.0, comp_optimizer.param_groups[0]["lr"],
+                )
+
+        if skipped_sample > 0 or skipped_nonfinite > 0:
+            _logger.warning(
+                "  [S1-Buffer] skipped steps: bad_sample=%d, nonfinite=%d (target=%d)",
+                skipped_sample, skipped_nonfinite, n_steps
+            )
+
     def _train_compressor_steps(self, iteration_idx, n_steps):
         """Stage 1: full-supervised reprojection training (compressor + fusion + head), aligned with map-anything logic."""
+        if self.s1_use_buffer:
+            s1_loss_mode = getattr(self.options, 's1_loss_mode', 'full_map')
+            if s1_loss_mode == 'full_map':
+                raise ValueError("S1 buffer mode does not support s1_loss_mode='full_map'.")
+            return self._train_compressor_steps_from_buffer(iteration_idx, n_steps)
+
         self.compressor.train()
         self.fusion.train()
         self.regressor.heads.train()
@@ -916,6 +1407,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         s1_loader = self._build_s1_dataloader()
         s1_loss_mode = getattr(self.options, 's1_loss_mode', 'full_map')
         s1_bs = max(1, getattr(self.options, 's1_batch_size', 8))
+        _logger.info("  [S1] source=online_encoder")
         _logger.info(
             "  [S1] loss_mode=%s, dataloader batch=%d, target_updates=%d (strict update-count mode)",
             s1_loss_mode,
@@ -949,18 +1441,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         update_step = 0
         raw_step = 0
         max_attempts = max(n_steps * 20, n_steps + 1)
-        s1_early_stop = getattr(self.options, 's1_early_stop', True)
-        s1_early_stop_min_updates = max(1, int(getattr(self.options, 's1_early_stop_min_updates', 400)))
-        s1_early_stop_patience = max(1, int(getattr(self.options, 's1_early_stop_patience', 180)))
-        s1_early_stop_rel_improve = float(getattr(self.options, 's1_early_stop_rel_improve', 0.01))
-        s1_early_stop_ema_beta = min(0.999, max(0.0, float(getattr(self.options, 's1_early_stop_ema_beta', 0.90))))
+        s1_early_stop_cfg = self._get_s1_early_stop_cfg()
         ema_px_err = None
         best_ema_px_err = float('inf')
         no_improve_updates = 0
-        if s1_early_stop:
+        if s1_early_stop_cfg["enabled"]:
             _logger.info(
                 "  [S1] early-stop ON (min_updates=%d, patience=%d, rel_improve=%.4f, ema_beta=%.2f)",
-                s1_early_stop_min_updates, s1_early_stop_patience, s1_early_stop_rel_improve, s1_early_stop_ema_beta
+                s1_early_stop_cfg["min_updates"],
+                s1_early_stop_cfg["patience"],
+                s1_early_stop_cfg["rel_improve"],
+                s1_early_stop_cfg["ema_beta"],
             )
 
         while update_step < n_steps:
@@ -1079,6 +1570,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 s1_lr_cap = max(s1_lr_floor, s1_lr_cap * 0.7)
                 for pg in comp_optimizer.param_groups:
                     pg["lr"] = min(pg["lr"], s1_lr_cap)
+                # Skip this noisy update entirely: no optimizer/scheduler step, no update counter increment.
                 comp_optimizer.zero_grad(set_to_none=True)
                 if consecutive_unstable >= max_consecutive_unstable:
                     _logger.warning(
@@ -1099,6 +1591,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 s1_lr_cap = max(s1_lr_floor, s1_lr_cap * 0.7)
                 for pg in comp_optimizer.param_groups:
                     pg["lr"] = min(pg["lr"], s1_lr_cap)
+                # Keep update-count semantics strict: non-finite loss must not advance optimizer/scheduler/step.
                 comp_optimizer.zero_grad(set_to_none=True)
                 if consecutive_unstable >= max_consecutive_unstable:
                     _logger.warning(
@@ -1141,23 +1634,26 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 px_err = 0.0
 
             # Optional early stop: terminate S1 plateau to avoid wasting updates.
-            if s1_early_stop:
+            if s1_early_stop_cfg["enabled"]:
                 if ema_px_err is None:
                     ema_px_err = px_err
                 else:
-                    ema_px_err = s1_early_stop_ema_beta * ema_px_err + (1.0 - s1_early_stop_ema_beta) * px_err
+                    ema_px_err = (
+                        s1_early_stop_cfg["ema_beta"] * ema_px_err
+                        + (1.0 - s1_early_stop_cfg["ema_beta"]) * px_err
+                    )
 
-                if update_step >= s1_early_stop_min_updates:
-                    if ema_px_err < best_ema_px_err * (1.0 - s1_early_stop_rel_improve):
+                if update_step >= s1_early_stop_cfg["min_updates"]:
+                    if ema_px_err < best_ema_px_err * (1.0 - s1_early_stop_cfg["rel_improve"]):
                         best_ema_px_err = ema_px_err
                         no_improve_updates = 0
                     else:
                         no_improve_updates += 1
 
-                    if no_improve_updates >= s1_early_stop_patience:
+                    if no_improve_updates >= s1_early_stop_cfg["patience"]:
                         _logger.info(
                             "  [S1] early-stop at update %d/%d (ema_pxErr=%.2f, best=%.2f, patience=%d)",
-                            update_step, n_steps, ema_px_err, best_ema_px_err, s1_early_stop_patience
+                            update_step, n_steps, ema_px_err, best_ema_px_err, s1_early_stop_cfg["patience"]
                         )
                         break
 
@@ -1195,27 +1691,54 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.steps_per_s2_phase = self.options.epochs * (current_buffer_size // self.options.batch_size)
         self.steps_per_s2_phase = max(self.steps_per_s2_phase, 1)
 
-        rewind_ratio = self.s2_repro_rewind_first_ratio if iteration_idx == 0 else self.s2_repro_rewind_later_ratio
+        if self.mapany_flow_profile:
+            rewind_ratio = 0.0
+        else:
+            rewind_ratio = self.s2_repro_rewind_first_ratio if iteration_idx == 0 else self.s2_repro_rewind_later_ratio
         self.s2_rewind_amount = rewind_ratio * self.steps_per_s2_phase
         self.current_lmc_iter = iteration_idx
         self.local_s2_step = 0
 
         base_lr = self.s2_learning_rate_max * self.head_lr_multiplier_s2
-        boost = self.s2_lr_boost_first if iteration_idx == 0 else self.s2_lr_boost_later
+        if self.mapany_flow_profile:
+            boost = 1.0
+        else:
+            boost = self.s2_lr_boost_first if iteration_idx == 0 else self.s2_lr_boost_later
         head_lr = base_lr * boost
-        self.optimizer_head = optim.AdamW(self.regressor.heads.parameters(), lr=head_lr)
+
+        # ACE-G R2 path: optionally include fusion params with slow LR
+        ace_g_fusion_in_s2 = (
+            self.lmc_flow == 'ace_g'
+            and getattr(self.options, 'ace_g_fusion_in_s2', False)
+        )
+        if ace_g_fusion_in_s2:
+            fusion_lr_ratio = float(getattr(self.options, 'ace_g_fusion_lr_ratio', 0.01))
+            fusion_lr = head_lr * fusion_lr_ratio
+            self.optimizer_head = optim.AdamW([
+                {'params': self.regressor.heads.parameters(), 'lr': head_lr},
+                {'params': self.fusion.parameters(), 'lr': fusion_lr},
+            ])
+            _logger.info(
+                "[S2-G] R2 active: fusion_lr=%.2e (ratio=%.4f of head_lr=%.2e)",
+                fusion_lr, fusion_lr_ratio, head_lr,
+            )
+        else:
+            self.optimizer_head = optim.AdamW(self.regressor.heads.parameters(), lr=head_lr)
+
         warmup_ratio = (self.s2_lr_warmup_steps / self.steps_per_s2_phase) if self.s2_lr_warmup_steps else 0.1
         warmup_ratio = min(0.5, max(0.0, warmup_ratio))
         self.scheduler_head = optim.lr_scheduler.OneCycleLR(
             self.optimizer_head,
-            max_lr=head_lr,
+            max_lr=[head_lr, fusion_lr] if ace_g_fusion_in_s2 else head_lr,
             total_steps=self.steps_per_s2_phase,
             pct_start=warmup_ratio,
             anneal_strategy='cos',
         )
         _logger.info(
-            "[S2] head lr=%.2e (boost=%.2f), steps=%d, rewind=%.1f (tau=%.0f)",
+            "[S2] head lr=%.2e (boost=%.2f), steps=%d, rewind=%.1f (tau=%.0f), repro_step_mode=%s%s",
             head_lr, boost, self.steps_per_s2_phase, self.s2_rewind_amount, self.s2_repro_rewind_tau,
+            self.repro_step_mode,
+            " [ACE-G R2: fusion trainable]" if ace_g_fusion_in_s2 else "",
         )
 
     # ------------------------------------------------------------------
@@ -1414,13 +1937,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     # Override: train (two-stage multi-iteration)
     # ------------------------------------------------------------------
 
-    def train(self):
-        """Two-stage iterative training with iteration-level eval and best-checkpoint policy."""
-        if not self.use_lmc:
-            if self.vanilla_iterations <= 1:
-                return super().train()
-            return self._train_vanilla_iterations()
-
+    def _train_iterative(self):
+        """Two-stage iterative training (S1+S2) with iteration-level eval and best-checkpoint policy."""
         self.training_start = time.time()
         self._write_train_header()
         best_ckpt_exists = False
@@ -1436,6 +1954,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             # --- Stage 1 ---
             s1_steps = self.lmc_warmup_steps if it == 0 else self.lmc_train_steps
             _logger.info(f"[S1] Training compressor for {s1_steps} steps")
+            if self.s1_use_buffer:
+                self._prepare_s1_buffer_for_iteration(it)
             self._train_compressor_steps(it, s1_steps)
 
             # S1 NaN guard: if compressor weights are all NaN (fp16 overflow / unstable S1),
@@ -1511,6 +2031,199 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         _logger.info("Done. Total time: %.1fs | best_iter=%s | best_score=%.4f", time.time() - self.training_start, self.best_iter, self.best_score)
         _logger.info("Logs: %s | %s | %s", self.step_log_path, self.training_log_path, self.eval_log_path)
 
+    def _train_ace_g(self):
+        """ACE-G hybrid training path.
+
+        Key difference from _train_iterative():
+        - Buffer stores raw backbone features (no fusion) via create_training_buffer_ace_g()
+        - Fusion is applied per-batch in S2 via _training_step_ace_g()
+        - Compressed memory is cached once at S2 start (_s2_compressor_out)
+        - R1 (default): fusion frozen in S2; R2: fusion trainable with slow LR
+
+        Shared with _train_iterative():
+        - S1 compressor training (_train_compressor_steps)
+        - Head reset (_maybe_reset_head)
+        - S2 optimizer/schedule (_setup_s2_optimizer_and_schedule)
+        - Eval/checkpoint logic
+        """
+        self.training_start = time.time()
+        self._write_train_header()
+        best_ckpt_exists = False
+
+        ace_g_fusion_in_s2 = getattr(self.options, 'ace_g_fusion_in_s2', False)
+        ace_g_cross_iter_eval = getattr(self.options, 'ace_g_cross_iter_eval', False)
+        _logger.info("[ACE-G] R2 (fusion trainable in S2): %s", ace_g_fusion_in_s2)
+        _logger.info("[ACE-G] Cross-iter eval: %s", ace_g_cross_iter_eval)
+
+        prev_post_s2_score = None  # Tracks previous iteration post-S2 score
+        prev_post_s2_head_state = None  # Snapshot of previous iteration head after S2
+
+        for it in range(self.lmc_iterations):
+            iter_start = time.time()
+            is_last = (it == self.lmc_iterations - 1)
+            _logger.info(f"\n{'='*60}")
+            _logger.info(f"[ACE-G] Iteration {it+1}/{self.lmc_iterations}"
+                         f"{' (FINAL)' if is_last else ''}")
+            _logger.info(f"{'='*60}")
+
+            # --- Stage 1: train compressor + fusion + head (same as iterative) ---
+            s1_steps = self.lmc_warmup_steps if it == 0 else self.lmc_train_steps
+            _logger.info(f"[S1] Training compressor for {s1_steps} steps")
+            if self.s1_use_buffer:
+                self._prepare_s1_buffer_for_iteration(it)
+            self._train_compressor_steps(it, s1_steps)
+
+            # S1 NaN guard
+            _s1_nan = any(
+                p.data.isnan().any().item()
+                for p in list(self.compressor.parameters()) + list(self.fusion.parameters())
+            )
+            if _s1_nan:
+                _logger.error(
+                    "[ACE-G] iter %d: compressor/fusion has NaN weights after S1 — "
+                    "skipping S2. Retry with --use_half False.",
+                    it + 1,
+                )
+                continue
+
+            # --- Cross-iteration eval (C3): old-head + new-compressor before current S2 ---
+            if (
+                ace_g_cross_iter_eval
+                and it > 0
+                and prev_post_s2_score is not None
+                and prev_post_s2_head_state is not None
+            ):
+                _logger.info(
+                    "[ACE-G] Cross-iter eval: old-head (iter %d post-S2) + new-compressor (iter %d post-S1)",
+                    it,
+                    it + 1,
+                )
+                cross_ckpt = self.options.output_map.parent / f"{self.options.output_map.stem}.cross_iter_{it+1:02d}.tmp.pt"
+                current_head_state = {
+                    k: v.detach().cpu().clone()
+                    for k, v in self.regressor.heads.state_dict().items()
+                }
+                self.save_model(cross_ckpt)
+                try:
+                    # Replace current head with previous-iteration post-S2 head to isolate compressor shift.
+                    self.regressor.heads.load_state_dict(prev_post_s2_head_state, strict=True)
+                    self.save_model(cross_ckpt)
+                    cross_eval = self._evaluate_checkpoint(cross_ckpt, it)
+                    cross_score = self._score_eval(cross_eval)
+                    drop = prev_post_s2_score - cross_score
+                    drop_ratio = drop / max(abs(prev_post_s2_score), 1e-6)
+                    _logger.info(
+                        "[ACE-G] Cross-iter eval: prev_post_s2=%.4f -> old_head+new_comp=%.4f "
+                        "(drop=%.4f, drop_ratio=%.4f)",
+                        prev_post_s2_score, cross_score, drop, drop_ratio,
+                    )
+                except Exception as e:
+                    _logger.warning("[ACE-G] Cross-iter eval failed: %s", e)
+                finally:
+                    # Restore current (post-S1) head for subsequent S2.
+                    self.regressor.heads.load_state_dict(current_head_state, strict=True)
+                    if cross_ckpt.exists():
+                        cross_ckpt.unlink()
+
+            # --- Head reset before Stage 2 (same as iterative) ---
+            self._maybe_reset_head(it)
+
+            # --- Stage 2: ACE-G specific ---
+            # 1. Compress memory once, cache for training step
+            self._s2_compressor_out = self._compress_memory()
+
+            # 2. Set fusion mode for S2
+            if ace_g_fusion_in_s2:
+                self.fusion.train()
+                _logger.info("[S2-G] Fusion set to TRAIN mode (R2)")
+            else:
+                self.fusion.eval()
+                _logger.info("[S2-G] Fusion set to EVAL mode (R1, frozen)")
+
+            # 3. Fill buffer with raw backbone features (no fusion)
+            buf_size = self.buffer_size_final if is_last else None
+            _logger.info(f"[S2-G] Filling buffer with raw backbone features"
+                         f" (size={'FINAL ' + str(self.buffer_size_final) if is_last else 'default'})")
+            self.create_training_buffer_ace_g(buffer_size_override=buf_size)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # 4. Build S2 optimizer/schedule (includes fusion params if R2)
+            self._setup_s2_optimizer_and_schedule(it, is_last)
+
+            # 5. Train head (with on-the-fly fusion via run_epoch routing)
+            _logger.info(f"[S2-G] Training head for {self.options.epochs} epochs")
+            for self.epoch in range(self.options.epochs):
+                self.run_epoch()
+
+            # Clean up cached compressor output
+            self._s2_compressor_out = None
+
+            # --- Iteration checkpoint + eval (same as iterative) ---
+            iter_ckpt = self.options.output_map.parent / f"{self.options.output_map.stem}.iter_{it+1:02d}.tmp.pt"
+            self.save_model(iter_ckpt)
+            eval_result = None
+            score = -float('inf')
+            if self.eval_each_iteration:
+                try:
+                    eval_result = self._evaluate_checkpoint(iter_ckpt, it)
+                    score = self._score_eval(eval_result)
+                except Exception as e:
+                    _logger.warning("[Eval] iteration %d failed: %s", it + 1, e, exc_info=True)
+            else:
+                score = float(it + 1)
+
+            prev_post_s2_score = score  # Store post-S2 score for next iteration cross-iter comparison
+            prev_post_s2_head_state = {
+                k: v.detach().cpu().clone()
+                for k, v in self.regressor.heads.state_dict().items()
+            }
+
+            is_best = (score > self.best_score)
+            if is_best:
+                self.best_score = score
+                self.best_iter = it + 1
+                self.best_eval = eval_result
+                os.replace(iter_ckpt, self.options.output_map)
+                best_ckpt_exists = True
+                _logger.info("[Best] Updated best ACE-G checkpoint at iter %d (score=%.4f)", it + 1, score)
+                self._write_best_checkpoint_meta(it + 1, score, eval_result)
+            else:
+                if iter_ckpt.exists():
+                    if self.keep_best_only:
+                        iter_ckpt.unlink()
+                    else:
+                        iter_ckpt.rename(self.options.output_map.parent / f"{self.options.output_map.stem}.iter_{it+1:02d}.pt")
+
+            elapsed_s = time.time() - iter_start
+            self._log_iteration_summary(it, s1_steps, is_last, is_best, score, eval_result, elapsed_s)
+
+        if not best_ckpt_exists:
+            self.save_model(self.options.output_map)
+
+        self._free_training_gpu_memory()
+
+        _logger.info(
+            "Done ACE-G. Total time: %.1fs | best_iter=%s | best_score=%.4f",
+            time.time() - self.training_start, self.best_iter, self.best_score,
+        )
+        _logger.info("Logs: %s | %s | %s", self.step_log_path, self.training_log_path, self.eval_log_path)
+
+    def train(self):
+        """Route to the appropriate training flow."""
+        if not self.use_lmc:
+            if self.vanilla_iterations <= 1:
+                return super().train()
+            return self._train_vanilla_iterations()
+
+        _logger.info("[LMC] Training flow: %s", self.lmc_flow)
+        if self.lmc_flow == 'iterative':
+            return self._train_iterative()
+        elif self.lmc_flow == 'ace_g':
+            return self._train_ace_g()
+        else:
+            raise ValueError(f"Unknown lmc_flow={self.lmc_flow!r}")
+
     def _free_training_gpu_memory(self):
         """Release training buffer and other large GPU tensors so eval can run in the same process."""
         if self.training_buffer is not None:
@@ -1535,6 +2248,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return super().run_epoch()
         torch.backends.cudnn.benchmark = True
         buf = self.training_buffer
+        schema_name = "raw_buffer" if self.lmc_flow == 'ace_g' else "fused_buffer"
+        self._validate_training_buffer_schema(
+            buffer_dict=buf,
+            schema_name=schema_name,
+            expected_size=buf['features'].shape[0],
+        )
         buffer_len = buf['features'].shape[0]
         buf_device = buf['features'].device
         # Randperm on same device as buffer so indexing is cheap (no cross-device)
@@ -1550,13 +2269,16 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 if out.device != self.device:
                     out = out.to(self.device, non_blocking=True)
                 return out
-            self.training_step(
+            step_fn = self._training_step_ace_g if self.lmc_flow == 'ace_g' else self.training_step
+            step_fn(
                 _to_dev(buf['features'][random_batch_indices]),
                 _to_dev(buf['target_px'][random_batch_indices]),
                 _to_dev(buf['gt_poses_inv'][random_batch_indices]),
                 _to_dev(buf['intrinsics'][random_batch_indices]),
                 _to_dev(buf['intrinsics_inv'][random_batch_indices]),
             )
+            if not bool(getattr(self, "_s2_update_applied_last", True)):
+                continue
             self.iteration += 1
             self.global_s2_step += 1
             self.local_s2_step += 1
@@ -1566,24 +2288,29 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if not self.use_lmc or self.optimizer_head is None:
             return super().training_step(features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33)
 
-        batch_size = features_bC.shape[0]
         channels = features_bC.shape[1]
-        h, w = 16, batch_size // 16
-        if h * w != batch_size:
-            batch_size = h * w
-            if batch_size <= 0:
-                return None
-            features_bC = features_bC[:batch_size]
-            target_px_b2 = target_px_b2[:batch_size]
-            gt_inv_poses_b34 = gt_inv_poses_b34[:batch_size]
-            Ks_b33 = Ks_b33[:batch_size]
-            invKs_b33 = invKs_b33[:batch_size]
+        features_bC, batch_size, h, w, trimmed = self._trim_batch_for_head_grid(
+            "S2",
+            features_bC,
+            target_px_b2,
+            gt_inv_poses_b34,
+            Ks_b33,
+            invKs_b33,
+        )
+        if batch_size is None:
+            self._s2_update_applied_last = False
+            return None
+        target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33 = trimmed
         features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
 
-        # step_eff: 每轮 S2 开始时小幅回拨，再随 local_s2_step 指数恢复至全局轨道
-        rewind = self.s2_rewind_amount * math.exp(-self.local_s2_step / max(1e-6, self.s2_repro_rewind_tau))
-        step_eff = max(0, self.global_s2_step - rewind)
-        step_eff = min(step_eff, self.repro_loss.total_iterations - 1)
+        if self.mapany_flow_profile:
+            # map-anything profile: monotonic global repro step, no rewind.
+            step_eff = self._monotonic_repro_step()
+        else:
+            # legacy: 每轮 S2 开始时小幅回拨，再随 local_s2_step 指数恢复至全局轨道
+            rewind = self.s2_rewind_amount * math.exp(-self.local_s2_step / max(1e-6, self.s2_repro_rewind_tau))
+            step_eff = max(0, self.global_s2_step - rewind)
+            step_eff = min(step_eff, self.repro_loss.total_iterations - 1)
 
         with autocast("cuda", enabled=self.options.use_half):
             pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(features_bCHW)
@@ -1631,20 +2358,23 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         loss_invalid = torch.nan_to_num(loss_invalid, nan=0.0, posinf=0.0, neginf=0.0)
         loss = (loss_valid + loss_invalid) / batch_size
 
-        # Guard NaN/Inf: head reset or bad buffer can make loss non-finite; skip update and log
-        loss_for_log = float(loss.item()) if torch.isfinite(loss).all() else -1.0  # step log 用，-1 表示被置零
-        if not torch.isfinite(loss).all():
-            loss = torch.zeros((), device=loss.device, dtype=loss.dtype)
+        # Guard NaN/Inf: truly skip optimizer/scheduler updates to avoid consuming LR schedule.
+        loss_is_finite = bool(torch.isfinite(loss).all().item())
+        loss_for_log = float(loss.item()) if loss_is_finite else -1.0  # -1 means skipped update
+        if not loss_is_finite:
+            self.optimizer_head.zero_grad(set_to_none=True)
+            self._s2_update_applied_last = False
             _logger.debug(
-                "S2 step %d: non-finite loss (valid_frac=%.2f), zeroing loss and skipping effective update.",
+                "S2 step %d: non-finite loss (valid_frac=%.2f), skipping optimizer/scheduler step.",
                 self.iteration, float(valid_mask_b1.sum() / batch_size),
             )
-
-        self.optimizer_head.zero_grad(set_to_none=True)
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer_head)
-        self.scaler.update()
-        self.scheduler_head.step()
+        else:
+            self.optimizer_head.zero_grad(set_to_none=True)
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer_head)
+            self.scaler.update()
+            self.scheduler_head.step()
+            self._s2_update_applied_last = True
 
         if self.iteration % self.iterations_output == 0:
             time_since_start = time.time() - self.training_start
@@ -1671,6 +2401,140 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             )
             _logger.info(
                 'Iteration: {:6d} | S2 global={:6d} local={:6d} step_eff={:.0f} | Epoch {:03d}|{:03d}, Loss: {:.4f}, Valid: {:.1f}%, pxErr_finite: {:.2f}, pxerr_naninf: {:d}, Time: {:.2f}s'.format(
+                    self.iteration,
+                    self.global_s2_step,
+                    self.local_s2_step,
+                    step_eff,
+                    self.epoch,
+                    self.options.epochs,
+                    loss_for_log if loss_for_log >= 0 else 0.0,
+                    fraction_valid * 100,
+                    px_err_finite if math.isfinite(px_err_finite) else -1.0,
+                    pxerr_naninf_count,
+                    time_since_start,
+                )
+            )
+        return loss
+
+    def _training_step_ace_g(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33):
+        """ACE-G S2 training step: apply fusion on-the-fly then head.
+
+        Key difference from training_step(): raw backbone features are fused
+        with compressed memory per-batch, rather than being pre-fused in buffer.
+        """
+        channels = features_bC.shape[1]
+        features_bC, batch_size, h, w, trimmed = self._trim_batch_for_head_grid(
+            "S2-G",
+            features_bC,
+            target_px_b2,
+            gt_inv_poses_b34,
+            Ks_b33,
+            invKs_b33,
+        )
+        if batch_size is None:
+            self._s2_update_applied_last = False
+            return None
+        target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33 = trimmed
+        features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
+
+        # --- Same repro loss as training_step from here on ---
+        if self.mapany_flow_profile:
+            step_eff = self._monotonic_repro_step()
+        else:
+            rewind = self.s2_rewind_amount * math.exp(-self.local_s2_step / max(1e-6, self.s2_repro_rewind_tau))
+            step_eff = max(0, self.global_s2_step - rewind)
+            step_eff = min(step_eff, self.repro_loss.total_iterations - 1)
+
+        with autocast("cuda", enabled=self.options.use_half):
+            # --- ACE-G core: apply fusion on-the-fly in S2 ---
+            ace_g_fusion_in_s2 = getattr(self.options, 'ace_g_fusion_in_s2', False)
+            if ace_g_fusion_in_s2:
+                # R2 path: fusion is trainable with slow LR
+                fused_bCHW = self._fuse_features(features_bCHW, self._s2_compressor_out)
+            else:
+                # R1 path: fusion frozen (default)
+                with torch.no_grad():
+                    fused_bCHW = self._fuse_features(features_bCHW, self._s2_compressor_out)
+            pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(fused_bCHW)
+
+        pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
+        pred_scene_coords_b41 = to_homogeneous(pred_scene_coords_b31)
+        pred_cam_coords_b31 = torch.bmm(gt_inv_poses_b34, pred_scene_coords_b41)
+        pred_px_b31 = torch.bmm(Ks_b33, pred_cam_coords_b31)
+        pred_px_b31[:, 2].clamp_(min=self.options.depth_min)
+        pred_px_b21 = pred_px_b31[:, :2] / pred_px_b31[:, 2, None]
+
+        reprojection_error_b2 = pred_px_b21.squeeze() - target_px_b2
+        reprojection_error_b1 = torch.norm(reprojection_error_b2, dim=1, keepdim=True, p=1)
+
+        invalid_min_depth_b1 = (pred_cam_coords_b31[:, 2] < self.options.depth_min).squeeze(-1)
+        invalid_repro_b1 = (reprojection_error_b1 > self.options.repro_loss_hard_clamp).squeeze(-1)
+        invalid_max_depth_b1 = (pred_cam_coords_b31[:, 2] > self.options.depth_max).squeeze(-1)
+        finite_repro_b1 = torch.isfinite(reprojection_error_b1).squeeze(-1)
+        finite_cam_b1 = torch.isfinite(pred_cam_coords_b31).all(dim=1).squeeze(-1)
+        invalid_mask_b1 = invalid_min_depth_b1 | invalid_repro_b1 | invalid_max_depth_b1 | (~finite_repro_b1) | (~finite_cam_b1)
+        n_batch = int(reprojection_error_b1.shape[0])
+        invalid_mask_b1 = invalid_mask_b1.reshape(-1)
+        if invalid_mask_b1.numel() != n_batch:
+            invalid_mask_b1 = invalid_mask_b1[:n_batch]
+        valid_mask_b1 = ~invalid_mask_b1
+
+        valid_reprojection_error_b1 = reprojection_error_b1[valid_mask_b1]
+        if valid_reprojection_error_b1.numel() > 0:
+            loss_valid = self.repro_loss.compute(valid_reprojection_error_b1, int(step_eff))
+            if not isinstance(loss_valid, torch.Tensor):
+                loss_valid = torch.tensor(loss_valid, device=features_bC.device, dtype=features_bC.dtype)
+        else:
+            loss_valid = torch.zeros((), device=features_bC.device, dtype=features_bC.dtype)
+
+        pixel_grid_crop_b31 = to_homogeneous(target_px_b2.unsqueeze(2))
+        target_camera_coords_b31 = self.options.depth_target * torch.bmm(invKs_b33, pixel_grid_crop_b31)
+        invalid_mask_b11 = invalid_mask_b1.reshape(n_batch, 1, 1)
+        loss_invalid = torch.abs(target_camera_coords_b31 - pred_cam_coords_b31).masked_select(invalid_mask_b11).sum()
+        loss_invalid = torch.nan_to_num(loss_invalid, nan=0.0, posinf=0.0, neginf=0.0)
+        loss = (loss_valid + loss_invalid) / batch_size
+
+        loss_is_finite = bool(torch.isfinite(loss).all().item())
+        loss_for_log = float(loss.item()) if loss_is_finite else -1.0
+        if not loss_is_finite:
+            self.optimizer_head.zero_grad(set_to_none=True)
+            self._s2_update_applied_last = False
+            _logger.debug(
+                "S2-G step %d: non-finite loss (valid_frac=%.2f), skipping optimizer/scheduler step.",
+                self.iteration, float(valid_mask_b1.sum() / batch_size),
+            )
+        else:
+            self.optimizer_head.zero_grad(set_to_none=True)
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer_head)
+            self.scaler.update()
+            self.scheduler_head.step()
+            self._s2_update_applied_last = True
+
+        if self.iteration % self.iterations_output == 0:
+            time_since_start = time.time() - self.training_start
+            fraction_valid = float(valid_mask_b1.sum() / batch_size)
+            finite_pxerr = torch.isfinite(reprojection_error_b1)
+            pxerr_naninf_count = int((~finite_pxerr).sum().item())
+            if finite_pxerr.any():
+                px_err_finite = float(reprojection_error_b1[finite_pxerr].mean().item())
+                px_err_for_log = px_err_finite
+            else:
+                px_err_finite = float('nan')
+                px_err_for_log = -1.0
+            lr = float(self.optimizer_head.param_groups[0]["lr"])
+            self._append_step_log(
+                iter_idx=self.current_lmc_iter,
+                step=self.iteration,
+                stage="S2-G",
+                loss=loss_for_log,
+                px_err=px_err_for_log,
+                lr=lr,
+                mode="reproj",
+                med3d=-1.0,
+            )
+            _logger.info(
+                'Iteration: {:6d} | S2-G global={:6d} local={:6d} step_eff={:.0f} | Epoch {:03d}|{:03d}, Loss: {:.4f}, Valid: {:.1f}%, pxErr: {:.2f}, naninf: {:d}, Time: {:.2f}s'.format(
                     self.iteration,
                     self.global_s2_step,
                     self.local_s2_step,
