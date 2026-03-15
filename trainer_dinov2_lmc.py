@@ -1844,43 +1844,51 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(meta, f, indent=2)
 
-    def _reset_vanilla_optimizer_scheduler(self):
-        """Reset optimizer/scheduler so each vanilla iteration uses the same training schedule."""
-        self.optimizer = optim.AdamW(self.regressor.parameters(), lr=self.options.learning_rate_min)
-        steps_per_epoch = self.options.training_buffer_size // self.options.batch_size
-        self.scheduler = optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=self.options.learning_rate_max,
-            epochs=self.options.epochs,
-            steps_per_epoch=steps_per_epoch,
-            cycle_momentum=False,
-        )
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.options.use_half)
-        self.iteration = 0
+    def _reset_vanilla_optimizer_scheduler_DEPRECATED(self):
+        """DEPRECATED: 此方法已废弃，vanilla路径现在使用与train_ace_dinov2_iterative.py完全相同的逻辑"""
+        raise NotImplementedError("This method is deprecated. Use reset_optimizer_scheduler() from parent class instead.")
 
     def _train_vanilla_iterations(self):
-        """Iterative vanilla baseline: repeat buffer+train+eval with no LMC modules."""
+        """
+        Iterative vanilla baseline using the EXACT same logic as train_ace_dinov2_iterative.py.
+        This ensures consistency and correctness with the verified implementation.
+        """
         self.training_start = time.time()
         self._write_train_header()
         best_ckpt_exists = False
 
+        _logger.info("=" * 80)
+        _logger.info("[Vanilla-Iter] Using train_ace_dinov2_iterative.py logic")
+        _logger.info("[Vanilla-Iter] Iterations: %d | Buffer per iter: %d | Epochs: %d",
+                     self.vanilla_iterations, self.options.training_buffer_size, self.options.epochs)
+        _logger.info("=" * 80)
+
+        # 关键修复：使用父类的 reset_optimizer_scheduler，与 train_ace_dinov2_iterative.py 完全一致
+        # 不重置 self.iteration，让 ReproLoss 正确调度
         for it in range(self.vanilla_iterations):
             iter_start = time.time()
-            _logger.info(f"\n{'='*60}")
-            _logger.info(f"[Vanilla-Iter] Iteration {it+1}/{self.vanilla_iterations}")
-            _logger.info(f"{'='*60}")
+            _logger.info("=== Iteration %d/%d ===", it + 1, self.vanilla_iterations)
 
-            self._reset_vanilla_optimizer_scheduler()
+            # 第一次迭代后，重置 optimizer/scheduler（与 train_ace_dinov2_iterative.py:252-256 一致）
+            if it > 0:
+                self.reset_optimizer_scheduler(
+                    keep_optimizer_state=False,  # 默认不保持 optimizer 状态，与原逻辑一致
+                    buffer_size=self.options.training_buffer_size,
+                )
 
-            _logger.info("[Vanilla-Iter] Filling buffer (size=%d)", self.options.training_buffer_size)
-            self.create_training_buffer()
+            # 填充 buffer（与 train_ace_dinov2_iterative.py:258-260 一致）
+            # 注：LMC 重写的方法参数为 buffer_size_override，vanilla 路径下调用 super() 用 options.training_buffer_size
+            buffer_start = time.time()
+            self.create_training_buffer(buffer_size_override=self.options.training_buffer_size)
+            _logger.info("Filled training buffer in %.1fs.", time.time() - buffer_start)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            _logger.info("[Vanilla-Iter] Training for %d epochs", self.options.epochs)
+            # 训练 epochs（与 train_ace_dinov2_iterative.py:262-263 一致）
             for self.epoch in range(self.options.epochs):
                 self.run_epoch()
 
+            # 保存和评估（与 train_ace_dinov2_iterative.py:265-268 一致）
             iter_ckpt = self.options.output_map.parent / f"{self.options.output_map.stem}.iter_{it+1:02d}.tmp.pt"
             self.save_model(iter_ckpt)
 
@@ -1895,6 +1903,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             else:
                 score = float(it + 1)
 
+            # 管理最优模型
             is_best = (score > self.best_score)
             if is_best:
                 self.best_score = score
@@ -1921,6 +1930,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 elapsed_s=elapsed_s,
             )
 
+        # 保存最终模型（与 train_ace_dinov2_iterative.py:270 一致）
         if not best_ckpt_exists:
             self.save_model(self.options.output_map)
 

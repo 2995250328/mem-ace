@@ -79,15 +79,8 @@ class TrainerACEDINOv2:
         self.regressor = self.regressor.to(self.device)
         self.regressor.train()
 
-        self.optimizer = optim.AdamW(self.regressor.parameters(), lr=self.options.learning_rate_min)
-        steps_per_epoch = self.options.training_buffer_size // self.options.batch_size
-        self.scheduler = optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=self.options.learning_rate_max,
-            epochs=self.options.epochs,
-            steps_per_epoch=steps_per_epoch,
-            cycle_momentum=False,
-        )
+        self._current_buffer_size = self.options.training_buffer_size
+        self._init_optimizer_scheduler()
         self.scaler = GradScaler("cuda", enabled=self.options.use_half)
 
         self.pixel_grid_2HW = get_pixel_grid(self.regressor.OUTPUT_SUBSAMPLE).to(self.device)
@@ -133,11 +126,38 @@ class TrainerACEDINOv2:
             )
         return CamLocDatasetDINOv2(**common)
 
-    def create_training_buffer(self):
+    def _init_optimizer_scheduler(self, buffer_size=None):
+        effective_size = self.options.training_buffer_size if buffer_size is None else buffer_size
+        steps_per_epoch = effective_size // self.options.batch_size
+        self.optimizer = optim.AdamW(self.regressor.parameters(), lr=self.options.learning_rate_min)
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=self.options.learning_rate_max,
+            epochs=self.options.epochs,
+            steps_per_epoch=steps_per_epoch,
+            cycle_momentum=False,
+        )
+
+    def reset_optimizer_scheduler(self, keep_optimizer_state=False, buffer_size=None):
+        effective_size = self.options.training_buffer_size if buffer_size is None else buffer_size
+        steps_per_epoch = effective_size // self.options.batch_size
+        if not keep_optimizer_state:
+            self.optimizer = optim.AdamW(self.regressor.parameters(), lr=self.options.learning_rate_min)
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=self.options.learning_rate_max,
+            epochs=self.options.epochs,
+            steps_per_epoch=steps_per_epoch,
+            cycle_momentum=False,
+        )
+
+    def create_training_buffer(self, buffer_size=None):
         """Same as ace_trainer: fill GPU buffer with (features, target_px, gt_poses_inv, intrinsics, intrinsics_inv).
         When buffer_batch_size > 1, use a dataset with fixed (H,W) so that encoder runs on batches of images.
         """
         torch.backends.cudnn.benchmark = False
+        effective_size = self.options.training_buffer_size if buffer_size is None else buffer_size
+        self._current_buffer_size = effective_size
 
         buffer_batch_size = getattr(self.options, 'buffer_batch_size', 10)
         if buffer_batch_size > 1:
@@ -187,14 +207,14 @@ class TrainerACEDINOv2:
 
         self.training_buffer = {
             'features': torch.empty(
-                (self.options.training_buffer_size, self.regressor.feature_dim),
+                (effective_size, self.regressor.feature_dim),
                 dtype=(torch.float32, torch.float16)[self.options.use_half],
                 device=buffer_device,
             ),
-            'target_px': torch.empty((self.options.training_buffer_size, 2), dtype=torch.float32, device=buffer_device),
-            'gt_poses_inv': torch.empty((self.options.training_buffer_size, 3, 4), dtype=torch.float32, device=buffer_device),
-            'intrinsics': torch.empty((self.options.training_buffer_size, 3, 3), dtype=torch.float32, device=buffer_device),
-            'intrinsics_inv': torch.empty((self.options.training_buffer_size, 3, 3), dtype=torch.float32, device=buffer_device),
+            'target_px': torch.empty((effective_size, 2), dtype=torch.float32, device=buffer_device),
+            'gt_poses_inv': torch.empty((effective_size, 3, 4), dtype=torch.float32, device=buffer_device),
+            'intrinsics': torch.empty((effective_size, 3, 3), dtype=torch.float32, device=buffer_device),
+            'intrinsics_inv': torch.empty((effective_size, 3, 3), dtype=torch.float32, device=buffer_device),
         }
 
         self.regressor.eval()
@@ -204,14 +224,14 @@ class TrainerACEDINOv2:
             sampled_total = 0
             sampled_duplicates = 0
             pbar = tqdm(
-                total=self.options.training_buffer_size,
+                total=effective_size,
                 unit="samples",
                 unit_scale=True,
                 desc="Buffer",
                 dynamic_ncols=True,
             )
 
-            while buffer_idx < self.options.training_buffer_size:
+            while buffer_idx < effective_size:
                 dataset_passes += 1
                 for batch in training_dataloader:
                     # Dataset returns: image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords
@@ -264,7 +284,7 @@ class TrainerACEDINOv2:
                     use_replacement = True if replacement_cfg is None else bool(replacement_cfg)
                     features_to_select = min(
                         self.options.samples_per_image * B,
-                        self.options.training_buffer_size - buffer_idx,
+                        effective_size - buffer_idx,
                     )
                     if not use_replacement:
                         valid_count = int((image_mask_N1.view(-1) > 0).sum().item())
@@ -289,7 +309,7 @@ class TrainerACEDINOv2:
                     buffer_idx = buffer_offset
                     pbar.update(features_to_select)
                     pbar.set_postfix(n_pass=dataset_passes)
-                    if buffer_idx >= self.options.training_buffer_size:
+                    if buffer_idx >= effective_size:
                         break
 
             pbar.close()
@@ -312,11 +332,12 @@ class TrainerACEDINOv2:
     def run_epoch(self):
         """Same as ace_trainer: shuffle buffer, iterate batches, training_step from buffer."""
         torch.backends.cudnn.benchmark = True
-        random_indices = torch.randperm(self.options.training_buffer_size, generator=self.training_generator)
+        current_buffer_size = getattr(self, "_current_buffer_size", self.options.training_buffer_size)
+        random_indices = torch.randperm(current_buffer_size, generator=self.training_generator)
 
-        for batch_start in range(0, self.options.training_buffer_size, self.options.batch_size):
+        for batch_start in range(0, current_buffer_size, self.options.batch_size):
             batch_end = batch_start + self.options.batch_size
-            if batch_end > self.options.training_buffer_size:
+            if batch_end > current_buffer_size:
                 continue
 
             random_batch_indices = random_indices[batch_start:batch_end]

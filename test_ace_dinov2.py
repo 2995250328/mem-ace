@@ -7,6 +7,7 @@ import argparse
 import logging
 import math
 import time
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -23,6 +24,12 @@ import ace_vis_util as vutil
 from ace_visualizer import ACEVisualizer
 
 _logger = logging.getLogger(__name__)
+
+
+def _sanitize_tag(text: str) -> str:
+    """Filesystem-safe tag for eval run directory names (alnum, ._- only)."""
+    s = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(text))
+    return s.strip("._-") or "run"
 
 
 def _strtobool(x):
@@ -309,6 +316,9 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda',
                         help='device to run on, e.g. cuda or cuda:0')
 
+    parser.add_argument('--eval_output_dir', type=Path, default=None,
+                        help='override: save eval outputs here; default is <model_dir>/eval_results/<session>/')
+
     # DSACStar RANSAC parameters. Same as test_ace.py.
     parser.add_argument('--hypotheses', '-hyps', type=int, default=64,
                         help='number of hypotheses, i.e. number of RANSAC iterations')
@@ -399,9 +409,20 @@ if __name__ == '__main__':
     network = network.to(device)
     network.eval()
 
-    # Save the outputs in the same folder as the network being evaluated. Same as test_ace.py.
-    output_dir = head_network_path.parent
+    # Output dir: <model_dir>/eval_results/<timestamp>_<scene>_<session>/ (like train_ace_dinov2_lmc run_id).
     scene_name = scene_path.name
+    if getattr(opt, 'eval_output_dir', None):
+        output_dir = Path(opt.eval_output_dir).resolve()
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_tag = _sanitize_tag(session) if session else "eval"
+        eval_run_id = f"{timestamp}_{_sanitize_tag(scene_name)}_{session_tag}"
+        eval_results_base = head_network_path.parent / "eval_results"
+        output_dir = (eval_results_base / eval_run_id).resolve()
+        eval_results_base.mkdir(parents=True, exist_ok=True)
+        (eval_results_base / "last_eval_dir.txt").write_text(eval_run_id + "\n", encoding="utf-8")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _logger.info("Eval outputs saved to: %s", output_dir)
     test_log_file = output_dir / f'test_{scene_name}_{session}.txt'
     _logger.info(f"Saving test aggregate statistics to: {test_log_file}")
     pose_log_file = output_dir / f'poses_{scene_name}_{session}.txt'

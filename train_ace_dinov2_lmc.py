@@ -16,11 +16,13 @@
 # -----------------------------------------------------------------------------
 
 import argparse
+import copy
 import json
 import logging
 import os
 import shutil
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -44,6 +46,7 @@ setup_cuda_environment()
 
 print("train_ace_dinov2_lmc: importing torch and LMC trainer...", flush=True)
 import torch
+from trainer_dinov2 import TrainerACEDINOv2
 from trainer_dinov2_lmc import TrainerACEDINOv2LMC
 
 print("train_ace_dinov2_lmc: ready, configuring logging.", flush=True)
@@ -112,14 +115,15 @@ def _apply_baseline_contract(args):
     # so explicit CLI (e.g. --training_buffer_size 8760000) is respected.
     if (not args.use_lmc) and args.apply_baseline_contract:
         _vanilla_defaults = {
-            "num_head_blocks": 1,
+            "num_head_blocks": 4,
             "learning_rate_max": 0.001,
             "s1_learning_rate_max": 0.001,
             "s2_learning_rate_max": 0.001,
-            "training_buffer_size": 5760000,
-            "samples_per_image": 384,
+            "training_buffer_size": 10000000,
+            "buffer_batch_size": 1,
+            "samples_per_image": 512,
             "epochs": 16,
-            "batch_size": 3840,
+            "batch_size": 5120,
         }
         _parser_defaults = {
             "num_head_blocks": 4,
@@ -127,6 +131,7 @@ def _apply_baseline_contract(args):
             "s1_learning_rate_max": 0.0001,
             "s2_learning_rate_max": 0.001,
             "training_buffer_size": 2560000,
+            "buffer_batch_size": 10,
             "samples_per_image": 512,
             "epochs": 24,
             "batch_size": 5120,
@@ -151,6 +156,185 @@ def _apply_baseline_contract(args):
             "[Baseline contract] disabled (apply_baseline_contract=False). "
             "Will use CLI hyperparameters as-is for iterative no-LMC baseline."
         )
+
+
+def _build_vanilla_iterative_args(args):
+    """
+    Build a vanilla baseline args object that matches train_ace_dinov2_iterative.py
+    semantics instead of reusing LMC-specific defaults.
+    """
+    vanilla_args = copy.copy(args)
+    vanilla_args.iterations = int(args.vanilla_iterations)
+    vanilla_args.iter_buffer_size = int(args.training_buffer_size)
+    vanilla_args.reset_optimizer_each_iter = False
+
+    # LMC parser default is 10 for faster LMC buffer fill, but the validated vanilla
+    # iterative baseline uses 1. If user did not explicitly override it, force parity.
+    if getattr(vanilla_args, "buffer_batch_size", None) == 10:
+        _logger.info(
+            "[Vanilla parity] Overriding buffer_batch_size: 10 -> 1 "
+            "to match train_ace_dinov2_iterative.py."
+        )
+        vanilla_args.buffer_batch_size = 1
+
+    return vanilla_args
+
+
+def _run_standard_eval(args, output_map, session):
+    """
+    Evaluate a vanilla checkpoint with the same evaluator used by train_ace_dinov2_iterative.py.
+    """
+    from test_ace_dinov2 import run_evaluation
+
+    eval_device = getattr(args, "post_train_eval_device", "cuda:0")
+    eval_opt = argparse.Namespace(
+        scene=args.scene,
+        network=output_map,
+        dinov2_path=args.dinov2_path,
+        device=eval_device,
+        image_resolution=args.image_resolution,
+        session=session,
+        render_visualization=False,
+    )
+    return run_evaluation(eval_opt)
+
+
+def _score_standard_eval(result, metric):
+    metric = (metric or "pct5").lower()
+    if metric == "pct25_5":
+        return float(result["pct25_5"])
+    if metric == "pct10_5":
+        return float(result["pct10_5"])
+    if metric == "pct2":
+        return float(result["pct2"])
+    if metric == "pct1":
+        return float(result["pct1"])
+    if metric == "median":
+        return -float(result["median_rErr"]) - float(result["median_tErr"])
+    return float(result["pct5"])
+
+
+def _write_vanilla_eval_summary(args, result):
+    eval_log_path = args.run_dir / "post_train_eval.txt"
+    with open(eval_log_path, "w", encoding="utf-8") as f:
+        f.write(f"median_rotation_deg\t{result['median_rErr']:.4f}\n")
+        f.write(f"median_translation_cm\t{result['median_tErr']:.4f}\n")
+        f.write(f"accuracy_25cm5deg_pct\t{result['pct25_5']:.2f}\n")
+        f.write(f"accuracy_10cm5deg_pct\t{result['pct10_5']:.2f}\n")
+        f.write(f"accuracy_5cm5deg_pct\t{result['pct5']:.2f}\n")
+        f.write(f"accuracy_2cm2deg_pct\t{result['pct2']:.2f}\n")
+        f.write(f"accuracy_1cm1deg_pct\t{result['pct1']:.2f}\n")
+        f.write(f"avg_time_per_frame_ms\t{result['avg_time'] * 1000:.2f}\n")
+        f.write(f"total_frames\t{result['total_frames']}\n")
+    _logger.info("Eval summary also written to: %s", eval_log_path)
+
+
+def run_vanilla_iterative_baseline(args):
+    """
+    Run the no-LMC baseline via the validated TrainerACEDINOv2 path instead of the
+    LMC trainer. This keeps the LMC entrypoint and output layout, but removes all
+    residual LMC-side training/eval differences.
+    """
+    vanilla_args = _build_vanilla_iterative_args(args)
+    iter_buffer_size = vanilla_args.iter_buffer_size
+
+    trainer_args = copy.copy(vanilla_args)
+    trainer_args.training_buffer_size = iter_buffer_size * vanilla_args.iterations
+
+    trainer = TrainerACEDINOv2(trainer_args)
+    trainer.training_start = time.time()
+
+    pt_name = Path(vanilla_args.output_map).name
+    out_base = Path(vanilla_args.output_map).parent
+    best_score = -float("inf")
+    best_iter = None
+
+    _logger.info("=" * 80)
+    _logger.info("[Vanilla parity] Running validated iterative baseline via TrainerACEDINOv2")
+    _logger.info(
+        "[Vanilla parity] iterations=%d iter_buffer_size=%d buffer_batch_size=%d epochs=%d",
+        vanilla_args.iterations,
+        iter_buffer_size,
+        vanilla_args.buffer_batch_size,
+        vanilla_args.epochs,
+    )
+    _logger.info("=" * 80)
+
+    for iteration_idx in range(vanilla_args.iterations):
+        _logger.info("=== Iteration %d/%d ===", iteration_idx + 1, vanilla_args.iterations)
+
+        if iteration_idx > 0:
+            trainer.reset_optimizer_scheduler(
+                keep_optimizer_state=not vanilla_args.reset_optimizer_each_iter,
+                buffer_size=iter_buffer_size,
+            )
+
+        buffer_start = time.time()
+        trainer.create_training_buffer(buffer_size=iter_buffer_size)
+        _logger.info("Filled training buffer in %.1fs.", time.time() - buffer_start)
+
+        for trainer.epoch in range(vanilla_args.epochs):
+            trainer.run_epoch()
+
+        iter_ckpt = out_base / f"{vanilla_args.output_map.stem}.iter_{iteration_idx + 1:02d}.tmp.pt"
+        trainer.save_model(iter_ckpt)
+
+        eval_result = None
+        score = -float("inf")
+        if vanilla_args.eval_each_iteration:
+            eval_result = _run_standard_eval(
+                vanilla_args,
+                iter_ckpt,
+                session=f"iter_{iteration_idx + 1:02d}",
+            )
+            score = _score_standard_eval(eval_result, vanilla_args.best_metric)
+            _logger.info(
+                "[Vanilla parity] Iter %02d eval: median=%.2fdeg/%.2fcm pct5=%.2f pct25_5=%.2f",
+                iteration_idx + 1,
+                eval_result["median_rErr"],
+                eval_result["median_tErr"],
+                eval_result["pct5"],
+                eval_result["pct25_5"],
+            )
+        else:
+            score = float(iteration_idx + 1)
+
+        if score > best_score:
+            best_score = score
+            best_iter = iteration_idx + 1
+            os.replace(iter_ckpt, vanilla_args.output_map)
+            _logger.info("[Vanilla parity] Updated best checkpoint at iter %d (score=%.4f)", best_iter, score)
+        elif iter_ckpt.exists():
+            if vanilla_args.keep_best_only:
+                iter_ckpt.unlink()
+            else:
+                iter_ckpt.rename(out_base / f"{vanilla_args.output_map.stem}.iter_{iteration_idx + 1:02d}.pt")
+
+    if not vanilla_args.output_map.exists():
+        trainer.save_model(vanilla_args.output_map)
+
+    if vanilla_args.eval_after_train:
+        _logger.info("Running post-training evaluation with standard ACE evaluator...")
+        result = _run_standard_eval(vanilla_args, vanilla_args.output_map, vanilla_args.eval_session)
+        _logger.info("========== Post-train Eval (standard ACE evaluator) ==========")
+        _logger.info(
+            "  Median: %.2f deg, %.2f cm | 25cm/5deg: %.2f%% | 10cm/5deg: %.2f%% | 5cm/5deg: %.2f%% | "
+            "2cm/2deg: %.2f%% | 1cm/1deg: %.2f%%",
+            result["median_rErr"], result["median_tErr"],
+            result["pct25_5"], result["pct10_5"], result["pct5"],
+            result["pct2"], result["pct1"],
+        )
+        _logger.info("  Avg time: %.2f ms | Frames: %d", result["avg_time"] * 1000, result["total_frames"])
+        _logger.info("==============================================================")
+        _write_vanilla_eval_summary(vanilla_args, result)
+
+    _logger.info(
+        "Vanilla parity run completed. Total time: %.1fs | best_iter=%s | best_score=%.4f",
+        time.time() - trainer.training_start,
+        best_iter,
+        best_score,
+    )
+    return trainer
 
 
 def _apply_lmc_profile(args):
@@ -517,6 +701,11 @@ def main():
     if getattr(args, 'device', '').startswith('cuda:') and os.environ.get('CUDA_VISIBLE_DEVICES'):
         args.device = 'cuda:0'
     setup_experiment(args)
+
+    if not args.use_lmc:
+        run_vanilla_iterative_baseline(args)
+        _logger.info("Training completed.")
+        return
 
     trainer = TrainerACEDINOv2LMC(args)
     trainer.train()

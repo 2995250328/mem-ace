@@ -3,6 +3,7 @@
 # Training script for ACE with DINOv2 encoder
 
 import argparse
+import json
 import logging
 import os
 import subprocess
@@ -166,6 +167,10 @@ if __name__ == '__main__':
     args.output_map = out_base / pt_name
     args._scene_display_name = scene_name  # 用于 eval 日志文件名（test_*_post_train.txt 等）
 
+    # trainer 期望 scene 为场景根目录（其下才有 train/），若传入 .../train 则改为 parent
+    if scene_path.name == "train":
+        args.scene = scene_path.parent
+
     # Validate image resolution
     if args.image_resolution % 14 != 0:
         _logger.warning(f"Image resolution {args.image_resolution} is not multiple of 14, "
@@ -206,27 +211,26 @@ if __name__ == '__main__':
         _logger.info("Running post-training evaluation on test set")
         _logger.info("=" * 80)
         try:
-            # 父进程已 del trainer 并 empty_cache()，GPU 可被子进程使用；默认 cuda:0 以加速评测。
+            # 通过 exec 替换当前进程为评测启动器，从而释放训练进程占用的全部 GPU 显存，
+            # 再由启动器子进程运行 test_ace_dinov2.py 使用同一块 GPU，避免 OOM。
             del trainer
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            eval_device = getattr(args, "post_train_eval_device", "cuda:0")
-            if eval_device.startswith("cuda"):
-                _logger.info("Running post-train evaluation in subprocess on %s (parent released GPU).", eval_device)
-            else:
-                _logger.info("Running post-train evaluation in subprocess on %s.", eval_device)
 
-            # 子进程使用独立 GPU，避免与父进程争用同一块卡导致 OOM
+            eval_device = getattr(args, "post_train_eval_device", "cuda:0")
             eval_env = os.environ.copy()
             if eval_device.startswith("cuda"):
                 gpu_id = eval_device.split(":")[-1]
                 eval_env["CUDA_VISIBLE_DEVICES"] = gpu_id
-                device_for_cmd = "cuda:0"  # 子进程内只看到一块卡，即物理 GPU gpu_id
+                device_for_cmd = "cuda:0"
             else:
                 device_for_cmd = eval_device
 
             output_dir = Path(args.output_map).parent
-            scene_name = getattr(args, "_scene_display_name", None) or Path(args.scene).parent.name if args.scene.parts and args.scene.name in ("train", "test", "val") else Path(args.scene).name
+            scene_name = getattr(args, "_scene_display_name", None) or (
+                Path(args.scene).parent.name if args.scene.parts and args.scene.name in ("train", "test", "val")
+                else Path(args.scene).name
+            )
             eval_session = getattr(args, "eval_session", "post_train")
             script_dir = Path(__file__).resolve().parent
             test_script = script_dir / "test_ace_dinov2.py"
@@ -242,76 +246,30 @@ if __name__ == '__main__':
                 "--device", device_for_cmd,
             ]
             _logger.info("Eval command: %s", " ".join(cmd))
-            result = subprocess.run(cmd, cwd=os.getcwd(), env=eval_env)
-            if result.returncode != 0:
-                raise RuntimeError(f"test_ace_dinov2.py exited with code {result.returncode}")
 
-            # 从评测脚本写出的 eval_summary 文件解析结果
-            eval_summary_file = output_dir / f"eval_summary_{scene_name}_{eval_session}.txt"
-            if not eval_summary_file.exists():
-                raise FileNotFoundError(f"Eval summary not found: {eval_summary_file}")
-
-            summary = {}
-            for line in eval_summary_file.read_text(encoding="utf-8").strip().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "\t" in line:
-                    key, value = line.split("\t", 1)
-                    summary[key.strip()] = value.strip()
-
-            def _float(k, default=0.0):
-                return float(summary.get(k, default))
-
-            def _int(k, default=0):
-                return int(summary.get(k, default))
-
-            eval_result = {
-                "median_rErr": _float("median_rotation_deg"),
-                "median_tErr": _float("median_translation_cm"),
-                "avg_time": _float("avg_time_per_frame_ms") / 1000.0,
-                "pct25_5": _float("accuracy_25cm5deg_pct"),
-                "pct10_5": _float("accuracy_10cm5deg_pct"),
-                "pct5": _float("accuracy_5cm5deg_pct"),
-                "pct2": _float("accuracy_2cm2deg_pct"),
-                "pct1": _float("accuracy_1cm1deg_pct"),
-                "total_frames": _int("total_frames"),
-                "test_log_file": str(output_dir / f"test_{scene_name}_{eval_session}.txt"),
-                "pose_log_file": str(output_dir / f"poses_{scene_name}_{eval_session}.txt"),
+            json_path = output_dir / "post_train_eval.json"
+            payload = {
+                "cmd": cmd,
+                "cwd": os.getcwd(),
+                "env": {k: str(v) for k, v in eval_env.items()},
+                "output_dir": str(output_dir),
+                "scene_name": scene_name,
+                "eval_session": eval_session,
+                "output_map": str(args.output_map),
+                "scene": str(args.scene),
+                "epochs": args.epochs,
+                "image_resolution": args.image_resolution,
             }
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
 
-            eval_log_path = output_dir / "eval_log.txt"
-            with open(eval_log_path, "w", encoding="utf-8") as f:
-                f.write("# DINOv2-ACE evaluation after training\n")
-                f.write(f"# Generated: {datetime.now().isoformat()}\n")
-                f.write(f"# Scene: {args.scene}\n")
-                f.write(f"# Model: {args.output_map}\n")
-                f.write(f"# Epochs: {args.epochs}  image_resolution: {args.image_resolution}\n")
-                f.write("\n")
-                f.write(f"median_rotation_deg\t{eval_result['median_rErr']:.4f}\n")
-                f.write(f"median_translation_cm\t{eval_result['median_tErr']:.4f}\n")
-                f.write(f"avg_time_per_frame_ms\t{eval_result['avg_time'] * 1000:.2f}\n")
-                f.write(f"accuracy_25cm5deg_pct\t{eval_result['pct25_5']:.2f}\n")
-                f.write(f"accuracy_10cm5deg_pct\t{eval_result['pct10_5']:.2f}\n")
-                f.write(f"accuracy_5cm5deg_pct\t{eval_result['pct5']:.2f}\n")
-                f.write(f"accuracy_2cm2deg_pct\t{eval_result['pct2']:.2f}\n")
-                f.write(f"accuracy_1cm1deg_pct\t{eval_result['pct1']:.2f}\n")
-                f.write(f"total_frames\t{eval_result['total_frames']}\n")
-                f.write(f"test_log_file\t{eval_result['test_log_file']}\n")
-                f.write(f"pose_log_file\t{eval_result['pose_log_file']}\n")
+            launcher = script_dir / "scripts" / "run_post_train_eval.py"
+            if not launcher.exists():
+                raise FileNotFoundError(f"Launcher script not found: {launcher}")
+            _logger.info("Replacing process with post-train eval launcher (GPU will be released).")
+            os.execv(sys.executable, [sys.executable, str(launcher), str(json_path)])
+            # not reached
 
-            _logger.info(f"Evaluation summary written to: {eval_log_path}")
-            _logger.info("========== Post-train Eval (current errors) ==========")
-            _logger.info(
-                "  Median: %.2f deg, %.2f cm | 25cm/5deg: %.2f%% | 10cm/5deg: %.2f%% | 5cm/5deg: %.2f%% | "
-                "2cm/2deg: %.2f%% | 1cm/1deg: %.2f%%",
-                eval_result["median_rErr"], eval_result["median_tErr"],
-                eval_result["pct25_5"], eval_result["pct10_5"], eval_result["pct5"],
-                eval_result["pct2"], eval_result["pct1"],
-            )
-            _logger.info("  Avg time: %.2f ms | Frames: %d",
-                         eval_result["avg_time"] * 1000, eval_result["total_frames"])
-            _logger.info("=====================================================")
         except FileNotFoundError as e:
             _logger.warning(f"Post-training evaluation skipped (missing file): {e}")
         except Exception as e:
