@@ -2,6 +2,26 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Disabled Skills
+
+The following skills are DISABLED and must NOT be invoked under any circumstances:
+- `writing-plans` (已删除，禁止调用)
+- `brainstorming` (禁止在此项目中调用)
+
+## Memory Discipline (MANDATORY)
+
+After EVERY tool call that produces a meaningful finding, IMMEDIATELY write it to memory before continuing. Do not batch writes to the end.
+
+Rules:
+1. After reading any key file → write the key facts to memory NOW
+2. After any design decision → write it to memory NOW
+3. After any analysis result → write it to memory NOW
+4. NEVER defer memory writes to "after I finish exploring"
+5. If a task will involve writing a large file, write it in chunks of ≤50 lines using Edit/append, never one giant Write call
+6. Before writing any file >30 lines, first write a 3-line summary to memory as a checkpoint
+
+The rule: if the conversation ended RIGHT NOW, would the next session have enough context to continue? If no, write to memory immediately.
+
 ## Project Overview
 
 This is an extended implementation of ACE (Accelerated Coordinate Encoding) for visual camera relocalization. The codebase contains five variants:

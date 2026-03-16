@@ -305,6 +305,7 @@ def preflight_memory_features(
         if sc.numel() < 3:
             _record(False, f"scene_center shape is invalid: got {tuple(scene_center.shape)}, expected at least 3 values.")
         else:
+            # scene_center 可为「相机位置均值」(与 ACE 对齐) 或「点云质心」；二者可差数米，仅作一致性提示
             pooled_mean = pooled_points[:, :3].detach().float().mean(dim=0).cpu()
             center_dist = float(torch.linalg.norm(sc[:3] - pooled_mean).item())
             stats["scene_center_dist_to_pooled_mean"] = center_dist

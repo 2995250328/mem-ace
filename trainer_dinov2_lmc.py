@@ -209,7 +209,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 scale_token_dim = st.shape[-1]
                 _logger.info("[LMC] scale_token_dim=%d from all_scale_tokens", scale_token_dim)
 
-        backbone_feature_dim = 1024
+        backbone_feature_dim = getattr(self.regressor.encoder, 'feature_dim', 1024)
+        _logger.info("[LMC] backbone_feature_dim=%d (from regressor.encoder)", backbone_feature_dim)
 
         self.lmc_config = {
             'use_lmc': True,
@@ -299,7 +300,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self.repro_step_mode = "global_monotonic"
         else:
             repro_total_iterations = total_s2_steps
-            self.repro_step_mode = "legacy_rewind"
+            # Determine step_eff mode: 'auto' chooses 'per_iter' when ace_g_fusion_in_s2=True
+            _ace_g_fusion_in_s2 = (
+                str(getattr(options, 'lmc_flow', 'ace')) == 'ace_g'
+                and bool(getattr(options, 'ace_g_fusion_in_s2', False))
+            )
+            _s2_step_eff_mode = str(getattr(options, 's2_step_eff_mode', 'auto'))
+            if _s2_step_eff_mode == 'auto':
+                _s2_step_eff_mode = 'per_iter' if _ace_g_fusion_in_s2 else 'legacy_rewind'
+            self.repro_step_mode = _s2_step_eff_mode
         self.repro_loss = ReproLoss(
             total_iterations=repro_total_iterations,
             soft_clamp=self.options.repro_loss_soft_clamp,
@@ -316,6 +325,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.scheduler_head = None
         self._s2_compressor_out = None  # Cached compressor output for ACE-G S2
         self._s2_update_applied_last = True
+        # S2 stability options (see options_dinov2_lmc.py for docs)
+        self._loss_invalid_max_delta = float(getattr(options, 'loss_invalid_max_delta', 1000.0))
+        self._s2_grad_clip_max_norm = float(getattr(options, 's2_grad_clip_max_norm', 1.0))
 
         # Rebuild optimizer to include compressor + fusion params (used only when not in LMC; S1/S2 use their own)
         self._rebuild_optimizer()
@@ -324,7 +336,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             f"[LMC] mode={lmc_mode}, tokens={num_latent_tokens}, "
             f"attn_layers={num_attn_layers}, iterations={self.lmc_iterations}, "
             f"profile={self.lmc_profile}, repro_step_mode={self.repro_step_mode}, "
-            f"repro_total_iterations={self.repro_loss.total_iterations}"
+            f"repro_total_iterations={self.repro_loss.total_iterations}, "
+            f"loss_invalid_max_delta={self._loss_invalid_max_delta}, "
+            f"s2_grad_clip={self._s2_grad_clip_max_norm}"
         )
 
     def _resolve_buffer_schema_dim(self, dim_spec):
@@ -2313,11 +2327,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33 = trimmed
         features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
 
-        if self.mapany_flow_profile:
-            # map-anything profile: monotonic global repro step, no rewind.
+        if self.repro_step_mode == "global_monotonic":
             step_eff = self._monotonic_repro_step()
+        elif self.repro_step_mode == "per_iter":
+            # 每轮 S2 独立调度：local_s2_step 按比例映射到完整调度区间，保证每轮都经历完整 soft_clamp 范围
+            step_eff = int(self.local_s2_step * self.repro_loss.total_iterations / max(1, self.steps_per_s2_phase))
+            step_eff = min(step_eff, self.repro_loss.total_iterations - 1)
         else:
-            # legacy: 每轮 S2 开始时小幅回拨，再随 local_s2_step 指数恢复至全局轨道
+            # legacy_rewind: 每轮 S2 开始时小幅回拨，再随 local_s2_step 指数恢复至全局轨道
             rewind = self.s2_rewind_amount * math.exp(-self.local_s2_step / max(1e-6, self.s2_repro_rewind_tau))
             step_eff = max(0, self.global_s2_step - rewind)
             step_eff = min(step_eff, self.repro_loss.total_iterations - 1)
@@ -2364,8 +2381,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         target_camera_coords_b31 = self.options.depth_target * torch.bmm(invKs_b33, pixel_grid_crop_b31)
         # Match (B, 3, 1) camera-coordinate tensor shape via broadcastable mask.
         invalid_mask_b11 = invalid_mask_b1.reshape(n_batch, 1, 1)
-        loss_invalid = torch.abs(target_camera_coords_b31 - pred_cam_coords_b31).masked_select(invalid_mask_b11).sum()
-        loss_invalid = torch.nan_to_num(loss_invalid, nan=0.0, posinf=0.0, neginf=0.0)
+        # FIX: per-component clamp to prevent catastrophic loss_invalid explosion when predictions diverge.
+        # Without clamp, camera-space L1 deltas can reach millions of meters (vs. typical ~0.1m target scale),
+        # causing loss ~650K+ that overwhelms loss_valid and produces destructive gradients leading to NaN.
+        delta_cam_b31 = torch.abs(target_camera_coords_b31 - pred_cam_coords_b31)
+        delta_cam_b31 = torch.nan_to_num(delta_cam_b31, nan=0.0, posinf=0.0, neginf=0.0)
+        if self._loss_invalid_max_delta > 0:
+            delta_cam_b31 = delta_cam_b31.clamp(max=self._loss_invalid_max_delta)
+        loss_invalid = delta_cam_b31.masked_select(invalid_mask_b11).sum()
         loss = (loss_valid + loss_invalid) / batch_size
 
         # Guard NaN/Inf: truly skip optimizer/scheduler updates to avoid consuming LR schedule.
@@ -2381,6 +2404,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         else:
             self.optimizer_head.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
+            # FIX: gradient clipping (same as S1) to prevent NaN divergence from large gradients.
+            if self._s2_grad_clip_max_norm > 0:
+                self.scaler.unscale_(self.optimizer_head)
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.regressor.heads.parameters()),
+                    max_norm=self._s2_grad_clip_max_norm,
+                )
             self.scaler.step(self.optimizer_head)
             self.scaler.update()
             self.scheduler_head.step()
@@ -2448,8 +2478,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
 
         # --- Same repro loss as training_step from here on ---
-        if self.mapany_flow_profile:
+        if self.repro_step_mode == "global_monotonic":
             step_eff = self._monotonic_repro_step()
+        elif self.repro_step_mode == "per_iter":
+            step_eff = int(self.local_s2_step * self.repro_loss.total_iterations / max(1, self.steps_per_s2_phase))
+            step_eff = min(step_eff, self.repro_loss.total_iterations - 1)
         else:
             rewind = self.s2_rewind_amount * math.exp(-self.local_s2_step / max(1e-6, self.s2_repro_rewind_tau))
             step_eff = max(0, self.global_s2_step - rewind)
@@ -2500,8 +2533,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         pixel_grid_crop_b31 = to_homogeneous(target_px_b2.unsqueeze(2))
         target_camera_coords_b31 = self.options.depth_target * torch.bmm(invKs_b33, pixel_grid_crop_b31)
         invalid_mask_b11 = invalid_mask_b1.reshape(n_batch, 1, 1)
-        loss_invalid = torch.abs(target_camera_coords_b31 - pred_cam_coords_b31).masked_select(invalid_mask_b11).sum()
-        loss_invalid = torch.nan_to_num(loss_invalid, nan=0.0, posinf=0.0, neginf=0.0)
+        # FIX: per-component clamp to prevent catastrophic loss_invalid explosion.
+        delta_cam_b31 = torch.abs(target_camera_coords_b31 - pred_cam_coords_b31)
+        delta_cam_b31 = torch.nan_to_num(delta_cam_b31, nan=0.0, posinf=0.0, neginf=0.0)
+        if self._loss_invalid_max_delta > 0:
+            delta_cam_b31 = delta_cam_b31.clamp(max=self._loss_invalid_max_delta)
+        loss_invalid = delta_cam_b31.masked_select(invalid_mask_b11).sum()
         loss = (loss_valid + loss_invalid) / batch_size
 
         loss_is_finite = bool(torch.isfinite(loss).all().item())
@@ -2516,6 +2553,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         else:
             self.optimizer_head.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
+            # FIX: gradient clipping (same as S1) to prevent NaN divergence from large gradients.
+            if self._s2_grad_clip_max_norm > 0:
+                self.scaler.unscale_(self.optimizer_head)
+                params_to_clip = list(self.regressor.heads.parameters())
+                if ace_g_fusion_in_s2:
+                    params_to_clip += list(self.fusion.parameters())
+                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=self._s2_grad_clip_max_norm)
             self.scaler.step(self.optimizer_head)
             self.scaler.update()
             self.scheduler_head.step()

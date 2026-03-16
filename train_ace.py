@@ -121,6 +121,15 @@ if __name__ == '__main__':
     parser.add_argument('--render_camera_z_offset', type=int, default=4,
                         help='zoom out of the scene by moving render camera backwards, in meters')
 
+    parser.add_argument('--sampler_path', type=Path, default=None,
+                        help='trained SamplerNet .pt; if set, replaces random buffer sampling')
+
+    parser.add_argument('--sampler_ratio', type=float, default=0.7,
+                        help='fraction of buffer samples from sampler top-k (rest random)')
+
+    parser.add_argument('--use_neighbors', type=_strtobool, default=False,
+                        help='expand sampler selections to 4-connected neighbors')
+
     options = parser.parse_args()
 
     trainer = TrainerACE(options)

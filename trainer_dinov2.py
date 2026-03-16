@@ -65,16 +65,9 @@ class TrainerACEDINOv2:
             self.dataset.mean_cam_center[1],
             self.dataset.mean_cam_center[2]))
 
-        # Regressor with DINOv2 encoder (only difference from ACE: create_from_encoder args)
-        self.regressor = Regressor.create_from_encoder(
-            dinov2_path=self.options.dinov2_path,
-            mean=self.dataset.mean_cam_center,
-            num_head_blocks=self.options.num_head_blocks,
-            use_homogeneous=self.options.use_homogeneous,
-            num_encoder_features=1024,
-            freeze_backbone=self.options.freeze_backbone,
-        )
-        _logger.info("Loaded DINOv2 encoder from: {}".format(self.options.dinov2_path))
+        # Regressor — subclasses may override _create_regressor() to swap the backbone.
+        self.regressor = self._create_regressor()
+        _logger.info("Regressor created: %s", type(self.regressor).__name__)
 
         self.regressor = self.regressor.to(self.device)
         self.regressor.train()
@@ -96,6 +89,19 @@ class TrainerACEDINOv2:
         )
 
         self.training_buffer = None
+
+    def _create_regressor(self):
+        """Create the scene coordinate regressor. Override in subclasses to swap the backbone."""
+        regressor = Regressor.create_from_encoder(
+            dinov2_path=self.options.dinov2_path,
+            mean=self.dataset.mean_cam_center,
+            num_head_blocks=self.options.num_head_blocks,
+            use_homogeneous=self.options.use_homogeneous,
+            num_encoder_features=1024,
+            freeze_backbone=self.options.freeze_backbone,
+        )
+        _logger.info("Loaded DINOv2 encoder from: %s", self.options.dinov2_path)
+        return regressor
 
     def _get_train_root(self):
         backend = getattr(self.options, "data_backend", "ace")

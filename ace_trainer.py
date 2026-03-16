@@ -102,6 +102,15 @@ class TrainerACE:
         self.regressor = self.regressor.to(self.device)
         self.regressor.train()
 
+        # Load optional SamplerNet for guided buffer sampling
+        self.sampler_net = None
+        sampler_path = getattr(self.options, 'sampler_path', None)
+        if sampler_path is not None:
+            from ace_sampler.model import SamplerNet
+            self.sampler_net = SamplerNet.load(str(sampler_path), self.device)
+            self.sampler_net.eval()
+            _logger.info(f'Loaded SamplerNet from {sampler_path}')
+
         # Setup optimization parameters.
         self.optimizer = optim.AdamW(self.regressor.parameters(), lr=self.options.learning_rate_min)
 
@@ -242,6 +251,15 @@ class TrainerACE:
                                          )
 
         _logger.info("Starting creation of the training buffer.")
+
+        if self.sampler_net is not None:
+            from ace_sampler.buffer_sampler import fill_buffer_with_sampler
+            self.training_buffer = fill_buffer_with_sampler(
+                self.regressor, self.sampler_net, self.dataset,
+                self.options, self.device,
+                self.sampling_generator, self.batch_generator, self.loader_generator)
+            self.regressor.train()
+            return
 
         # Create a training buffer that lives on the GPU.
         self.training_buffer = {

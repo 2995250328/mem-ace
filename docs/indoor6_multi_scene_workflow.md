@@ -41,7 +41,7 @@ DATASET=indoor6_dataset \
 SCENE_TRAIN=<scene>_train \
 SCENE_TEST=<scene>_test \
 N_VIEWS=40 \
-GPU_ID=0 \
+GPU_ID=2 \
 bash bash_scripts/ace/fps_memory.sh
 ```
 
@@ -53,22 +53,22 @@ bash bash_scripts/ace/fps_memory.sh
 cd /home/xwh/project/map-anything
 
 # scene1（若已有 memory 可跳过）
-DATASET=indoor6_dataset SCENE_TRAIN=scene1_train SCENE_TEST=scene1_test N_VIEWS=40 GPU_ID=0 bash bash_scripts/ace/fps_memory.sh
+DATASET=indoor6_dataset SCENE_TRAIN=scene1_train SCENE_TEST=scene1_test N_VIEWS=40 GPU_ID=2 bash bash_scripts/ace/fps_memory.sh
 
 # scene2a
-DATASET=indoor6_dataset SCENE_TRAIN=scene2a_train SCENE_TEST=scene2a_test N_VIEWS=40 GPU_ID=0 bash bash_scripts/ace/fps_memory.sh
+DATASET=indoor6_dataset SCENE_TRAIN=scene2a_train SCENE_TEST=scene2a_test N_VIEWS=40 GPU_ID=2 bash bash_scripts/ace/fps_memory.sh
 
 # scene3
-DATASET=indoor6_dataset SCENE_TRAIN=scene3_train SCENE_TEST=scene3_test N_VIEWS=40 GPU_ID=0 bash bash_scripts/ace/fps_memory.sh
+DATASET=indoor6_dataset SCENE_TRAIN=scene3_train SCENE_TEST=scene3_test N_VIEWS=40 GPU_ID=2 bash bash_scripts/ace/fps_memory.sh
 
 # scene4a
-DATASET=indoor6_dataset SCENE_TRAIN=scene4a_train SCENE_TEST=scene4a_test N_VIEWS=40 GPU_ID=0 bash bash_scripts/ace/fps_memory.sh
+DATASET=indoor6_dataset SCENE_TRAIN=scene4a_train SCENE_TEST=scene4a_test N_VIEWS=40 GPU_ID=2 bash bash_scripts/ace/fps_memory.sh
 
 # scene5
-DATASET=indoor6_dataset SCENE_TRAIN=scene5_train SCENE_TEST=scene5_test N_VIEWS=40 GPU_ID=0 bash bash_scripts/ace/fps_memory.sh
+DATASET=indoor6_dataset SCENE_TRAIN=scene5_train SCENE_TEST=scene5_test N_VIEWS=40 GPU_ID=2 bash bash_scripts/ace/fps_memory.sh
 
 # scene6
-DATASET=indoor6_dataset SCENE_TRAIN=scene6_train SCENE_TEST=scene6_test N_VIEWS=40 GPU_ID=0 bash bash_scripts/ace/fps_memory.sh
+DATASET=indoor6_dataset SCENE_TRAIN=scene6_train SCENE_TEST=scene6_test N_VIEWS=40 GPU_ID=2 bash bash_scripts/ace/fps_memory.sh
 ```
 
 提取完成后，每个场景会得到目录：
