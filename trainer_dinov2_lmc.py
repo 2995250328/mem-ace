@@ -1214,6 +1214,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         ema_px_err = None
         best_ema_px_err = float('inf')
         no_improve_updates = 0
+        _s1_loss_step1 = None
+        _s1_loss_last = None
 
         _logger.info(
             "  [S1-Buffer] source=raw_buffer, target_updates=%d, s1_loss_mode=%s",
@@ -1367,11 +1369,16 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         break
 
             if update_step % log_interval == 0 or update_step == 1 or update_step == n_steps:
+                _cur_loss = float(loss.item())
+                if update_step == 1 and math.isfinite(_cur_loss):
+                    _s1_loss_step1 = _cur_loss
+                if math.isfinite(_cur_loss):
+                    _s1_loss_last = _cur_loss
                 self._append_step_log(
                     iter_idx=iteration_idx,
                     step=self.iteration,
                     stage="S1-BUF",
-                    loss=float(loss.item()),
+                    loss=_cur_loss,
                     px_err=float(px_err),
                     lr=float(comp_optimizer.param_groups[0]["lr"]),
                     mode="reproj",
@@ -1379,7 +1386,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 )
                 _logger.info(
                     "  [S1-Buffer] update %d/%d (attempt=%d), samples=%d, loss=%.4f, valid=%.1f%%, pxErrL1=%.2f, pxErrL2=%.2f, nonFinite=%.2f%%, lr=%.2e",
-                    update_step, n_steps, raw_step, batch_size, loss.item(),
+                    update_step, n_steps, raw_step, batch_size, _cur_loss,
                     s1_stats["fraction_valid"] * 100.0, s1_stats["pxerr_l1"], s1_stats["pxerr_l2"],
                     s1_stats["nonfinite_ratio"] * 100.0, comp_optimizer.param_groups[0]["lr"],
                 )
@@ -1388,6 +1395,20 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             _logger.warning(
                 "  [S1-Buffer] skipped steps: bad_sample=%d, nonfinite=%d (target=%d)",
                 skipped_sample, skipped_nonfinite, n_steps
+            )
+
+        if (
+            _s1_loss_step1 is not None
+            and _s1_loss_last is not None
+            and _s1_loss_step1 > 0
+            and _s1_loss_last > _s1_loss_step1 * 0.9
+        ):
+            _logger.warning(
+                "  [S1-Buffer] CONVERGENCE WARNING: loss did not decrease significantly "
+                "(step1=%.4f → final=%.4f, ratio=%.3f). "
+                "Possible compressor-fusion desync building up. "
+                "If this persists across iterations, late-stage S2 may diverge.",
+                _s1_loss_step1, _s1_loss_last, _s1_loss_last / _s1_loss_step1,
             )
 
     def _train_compressor_steps(self, iteration_idx, n_steps):
@@ -1459,6 +1480,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         ema_px_err = None
         best_ema_px_err = float('inf')
         no_improve_updates = 0
+        _s1_loss_step1 = None
+        _s1_loss_last = None
         if s1_early_stop_cfg["enabled"]:
             _logger.info(
                 "  [S1] early-stop ON (min_updates=%d, patience=%d, rel_improve=%.4f, ema_beta=%.2f)",
@@ -1672,11 +1695,16 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         break
 
             if update_step % log_interval == 0 or update_step == 1 or update_step == n_steps:
+                _cur_loss = float(loss.item())
+                if update_step == 1 and math.isfinite(_cur_loss):
+                    _s1_loss_step1 = _cur_loss
+                if math.isfinite(_cur_loss):
+                    _s1_loss_last = _cur_loss
                 self._append_step_log(
                     iter_idx=iteration_idx,
                     step=self.iteration,
                     stage="S1",
-                    loss=float(loss.item()),
+                    loss=_cur_loss,
                     px_err=float(px_err),
                     lr=float(comp_optimizer.param_groups[0]["lr"]),
                     mode="reproj",
@@ -1684,7 +1712,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 )
                 _logger.info(
                     "  [S1] update %d/%d (attempt=%d), bs=%d, loss=%.4f, valid=%.1f%%, pxErrL1=%.2f, pxErrL2=%.2f, validPxErrL1=%.2f, nonFinite=%.2f%%, lr=%.2e",
-                    update_step, n_steps, raw_step, image_BCHW.shape[0], loss.item(),
+                    update_step, n_steps, raw_step, image_BCHW.shape[0], _cur_loss,
                     s1_stats["fraction_valid"] * 100.0, s1_stats["pxerr_l1"], s1_stats["pxerr_l2"],
                     s1_stats["valid_pxerr_l1"], s1_stats["nonfinite_ratio"] * 100.0, comp_optimizer.param_groups[0]["lr"],
                 )
@@ -1693,6 +1721,20 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             _logger.warning(
                 "  [S1] skipped batches: empty_mask=%d, few_samples=%d, nonfinite_loss=%d (total steps=%d)",
                 skipped_mask, skipped_sample, skipped_nonfinite, n_steps
+            )
+
+        if (
+            _s1_loss_step1 is not None
+            and _s1_loss_last is not None
+            and _s1_loss_step1 > 0
+            and _s1_loss_last > _s1_loss_step1 * 0.9
+        ):
+            _logger.warning(
+                "  [S1] CONVERGENCE WARNING: loss did not decrease significantly "
+                "(step1=%.4f → final=%.4f, ratio=%.3f). "
+                "Possible compressor-fusion desync building up. "
+                "If this persists across iterations, late-stage S2 may diverge.",
+                _s1_loss_step1, _s1_loss_last, _s1_loss_last / _s1_loss_step1,
             )
 
     # ------------------------------------------------------------------
@@ -1728,13 +1770,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if ace_g_fusion_in_s2:
             fusion_lr_ratio = float(getattr(self.options, 'ace_g_fusion_lr_ratio', 0.01))
             fusion_lr = head_lr * fusion_lr_ratio
+            # ROOT-CAUSE FIX: compressor must drift together with fusion during S2.
+            # Previously only fusion was in the S2 optimizer, causing compressor-fusion
+            # desync that accumulated over iterations and led to catastrophic S1 loss
+            # explosion (e.g. 538K vs normal 16) in late iterations (iter 26+).
             self.optimizer_head = optim.AdamW([
                 {'params': self.regressor.heads.parameters(), 'lr': head_lr},
                 {'params': self.fusion.parameters(), 'lr': fusion_lr},
+                {'params': self.compressor.parameters(), 'lr': fusion_lr},
             ])
             _logger.info(
-                "[S2-G] R2 active: fusion_lr=%.2e (ratio=%.4f of head_lr=%.2e)",
-                fusion_lr, fusion_lr_ratio, head_lr,
+                "[S2-G] R2 active: fusion_lr=%.2e, compressor_lr=%.2e (ratio=%.4f of head_lr=%.2e)",
+                fusion_lr, fusion_lr, fusion_lr_ratio, head_lr,
             )
         else:
             self.optimizer_head = optim.AdamW(self.regressor.heads.parameters(), lr=head_lr)
@@ -1743,7 +1790,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         warmup_ratio = min(0.5, max(0.0, warmup_ratio))
         self.scheduler_head = optim.lr_scheduler.OneCycleLR(
             self.optimizer_head,
-            max_lr=[head_lr, fusion_lr] if ace_g_fusion_in_s2 else head_lr,
+            max_lr=[head_lr, fusion_lr, fusion_lr] if ace_g_fusion_in_s2 else head_lr,
             total_steps=self.steps_per_s2_phase,
             pct_start=warmup_ratio,
             anneal_strategy='cos',
@@ -1752,7 +1799,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "[S2] head lr=%.2e (boost=%.2f), steps=%d, rewind=%.1f (tau=%.0f), repro_step_mode=%s%s",
             head_lr, boost, self.steps_per_s2_phase, self.s2_rewind_amount, self.s2_repro_rewind_tau,
             self.repro_step_mode,
-            " [ACE-G R2: fusion trainable]" if ace_g_fusion_in_s2 else "",
+            " [ACE-G R2: fusion+compressor trainable]" if ace_g_fusion_in_s2 else "",
         )
 
     # ------------------------------------------------------------------
@@ -1763,10 +1810,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         with open(self.step_log_path, 'w', encoding='utf-8') as f:
             f.write("Timestamp   Iter      Step  Stage               Loss       PxErr          LR    3D_Med  Mode        \n")
         with open(self.training_log_path, 'w', encoding='utf-8') as f:
-            f.write("iter,s1_steps,s2_epochs,buffer_size,is_best,score,pct25_5,pct5,median_tErr_cm,median_rErr_deg,elapsed_s\n")
+            f.write(
+                "iter,s1_steps,s2_epochs,buffer_size,is_best,score,"
+                "pct25_5,pct10_5,pct5,pct2,pct1,median_t_cm,median_r_deg,avg_time_ms,elapsed_s\n"
+            )
         with open(self.eval_log_path, 'w', encoding='utf-8') as f:
-            f.write("# Iteration evaluation log\n")
+            f.write("# Iteration evaluation log (aligns with post_train_eval.txt fields)\n")
             f.write(f"best_metric={self.best_metric}, keep_best_only={self.keep_best_only}\n")
+            f.write(
+                "# Each iter: median_rotation_deg, median_translation_cm, acc25/10/5/2/1cm%% "
+                "same as post_train_eval; avg_time_ms=per-frame infer\n"
+            )
 
     def _append_step_log(self, iter_idx, step, stage, loss, px_err, lr, mode, med3d=-1.0):
         timestamp = time.strftime("%H:%M:%S", time.localtime())
@@ -1826,17 +1880,30 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
     def _log_iteration_summary(self, it, s1_steps, is_last, is_best, score, eval_result, elapsed_s):
         buffer_size = self.buffer_size_final if is_last else self.options.training_buffer_size
-        pct25_5 = eval_result.get('pct25_5', 0.0) if eval_result else 0.0
-        pct5 = eval_result.get('pct5', 0.0) if eval_result else 0.0
-        med_t = eval_result.get('median_tErr', 0.0) if eval_result else 0.0
-        med_r = eval_result.get('median_rErr', 0.0) if eval_result else 0.0
+        if eval_result:
+            pct25_5 = float(eval_result.get('pct25_5', 0.0))
+            pct10_5 = float(eval_result.get('pct10_5', 0.0))
+            pct5 = float(eval_result.get('pct5', 0.0))
+            pct2 = float(eval_result.get('pct2', 0.0))
+            pct1 = float(eval_result.get('pct1', 0.0))
+            med_t = float(eval_result.get('median_tErr', 0.0))
+            med_r = float(eval_result.get('median_rErr', 0.0))
+            avg_ms = float(eval_result.get('avg_time', 0.0)) * 1000.0
+        else:
+            pct25_5 = pct10_5 = pct5 = pct2 = pct1 = med_t = med_r = avg_ms = 0.0
         with open(self.training_log_path, 'a', encoding='utf-8') as f:
-            f.write(f"{it+1},{s1_steps},{self.options.epochs},{buffer_size},{int(is_best)},{score:.6f},{pct25_5:.4f},{pct5:.4f},{med_t:.4f},{med_r:.4f},{elapsed_s:.2f}\n")
+            f.write(
+                f"{it + 1},{s1_steps},{self.options.epochs},{buffer_size},{int(is_best)},"
+                f"{score:.6f},{pct25_5:.4f},{pct10_5:.4f},{pct5:.4f},{pct2:.4f},{pct1:.4f},"
+                f"{med_t:.4f},{med_r:.4f},{avg_ms:.2f},{elapsed_s:.2f}\n"
+            )
         with open(self.eval_log_path, 'a', encoding='utf-8') as f:
             tag = "BEST" if is_best else "-"
             f.write(
-                f"iter={it+1:02d} tag={tag} score={score:.4f} "
-                f"pct25_5={pct25_5:.2f} pct5={pct5:.2f} median={med_r:.2f}deg/{med_t:.2f}cm elapsed={elapsed_s:.1f}s\n"
+                f"iter={it + 1:02d} tag={tag} score={score:.4f} "
+                f"median_rotation_deg={med_r:.4f} median_translation_cm={med_t:.4f} "
+                f"acc25_5={pct25_5:.2f} acc10_5={pct10_5:.2f} acc5={pct5:.2f} "
+                f"acc2={pct2:.2f} acc1={pct1:.2f} avg_time_ms={avg_ms:.2f} elapsed={elapsed_s:.1f}s\n"
             )
 
     def _write_best_checkpoint_meta(self, best_iter, best_score, eval_result):
@@ -1850,9 +1917,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         }
         if eval_result:
             meta["pct25_5"] = float(eval_result.get("pct25_5", 0.0))
+            meta["pct10_5"] = float(eval_result.get("pct10_5", 0.0))
             meta["pct5"] = float(eval_result.get("pct5", 0.0))
+            meta["pct2"] = float(eval_result.get("pct2", 0.0))
+            meta["pct1"] = float(eval_result.get("pct1", 0.0))
             meta["median_tErr"] = float(eval_result.get("median_tErr", 0.0))
             meta["median_rErr"] = float(eval_result.get("median_rErr", 0.0))
+            meta["avg_time_ms"] = float(eval_result.get("avg_time", 0.0)) * 1000.0
         import json
         path = self.options.output_map.parent / "best_checkpoint_meta.json"
         with open(path, 'w', encoding='utf-8') as f:
@@ -1995,6 +2066,19 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     "Retry with --use_half False to use fp32 throughout.",
                     it + 1,
                 )
+                elapsed_s = time.time() - iter_start
+                with open(self.eval_log_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"iter={it + 1:02d} tag=SKIP_S1_NAN score=-inf "
+                        f"median_rotation_deg=n/a median_translation_cm=n/a "
+                        f"acc25_5=0 acc10_5=0 acc5=0 acc2=0 acc1=0 avg_time_ms=0 elapsed={elapsed_s:.1f}s\n"
+                    )
+                with open(self.training_log_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"{it + 1},{s1_steps},{self.options.epochs},"
+                        f"{self.training_buffer_size},0,-999999.000000,"
+                        f"0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.00,{elapsed_s:.2f}\n"
+                    )
                 continue
 
             # --- Head reset before Stage 2 ---
@@ -2108,6 +2192,19 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     "skipping S2. Retry with --use_half False.",
                     it + 1,
                 )
+                elapsed_s = time.time() - iter_start
+                with open(self.eval_log_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"iter={it + 1:02d} tag=SKIP_S1_NAN score=-inf "
+                        f"median_rotation_deg=n/a median_translation_cm=n/a "
+                        f"acc25_5=0 acc10_5=0 acc5=0 acc2=0 acc1=0 avg_time_ms=0 elapsed={elapsed_s:.1f}s\n"
+                    )
+                with open(self.training_log_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"{it + 1},{s1_steps},{self.options.epochs},"
+                        f"{self.training_buffer_size},0,-999999.000000,"
+                        f"0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.00,{elapsed_s:.2f}\n"
+                    )
                 continue
 
             # --- Cross-iteration eval (C3): old-head + new-compressor before current S2 ---
@@ -2559,6 +2656,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 params_to_clip = list(self.regressor.heads.parameters())
                 if ace_g_fusion_in_s2:
                     params_to_clip += list(self.fusion.parameters())
+                    params_to_clip += list(self.compressor.parameters())
                 torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=self._s2_grad_clip_max_norm)
             self.scaler.step(self.optimizer_head)
             self.scaler.update()

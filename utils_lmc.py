@@ -54,6 +54,56 @@ def _format_buf_million(x: int) -> str:
     return f"{x / 1_000_000:.1f}".rstrip('0').rstrip('.')
 
 
+def build_lmc_run_folder_config_tag(args: Any) -> str:
+    """
+    用于 LMC 实验目录名的配置指纹，区分：
+    - iterative vs ace_g；ACE-G 下 S2 是否训 fusion (fS2/fS1)、是否 cross-iter eval (cie)
+    - lmc_mode、分辨率、buffer 初值/末值、K、迭代轮数、S2 epochs、batch
+    - S1：loss 模式 (fm/spi/spool) + 是否 s1 buffer (s1buf/s1enc)
+    - samples_per_image、LR 调度、非 legacy 的 lmc_profile
+    """
+    mode_tag = _sanitize_tag(getattr(args, "lmc_mode", "global"))
+    sched_tag = _sanitize_tag(getattr(args, "lmc_lr_scheduler_type", "onecycle_improved"))
+    profile_tag = ""
+    if getattr(args, "lmc_profile", "legacy") != "legacy":
+        profile_tag = f"_pf{_sanitize_tag(args.lmc_profile)}"
+
+    buf_tag = _format_buf_million(int(getattr(args, "training_buffer_size", 2_560_000)))
+    tbs = int(getattr(args, "training_buffer_size", 2_560_000))
+    bufff = getattr(args, "buffer_size_final", None)
+    if bufff is None:
+        bufff = tbs * 3
+    bufff_tag = _format_buf_million(int(bufff))
+
+    flow = str(getattr(args, "lmc_flow", "iterative"))
+    if flow == "ace_g":
+        flow_part = "aceg"
+        flow_part += "_fS2" if getattr(args, "ace_g_fusion_in_s2", False) else "_fS1"
+        if getattr(args, "ace_g_cross_iter_eval", False):
+            flow_part += "cie"
+    else:
+        flow_part = "iter"
+
+    s1_map = {"full_map": "fm", "sample_per_image": "spi", "sample_pooled": "spool"}
+    s1_short = s1_map.get(getattr(args, "s1_loss_mode", "full_map"), "s1x")
+    s1buf = "s1buf" if getattr(args, "s1_use_buffer", False) else "s1enc"
+
+    parts = [
+        flow_part,
+        mode_tag,
+        f"res{int(getattr(args, 'image_resolution', 480))}",
+        f"buf{buf_tag}M_F{bufff_tag}M",
+        f"K{int(getattr(args, 'num_latent_tokens', 64))}",
+        f"it{int(getattr(args, 'lmc_iterations', 1))}",
+        f"ep{int(getattr(args, 'epochs', 24))}",
+        f"bs{int(getattr(args, 'batch_size', 5120))}",
+        f"{s1_short}_{s1buf}",
+        f"sp{int(getattr(args, 'samples_per_image', 512))}",
+        sched_tag + profile_tag,
+    ]
+    return "_".join(parts)
+
+
 def estimate_memory_front_visibility(
     pooled_points: torch.Tensor,
     all_poses: torch.Tensor,

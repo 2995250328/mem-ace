@@ -1,0 +1,6 @@
+# New Requirements
+
+# No new packages required.
+# All dependencies are already present in the parent project's environment:
+#   torch, numpy — already in environment_depth.yaml
+#   ace_network, dataset_origin, ace_util — already in project root

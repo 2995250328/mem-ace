@@ -39,6 +39,7 @@ from utils_lmc import (
     _format_buf_million,
     _sanitize_stem,
     _sanitize_tag,
+    build_lmc_run_folder_config_tag,
     setup_cuda_environment,
 )
 
@@ -449,11 +450,14 @@ def _build_run_dir(args):
         profile_tag = f"_pf-{_sanitize_tag(args.lmc_profile)}"
     buf_tag = _format_buf_million(args.training_buffer_size)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    auto_run_name = (
-        f"{timestamp}_{scene_tag}_{mode_tag}"
-        f"_buf{buf_tag}M_K{args.num_latent_tokens}"
-        f"_it{args.lmc_iterations}_bs{args.batch_size}_{sched_tag}{profile_tag}"
-    )
+    if args.use_lmc and args.run_name == "auto":
+        auto_run_name = f"{timestamp}_{build_lmc_run_folder_config_tag(args)}"
+    else:
+        auto_run_name = (
+            f"{timestamp}_{scene_tag}_{mode_tag}"
+            f"_buf{buf_tag}M_K{args.num_latent_tokens}"
+            f"_it{args.lmc_iterations}_bs{args.batch_size}_{sched_tag}{profile_tag}"
+        )
     run_name = auto_run_name if args.run_name == 'auto' else _sanitize_tag(args.run_name)
 
     output_layout = getattr(args, 'output_layout', 'hierarchical')

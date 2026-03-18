@@ -160,6 +160,72 @@ def main():
 
 ### 完整命令示例对比
 
+  python train_ace_lmc.py \                                                                
+      /data/xwh/7Scenes/pgt_7scenes_chess \                                                
+      output/chess_lmc_simple.pt \                                                         
+      --encoder_path ace_encoder_pretrained.pt \                                           
+      --device cuda:0 \
+      --image_resolution 480 \
+      \
+      # ── LMC 开关 ──────────────────────────────────────────────
+      --use_lmc True \
+      --memory_path /home/xwh/project/map-anything-experiments/memory_extract/chess_train/2
+  0views/20260114_164907/7Scenes_chess_train_pooled_GT.pt \
+      --lmc_mode global \
+      --lmc_flow iterative \          # iterative | ace_g
+      --lmc_profile legacy \          # legacy | mapany_flow_v1
+      \
+      # ── 迭代规模 ──────────────────────────────────────────────
+      --lmc_iterations 4 \
+      --lmc_warmup_steps 1000 \       # 第1轮 S1 步数
+      --lmc_train_steps 500 \         # 后续轮 S1 步数
+      \
+      # ── S1 配置 ───────────────────────────────────────────────
+      --s1_use_buffer False \         # True=预填 raw buffer；False=online encoder 前向
+      --s1_loss_mode full_map \       # full_map | sample_per_image | sample_pooled
+      --s1_batch_size 16 \
+      --s1_buffer_refill_mode full \  # full | partial（仅 s1_use_buffer=True 时生效）
+      --s1_learning_rate_max 1e-4 \
+      --s1_early_stop True \
+      \
+      # ── S2 配置 ───────────────────────────────────────────────
+      --training_buffer_size 2560000 \
+      --buffer_size_final None \      # None=3x training_buffer_size；或显式指定
+      --buffer_batch_size 1 \
+      --buffer_on_cpu True \
+      --samples_per_image 768 \
+      --epochs 16 \
+      --batch_size 5120 \
+      --s2_learning_rate_max 1e-3 \
+      --head_reset_strategy first_only \  # first_only | every | output_only | none
+      \
+      # ── ACE-G 专属（lmc_flow=ace_g 时生效）────────────────────
+      --ace_g_fusion_in_s2 False \    # True=S2 中训练 fusion（R2路径）
+      --ace_g_fusion_lr_ratio 0.01 \
+      --ace_g_cross_iter_eval False \
+      \
+      # ── 网络结构 ──────────────────────────────────────────────
+      --num_head_blocks 4 \
+      --num_latent_tokens 128 \
+      --num_attn_layers 4 \
+      --freeze_backbone True \
+      --use_half False \
+      \
+      # ── Memory 校验 ───────────────────────────────────────────
+      --lmc_memory_preflight True \
+      --lmc_memory_preflight_strict False \
+      --lmc_strict_scene_check True \
+      --lmc_strict_center_check True \
+      --lmc_scene_center_max_distance 3.0 \
+      \
+      # ── 评估与输出 ────────────────────────────────────────────
+      --run_name chess_lmc_simple \
+      --eval_each_iteration True \
+      --eval_after_train True \
+      --eval_session lmc_simple \
+      --keep_best_only True \
+      --best_metric pct5
+
 #### 示例 1：Vanilla 基础训练（快速实验）
 
 ```bash
@@ -186,14 +252,14 @@ def main():
 
 ```bash
 ./train_ace_lmc.py \
-    /data/xwh/7scenes_chess \
+    /data/xwh/7Scenes/pgt_7scenes_chess \
     output/chess_vanilla_full.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 \
     --run_name chess_vanilla_full \
     --image_resolution 480 \
     --batch_size 5120 \
-    --training_buffer_size 2560000 \
+    --training_buffer_size 8000000 \
     --buffer_batch_size 10 \
     --samples_per_image 512 \
     --epochs 24 \
@@ -237,23 +303,23 @@ def main():
 #### 示例 4：LMC 简化训练（快速 LMC 实验）
 
 ```bash
-./train_ace_lmc.py \
-    /data/xwh/7scenes_chess \
+python train_ace_lmc.py \
+    /data/xwh/7Scenes/pgt_7scenes_chess \
     output/chess_lmc_simple.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 \
     --use_lmc True \
-    --memory_path /path/to/memory_pooled.pt \
+    --memory_path /home/xwh/project/map-anything-experiments/memory_extract/chess_train/20views/20260114_164907/7Scenes_chess_train_pooled_GT.pt \
     --run_name chess_lmc_simple \
     --image_resolution 480 \
     --num_latent_tokens 128 \
     --lmc_iterations 4 \
     --lmc_warmup_steps 1000 \
     --lmc_train_steps 500 \
-    --training_buffer_size 1280000 \
-    --buffer_batch_size 5 \
-    --samples_per_image 256 \
-    --batch_size 2560 \
+    --training_buffer_size 2560000 \
+    --buffer_batch_size 1 \
+    --samples_per_image 768 \
+    --batch_size 5120 \
     --epochs 16 \
     --s1_learning_rate_max 1e-4 \
     --s2_learning_rate_max 1e-3 \
@@ -477,7 +543,9 @@ output/
 │       │           ├── {timestamp}_post_train_eval.json
 │       │           ├── {timestamp}_post_train_eval.txt
 │       │           └── ...
-│       └── ace_fcn_lmc/
+│       ├── ace_fcn_lmc_iter/          # lmc_flow=iterative（经典 S1+S2 迭代）
+│       │   └── {timestamp}_{config_tag}/
+│       └── ace_fcn_lmc_aceg/          # lmc_flow=ace_g（含 fS2/fS1、cie 等在 config_tag）
 │           └── {timestamp}_{config_tag}/
 │               ├── run_metadata.json
 │               ├── training_summary.json
@@ -486,15 +554,16 @@ output/
 │               ├── training_full_log.txt
 │               ├── post_train_eval.txt
 │               ├── eval_results/
-│               │   ├── {timestamp}_post_train_eval.json
-│               │   ├── {timestamp}_post_train_eval.txt
-│               │   └── ...
 │               └── iteration_results/
-│                   ├── iter_01_eval.json
-│                   ├── iter_02_eval.json
-│                   └── ...
 └── results_index.json                         # 全局结果索引
 ```
+
+**`config_tag`**（`utils_lmc.build_lmc_run_folder_config_tag`）示例：
+
+- **iter**：`iter_global_res480_buf2.6M_F7.7M_K128_it4_ep16_bs5120_fm_s1enc_sp768_onecycle_improved`
+- **ace_g（S2 训 fusion）**：`aceg_fS2cie_global_res518_buf2.6M_F7.7M_K64_it28_ep24_bs5120_spi_s1buf_sp384_onecycle_improved`
+
+字段含义：`aceg`/`iter`；`fS2`=ACE-G 在 S2 训练 fusion，`fS1`=仅 S1 相关；`cie`=cross-iter eval；`fm`/`spi`/`spool`=S1 loss；`s1buf`/`s1enc`；`buf`/`F`=S2 首末 buffer 规模（M）；`res`/`K`/`it`/`ep`/`bs`/`sp`=分辨率、latent 数、迭代轮、S2 epoch、batch、每图采样数。
 
 ### 文件说明
 

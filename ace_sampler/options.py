@@ -24,6 +24,16 @@ def add_sampler_train_args(parser):
                    help='confidence target: exp(-alpha * repro_error_px)')
     g.add_argument('--use_half', type=_strtobool, default=True)
     g.add_argument('--device', type=str, default='cuda')
+    g.add_argument('--use_mc_dropout', type=_strtobool, default=False,
+                   help='enable MC Dropout uncertainty estimation in Phase 1')
+    g.add_argument('--mc_samples', type=int, default=10,
+                   help='number of MC Dropout forward passes per image')
+    g.add_argument('--mc_dropout_p', type=float, default=0.1,
+                   help='dropout probability for UncertaintyHead')
+    g.add_argument('--sampler_beta', type=float, default=0.01,
+                   help='weight for MC uncertainty term: exp(-(alpha*error + beta*var))')
+    g.add_argument('--uncertainty_head_path', type=Path, default=None,
+                   help='pretrained UncertaintyHead .pt; None = train from scratch')
 
 
 def add_sampler_buffer_args(parser):

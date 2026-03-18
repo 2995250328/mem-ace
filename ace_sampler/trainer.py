@@ -46,9 +46,24 @@ class SamplerTrainer:
 
         self.pixel_grid = get_pixel_grid(self.regressor.OUTPUT_SUBSAMPLE).to(self.device)
 
+        # Optional MC Dropout uncertainty head
+        self.uncertainty_head = None
+        if getattr(options, 'use_mc_dropout', False):
+            from .uncertainty import UncertaintyHead
+            uh_path = getattr(options, 'uncertainty_head_path', None)
+            if uh_path is not None:
+                self.uncertainty_head = UncertaintyHead.load(str(uh_path), self.device)
+                _logger.info(f'Loaded UncertaintyHead from {uh_path}')
+            else:
+                self.uncertainty_head = UncertaintyHead(
+                    in_channels=self.regressor.feature_dim,
+                    dropout_p=options.mc_dropout_p,
+                ).to(self.device)
+                _logger.info('UncertaintyHead created (will pretrain via distillation)')
+
     @torch.no_grad()
     def _compute_error_map(self, image_B1HW, gt_pose_inv_B44, intrinsics_B33):
-        """Returns (error_map (B,1,Hf,Wf), features (B,C,Hf,Wf)). Error in pixels."""
+        """Returns (error_map (B,1,Hf,Wf), var_map (B,1,Hf,Wf), features (B,C,Hf,Wf))."""
         with autocast(enabled=self.options.use_half):
             features = self.regressor.get_features(image_B1HW)
             scene_coords = self.regressor.get_scene_coordinates(features).float()
@@ -71,8 +86,54 @@ class SamplerTrainer:
         error = torch.norm(uv_pred - grid, dim=1)                     # (B,N)
         valid = (cam_coords[:, 2] > 0.1) & (cam_coords[:, 2] < 1000.0)
         error = error * valid.float()
+        error_map = error.view(B, 1, Hf, Wf)
 
-        return error.view(B, 1, Hf, Wf), features
+        if self.uncertainty_head is not None:
+            samples = self.uncertainty_head.mc_coordinate_samples(
+                features.detach().float(), T=self.options.mc_samples)
+            var_map = self._mc_reprojection_variance(samples, gt_pose_inv_B44, intrinsics_B33)
+        else:
+            var_map = torch.zeros_like(error_map)
+
+        return error_map, var_map, features
+
+    def _mc_reprojection_variance(self, samples_TBCHW, gt_pose_inv_B44, intrinsics_B33):
+        """
+        samples_TBCHW: (T, B, 3, Hf, Wf)
+        Returns: (B, 1, Hf, Wf) mean 2D reprojection variance in pixels^2.
+        """
+        T, B, _, Hf, Wf = samples_TBCHW.shape
+        N = Hf * Wf
+        uv_list = []
+        for t in range(T):
+            sc = samples_TBCHW[t].view(B, 3, N)
+            ones = torch.ones(B, 1, N, device=self.device)
+            cam = torch.bmm(gt_pose_inv_B44[:, :3], torch.cat([sc, ones], dim=1))
+            uv_h = torch.bmm(intrinsics_B33, cam)
+            uv = uv_h[:, :2] / uv_h[:, 2:3].clamp(min=0.1)  # (B, 2, N)
+            uv_list.append(uv)
+        uv_stack = torch.stack(uv_list, dim=0)       # (T, B, 2, N)
+        var = uv_stack.var(dim=0).mean(dim=1)         # (B, N)
+        return var.view(B, 1, Hf, Wf)
+
+    def _pretrain_uncertainty_head(self, loader, epochs=2):
+        """Distill frozen Head into UncertaintyHead so MC variance is meaningful."""
+        uh_optimizer = optim.Adam(self.uncertainty_head.parameters(), lr=1e-3)
+        self.uncertainty_head.train()
+        for ep in range(epochs):
+            total, n = 0.0, 0
+            for batch in loader:
+                img = batch[0].to(self.device)
+                with torch.no_grad():
+                    feats = self.regressor.get_features(img)
+                    target_sc = self.regressor.get_scene_coordinates(feats).float()
+                pred_sc = self.uncertainty_head(feats.detach().float())
+                loss = F.mse_loss(pred_sc, target_sc)
+                uh_optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                uh_optimizer.step()
+                total += loss.item(); n += 1
+            _logger.info(f'UncertaintyHead pretrain epoch {ep} avg_loss={total/max(n,1):.4f}')
 
     def train(self):
         batch_gen = torch.Generator()
@@ -83,6 +144,12 @@ class SamplerTrainer:
         loader = DataLoader(self.dataset, sampler=batch_sampler,
                             batch_size=None, num_workers=4, pin_memory=True)
 
+        # Pretrain uncertainty head via distillation if needed
+        if self.uncertainty_head is not None and \
+                getattr(self.options, 'uncertainty_head_path', None) is None:
+            _logger.info('Pretraining UncertaintyHead via distillation (2 epochs)...')
+            self._pretrain_uncertainty_head(loader, epochs=2)
+
         for epoch in range(self.options.sampler_epochs):
             total_loss, n_steps = 0.0, 0
             for batch in loader:
@@ -91,10 +158,14 @@ class SamplerTrainer:
                 gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True)
                 intrinsics_B33 = intrinsics_B33.to(self.device, non_blocking=True)
 
-                error_map, features = self._compute_error_map(
+                error_map, var_map, features = self._compute_error_map(
                     image_B1HW, gt_pose_inv_B44, intrinsics_B33)
 
-                target = torch.exp(-self.options.sampler_alpha * error_map.clamp(0, 500))
+                beta = getattr(self.options, 'sampler_beta', 0.0)
+                target = torch.exp(-(
+                    self.options.sampler_alpha * error_map.clamp(0, 500) +
+                    beta * var_map.clamp(0, 1000)
+                ))
 
                 self.optimizer.zero_grad(set_to_none=True)
                 with autocast(enabled=self.options.use_half):
