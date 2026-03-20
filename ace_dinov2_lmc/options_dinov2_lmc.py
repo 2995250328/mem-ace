@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Argument parser builder for ACE (FCN encoder) + LMC training."""
+"""Argument parser builder for ACE DINOv2 + LMC training."""
 
 import argparse
 import sys
@@ -13,7 +13,7 @@ from utils_lmc import _strtobool
 def get_lmc_train_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            'Train ACE (FCN encoder) with optional GeoLMC iterative training.\n'
+            'Train ACE DINOv2 with optional GeoLMC iterative training.\n'
             'Vanilla mode: --use_lmc False\n'
             'LMC mode: --use_lmc True --memory_path <pooled_memory.pt>'
         ),
@@ -87,20 +87,20 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
     )
 
     # ------------------------------------------------------------------
-    # ACE FCN 编码器相关
+    # DINOv2 编码器相关
     # ------------------------------------------------------------------
     parser.add_argument(
-        '--encoder_path',
+        '--dinov2_path',
         type=Path,
-        default=Path('ace_encoder_pretrained.pt'),
-        help='ACE FCN 预训练编码器权重路径。',
+        default=Path('/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth'),
+        help='DINOv2 ViT-L/14 预训练权重路径。',
     )
     parser.add_argument(
         '--freeze_backbone',
         type=_strtobool,
         default=True,
         help=(
-            '是否冻结 FCN backbone。\n'
+            '是否冻结 DINOv2 backbone。\n'
             'True: 显存/速度更稳，通常用于 LMC 训练；False: 会训练 backbone，代价更高。'
         ),
     )
@@ -215,8 +215,8 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--image_resolution',
         type=int,
-        default=480,
-        help='输入图像高度（FCN encoder 无 patch 对齐限制）。',
+        default=518,
+        help='输入图像高度（会自动修正到 14 的倍数）。',
     )
 
     # ------------------------------------------------------------------
@@ -486,7 +486,7 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         default=28,
         help=(
             'S1 阶段实际使用的 batch 大小（默认 28）。'
-            'full_map 与 sample_per_image 都会用该 batch 过 FCN encoder，显存峰值相同；'
+            'full_map 与 sample_per_image 都会用该 batch 过 DINOv2 encoder，显存峰值相同；'
             '24GB 显存建议设为 1 或 2 以免多步后碎片化 OOM（如 --s1_batch_size 1）。'
         ),
     )
@@ -567,7 +567,7 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--s1_early_stop_rel_improve',
         type=float,
         default=0.01,
-        help='S1 早停最小相对改善阈值，例如 0.01 表示需优于历史最好值 1%% 才算改善。',
+        help='S1 早停最小相对改善阈值，例如 0.01 表示需优于历史最好值 1% 才算改善。',
     )
     parser.add_argument(
         '--s1_early_stop_ema_beta',
@@ -616,7 +616,7 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=_strtobool,
         default=False,
         help=(
-            '最后一轮 S1 是否使用 buffer_size_final 大小的 buffer。'
+            '最后一轮的 S1 是否使用 buffer_size_final 大小的 buffer。'
             'False（默认）：与 V1 一致，S1 始终用 training_buffer_size；'
             'True：最后一轮 S1 扩大为 buffer_size_final，可让 S1 在最终轮见到更多数据。'
         ),
@@ -767,8 +767,10 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         choices=['legacy_rewind', 'per_iter', 'auto'],
         help=(
             'S2 阶段 step_eff（控制 soft_clamp 调度）的计算方式。\n'
-            '  legacy_rewind: 全局单调步 + 指数衰减回拨（旧行为）。\n'
-            '  per_iter: 每轮 S2 从 step_eff=0 开始，按比例映射到完整调度区间。\n'
+            '  legacy_rewind: 全局单调步 + 指数衰减回拨（旧行为，late iter 时 soft_clamp 趋近最小值）。\n'
+            '  per_iter: 每轮 S2 从 step_eff=0 开始，按比例映射到完整调度区间，\n'
+            '             确保每轮都经历完整 soft_clamp 范围（max→min）。\n'
+            '             有效防止 ACE-G R2 模式中融合模块更新后 soft_clamp 过小导致的发散。\n'
             '  auto (默认): ace_g_fusion_in_s2=True 时自动使用 per_iter，否则使用 legacy_rewind。'
         ),
     )
@@ -778,7 +780,7 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         default=1.0,
         help=(
             'S2 阶段反向传播后的梯度裁剪范数上限（<=0 表示禁用）。'
-            ' 防止 loss_invalid 异常时梯度爆炸导致 NaN。'
+            ' 与 S1 阶段的 clip_grad_norm(1.0) 保持一致，防止 loss_invalid 异常时梯度爆炸导致 NaN。'
         ),
     )
     parser.add_argument(
@@ -786,8 +788,10 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=float,
         default=1000.0,
         help=(
-            'loss_invalid（相机空间 L1 距离）每个分量的最大值（单位：米）。'
-            ' 当预测完全发散时防止 loss 爆炸。设为 0 表示禁用裁剪。'
+            'loss_invalid（相机空间 L1 距离）每个分量的最大值（单位：与 depth_target 同量纲，通常为米）。'
+            ' 当预测完全发散（相机坐标偏差达数百万米）时防止 loss 爆炸。'
+            ' 设为 0 表示禁用裁剪（不推荐，等同于旧行为）。'
+            ' 默认 1000.0 对室内外场景均适用。'
         ),
     )
 

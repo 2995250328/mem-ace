@@ -1,0 +1,5 @@
+# Ignore all experiment results under this directory.
+# The directory itself is tracked via .gitkeep.
+*
+!.gitignore
+!.gitkeep

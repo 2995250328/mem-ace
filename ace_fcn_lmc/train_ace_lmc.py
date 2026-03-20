@@ -153,6 +153,8 @@ def _build_run_dir(args):
     if args.buffer_size_final is None:
         args.buffer_size_final = args.training_buffer_size * 3
 
+    if args.experiment_root is None:
+        args.experiment_root = Path(__file__).parent / "04_evaluation"
     result_mgr = ResultManager(args.experiment_root)
     scene_info = result_mgr.parse_scene_info(args.scene)
 
@@ -337,24 +339,8 @@ def _apply_lmc_profile(args):
     )
 
 
-def _build_vanilla_iterative_args(args):
-    vanilla_args = copy.copy(args)
-    vanilla_args.iterations = int(args.vanilla_iterations)
-    vanilla_args.iter_buffer_size = int(args.training_buffer_size)
-    vanilla_args.reset_optimizer_each_iter = False
-
-    if getattr(vanilla_args, "buffer_batch_size", None) == 10:
-        _logger.info(
-            "[Vanilla parity] Overriding buffer_batch_size: 10 -> 1 "
-            "to match ACE vanilla iterative baseline."
-        )
-        vanilla_args.buffer_batch_size = 1
-
-    return vanilla_args
-
-
 def _run_standard_eval(args, output_map, session):
-    from test_ace_lmc import run_evaluation
+    from test_ace_lmc import run_evaluation_lmc
 
     eval_device = getattr(args, "post_train_eval_device", "cuda:0")
     eval_opt = argparse.Namespace(
@@ -366,7 +352,7 @@ def _run_standard_eval(args, output_map, session):
         session=session,
         render_visualization=False,
     )
-    return run_evaluation(eval_opt)
+    return run_evaluation_lmc(eval_opt)
 
 
 def _score_standard_eval(result, metric):
@@ -384,19 +370,20 @@ def _score_standard_eval(result, metric):
     return float(result["pct5"])
 
 
-def _write_vanilla_eval_summary(args, result):
-    eval_log_path = args.run_dir / "post_train_eval.txt"
-    with open(eval_log_path, "w", encoding="utf-8") as f:
-        f.write(f"median_rotation_deg\t{result['median_rErr']:.4f}\n")
-        f.write(f"median_translation_cm\t{result['median_tErr']:.4f}\n")
-        f.write(f"accuracy_25cm5deg_pct\t{result['pct25_5']:.2f}\n")
-        f.write(f"accuracy_10cm5deg_pct\t{result['pct10_5']:.2f}\n")
-        f.write(f"accuracy_5cm5deg_pct\t{result['pct5']:.2f}\n")
-        f.write(f"accuracy_2cm2deg_pct\t{result['pct2']:.2f}\n")
-        f.write(f"accuracy_1cm1deg_pct\t{result['pct1']:.2f}\n")
-        f.write(f"avg_time_per_frame_ms\t{result['avg_time'] * 1000:.2f}\n")
-        f.write(f"total_frames\t{result['total_frames']}\n")
-    _logger.info("Eval summary also written to: %s", eval_log_path)
+def _build_vanilla_iterative_args(args):
+    vanilla_args = copy.copy(args)
+    vanilla_args.iterations = int(args.vanilla_iterations)
+    vanilla_args.iter_buffer_size = int(args.training_buffer_size)
+    vanilla_args.reset_optimizer_each_iter = False
+
+    if getattr(vanilla_args, "buffer_batch_size", None) == 10:
+        _logger.info(
+            "[Vanilla parity] Overriding buffer_batch_size: 10 -> 1 "
+            "to match ACE vanilla iterative baseline."
+        )
+        vanilla_args.buffer_batch_size = 1
+
+    return vanilla_args
 
 
 def run_vanilla_iterative_baseline(args):
@@ -469,18 +456,6 @@ def run_vanilla_iterative_baseline(args):
 
     if not vanilla_args.output_map.exists():
         trainer.save_model(vanilla_args.output_map)
-
-    if vanilla_args.eval_after_train:
-        _logger.info("Running post-training evaluation...")
-        result = _run_standard_eval(vanilla_args, vanilla_args.output_map, vanilla_args.eval_session)
-        _logger.info("========== Post-train Eval ==========")
-        _logger.info(
-            "  Median: %.2f deg, %.2f cm | 25cm/5deg: %.2f%% | 10cm/5deg: %.2f%% | 5cm/5deg: %.2f%%",
-            result["median_rErr"], result["median_tErr"],
-            result["pct25_5"], result["pct10_5"], result["pct5"],
-        )
-        _logger.info("=====================================")
-        _write_vanilla_eval_summary(vanilla_args, result)
 
     _logger.info(
         "Vanilla run completed. Total time: %.1fs | best_iter=%s | best_score=%.4f",
