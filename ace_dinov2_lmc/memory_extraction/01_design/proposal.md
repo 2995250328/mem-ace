@@ -89,28 +89,82 @@ prevent zero-shot transfer of the downstream regressor.
 - Practical: can be implemented with index_add_ (already in codebase), no torch_scatter needed
 - Ablation-friendly: τ exposed as CLI arg; BSE can be disabled with --use_bse False
 
-### Core Algorithm: BSE
+### Detailed Pipeline Steps
 
+**Step 1 — Plenoptic Unprojection**
+
+For each valid pixel (u, v) with depth Z, intrinsics K, rotation R, translation t:
 ```
-Step 1: coarse_voxel_hash(P, voxel_size) → cluster_ids  [O(N)]
-Step 2: scatter_mean(F, cluster_ids) → F_cluster_mean   [O(N) via index_add_]
-Step 3: cosine_sim(F_i, F_cluster_mean[cluster_ids[i]]) → sim_i  [O(N)]
-Step 4: is_outlier_i = (sim_i < τ)
-Step 5: sub_id_i = cluster_ids[i] * 2 + is_outlier_i
-Step 6: scatter_mean({P,D,F,C}, sub_id) → pooled output  [O(N)]
-Step 7: L2-normalize pooled D
+P_cam = Z · K⁻¹ · [u, v, 1]ᵀ
+P_raw = R · P_cam + t          # world coordinates [N, 3]
+O_cam = t                       # camera center in world [3]
+D_raw = (P_raw - O_cam) / ‖P_raw - O_cam‖₂   # unit ray direction [N, 3]
 ```
 
-### Global Metric Normalization
-
-Computed AFTER unprojection, BEFORE pooling:
+**Step 2 — Coarse Geometric Hashing**
 ```
-μ_scene = mean(P_raw, dim=0)          # [3]
-σ_scene = std(P_raw - μ_scene).item() # scalar
-P_norm  = (P_raw - μ_scene) / σ_scene
+V_idx = floor(P_raw / voxel_size).long()   # [N, 3]
+_, cluster_ids = torch.unique(V_idx, dim=0, return_inverse=True)  # [N]
+```
+
+**Step 3 — Bilateral Feature Clustering (the boundary-preserving split)**
+
+Must avoid Python loops — fully vectorized:
+```
+# Compute cluster mean features via index_add_ (no torch_scatter needed)
+F_fp32 = F_raw.float()                          # cast to fp32 for numerical safety
+F_mean = zeros(M, C).index_add_(0, cluster_ids, F_fp32) / count  # [M, C]
+
+# Cosine similarity of each point to its cluster mean
+F_i    = F_fp32                                 # [N, C]
+F_ci   = F_mean[cluster_ids]                    # [N, C]
+sim_i  = (F_i * F_ci).sum(1) / (‖F_i‖ · ‖F_ci‖ + 1e-6)  # [N], fp32
+
+# Binary split: outlier = semantically different from cluster majority
+is_outlier = (sim_i < τ).long()                 # [N], 0 or 1
+sub_id = cluster_ids * 2 + is_outlier           # [N]
+```
+
+**Step 4 — Fine-grained Pooling**
+```
+# scatter_mean on {P_raw, D_raw, F_raw, colors} using sub_id
+P_bse, D_bse, F_bse, C_bse = scatter_mean_all(sub_id)
+D_bse = D_bse / (‖D_bse‖₂ + 1e-6)             # re-normalize ray dirs
+```
+
+**Step 5 — Global Metric Normalization**
+
+Computed AFTER BSE pooling (on P_bse, not P_raw — avoids outlier contamination):
+```
+μ_scene = mean(P_bse, dim=0)                    # [3]
+σ_scene = std(‖P_bse - μ_scene‖₂).item()       # scalar
+P_norm  = (P_bse - μ_scene) / σ_scene           # [N, 3]
 ```
 
 This ensures P_norm ∈ [-3, 3] for typical indoor scenes (3σ coverage).
+
+### OOM Mitigation: Chunked Two-Pass Processing
+
+For large scenes (>1000 images at high resolution), full unprojection exceeds GPU memory.
+Use a two-pass strategy:
+
+```
+Pass 1 (per-chunk): for each batch of B images:
+    unproject → D_raw → BSE (Steps 1-4) → append P_bse_chunk to global buffer
+
+Pass 2 (global): run Steps 2-4 once more on the full global buffer
+    → final P_bse, D_bse, F_bse, C_bse
+
+Pass 3: compute μ_scene, σ_scene, P_norm on final P_bse
+```
+
+Default chunk_size = 500,000 points; B = 16 images per chunk.
+
+### Adaptive Fallback
+
+If len(P_bse) > 100,000 after BSE (insufficient compression):
+- Double voxel_size and rerun Steps 2-4
+- Log warning with original and new point counts
 
 ## 4. Evaluation & Validation Plan
 
@@ -140,9 +194,10 @@ This ensures P_norm ∈ [-3, 3] for typical indoor scenes (3σ coverage).
 | Risk | Likelihood | Mitigation |
 |------|-----------|------------|
 | torch_scatter not in ace env | High | Use index_add_ + count division (proven in existing code) |
-| OOM during unprojection of large scenes | Medium | Chunked processing (chunk_size=500k) |
+| OOM during unprojection of large scenes | Medium | Chunked two-pass processing (chunk_size=500k, B=16 images/chunk) |
+| FP16 numerical instability in cosine similarity | High | Cast to fp32 before dot product; add ε=1e-6 to denominator |
 | τ=0.90 over-segments flat walls | Medium | Expose as --bse_tau; default conservative |
-| Output >100k points (insufficient compression) | Low | Adaptive fallback: double voxel_size and retry |
+| Output >100k points (insufficient compression) | Low | Adaptive fallback: double voxel_size and retry once |
 | mapanything import paths break | High | Replace all mapanything.* imports with direct equivalents |
 | WAI dataset format incompatibility | Medium | Test with ace backend first; WAI support is optional |
 
@@ -166,3 +221,26 @@ This ensures P_norm ∈ [-3, 3] for typical indoor scenes (3σ coverage).
 ### Migration Source (read-only reference)
 - `map-anything/mapanything/tasks/run_memory_extraction.py`
 - `map-anything/bash_scripts/ace/fps_memory.sh`
+
+## 7. Implementation Roadmap
+
+Three incremental steps — each independently testable:
+
+**Step 1 — Minimal Invasion (normalization + ray directions only)**
+- Keep existing voxel pooling logic unchanged
+- Add O_cam → D_raw computation after unprojection
+- Add μ_scene, σ_scene computation and P_norm after pooling
+- Save extended .pt format; update downstream reader with one-line denorm adapter
+- Smoke test: run on 7-Scenes Chess, assert P_norm ∈ [-5, 5]
+
+**Step 2 — Vectorized Geometric Hashing (replace pooling core)**
+- Introduce torch.unique(return_inverse=True) for cluster_ids
+- Rewrite scatter_mean using index_add_ + count division (single-pass, no loop)
+- Verify compression ratio: len(P_bse) / total_input_pixels < 0.05
+
+**Step 3 — Bilateral Feature Split (BSE core)**
+- Add fp32 cosine similarity computation with ε guard
+- Add is_outlier mask and sub_id = cluster_id * 2 + is_outlier
+- Add adaptive fallback (double voxel_size if output > 100k points)
+- Ablation: compare --use_bse False vs True on Indoor6 scene3/scene4a
+- Visualize with Open3D: expect dense points at edges, sparse on flat walls

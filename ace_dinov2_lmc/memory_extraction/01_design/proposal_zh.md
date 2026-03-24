@@ -87,28 +87,82 @@
 - 实践：可用 index_add_（代码库中已有）实现，无需 torch_scatter
 - 消融友好：τ 作为 CLI 参数暴露；可用 --use_bse False 禁用 BSE
 
-### 核心算法：BSE
+### 详细管线步骤
 
-```
-步骤 1：coarse_voxel_hash(P, voxel_size) → cluster_ids  [O(N)]
-步骤 2：scatter_mean(F, cluster_ids) → F_cluster_mean   [O(N) via index_add_]
-步骤 3：cosine_sim(F_i, F_cluster_mean[cluster_ids[i]]) → sim_i  [O(N)]
-步骤 4：is_outlier_i = (sim_i < τ)
-步骤 5：sub_id_i = cluster_ids[i] * 2 + is_outlier_i
-步骤 6：scatter_mean({P,D,F,C}, sub_id) → 池化输出  [O(N)]
-步骤 7：L2 归一化池化后的 D
-```
+**步骤 1 — 全光反投影**
 
-### 全局度量归一化
-
-在反投影后、池化前计算：
+对每个有效像素 (u, v)，深度 Z，内参 K，旋转 R，平移 t：
 ```
-μ_scene = mean(P_raw, dim=0)          # [3]
-σ_scene = std(P_raw - μ_scene).item() # 标量
-P_norm  = (P_raw - μ_scene) / σ_scene
+P_cam = Z · K⁻¹ · [u, v, 1]ᵀ
+P_raw = R · P_cam + t          # 世界坐标 [N, 3]
+O_cam = t                       # 相机光心世界坐标 [3]
+D_raw = (P_raw - O_cam) / ‖P_raw - O_cam‖₂   # 单位射线方向 [N, 3]
 ```
 
-这确保典型室内场景的 P_norm ∈ [-3, 3]（3σ 覆盖）。
+**步骤 2 — 粗几何哈希**
+```
+V_idx = floor(P_raw / voxel_size).long()   # [N, 3]
+_, cluster_ids = torch.unique(V_idx, dim=0, return_inverse=True)  # [N]
+```
+
+**步骤 3 — 双边特征聚类（保边分裂，核心步骤）**
+
+必须避免 Python 循环，全向量化：
+```
+# 通过 index_add_ 计算簇均值特征（无需 torch_scatter）
+F_fp32 = F_raw.float()                          # 转 fp32 保证数值稳定
+F_mean = zeros(M, C).index_add_(0, cluster_ids, F_fp32) / count  # [M, C]
+
+# 每个点与其簇均值的余弦相似度
+F_i    = F_fp32                                 # [N, C]
+F_ci   = F_mean[cluster_ids]                    # [N, C]
+sim_i  = (F_i * F_ci).sum(1) / (‖F_i‖ · ‖F_ci‖ + 1e-6)  # [N], fp32
+
+# 二值分裂：语义与簇主体差异大的点标记为离群点
+is_outlier = (sim_i < τ).long()                 # [N], 0 或 1
+sub_id = cluster_ids * 2 + is_outlier           # [N]
+```
+
+**步骤 4 — 细粒度池化**
+```
+# 用 sub_id 对 {P_raw, D_raw, F_raw, colors} 做 scatter_mean
+P_bse, D_bse, F_bse, C_bse = scatter_mean_all(sub_id)
+D_bse = D_bse / (‖D_bse‖₂ + 1e-6)             # 重新归一化射线方向
+```
+
+**步骤 5 — 全局度量归一化**
+
+在 BSE 池化之后计算（对 P_bse，而非 P_raw——避免离群点污染统计量）：
+```
+μ_scene = mean(P_bse, dim=0)                    # [3]
+σ_scene = std(‖P_bse - μ_scene‖₂).item()       # 标量
+P_norm  = (P_bse - μ_scene) / σ_scene           # [N, 3]
+```
+
+典型室内场景的 P_norm ∈ [-3, 3]（3σ 覆盖）。
+
+### OOM 缓解：分块两阶段处理
+
+对于大场景（>1000 张高分辨率图像），全量反投影超出 GPU 显存。
+采用两阶段策略：
+
+```
+第一阶段（逐块）：每次处理 B 张图像：
+    反投影 → D_raw → BSE（步骤 1-4）→ 将 P_bse_chunk 追加到全局 Buffer
+
+第二阶段（全局）：对完整全局 Buffer 再执行一次步骤 2-4
+    → 最终 P_bse, D_bse, F_bse, C_bse
+
+第三阶段：对最终 P_bse 计算 μ_scene, σ_scene, P_norm
+```
+
+默认 chunk_size = 500,000 点；B = 16 张图像/块。
+
+### 自适应回退
+
+若 BSE 后 len(P_bse) > 100,000（压缩不足）：
+- 将 voxel_size 加倍，重新执行步骤 2-4
+- 记录警告日志，包含原始和新的点数
 
 ## 4. 评估与验证计划
 
@@ -138,9 +192,10 @@ P_norm  = (P_raw - μ_scene) / σ_scene
 | 风险 | 可能性 | 缓解措施 |
 |------|--------|---------|
 | ace 环境中无 torch_scatter | 高 | 使用 index_add_ + 计数除法（代码库中已验证） |
-| 大场景反投影时 OOM | 中 | 分块处理（chunk_size=500k） |
+| 大场景反投影时 OOM | 中 | 分块两阶段处理（chunk_size=500k，B=16 张/块） |
+| FP16 余弦相似度数值不稳定 | 高 | 计算前转 fp32；分母加 ε=1e-6 |
 | τ=0.90 过度分割平坦墙面 | 中 | 暴露为 --bse_tau；默认保守 |
-| 输出 >100k 点（压缩不足） | 低 | 自适应回退：加倍 voxel_size 并重试 |
+| 输出 >100k 点（压缩不足） | 低 | 自适应回退：加倍 voxel_size 并重试一次 |
 | mapanything 导入路径失效 | 高 | 用直接等价物替换所有 mapanything.* 导入 |
 | WAI 数据集格式不兼容 | 中 | 先用 ace 后端测试；WAI 支持可选 |
 
@@ -164,3 +219,26 @@ P_norm  = (P_raw - μ_scene) / σ_scene
 ### 迁移源（只读参考）
 - `map-anything/mapanything/tasks/run_memory_extraction.py`
 - `map-anything/bash_scripts/ace/fps_memory.sh`
+
+## 7. 实施行动路线图
+
+三步渐进式推进——每步均可独立测试：
+
+**步骤 1 — 最小化侵入（仅归一化 + 光线方向）**
+- 保持现有体素池化逻辑不变
+- 在反投影后添加 O_cam → D_raw 计算
+- 在池化后添加 μ_scene、σ_scene 计算和 P_norm
+- 保存扩展 .pt 格式；下游读取代码加一行反归一化适配
+- 冒烟测试：在 7-Scenes Chess 上运行，断言 P_norm ∈ [-5, 5]
+
+**步骤 2 — 向量化几何哈希（重写池化核心）**
+- 引入 torch.unique(return_inverse=True) 生成 cluster_ids
+- 用 index_add_ + 计数除法重写 scatter_mean（单次遍历，无循环）
+- 验证压缩率：len(P_bse) / total_input_pixels < 0.05
+
+**步骤 3 — 双边特征分裂（BSE 核心）**
+- 添加 fp32 余弦相似度计算（含 ε 保护）
+- 添加 is_outlier mask 和 sub_id = cluster_id * 2 + is_outlier
+- 添加自适应回退（输出 >100k 点时加倍 voxel_size）
+- 消融：在 Indoor6 scene3/scene4a 上对比 --use_bse False vs True
+- Open3D 可视化：预期边缘处点云密集，平坦墙面稀疏
