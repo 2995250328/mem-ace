@@ -63,8 +63,8 @@ prevent zero-shot transfer of the downstream regressor.
 ### Why Non-Trivial
 
 - Bilateral filtering in 3D point clouds requires efficient GPU implementation without torch_scatter
-- The binary split (main/outlier) must be calibrated (τ) to avoid over-segmentation
-- Global normalization must be computed before pooling to avoid data leakage
+- **Adaptive threshold selection**: Fixed τ risks over/under-segmentation across scenes with varying contrast. Otsu's method provides principled, data-driven threshold selection.
+- **Chunked processing with global normalization**: Computing μ_scene, σ_scene on chunked data requires streaming algorithms (Welford) to maintain mathematical consistency.
 - Migration from Hydra/mapanything to standalone argparse requires careful dependency analysis
 
 ## 3. Design Space & Selected Architecture
@@ -81,13 +81,15 @@ prevent zero-shot transfer of the downstream regressor.
 
 ### Paradigm C — Bilateral Supervoxel Extraction (SELECTED)
 - Two-level clustering: coarse geometric hash → fine bilateral split by feature similarity
-- Pro: preserves semantic boundaries; O(N) vectorized; no new dependencies
-- Con: binary split may be too coarse for complex boundaries (acceptable for v1)
+- **Adaptive threshold**: Uses Otsu's method to find optimal split point τ_otsu from cosine similarity histogram (no fixed hyperparameter)
+- Pro: preserves semantic boundaries; O(N) vectorized; no new dependencies; adapts to scene contrast
+- Con: assumes bimodal similarity distribution (mitigated by unimodal guard)
 
 **Justification for Paradigm C:**
 - Theoretical: bilateral filtering is the principled way to preserve discontinuities
 - Practical: can be implemented with index_add_ (already in codebase), no torch_scatter needed
-- Ablation-friendly: τ exposed as CLI arg; BSE can be disabled with --use_bse False
+- Adaptive: Otsu's method automatically finds the optimal threshold for each chunk based on local feature distribution
+- Ablation-friendly: Otsu can be disabled with --use_otsu False to fall back to fixed τ
 
 ### Detailed Pipeline Steps
 
@@ -120,10 +122,20 @@ F_i    = F_fp32                                 # [N, C]
 F_ci   = F_mean[cluster_ids]                    # [N, C]
 sim_i  = (F_i * F_ci).sum(1) / (‖F_i‖ · ‖F_ci‖ + 1e-6)  # [N], fp32
 
+# Otsu adaptive thresholding (finds optimal split automatically)
+hist, bins = histogram(sim_i, bins=256, range=[0, 1])
+τ_otsu = otsu_threshold(hist, bins)             # maximizes between-class variance
+
+# Unimodal guard: skip splitting if distribution is too uniform
+if std(sim_i) < 0.02:
+    τ_otsu = -1.0  # force all points to main cluster
+
 # Binary split: outlier = semantically different from cluster majority
-is_outlier = (sim_i < τ).long()                 # [N], 0 or 1
+is_outlier = (sim_i < τ_otsu).long()            # [N], 0 or 1
 sub_id = cluster_ids * 2 + is_outlier           # [N]
 ```
+
+**Otsu's Method**: Treats similarity distribution as a mixture of two classes (main cluster vs. boundary). Searches for threshold that maximizes inter-class variance, equivalent to minimizing intra-class variance. Proven optimal for bimodal distributions.
 
 **Step 4 — Fine-grained Pooling**
 ```
@@ -143,22 +155,47 @@ P_norm  = (P_bse - μ_scene) / σ_scene           # [N, 3]
 
 This ensures P_norm ∈ [-3, 3] for typical indoor scenes (3σ coverage).
 
-### OOM Mitigation: Chunked Two-Pass Processing
+### OOM Mitigation: Welford Streaming Normalization
 
 For large scenes (>1000 images at high resolution), full unprojection exceeds GPU memory.
-Use a two-pass strategy:
+Use Welford's online algorithm for numerically stable, O(1) memory global statistics:
 
 ```
-Pass 1 (per-chunk): for each batch of B images:
-    unproject → D_raw → BSE (Steps 1-4) → append P_bse_chunk to global buffer
+Pass 1 (per-chunk streaming): for each batch of B images:
+    unproject → D_raw → BSE (Steps 1-4) → P_bse_chunk
 
-Pass 2 (global): run Steps 2-4 once more on the full global buffer
-    → final P_bse, D_bse, F_bse, C_bse
+    # Welford online update (FP64 for numerical stability)
+    for each point p in P_bse_chunk:
+        count += 1
+        delta = p - mean
+        mean += delta / count
+        M2 += delta * (p - mean)  # running sum of squared deviations
 
-Pass 3: compute μ_scene, σ_scene, P_norm on final P_bse
+    # Spool chunk to disk (temporary .pt file)
+    save(P_bse_chunk, F_bse_chunk, D_bse_chunk, f"temp_chunk_{i}.pt")
+
+Pass 2 (global scaling): after all chunks processed:
+    μ_scene = mean                          # [3], FP64 → FP32
+    σ_scene = sqrt(M2 / count)              # scalar, FP64 → FP32
+
+    # Stream normalize each chunk
+    for each temp_chunk_{i}.pt:
+        load(P_bse_chunk, F_bse_chunk, D_bse_chunk)
+        P_norm_chunk = (P_bse_chunk - μ_scene) / σ_scene
+        append to final buffer
+
+    # Save final memory
+    save(P_norm, F_bse, D_bse, C_bse, μ_scene, σ_scene, "pooled_memory.pt")
+    cleanup temp files
 ```
 
-Default chunk_size = 500,000 points; B = 16 images per chunk.
+**Key advantages**:
+- O(1) memory: only stores running statistics, not all points
+- Numerically stable: Welford's algorithm avoids catastrophic cancellation in variance computation
+- Mathematically exact: produces identical μ, σ as full batch computation (up to FP64 precision)
+- No double-pooling: BSE runs once per chunk, normalization is a simple scalar operation
+
+Default: B = 16 images per chunk, temp files written to /dev/shm (RAM disk) for fast I/O.
 
 ### Adaptive Fallback
 
@@ -174,29 +211,33 @@ If len(P_bse) > 100,000 after BSE (insufficient compression):
 
 ### Metrics
 - **Compression ratio**: len(P_bse) / total_input_pixels (target: <0.05)
-- **Boundary preservation**: qualitative Open3D visualization
+- **FVR (Feature Variance Retention)**: Var(F_bse) / Var(F_raw) — measures information preservation in feature space (target: >0.90)
+- **SCD (Semantic Chamfer Distance)**: Chamfer distance in joint space [P_xyz, λ·F_dino] between raw and pooled point clouds (target: <0.5× baseline)
 - **Relocalization accuracy**: median translation error (cm) and rotation error (°) on Indoor6
 - **Normalization check**: assert P_norm ∈ [-5, 5] (99.9% of points)
 
 ### Baselines
 1. `--use_bse False` (vanilla voxel pooling, current behavior)
-2. `--use_bse True --bse_tau 0.90` (proposed BSE)
-3. `--use_bse True --bse_tau 0.70` (aggressive split, ablation)
-4. `--use_bse True --bse_tau 0.95` (conservative split, ablation)
+2. `--use_bse True --use_otsu True` (proposed: Otsu-adaptive BSE)
+3. `--use_bse True --use_otsu False --bse_tau 0.90` (fixed threshold BSE, for comparison)
 
 ### Ablation Studies
-- τ sweep: {0.70, 0.80, 0.90, 0.95} on Indoor6 scene3
+- Otsu vs. fixed τ: compare FVR and SCD on Indoor6 scene3 (varying contrast)
 - voxel_size sweep: {0.03, 0.05, 0.10} on 7-Scenes Chess
-- With/without global normalization (P_raw vs P_norm as input to downstream trainer)
+- Unimodal guard: measure false split rate on homogeneous regions (flat walls)
+- Welford precision: verify μ_scene, σ_scene match full-batch computation to 4 decimal places
 
 ## 5. Expected Failure Modes & Engineering Risks
 
 | Risk | Likelihood | Mitigation |
 |------|-----------|------------|
 | torch_scatter not in ace env | High | Use index_add_ + count division (proven in existing code) |
-| OOM during unprojection of large scenes | Medium | Chunked two-pass processing (chunk_size=500k, B=16 images/chunk) |
+| OOM during unprojection of large scenes | Medium | Welford streaming with O(1) memory, temp files to /dev/shm |
 | FP16 numerical instability in cosine similarity | High | Cast to fp32 before dot product; add ε=1e-6 to denominator |
-| τ=0.90 over-segments flat walls | Medium | Expose as --bse_tau; default conservative |
+| FP32 precision loss in Welford M2 accumulator | High | Use FP64 for mean and M2, convert to FP32 only at output |
+| Otsu fails on unimodal distributions | Medium | Unimodal guard: skip splitting if std(sim) < 0.02 |
+| Otsu assumes bimodal distribution | Medium | Acceptable for DINOv2 features (semantic boundaries create natural bimodality) |
+| Disk I/O bottleneck in temp file spooling | Low | Write to /dev/shm (RAM disk) instead of HDD; async torch.save |
 | Output >100k points (insufficient compression) | Low | Adaptive fallback: double voxel_size and retry once |
 | mapanything import paths break | High | Replace all mapanything.* imports with direct equivalents |
 | WAI dataset format incompatibility | Medium | Test with ace backend first; WAI support is optional |
@@ -224,23 +265,25 @@ If len(P_bse) > 100,000 after BSE (insufficient compression):
 
 ## 7. Implementation Roadmap
 
-Three incremental steps — each independently testable:
+Three incremental sprints — each independently testable:
 
-**Step 1 — Minimal Invasion (normalization + ray directions only)**
-- Keep existing voxel pooling logic unchanged
-- Add O_cam → D_raw computation after unprojection
-- Add μ_scene, σ_scene computation and P_norm after pooling
-- Save extended .pt format; update downstream reader with one-line denorm adapter
-- Smoke test: run on 7-Scenes Chess, assert P_norm ∈ [-5, 5]
+**Sprint 1 — Welford Streaming Normalization (resolve mathematical contradiction)**
+- Implement WelfordMeter class with FP64 accumulators (count, mean, M2)
+- Rewrite main loop in run_memory_extraction.py for two-pass processing
+- Pass 1: stream chunks, update Welford state, spool to temp files
+- Pass 2: load temp files, apply normalization, assemble final memory
+- Acceptance: verify μ_scene, σ_scene match full-batch computation to 4 decimal places
 
-**Step 2 — Vectorized Geometric Hashing (replace pooling core)**
-- Introduce torch.unique(return_inverse=True) for cluster_ids
-- Rewrite scatter_mean using index_add_ + count division (single-pass, no loop)
-- Verify compression ratio: len(P_bse) / total_input_pixels < 0.05
+**Sprint 2 — Otsu Adaptive Thresholding (resolve hyperparameter critique)**
+- Implement vectorized otsu_threshold(sim_tensor, bins=256) function
+- Add unimodal guard: skip splitting if std(sim) < 0.02
+- Replace `is_outlier = sim < 0.90` with `is_outlier = sim < τ_otsu`
+- Log τ_otsu for each chunk to observe dynamic adaptation
+- Acceptance: verify τ_otsu varies across chunks with different contrast levels
 
-**Step 3 — Bilateral Feature Split (BSE core)**
-- Add fp32 cosine similarity computation with ε guard
-- Add is_outlier mask and sub_id = cluster_id * 2 + is_outlier
-- Add adaptive fallback (double voxel_size if output > 100k points)
-- Ablation: compare --use_bse False vs True on Indoor6 scene3/scene4a
-- Visualize with Open3D: expect dense points at edges, sparse on flat walls
+**Sprint 3 — Quantitative Evaluation Metrics (provide rebuttal ammunition)**
+- Implement eval_boundary_metrics.py script
+- Compute FVR = Var(F_bse) / Var(F_raw) for boundary preservation
+- Compute SCD in joint [P, λ·F] space using Chamfer distance
+- Generate comparison table: Uniform Voxel vs. Otsu-BSE
+- Acceptance: FVR > 0.90 for Otsu-BSE, FVR < 0.50 for Uniform baseline
