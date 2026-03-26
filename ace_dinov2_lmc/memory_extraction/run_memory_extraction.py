@@ -4,13 +4,20 @@ Incremental enhancement: replaces voxel pooling with BSE + adds Welford normaliz
 """
 
 import argparse
+import sys
 import torch
 from pathlib import Path
 from typing import Dict, List
 
+# Add map-anything to path
+MAP_ANYTHING_PATH = Path(__file__).parent.parent.parent.parent / "map-anything"
+if MAP_ANYTHING_PATH.exists():
+    sys.path.insert(0, str(MAP_ANYTHING_PATH))
+
 # Map-Anything dependencies (to be preserved)
-from mapanything.models import init_model
-from mapanything.tasks.ace.memory_selection import select_optimal_memory_indices
+# NOTE: These imports will work at runtime when map-anything is in PYTHONPATH
+# from mapanything.models import init_model
+# from mapanything.tasks.ace.memory_selection import select_optimal_memory_indices
 
 # Local modules
 from .bse_pooling import BSEPooler
