@@ -50,15 +50,41 @@ def main():
     """Main entry point."""
     args = parse_args()
 
-    print(f"Loading dataset from {args.dataset_path}")
-    print(f"Output will be saved to {args.output_path}")
-    print(f"BSE pooling: {args.use_bse}, Otsu: {args.use_otsu}")
+    print(f"[Stage 5] BSE-enhanced memory extraction")
+    print(f"Dataset: {args.dataset_path}")
+    print(f"Output: {args.output_path}")
+    print(f"N_MEMORY: {args.n_memory}")
+    print(f"BSE: {args.use_bse}, Otsu: {args.use_otsu}, voxel_size: {args.voxel_size}")
 
-    # TODO: Implement two-pass processing
-    # Pass 1: Extract + pool + accumulate statistics
-    # Pass 2: Normalize + save
+    # Initialize modules
+    device = torch.device(args.device)
+    welford = WelfordNormalizer()
 
-    raise NotImplementedError("Stage 4 skeleton - implementation in Stage 5")
+    if args.use_bse:
+        pooler = BSEPooler(
+            voxel_size=args.voxel_size,
+            use_otsu=args.use_otsu,
+            otsu_bins=256,
+            unimodal_threshold=0.02
+        )
+    else:
+        # Fallback to vanilla voxel pooling (TODO: implement)
+        raise NotImplementedError("Vanilla voxel pooling not yet implemented in Stage 5")
+
+    # TODO: Load dataset and model (requires map-anything integration)
+    # from mapanything.models import init_model
+    # from mapanything.datasets import SevenScenesWAI, Indoor6WAI
+    # from mapanything.tasks.ace.memory_selection import select_optimal_memory_indices
+
+    print("[Stage 5] TODO: Implement dataset loading, model inference, and two-pass processing")
+    print("[Stage 5] Skeleton complete. Full implementation requires:")
+    print("  1. Dataset loader integration")
+    print("  2. Model inference (model.infer())")
+    print("  3. Multi-scale feature processing")
+    print("  4. Unprojection with real depth")
+    print("  5. Two-pass BSE + Welford normalization")
+
+    raise NotImplementedError("Stage 5 minimal skeleton - full implementation pending")
 
 
 if __name__ == '__main__':
