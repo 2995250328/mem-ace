@@ -3,9 +3,11 @@
 
 import argparse
 import logging
+import os
 from distutils.util import strtobool
 from pathlib import Path
 
+import torch
 from ace_trainer import TrainerACE
 
 
@@ -130,7 +132,29 @@ if __name__ == '__main__':
     parser.add_argument('--use_neighbors', type=_strtobool, default=False,
                         help='expand sampler selections to 4-connected neighbors')
 
+    parser.add_argument('--eval_after_train', type=_strtobool, default=True,
+                        help='run evaluation on the test split immediately after training')
+
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='GPU device to use, e.g. cuda:0, cuda:1')
+
     options = parser.parse_args()
+
+    # Isolate the requested GPU via CUDA_VISIBLE_DEVICES so ace_trainer's
+    # hardcoded torch.device('cuda') always maps to the right card.
+    if options.device.startswith('cuda:'):
+        gpu_idx = options.device.split(':')[1]
+        os.environ['CUDA_VISIBLE_DEVICES'] = gpu_idx
 
     trainer = TrainerACE(options)
     trainer.train()
+
+    if options.eval_after_train:
+        from ace_eval import evaluate_scene
+        evaluate_scene(
+            scene=options.scene,
+            network_path=options.output_map_file,
+            encoder_path=options.encoder_path,
+            device=torch.device('cuda'),  # CUDA_VISIBLE_DEVICES already set above
+            image_resolution=options.image_resolution,
+        )

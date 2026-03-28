@@ -54,7 +54,8 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         'output_map',
         type=Path,
         help=(
-            '输出权重文件名后缀（如 lmc.pt）。实际路径为 <experiment_root>/<dataset>/<scene>/<function>/<run_id>/best_K*_it*_<suffix>.pt'
+            '输出权重文件名后缀（如 lmc.pt）。实际路径为 '
+            '<experiment_root>[/<experiment_subdir>]/<dataset>/<scene>/<function>/<run_id>/best_K*_it*_<suffix>.pt'
         ),
     )
     parser.add_argument(
@@ -62,6 +63,16 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help='实验输出根目录。None 时默认为 output/；下按 数据集/场景/function/run_id 组织。',
+    )
+    parser.add_argument(
+        '--experiment_subdir',
+        type=str,
+        default=None,
+        help=(
+            '在 experiment_root 下再套一层子目录，用于区分代码版本/分支（如 v1）。'
+            '例如设为 v1 时：run_dir = <experiment_root>/v1/<dataset>/<scene>/<function>/<run_id>/。'
+            'None 或空字符串表示不使用额外子目录。'
+        ),
     )
     parser.add_argument(
         '--run_name',

@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 import torchvision.transforms.functional as TF
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.data import sampler
 
@@ -123,7 +123,7 @@ class TrainerACE:
                                                        cycle_momentum=False)
 
         # Gradient scaler in case we train with half precision.
-        self.scaler = GradScaler(enabled=self.options.use_half)
+        self.scaler = GradScaler('cuda', enabled=self.options.use_half)
 
         # Generate grid of target reprojection pixel positions.
         pixel_grid_2HW = get_pixel_grid(self.regressor.OUTPUT_SUBSAMPLE)
@@ -295,7 +295,7 @@ class TrainerACE:
                     intrinsics_inv_B33 = intrinsics_inv_B33.to(self.device, non_blocking=True)
 
                     # Compute image features.
-                    with autocast(enabled=self.options.use_half):
+                    with autocast('cuda', enabled=self.options.use_half):
                         features_BCHW = self.regressor.get_features(image_B1HW)
 
                     # Dimensions after the network's downsampling.
@@ -407,7 +407,7 @@ class TrainerACE:
 
         # Reshape to a "fake" BCHW shape, since it's faster to run through the network compared to the original shape.
         features_bCHW = features_bC[None, None, ...].view(-1, 16, 32, channels).permute(0, 3, 1, 2)
-        with autocast(enabled=self.options.use_half):
+        with autocast('cuda', enabled=self.options.use_half):
             pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(features_bCHW)
 
         # Back to the original shape. Convert to float32 as well.

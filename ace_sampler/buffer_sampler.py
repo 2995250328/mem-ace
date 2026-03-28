@@ -1,11 +1,47 @@
 import logging
 import torch
 import torch.nn.functional as F
+from torch.amp import autocast
 from torch.utils.data import DataLoader
 from torch.utils.data import sampler as torch_sampler
-from torch.cuda.amp import autocast
+from tqdm import tqdm
 
 _logger = logging.getLogger(__name__)
+
+
+def nms_topk(conf: torch.Tensor, k: int, nms_size: int = 5) -> torch.Tensor:
+    """Grid-based NMS: divide feature map into nms_size×nms_size non-overlapping
+    cells, pick the argmax pixel in each cell (conf>0 only), sort by confidence,
+    return top-k. May return fewer than k indices if not enough conf>0 cells exist.
+    """
+    if nms_size <= 1:
+        return torch.topk(conf.view(-1), min(k, conf.numel())).indices
+
+    Hf, Wf = conf.shape
+    noise   = torch.rand_like(conf) * 1e-6
+    conf_tb = conf + noise
+    ph = (nms_size - Hf % nms_size) % nms_size
+    pw = (nms_size - Wf % nms_size) % nms_size
+    conf_pad = F.pad(conf_tb, (0, pw, 0, ph), value=-1.0)
+    nh = conf_pad.shape[0] // nms_size
+    nw = conf_pad.shape[1] // nms_size
+
+    cells  = conf_pad.reshape(nh, nms_size, nw, nms_size).permute(0, 2, 1, 3)
+    cells  = cells.reshape(nh, nw, nms_size * nms_size)
+    argmax = cells.max(dim=-1).indices
+
+    local_r  = argmax // nms_size
+    local_c  = argmax % nms_size
+    global_r = torch.arange(nh, device=conf.device).unsqueeze(1) * nms_size + local_r
+    global_c = torch.arange(nw, device=conf.device).unsqueeze(0) * nms_size + local_c
+
+    valid = (global_r < Hf) & (global_c < Wf) & \
+            (conf[global_r.clamp(0, Hf-1), global_c.clamp(0, Wf-1)] > 0)
+    gr, gc = global_r[valid], global_c[valid]
+    order  = torch.argsort(conf[gr, gc], descending=True)
+    gr, gc = gr[order], gc[order]
+
+    return (gr * Wf + gc)[:k]
 
 
 def expand_neighbors_gpu(coords, H, W, patch_size, include_diagonal=4):
@@ -54,6 +90,7 @@ def fill_buffer_with_sampler(regressor, sampler_net, dataset, options, device,
     sampler_net.eval()
     idx = 0
 
+    pbar = tqdm(total=buf_size, desc='Filling buffer', unit='sample', dynamic_ncols=True)
     with torch.no_grad():
         while idx < buf_size:
             for img, mask, _, pose_inv, K, Kinv, _, _ in loader:
@@ -64,7 +101,7 @@ def fill_buffer_with_sampler(regressor, sampler_net, dataset, options, device,
                 Kinv = Kinv.to(device, non_blocking=True)
                 B, _, H, W = img.shape
 
-                with autocast(enabled=options.use_half):
+                with autocast('cuda', enabled=options.use_half):
                     feats = regressor.get_features(img)
                 _, _, Hf, Wf = feats.shape
 
@@ -75,16 +112,17 @@ def fill_buffer_with_sampler(regressor, sampler_net, dataset, options, device,
                 na = int(total * ratio)
                 nb = total - na
 
-                # Part A: top-k confidence
-                flat = conf.view(-1)
+                # Part A: grid NMS top-k confidence
+                nms_size = getattr(options, 'sampler_nms_size', 5)
                 ka = min(na, int(mask_f.sum().item()))
                 if ka > 0:
-                    ti = torch.topk(flat, ka).indices
+                    ti = nms_topk(conf, ka, nms_size=nms_size)
                     ya = torch.div(ti, Wf, rounding_mode='floor')
                     xa = ti % Wf
                     ca = torch.stack([xa, ya], 1).float() * patch + patch // 2
                     if use_nbr:
                         ca = expand_neighbors_gpu(ca, H, W, patch, include_diagonal=4)
+                    nb += (ka - ti.numel())          # shortfall → Part B
                 else:
                     ca = torch.zeros((0, 2), device=device)
 
@@ -106,7 +144,7 @@ def fill_buffer_with_sampler(regressor, sampler_net, dataset, options, device,
                 nx = 2.0 * coords[:, 0] / (W - 1) - 1.0
                 ny = 2.0 * coords[:, 1] / (H - 1) - 1.0
                 grid = torch.stack([nx, ny], 1).unsqueeze(0).unsqueeze(1)
-                with autocast(enabled=options.use_half):
+                with autocast('cuda', enabled=options.use_half):
                     sf = F.grid_sample(feats, grid.to(feats.dtype),
                                        align_corners=True, mode='bilinear')
                 fNC = sf.squeeze(2).permute(0, 2, 1).reshape(-1, regressor.feature_dim)
@@ -120,8 +158,10 @@ def fill_buffer_with_sampler(regressor, sampler_net, dataset, options, device,
                 buf['intrinsics'][idx:end]     = K.expand(add, 3, 3)
                 buf['intrinsics_inv'][idx:end] = Kinv.expand(add, 3, 3)
                 idx = end
+                pbar.update(add)
                 if idx >= buf_size:
                     break
 
+    pbar.close()
     _logger.info(f'Sampler buffer filled: {idx} samples.')
     return buf

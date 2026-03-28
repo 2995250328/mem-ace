@@ -4,6 +4,7 @@
 import argparse
 import logging
 import math
+import os
 import time
 from distutils.util import strtobool
 from pathlib import Path
@@ -93,7 +94,13 @@ if __name__ == '__main__':
     parser.add_argument('--render_frame_skip', type=int, default=1,
                         help='skip every xth frame for long and dense query sequences')
 
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='GPU device to use, e.g. cuda:0, cuda:1')
+
     opt = parser.parse_args()
+
+    if opt.device.startswith('cuda:'):
+        os.environ['CUDA_VISIBLE_DEVICES'] = opt.device.split(':')[1]
 
     device = torch.device("cuda")
     num_workers = 6

@@ -2,52 +2,63 @@ import torch
 import torch.nn as nn
 
 
-class UncertaintyHead(nn.Module):
+class MCDropoutRegressor:
+    """MC Dropout wrapper for a frozen ACE Regressor.
+
+    Injects Dropout2d after every Conv2d in the head via forward hooks,
+    then runs T stochastic forward passes to estimate per-pixel uncertainty.
+
+    No separate network, no pretraining — uses the actual frozen head directly.
+
+    Usage:
+        mc = MCDropoutRegressor(regressor, dropout_p=0.1)
+        samples = mc.coordinate_samples(features, T=10)  # (T, B, 3, Hf, Wf)
+        var_map = samples.var(dim=0).mean(dim=1, keepdim=True)  # (B, 1, Hf, Wf)
     """
-    Lightweight coordinate predictor with MC Dropout.
-    Input:  (B, in_channels, Hf, Wf) frozen encoder features
-    Output: (B, 3, Hf, Wf) scene coordinate prediction
 
-    Used in Phase 1 SamplerNet training to estimate per-pixel prediction
-    uncertainty via multiple stochastic forward passes (MC Dropout).
-    """
-    def __init__(self, in_channels: int = 512, dropout_p: float = 0.1):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 256, 1, bias=False),
-            nn.Dropout2d(p=dropout_p),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 3, 1),
-        )
+    def __init__(self, regressor: nn.Module, dropout_p: float = 0.1):
+        self.regressor = regressor
+        self.dropout = nn.Dropout2d(p=dropout_p)
+        self._hooks: list = []
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.net(features)
+    # ── hook management ───────────────────────────────────────────────────────
 
-    def mc_coordinate_samples(self, features: torch.Tensor, T: int = 10) -> torch.Tensor:
+    def _attach(self):
+        """Register post-conv dropout hooks on every Conv2d in the head."""
+        dropout = self.dropout
+        dropout.train()
+
+        def _hook(module, inp, out):
+            return dropout(out)
+
+        for module in self.regressor.heads.modules():
+            if isinstance(module, nn.Conv2d):
+                self._hooks.append(module.register_forward_hook(_hook))
+
+    def _detach(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+    # ── MC inference ──────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def coordinate_samples(self, features: torch.Tensor, T: int = 10) -> torch.Tensor:
+        """Run T stochastic forward passes through the frozen head.
+
+        Args:
+            features: (B, C, Hf, Wf) — frozen encoder features
+            T:        number of MC samples
+
+        Returns:
+            (T, B, 3, Hf, Wf) scene coordinate samples
         """
-        Run T stochastic forward passes with dropout enabled.
-        Returns (T, B, 3, Hf, Wf).
-        """
-        self.train()
-        with torch.no_grad():
-            return torch.stack([self.forward(features) for _ in range(T)], dim=0)
-
-    def save(self, path: str, meta: dict = None):
-        payload = {
-            'state_dict': self.state_dict(),
-            'in_channels': self.net[0].in_channels,
-            'dropout_p': self.net[1].p,
-        }
-        if meta:
-            payload.update(meta)
-        torch.save(payload, path)
-
-    @classmethod
-    def load(cls, path: str, device) -> 'UncertaintyHead':
-        ckpt = torch.load(path, map_location=device)
-        head = cls(
-            in_channels=ckpt.get('in_channels', 512),
-            dropout_p=ckpt.get('dropout_p', 0.1),
-        )
-        head.load_state_dict(ckpt['state_dict'])
-        return head.to(device)
+        self._attach()
+        try:
+            samples = [
+                self.regressor.get_scene_coordinates(features).float()
+                for _ in range(T)
+            ]
+        finally:
+            self._detach()
+        return torch.stack(samples, dim=0)

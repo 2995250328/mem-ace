@@ -3,9 +3,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from torch.utils.data import sampler as torch_sampler
+from tqdm import tqdm
 
 from ace_network import Regressor
 from dataset_origin import CamLocDataset
@@ -42,29 +43,24 @@ class SamplerTrainer:
 
         self.sampler_net = SamplerNet(in_channels=self.regressor.feature_dim).to(self.device)
         self.optimizer = optim.AdamW(self.sampler_net.parameters(), lr=options.sampler_lr)
-        self.scaler = GradScaler(enabled=options.use_half)
+        self.scaler = GradScaler('cuda', enabled=options.use_half)
 
         self.pixel_grid = get_pixel_grid(self.regressor.OUTPUT_SUBSAMPLE).to(self.device)
 
-        # Optional MC Dropout uncertainty head
-        self.uncertainty_head = None
+        # Optional MC Dropout — wraps the frozen regressor head directly
+        self.mc_dropout = None
         if getattr(options, 'use_mc_dropout', False):
-            from .uncertainty import UncertaintyHead
-            uh_path = getattr(options, 'uncertainty_head_path', None)
-            if uh_path is not None:
-                self.uncertainty_head = UncertaintyHead.load(str(uh_path), self.device)
-                _logger.info(f'Loaded UncertaintyHead from {uh_path}')
-            else:
-                self.uncertainty_head = UncertaintyHead(
-                    in_channels=self.regressor.feature_dim,
-                    dropout_p=options.mc_dropout_p,
-                ).to(self.device)
-                _logger.info('UncertaintyHead created (will pretrain via distillation)')
+            from .uncertainty import MCDropoutRegressor
+            self.mc_dropout = MCDropoutRegressor(
+                self.regressor,
+                dropout_p=options.mc_dropout_p,
+            )
+            _logger.info(f'MC Dropout enabled: p={options.mc_dropout_p}, T={options.mc_samples}')
 
     @torch.no_grad()
     def _compute_error_map(self, image_B1HW, gt_pose_inv_B44, intrinsics_B33):
         """Returns (error_map (B,1,Hf,Wf), var_map (B,1,Hf,Wf), features (B,C,Hf,Wf))."""
-        with autocast(enabled=self.options.use_half):
+        with autocast('cuda', enabled=self.options.use_half):
             features = self.regressor.get_features(image_B1HW)
             scene_coords = self.regressor.get_scene_coordinates(features).float()
 
@@ -88,8 +84,8 @@ class SamplerTrainer:
         error = error * valid.float()
         error_map = error.view(B, 1, Hf, Wf)
 
-        if self.uncertainty_head is not None:
-            samples = self.uncertainty_head.mc_coordinate_samples(
+        if self.mc_dropout is not None:
+            samples = self.mc_dropout.coordinate_samples(
                 features.detach().float(), T=self.options.mc_samples)
             var_map = self._mc_reprojection_variance(samples, gt_pose_inv_B44, intrinsics_B33)
         else:
@@ -116,25 +112,6 @@ class SamplerTrainer:
         var = uv_stack.var(dim=0).mean(dim=1)         # (B, N)
         return var.view(B, 1, Hf, Wf)
 
-    def _pretrain_uncertainty_head(self, loader, epochs=2):
-        """Distill frozen Head into UncertaintyHead so MC variance is meaningful."""
-        uh_optimizer = optim.Adam(self.uncertainty_head.parameters(), lr=1e-3)
-        self.uncertainty_head.train()
-        for ep in range(epochs):
-            total, n = 0.0, 0
-            for batch in loader:
-                img = batch[0].to(self.device)
-                with torch.no_grad():
-                    feats = self.regressor.get_features(img)
-                    target_sc = self.regressor.get_scene_coordinates(feats).float()
-                pred_sc = self.uncertainty_head(feats.detach().float())
-                loss = F.mse_loss(pred_sc, target_sc)
-                uh_optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                uh_optimizer.step()
-                total += loss.item(); n += 1
-            _logger.info(f'UncertaintyHead pretrain epoch {ep} avg_loss={total/max(n,1):.4f}')
-
     def train(self):
         batch_gen = torch.Generator()
         batch_gen.manual_seed(2089)
@@ -144,15 +121,11 @@ class SamplerTrainer:
         loader = DataLoader(self.dataset, sampler=batch_sampler,
                             batch_size=None, num_workers=4, pin_memory=True)
 
-        # Pretrain uncertainty head via distillation if needed
-        if self.uncertainty_head is not None and \
-                getattr(self.options, 'uncertainty_head_path', None) is None:
-            _logger.info('Pretraining UncertaintyHead via distillation (2 epochs)...')
-            self._pretrain_uncertainty_head(loader, epochs=2)
-
         for epoch in range(self.options.sampler_epochs):
             total_loss, n_steps = 0.0, 0
-            for batch in loader:
+            _logger.info(f'Epoch {epoch}/{self.options.sampler_epochs} — {len(self.dataset)} images')
+            pbar = tqdm(loader, desc=f'Epoch {epoch}', unit='img', dynamic_ncols=True)
+            for batch in pbar:
                 image_B1HW, _, pose, gt_pose_inv_B44, intrinsics_B33, _, _, _ = batch
                 image_B1HW = image_B1HW.to(self.device, non_blocking=True)
                 gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True)
@@ -168,7 +141,7 @@ class SamplerTrainer:
                 ))
 
                 self.optimizer.zero_grad(set_to_none=True)
-                with autocast(enabled=self.options.use_half):
+                with autocast('cuda', enabled=self.options.use_half):
                     pred = self.sampler_net(features.detach().float())
                     loss = F.mse_loss(pred, target)
 
@@ -178,8 +151,7 @@ class SamplerTrainer:
 
                 total_loss += loss.item()
                 n_steps += 1
-                if n_steps % 100 == 0:
-                    _logger.info(f'Epoch {epoch} step {n_steps} loss {total_loss/n_steps:.4f}')
+                pbar.set_postfix(loss=f'{total_loss/n_steps:.4f}')
 
             avg = total_loss / max(n_steps, 1)
             _logger.info(f'Epoch {epoch} done. avg_loss={avg:.4f}')

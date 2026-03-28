@@ -430,6 +430,9 @@ def _build_run_dir(args):
     # 输出结构：<experiment_root>/<dataset>/<scene>/<function>/<run_id>/best_K*_it*_<suffix>.pt
     # dataset/scene 从 scene 路径解析，与 train_ace_dinov2 一致（如 .../indoor6_ace/scene1/train -> indoor6_ace, scene1）
     run_root = Path(args.experiment_root).resolve() if args.experiment_root is not None else (Path(__file__).parent / "04_evaluation").resolve()
+    _subdir = getattr(args, "experiment_subdir", None)
+    if _subdir is not None and str(_subdir).strip():
+        run_root = run_root / _sanitize_tag(str(_subdir).strip())
     run_root.mkdir(parents=True, exist_ok=True)
 
     scene_path = Path(args.scene).resolve()

@@ -155,6 +155,11 @@ def _build_run_dir(args):
 
     if args.experiment_root is None:
         args.experiment_root = Path(__file__).parent / "04_evaluation"
+    run_root = Path(args.experiment_root).resolve()
+    _subdir = getattr(args, "experiment_subdir", None)
+    if _subdir is not None and str(_subdir).strip():
+        run_root = run_root / _sanitize_tag(str(_subdir).strip())
+    args.experiment_root = run_root
     result_mgr = ResultManager(args.experiment_root)
     scene_info = result_mgr.parse_scene_info(args.scene)
 
