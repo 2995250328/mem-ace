@@ -11,3 +11,6 @@ output/
 
 wtconv/
 wtconvnext/
+
+# Evaluation outputs.
+**/04_evaluation/

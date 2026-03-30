@@ -1,18 +1,20 @@
 # BSE Memory Extraction 流程指南
 
-本文档全面解释了 ACE DINOv2 LMC 的 BSE（双边超体素提取）Memory Extraction 流程。
+本文档说明 **当前仓库真实脚本**（`extract_memory.sh` → `run_memory_extraction.py`）下的 BSE Memory Extraction 流程；参数默认值、路径与 `map-anything/bash_scripts/ace/fps_memory.sh` 对齐处会单独标注。
 
 ## 概述
 
 该流程从多视角 RGB-D 数据中提取压缩的场景表示，包括：
 
-1. **视角选择**：从训练数据中选择最优的记忆视图
-2. **特征提取**：从 RGB 图像中提取 DINOv2 特征
-3. **反投影**：将 2D 像素 + 深度转换为带射线方向的 3D 点
-4. **BSE 池化**：边界保持的双边聚类以压缩点云
-5. **归一化**：使用 Welford 算法进行全局场景归一化
+1. **视角选择**：优先调用 `mapanything.tasks.ace.memory_selection.select_optimal_memory_indices`（失败则均匀采样）
+2. **加载视图 + 深度/RGB 校验导出**（与 `fps_memory` 一致）：在特征推理前写入本次 run 目录下的 `depth_validation/`、`model_input_vis/`
+3. **特征提取**：默认 `MapAnythingExtractor` → `model.infer(memory_views, ...)`，从 `store_info_sharing_intermediate_features` 取多尺度特征（非「先 torch.save 再读临时文件」的主路径）
+4. **反投影**：在特征网格上对深度采样（`--patch_depth_sampling`：`nearest` / `median` / `nearest_valid`），再与 `process_multiscale_features_to_grid` 展平顺序对齐
+5. **BSE 池化** + **Welford 两遍归一化**：临时块默认写在 `--temp_dir`（默认 `/dev/shm`）
 
-输出是一个 `.pt` 文件，包含：
+**默认视角数**：`extract_memory.sh` 中 `N_VIEWS` 默认为 **20**；直接调用 Python 时 `--n_memory` 默认为 **100**（以实际命令为准）。
+
+输出主文件为 **`memory_bse.pt`**（`--output_path` / 脚本中的 `OUTPUT_FILE`），并包含：
 - 带特征和颜色的压缩 3D 点
 - 多种射线方向表示
 - 视图级别的相机信息
@@ -34,8 +36,8 @@
 │                           步骤 1: 视角选择                                  │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │ 输入: 所有训练帧                                                     │   │
-│  │ 方法: 均匀采样或 FPS（最远点采样）                                    │   │
-│  │ 输出: M 个记忆视图（默认：100）                                       │   │
+│  │ 方法: 优先 FPS（`select_optimal_memory_indices`），否则均匀采样        │   │
+│  │ 输出: M 个记忆视图（M = `N_VIEWS` / `--n_memory`）                     │   │
 │  └──────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────┬───────────────────────────────────────┘
                                       │
@@ -44,8 +46,8 @@
 │                           步骤 2: 特征提取                                  │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │ 输入: M 张 RGB 图像                                                  │   │
-│  │ 模型: DINOv2 ViT-L/14（预训练）                                      │   │
-│  │ 输出: M 个特征图 [1024, H/14, W/14]                                  │   │
+│  │ 模型: MapAnything（DINOv2 骨干 + 多尺度中间层拼接）                    │   │
+│  │ 输出: 每层特征经对齐后与网格 grid_H×grid_W 对应（维度为拼接通道数）     │   │
 │  └──────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────┬───────────────────────────────────────┘
                                       │
@@ -62,7 +64,7 @@
 │  │                                                                      │   │
 │  │ 每个视图的输出:                                                       │   │
 │  │   - points: [N_i, 3] 3D 坐标                                         │   │
-│  │   - features: [N_i, 1024] DINOv2 特征                                │   │
+│  │   - features: [N_i, C] 多尺度拼接特征                                 │   │
 │  │   - colors: [N_i, 3] RGB 颜色                                        │   │
 │  │   - ray_dirs: [N_i, 3] 单位射线方向                                  │   │
 │  │   - camera_centers: [N_i, 3] 相机中心（重复）                        │   │
@@ -140,7 +142,7 @@
 │  │                                                                      │   │
 │  │ 点级别数据（N = 总聚类数）:                                            │   │
 │  │   - points: [N, 3] 归一化 3D 坐标                                    │   │
-│  │   - features: [N, 1024] DINOv2 特征（fp16）                          │   │
+│  │   - features: [N, C] 多尺度拼接特征（fp16，C 为配置相关数千维）        │   │
 │  │   - colors: [N, 3] RGB 颜色                                          │   │
 │  │   - cluster_sizes: [N] 每聚类的点数                                  │   │
 │  │   - ray_dirs: [N, 3] 主射线方向                                      │   │
@@ -162,6 +164,23 @@
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+**与真实脚本一致的补充**：在「步骤 2」之前，`run_memory_extraction.py` 会调用 `export_memory_views_visualization`，向 **`OUTPUT_DIR`**（即本次 run 的时间戳目录）写入 `depth_validation/`、`model_input_vis/`；深度张量会先经 `normalize_depth_to_hw` 处理 `[H,W,1]` 等布局。详见 `README_zh.md`。
+
+---
+
+## 脚本入口、路径与 `fps_memory` 对齐项
+
+| 项目 | 真实行为（`extract_memory.sh`） |
+|------|----------------------------------|
+| 输出根目录 | `OUTPUT_ROOT` 默认为 **脚本所在目录**下的 `04_evaluation/memory_extract/`，即 `.../memory_extraction/04_evaluation/memory_extract/` |
+| 单次 run 目录 | `${OUTPUT_ROOT}/${SCENE_NAME}/${N_VIEWS}v_${CONFIG_TAG}/${TIMESTAMP}/` |
+| 主输出文件 | `memory_bse.pt`（`OUTPUT_FILE`） |
+| `DATASET_PATH` | 等于 `DATASET_ROOT`；7scenes/indoor6 默认指向 WAI 根路径（见脚本内 `case`） |
+| `DEPTH_MIN`/`DEPTH_MAX` | indoor6 默认 `0.1`/`100.0`；7scenes 默认 `0.1`/`6.0` |
+| `PATCH_DEPTH_SAMPLING` | indoor6 默认 **`nearest_valid`**；否则默认 **`nearest`**（与 `fps_memory.sh` 一致） |
+| `GPU_ID` | 默认 **3**（`CUDA_VISIBLE_DEVICES`） |
+| 传入 Python | `--depth_valid_range`、`--patch_depth_sampling` 等由脚本拼接 |
+
 ---
 
 ## 详细算法解释
@@ -171,40 +190,33 @@
 **目的**：从训练数据中选择代表性的帧子集。
 
 **方法**：
-- **均匀采样**：每隔 k 帧选择一帧（回退方案）
-- **FPS（最远点采样）**：选择最大化空间覆盖的视图
+- **优先**：`select_optimal_memory_indices`（与 map-anything 共用）
+- **回退**：均匀采样（`run_memory_extraction.select_memory_views` 内 `ImportError` 分支）
 
-**输出**：M 个记忆视图（默认：100）
+**输出**：M 个记忆视图（M = 环境变量 `N_VIEWS` 或 CLI `--n_memory`）
 
 ### 2. 特征提取
 
-**目的**：使用 MapAnything 模型从 RGB 图像中提取多尺度语义特征。
+**目的**：从 RGB 图像中提取多尺度语义特征。
 
-**模型**：MapAnything（DINOv2 ViT-L/14 骨干网络 + info-sharing）
-- 在大规模图像数据上预训练
-- 输出 24 个中间层 + 1 个最终层
-- 我们使用层 [0, 6, 12, 18, 24] 进行 DPT 风格的多尺度特征提取
-- 每层输出 1024 维特征
+**默认模型**：MapAnything（DINOv2 ViT-L/14 骨干网络 + AAT 24 层 + DPT 预测头）
+- 在大规模数据上预训练的统一模型
+- 目标中间层索引为 `[2,5,8,11,14,17,20,23]` 等（见 `MapAnythingExtractor.TARGET_INTERM_LAYERS`）+ 最终层；单层通道维常见为 1024，**拼接后** `C_total` 为数千维（由 `process_multiscale_features_to_grid` 对齐并 concat）
 
-**过程**：
+**Fallback 模型**：`DINOv2Extractor`（`USE_MODEL=dinov2` 或 MapAnything 初始化失败时）
+
+**当前主路径（MapAnything）**（与伪代码差异说明）：
+- 使用 `MapAnythingExtractor` 加载 `mapanything_store_intermediates_ace` 等配置，`model.infer(memory_views, memory_efficient_inference=True, ...)` **不写**中间特征到临时 pt 再读回的主流程；
+- 多尺度张量来自 `model.get_info_sharing_intermediate_features()`，再经 `_process_saved_features` → `process_multiscale_features_to_grid` 对齐网格。
+
+**过程（逻辑示意）**：
 ```python
-# MapAnything 推理并保存中间特征
-model.infer(
-    input_views,
-    save_filename=temp_file,
-    memory_efficient_inference=True
-)
+# MapAnything（与仓库实现一致）
+predictions = extractor.model.infer(memory_views, memory_efficient_inference=True, ...)
+stored = extractor.model.get_info_sharing_intermediate_features()
+features_dict = extractor._process_saved_features(stored, n_views)
 
-# 加载保存的特征
-saved_data = torch.load(temp_file)
-raw_interm = saved_data["intermediate"]  # 24 层
-raw_final = saved_data["final"]  # 最终层
-
-# 提取目标层: [0, 6, 12, 18] + 最终层
-feat_list = []
-for layer_idx in [0, 6, 12, 18]:
-    feat_list.append(raw_interm[layer_idx]["features"][view_idx])
-feat_list.append(raw_final["features"][view_idx])
+# DINOv2 分支：拼接 batch 张量后 extract(...)
 ```
 
 **多尺度特征处理**（DPT 风格）：
@@ -221,66 +233,37 @@ features_flat, grid_H, grid_W = process_multiscale_features_to_grid(feat_list)
 
 ### 3. 反投影（2D 网格到 3D）
 
-**目的**：使用真实深度将网格分辨率特征转换为 3D 点。
+**目的**：使用真实深度将**与特征对齐的网格**上的点反投影到 3D，与 `mapanything.tasks.run_memory_extraction.generate_patch_point_cloud` 使用相同的网格与采样语义。
 
-**关键差异**：不是逐像素反投影，而是在**网格中心**采样深度。
+**关键差异**：不是全图逐像素，而是在 **grid_H×grid_W** 上与特征一一对应；深度张量先 **`normalize_depth_to_hw`**（处理 `[H,W,1]` / `[B,H,W]` 等），避免误用 `depth[0]` 只取一行。
 
-**数学公式**：
+**网格与 flatten 顺序**：使用 `meshgrid(..., indexing='ij')` 得到 `grid_v, grid_u`，再 `reshape(-1)`，与 `feat.permute(0,2,3,1).reshape(-1,C)` 的先行后列顺序一致。
 
-给定：
-- 深度图: Z[u, v] 在图像分辨率（如 518×518）
-- 相机内参: K (3x3 矩阵)
-- 相机位姿: T = [R | t] (4x4 矩阵)
-- 网格尺寸: grid_H × grid_W (如 37×37)
+**深度采样**（`--patch_depth_sampling`，与 `fps_memory` 的 `PATCH_DEPTH_SAMPLING` 一致）：
 
-**分步骤**：
+| 模式 | 行为 |
+|------|------|
+| `nearest` | `z = depth[gy, gx]`（整数格点，与单像素最近） |
+| `median` | 以网格为中心的 3×3 邻域深度的中位数 |
+| `nearest_valid` | 半径 **10** 像素窗口内，落在 `[depth_min, depth_max]` 且有限的深度的**中位数**；Indoor6 稀疏深度**推荐** |
 
-1. **创建网格中心坐标**：
-   ```
-   u_grid = linspace(0, img_W - 1, grid_W)
-   v_grid = linspace(0, img_H - 1, grid_H)
-   ```
+**数学公式（子步骤）**：
 
-2. **在网格中心采样深度**：
-   ```
-   z_sampled = depth[v_grid_int, u_grid_int]
-   ```
+给定深度图 `Z` 形状 `[H,W]`、内参 `K`、位姿 `T=[R|t]`、网格 `grid_H×grid_W`：
 
-3. **过滤有效深度**：
-   ```
-   valid_mask = (z_sampled > min_depth) & (z_sampled < max_depth)
-   ```
-
-4. **反投影到相机坐标**：
-   ```
-   x_cam = (u_valid - cx) * z_valid / fx
-   y_cam = (v_valid - cy) * z_valid / fy
-   P_cam = [x_cam, y_cam, z_valid]
-   ```
-
-5. **变换到世界坐标**：
-   ```
-   P_world = R * P_cam + t
-   ```
-
-6. **计算射线方向**：
-   ```
-   camera_center = -R^T * t
-   ray_dir = normalize(P_world - camera_center)
-   ```
-
-7. **采样颜色和特征**：
-   - 颜色：在网格中心进行双线性插值
-   - 特征：已在网格分辨率，过滤到有效点
+1. 生成网格中心 `(u, v)`（浮点，与 `ij` 网格一致）
+2. 按上表得到每格 `z_sampled`
+3. `valid_mask = (z > depth_min) & (z < depth_max)`
+4. `x_cam = (u - cx) * z / fx`，`y_cam = (v - cy) * z / fy`，`P_world = P_cam @ R.T + t`（实现与脚本中矩阵形状一致）
+5. `ray_dir = normalize(P_world - camera_center)`，`camera_center = -R^T t`
+6. **特征**：`features_flat[valid_mask]`（CPU/GPU 与 mask 对齐）；若 batch 含 `images` 键则对 RGB `grid_sample`，否则灰色占位
 
 **每个视图的输出**：
-- points: [N_valid, 3] - 有效的 3D 点（N_valid ≤ grid_H × grid_W）
-- features: [N_valid, ~5000] - 多尺度 DINOv2 特征
-- colors: [N_valid, 3] - RGB 颜色
-- ray_dirs: [N_valid, 3] - 单位射线方向
-- camera_centers: [N_valid, 3] - 相机中心（重复）
+- points: [N_valid, 3]
+- features: [N_valid, C_total]（多尺度拼接维度，通常为数千维而非单层 1024）
+- colors / ray_dirs / camera_centers 等同理
 
-**压缩**：基于网格的采样将点数减少约 196 倍（从 518×518 到 37×37）。
+**压缩**：网格点数约为 `grid_H*grid_W`（例如 37×37），相对全分辨率像素大幅减少。
 
 ### 4. BSE 池化
 
@@ -408,31 +391,23 @@ pooled_color = colors[mask].mean(dim=0)
 
 ```python
 for view_idx in range(M):
-    # 提取特征
-    features = dinov2(images[view_idx])
+    # 已由 infer 得到 features_dict[view_idx]; 与 raw_batches[view_idx] 深度对齐
+    features_flat, grid_H, grid_W = process_multiscale_features_to_grid(feat_list)
+    points, ray_dirs, colors, features_flat, camera_centers = unproject_with_grid_features(
+        batch_gpu, features_flat, grid_H, grid_W,
+        config.depth_valid_range,
+        sampling_method=config.patch_depth_sampling,
+    )
 
-    # 反投影到 3D
-    points, ray_dirs, colors, features, camera_centers = unproject(...)
-
-    # 可选: SOR 过滤
     if enable_sor:
         inliers = sor_filter(points)
         points = points[inliers]
+        # ... 同步过滤 features_flat / colors / ray_dirs
 
-    # BSE 池化
-    pooled = bse_pooler.pool(points, features, colors, ray_dirs, camera_centers)
-
-    # 累积统计
+    pooled = pooler.pool(points, features_flat, colors, ray_dirs, camera_centers=camera_centers)
     welford.update(pooled['points'])
-
-    # 收集视图级别的相机信息
-    view_info['camera_centers'].append(camera_center)
-    view_info['camera_rotations'].append(R)
-    view_info['camera_intrinsics'].append(K)
-    # ... 计算 Plücker 主射线
-
-    # 保存临时分块
-    torch.save(pooled, f"/dev/shm/chunk_{view_idx}.pt")
+    # ... 视图级相机与 Plücker
+    torch.save(pooled, os.path.join(config.temp_dir, f"chunk_{view_idx}.pt"))
 ```
 
 #### 第二遍：归一化 + 组装
@@ -539,40 +514,50 @@ L = (d, m)
 
 ## 使用示例
 
+**推荐（与仓库一致）**：在 `ace_depth` 根目录执行 `extract_memory.sh`，由脚本设置 `PYTHONPATH`、`CUDA_VISIBLE_DEVICES`、`OUTPUT_DIR` 及 `--depth_valid_range`、`--patch_depth_sampling` 等。
+
 ```bash
-python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
-    output/chess_memory.pt \
-    --n_memory 100 \
-    --voxel_size 0.05 \
-    --use_otsu \
-    --ray_pool_strategy mean \
+cd /home/xwh/project/ace_depth
+
+# 7-Scenes（WAI ROOT，与脚本默认 DATASET_ROOT 一致）
+bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+
+# Indoor6 + 稀疏深度默认 nearest_valid
+DATASET_TYPE=indoor6 SCENE_TRAIN=scene2a_train N_VIEWS=40 \
+  bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+```
+
+**直接调用 Python**（需自行保证 `PYTHONPATH` 含 `ace_depth` 与 `map-anything`；`dataset_path` 为 WAI 数据集 ROOT）：
+
+```bash
+python -u -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
+    /data/xwh/mapanything-dataset/wai_data/indoor6 \
+    /path/to/run_dir/memory_bse.pt \
+    --n_memory 40 \
+    --dataset_type indoor6 \
+    --scene_name scene2a_train \
+    --depth_valid_range 0.1 100 \
+    --patch_depth_sampling nearest_valid \
     --device cuda:0
 ```
 
-**预期输出**：
+**预期终端日志（节选，真实脚本）**：
 ```
-[BSE Memory] Dataset: /data/xwh/7Scenes/pgt_7scenes_chess
-[BSE Memory] Output: output/chess_memory.pt
-[BSE Memory] N_MEMORY: 100, BSE: True
-[BSE Memory] Voxel size: 0.05, Otsu: True
-[BSE Memory] Train dataset: 1000 samples
-[BSE Memory] Selected 100 views
-[BSE Memory] Using standalone DINOv2 extractor
+[BSE Memory] Dataset: ...
+[BSE Memory] Scene: scene2a_train (type=indoor6)
+[BSE Memory] Output: .../memory_bse.pt
+[Config] patch_depth_sampling: nearest_valid (align map-anything fps_memory: ...)
+[Config] Depth valid range: [0.100, 100.000] m
+[Data] Selected memory indices (40): [...]
+[Vis] Exporting depth/RGB validation under run dir: .../<timestamp>
 [BSE Memory] Extracting features...
 [BSE Memory] Two-pass processing...
 [Pass 1] Extracting and pooling...
-100%|████████████████████| 100/100
 [Pass 2] Normalizing and assembling...
-[Save] Memory saved to output/chess_memory.pt
-[Save] Schema version: 1.2
-[Save] Total points: 52341
-[Save] Feature dim: 1024
-[Save] Scene mean: [1.234, -0.567, 2.345]
-[Save] Scene sigma: 1.2345
-[Save] View count: 100
 [BSE Memory] Done!
 ```
+
+主输出旁会生成 `extraction_config.json`、`extraction_log.txt`，以及 `depth_validation/`、`model_input_vis/`（见 `README_zh.md`）。
 
 ---
 
@@ -611,38 +596,34 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 
 ## 故障排除
 
+### `ValueError: No points accumulated` / 网格有效点极少（Indoor6）
+
+- 确认 **`--patch_depth_sampling nearest_valid`**（`extract_memory.sh` 对 indoor6 已默认）且 **`--depth_valid_range`** 与数据一致（如 `0.1 100`）。
+- 确认深度为 `[H,W]` / `[H,W,1]` 等常见布局（已内置 `normalize_depth_to_hw`）。
+
 ### 内存不足
 
 ```bash
-# 减少记忆视图数量
---n_memory 50
+# 减少记忆视图数量（脚本用环境变量 N_VIEWS）
+N_VIEWS=20 bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
-# 增大体素大小（更粗糙的池化）
---voxel_size 0.08
-
-# 减少特征提取的批大小
-#（修改代码以较小的批次处理）
+# 或直接调用 Python
+--n_memory 20 --voxel_size 0.08
 ```
 
 ### 处理速度慢
 
 ```bash
-# 禁用 SOR 过滤
---enable_sor false
-
-# 使用更大的体素大小
---voxel_size 0.06
-
-# 禁用 Otsu（使用固定阈值）
---use_otsu false
+# 脚本默认不启用 SOR；若曾加 --enable_sor，可去掉该 flag
+# 增大体素（脚本环境变量 VOXEL_SIZE）
+VOXEL_SIZE=0.08 bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 ```
 
 ### 结果质量差
 
-- **边界模糊**：减小 `voxel_size`（例如 0.03）
-- **聚类太少**：减小 `voxel_size`
-- **聚类太多**：增大 `voxel_size`
-- **特征噪声**：启用 SOR 过滤 `--enable_sor`
+- **边界模糊**：减小 `VOXEL_SIZE` / `--voxel_size`
+- **聚类数量不合适**：同上调节体素
+- **特征噪声**：按需启用 SOR：`ENABLE_SOR=true bash ...`（对应 `--enable_sor`）
 
 ---
 

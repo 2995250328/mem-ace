@@ -7,7 +7,7 @@ This document provides a comprehensive explanation of the BSE (Bilateral Supervo
 The pipeline extracts a compressed scene representation from multi-view RGB-D data through:
 
 1. **View Selection**: Selecting optimal memory views from training data
-2. **Feature Extraction**: Extracting DINOv2 features from RGB images
+2. **Feature Extraction**: Extracting MapAnything multi-scale features from RGB images (default)
 3. **Unprojection**: Converting 2D pixels + depth to 3D points with ray directions
 4. **BSE Pooling**: Boundary-preserving bilateral clustering to compress point cloud
 5. **Normalization**: Global scene normalization using Welford's algorithm
@@ -178,33 +178,43 @@ The output is a `.pt` file containing:
 
 ### 2. Feature Extraction
 
-**Purpose**: Extract multi-scale semantic features from RGB images using MapAnything model.
+**Purpose**: Extract multi-scale semantic features from RGB images.
 
-**Model**: MapAnything (DINOv2 ViT-L/14 backbone with info-sharing)
-- Pretrained on large-scale image data
-- Outputs 24 intermediate layers + final layer
-- We use layers [0, 6, 12, 18, 24] for DPT-style multi-scale features
+**Default Model**: MapAnything (DINOv2 ViT-L/14 backbone + AAT 24 layers + DPT prediction head)
+- Unified pretrained model on large-scale data
+- Outputs 8 intermediate transformer layers (DPT-style) + final layer
+- Uses layers [2, 5, 8, 11, 14, 17, 20, 23] + final layer
 - Each layer outputs 1024-dimensional features
+
+**Fallback Model**: DINOv2 standalone
+- Automatically falls back when MapAnything unavailable
+- Uses same DPT-style multi-scale layers
+- Force via `USE_MODEL=dinov2` environment variable
 
 **Process**:
 ```python
-# MapAnything inference with intermediate feature storage
-model.infer(
-    input_views,
-    save_filename=temp_file,
-    memory_efficient_inference=True
-)
+# Default: use MapAnything
+if config.use_model == "mapanything":
+    from mapanything.models import init_model
+    # Manually build config (bypass Hydra)
+    model_config = build_manual_config()
+    model = init_model("mapanything", model_config)
 
-# Load saved features
-saved_data = torch.load(temp_file)
-raw_interm = saved_data["intermediate"]  # 24 layers
-raw_final = saved_data["final"]  # Final layer
+    # Inference
+    model.infer(input_views, save_filename=temp_file)
 
-# Extract target layers: [0, 6, 12, 18] + final
-feat_list = []
-for layer_idx in [0, 6, 12, 18]:
-    feat_list.append(raw_interm[layer_idx]["features"][view_idx])
-feat_list.append(raw_final["features"][view_idx])
+    # Load intermediate features
+    saved_data = torch.load(temp_file)
+    # Use 8 intermediate layers + final layer
+    target_layers = [2, 5, 8, 11, 14, 17, 20, 23]
+    feat_list = [saved_data["intermediate"][i] for i in target_layers]
+    feat_list.append(saved_data["final"])
+
+else:  # DINOv2 fallback
+    # Load DINOv2 model
+    dinov2 = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14")
+    # Extract features directly from intermediate blocks
+    feat_list = extract_dinov2_intermediate_features(dinov2, image)
 ```
 
 **Multi-scale feature processing** (DPT-style):
@@ -558,7 +568,7 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 [BSE Memory] Voxel size: 0.05, Otsu: True
 [BSE Memory] Train dataset: 1000 samples
 [BSE Memory] Selected 100 views
-[BSE Memory] Using standalone DINOv2 extractor
+[BSE Memory] Using MapAnything extractor (default)
 [BSE Memory] Extracting features...
 [BSE Memory] Two-pass processing...
 [Pass 1] Extracting and pooling...
