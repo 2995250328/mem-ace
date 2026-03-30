@@ -41,7 +41,7 @@
 | `mu` [3] | `scene_center` [3] | Direct rename |
 | — | `all_poses` | Construct from `view_camera_centers` + `view_camera_rotations` |
 | — | `all_intrinsics` | Map from `view_camera_intrinsics` |
-| — | `all_scale_tokens` | **Missing** — set to None |
+| `all_scale_tokens` [M,D] | `all_scale_tokens` [M,D] | Direct rename (now saved by BSE extraction) |
 | — | `layers_idx` | **Missing** — default to [] → num_layers=4 |
 
 ### BSE Fields NOT Used

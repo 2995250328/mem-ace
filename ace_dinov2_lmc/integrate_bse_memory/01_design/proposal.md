@@ -76,7 +76,7 @@
 3. Construct missing optional fields:
    - all_poses: Build [M, 3, 4] from view_camera_rotations + view_camera_centers (if available)
    - all_intrinsics: Map from view_camera_intrinsics (if available)
-   - all_scale_tokens: None (warn as missing, same as current behavior when absent)
+   - all_scale_tokens: Direct rename from BSE file (now saved by extraction pipeline)
    - layers_idx: [] (trainer defaults to num_layers=4)
 4. Validate shapes (reuse existing validation logic)
 5. Return same dict format as pooled path
@@ -118,7 +118,7 @@ If the user wants single-layer behavior (`num_layers=1`, `feature_dim=1024`), th
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | Feature dim mismatch (BSE 1024 vs expected) | Low | High | Validate in adapter, log feature_dim |
-| Missing all_scale_tokens changes LMC behavior | Medium | Low | Trainer already handles None gracefully (defaults to dim=1024) |
+| Missing all_scale_tokens changes LMC behavior | ~~Medium~~ Resolved | Low | BSE extraction now saves all_scale_tokens from CLS token |
 | Different point density changes visibility stats | Medium | Low | Auto-mode fallback will switch global→local if needed |
 | fp16→float32 precision loss | Very Low | Very Low | Features are already fp16 in old format too |
 | BSE file has 0 points (empty scene) | Low | High | Reuse existing empty-check in validation |
