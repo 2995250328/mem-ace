@@ -22,7 +22,7 @@ def main():
     parser = argparse.ArgumentParser(description="Verify DINOv2 buffer & training_step (same code as trainer)")
     parser.add_argument("scene", type=Path, help="Scene folder (e.g. datasets/7scenes/chess)")
     parser.add_argument("--dinov2_path", type=Path,
-                        default=Path("/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth"))
+                        default=Path("/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth"))
     parser.add_argument("--image_resolution", type=int, default=518)
     parser.add_argument("--buffer_batch_size", type=int, default=10,
                         help="Must match trainer (images per forward when filling buffer)")

@@ -84,7 +84,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Check if a scene folder is valid for DINOv2-ACE (train/test, rgb/poses/calibration)."
     )
-    parser.add_argument("scene", type=Path, help="Scene root (e.g. /data/xwh/Cambridge/GreatCourt)")
+    parser.add_argument("scene", type=Path, help="Scene root (e.g. /mnt/storage/xwh/Cambridge/GreatCourt)")
     args = parser.parse_args()
 
     print(f"检查场景: {args.scene}")

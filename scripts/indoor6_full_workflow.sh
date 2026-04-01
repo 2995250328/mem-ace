@@ -40,8 +40,8 @@ GPU_ACEG="${GPU_ACEG:-3}"
 N_VIEWS="${N_VIEWS:-40}"
 DATASET="${DATASET:-indoor6_dataset}"
 
-DATA_ROOT="${DATA_ROOT:-/data/xwh/indoor6_ace}"
-DINOV2_PATH="${DINOV2_PATH:-/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth}"
+DATA_ROOT="${DATA_ROOT:-/mnt/storage/xwh/indoor6_ace}"
+DINOV2_PATH="${DINOV2_PATH:-/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth}"
 
 do_extract() {
   if [ ! -d "$MAPANYTHING_ROOT" ]; then

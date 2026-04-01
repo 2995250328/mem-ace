@@ -531,7 +531,7 @@ DATASET_TYPE=indoor6 SCENE_TRAIN=scene2a_train N_VIEWS=40 \
 
 ```bash
 python -u -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /data/xwh/mapanything-dataset/wai_data/indoor6 \
+    /mnt/storage/xwh/mapanything-dataset/wai_data/indoor6 \
     /path/to/run_dir/memory_bse.pt \
     --n_memory 40 \
     --dataset_type indoor6 \

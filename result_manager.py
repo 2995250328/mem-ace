@@ -30,7 +30,7 @@ class ResultManager:
         从场景路径解析数据集和场景信息
 
         Args:
-            scene_path: 场景路径（如 /data/xwh/7scenes_chess 或 /data/xwh/indoor6_ace/scene3）
+            scene_path: 场景路径（如 /mnt/storage/xwh/7scenes_chess 或 /mnt/storage/xwh/indoor6_ace/scene3）
 
         Returns:
             {'dataset': str, 'scene': str}

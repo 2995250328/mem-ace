@@ -60,7 +60,7 @@ if __name__ == '__main__':
 
     # Required arguments
     parser.add_argument('scene', type=Path,
-                       help='Path to scene folder (e.g., /data/xwh/indoor6_ace/scene1/train)')
+                       help='Path to scene folder (e.g., /mnt/storage/xwh/indoor6_ace/scene1/train)')
     parser.add_argument('output_map', type=Path,
                        help='Output filename suffix (e.g. best.pt). 实际路径为 <experiment_root>/<dataset>/<scene>/<scene>_dinov2_ep*_bs*_<suffix>.pt')
 
@@ -70,7 +70,7 @@ if __name__ == '__main__':
 
     # DINOv2 settings
     parser.add_argument('--dinov2_path', type=Path,
-                       default=Path('/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth'),
+                       default=Path('/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth'),
                        help='Path to DINOv2 pretrained weights')
     parser.add_argument('--freeze_backbone', type=_strtobool, default=True,
                        help='Freeze DINOv2 backbone during training')

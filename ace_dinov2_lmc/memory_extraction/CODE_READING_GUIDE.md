@@ -472,7 +472,7 @@ class ExtractionConfig:
 {
     'schema_version': '1.2',
     'points': torch.Tensor,          # [N, 3] 归一化点云
-    'features': torch.Tensor,        # [N, C] 特征
+    'features': torch.Tensor,        # [N, C_total] 多尺度拼接特征 (C_total ~ 5000-9000, 非 1024)
     'colors': torch.Tensor,          # [N, 3] 颜色
     'ray_dirs': torch.Tensor,        # [N, 3] 射线方向
     'ray_dirs_dominant': torch.Tensor,  # [N, 3] 主方向

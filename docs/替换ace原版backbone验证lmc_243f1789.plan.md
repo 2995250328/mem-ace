@@ -237,7 +237,7 @@ class TrainerACELMC(TrainerACEDINOv2LMC):
 cd /home/xwh/project/ace_depth
 
 python train_ace_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_heads \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
     ace_heads_vanilla_baseline.pt \
     --experiment_root output \
     --encoder_path ace_encoder_pretrained.pt \
@@ -268,7 +268,7 @@ python train_ace_lmc.py \
 
 ```bash
 python train_ace_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_heads \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
     ace_heads_lmc.pt \
     --experiment_root output \
     --encoder_path ace_encoder_pretrained.pt \
@@ -295,7 +295,7 @@ python train_ace_lmc.py \
 ```bash
 # 使用 ACE encoder 提取 memory 特征
 python scripts/create_memory_bank.py \
-    /data/xwh/7Scenes/pgt_7scenes_heads \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
     output/7Scenes/pgt_7scenes_heads/memory_bank/heads_memory_ace.pt \
     --encoder_type ace \
     --encoder_path ace_encoder_pretrained.pt

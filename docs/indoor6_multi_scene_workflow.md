@@ -8,7 +8,7 @@
 
 | 项目 | 路径/说明 |
 |------|-----------|
-| **ACE 场景数据** | `/data/xwh/indoor6_ace/<scene>/`，`<scene>` = scene1, scene2a, scene3, scene4a, scene5, scene6 |
+| **ACE 场景数据** | `/mnt/storage/xwh/indoor6_ace/<scene>/`，`<scene>` = scene1, scene2a, scene3, scene4a, scene5, scene6 |
 | **Memory 提取脚本** | `map-anything/bash_scripts/ace/fps_memory.sh`，需在 **map-anything 项目根目录** 执行 |
 | **提取任务入口** | `map-anything/mapanything/tasks/run_memory_extraction.py`（由 fps_memory.sh 调用） |
 | **Memory 输出根目录** | `map-anything-experiments/memory_extract/` |
@@ -105,7 +105,7 @@ cd /home/xwh/project/ace_depth
 # 将 <SCENE> 换为 scene1, scene2a, scene3, scene4a, scene5, scene6
 # 将 <CUDA> 换为实际 GPU，如 cuda:2
 python train_ace_dinov2_lmc.py \
-    /data/xwh/indoor6_ace/<SCENE> \
+    /mnt/storage/xwh/indoor6_ace/<SCENE> \
     <SCENE>_vanilla_it28.pt \
     --experiment_root output \
     --device <CUDA> \
@@ -137,13 +137,13 @@ cd /home/xwh/project/ace_depth
 # <MEMORY_PT> = 该场景 Phase 1 得到的 .pt 完整路径（见 3.1）
 # <CUDA> = 如 cuda:3
 python train_ace_dinov2_lmc.py \
-    /data/xwh/indoor6_ace/<SCENE> \
+    /mnt/storage/xwh/indoor6_ace/<SCENE> \
     <SCENE>_aceg_full_refill.pt \
     --device <CUDA> \
     --run_name <SCENE>_aceg_full_refill \
     --use_lmc True \
     --memory_path <MEMORY_PT> \
-    --dinov2_path /data/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
+    --dinov2_path /mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
     --lmc_mode global \
     --num_latent_tokens 64 \
     --lmc_iterations 28 \

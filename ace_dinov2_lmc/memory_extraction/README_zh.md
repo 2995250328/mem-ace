@@ -11,12 +11,16 @@
 
 ## 快速开始
 
+<!-- Updated 2026-03-31: added ACE dataset loader examples -->
+
 ### 使用 Shell 脚本（推荐）
 
 ```bash
 cd /home/xwh/project/ace_depth
 
-# 7-Scenes chess，20 视角（默认配置）
+# === WAI 数据集（默认） ===
+
+# 7-Scenes chess，20 视角（默认配置，WAI 加载器）
 bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
 # 通过环境变量覆盖
@@ -25,26 +29,97 @@ SCENE_TRAIN=fire_train N_VIEWS=40 bash ace_dinov2_lmc/memory_extraction/extract_
 # Indoor6 场景
 DATASET_TYPE=indoor6 SCENE_TRAIN=scene2a_train N_VIEWS=40 bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
+# === ACE 数据集加载器（CamLocDatasetDINOv2） ===
+# 适用于任何含 rgb/、poses/、calibration/ 目录的场景（7-Scenes / Indoor6 / 自定义）
+#
+# 路径说明：
+#   DATASET_ROOT 指向 scene 根目录（如 pgt_7scenes_chess/），
+#   脚本会自动拼接 SCENE_TRAIN（如 train）形成最终 dataset_path（前提是根目录下没有 rgb/ 子目录）。
+#   若 DATASET_ROOT 下已有 rgb/，则不做拼接。
+
+# 7-Scenes chess — 脚本自动拼接 /train（pgt_7scenes_chess/ 下无 rgb/，但 pgt_7scenes_chess/train/ 下有）
+DATASET_LOADER=ace DATASET_ROOT=/mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
+  SCENE_TRAIN=train N_VIEWS=20 GPU_ID=0 \
+  bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+
+# 7-Scenes heads — 同上，自动拼接
+DATASET_LOADER=ace DATASET_ROOT=/mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
+  SCENE_TRAIN=train N_VIEWS=20 GPU_ID=0 \
+  bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+
+# Indoor6 scene2a — 同样格式（scene2a/ 下有 train/rgb/）
+DATASET_LOADER=ace DATASET_ROOT=/mnt/storage/xwh/indoor6_ace/scene2a \
+  SCENE_TRAIN=train N_VIEWS=40 GPU_ID=0 \
+  bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+
+# === 其他选项 ===
+
 # 消融实验：不同 voxel size
 VOXEL_SIZE=0.10 N_VIEWS=40 bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
 # 使用 DINOv2 fallback（默认是 MapAnything）
 USE_MODEL=dinov2 bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+
+# 关闭 SOR（默认已开启）
+ENABLE_SOR=false bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 ```
 
 ### 直接调用 Python
 
-`dataset_path` 应与 `extract_memory.sh` 中传给 Python 的根路径一致（一般为 WAI 的 `DATASET_ROOT`，而非某个硬编码的旧 7Scenes 路径）。
+**WAI 数据集：**
 
 ```bash
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /data/xwh/mapanything-dataset/wai_data/7scenes \
+    /mnt/storage/xwh/mapanything-dataset/wai_data/7scenes \
     /path/to/out/memory.pt \
     --n_memory 20 \
     --dataset_type 7scenes \
+    --dataset_loader wai \
     --patch_depth_sampling nearest \
+    --enable_sor \
     --device cuda:0
 ```
+
+**ACE 数据集（CamLocDatasetDINOv2）：**
+
+`dataset_path` 直接指向包含 `rgb/`、`poses/`、`depth/`、`calibration/` 的目录。注意与 WAI 不同，ACE 不需要 `--scene_name`。
+
+```bash
+# dataset_path 指向含 rgb/ 的目录（7-Scenes: pgt_7scenes_chess/train/）
+python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess/train \
+    /path/to/out/memory.pt \
+    --n_memory 20 \
+    --dataset_loader ace \
+    --enable_sor \
+    --device cuda:0
+
+# Indoor6: 同样直接指向 train/ 目录
+python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
+    /mnt/storage/xwh/indoor6_ace/scene2a/train \
+    /path/to/out/memory.pt \
+    --n_memory 40 \
+    --dataset_loader ace \
+    --enable_sor \
+    --depth_valid_range 0.02 100.0 \
+    --device cuda:0
+```
+
+### 两种数据集加载器的区别
+
+| 特性 | WAI (`--dataset_loader wai`) | ACE (`--dataset_loader ace`) |
+|------|---------------------------|---------------------------|
+| 数据格式 | MapAnything WAI 目录结构 | ACE CamLocDataset 格式 |
+| `dataset_path` | 数据集根目录（其下含各 scene 子目录） | **直接指向含 `rgb/`、`poses/` 的目录** |
+| 场景指定 | `--scene_name chess_train` | 无需额外指定 |
+| 深度来源 | WAI 格式 depth map（COLMAP sparse / GT） | ACE 格式 depth map |
+| 归一化 | MapAnything 风格 | ImageNet（DINOv2） |
+| Shell 自动拼接 | 不拼接（WAI 的 DATASET_ROOT 即数据集根） | 若 `DATASET_ROOT/` 下无 `rgb/`，自动拼接 `/${SCENE_TRAIN}` |
+| 适用数据 | `/mnt/storage/xwh/mapanything-dataset/wai_data/` | `/mnt/storage/xwh/7Scenes/pgt_7scenes_*/`、`/mnt/storage/xwh/indoor6_ace/*/` |
+
+**ACE 路径拼接规则**：Shell 脚本在 `DATASET_LOADER=ace` 时会检查 `DATASET_ROOT/rgb/` 是否存在：
+- 若存在 → 直接用 `DATASET_ROOT` 作为 `dataset_path`
+- 若不存在 → 拼接 `DATASET_ROOT/${SCENE_TRAIN}`（如 `pgt_7scenes_chess/train`）作为 `dataset_path`
 
 ## 与 map-anything `fps_memory.sh` 的对齐
 
@@ -106,15 +181,17 @@ memory_extract/
 | `SCENE_TRAIN` | `chess_train` | 提取用场景名 |
 | `SCENE_TEST` | 自动推导 | 测试场景名（从 `SCENE_TRAIN` 自动推导） |
 | `DATASET_ROOT` | 自动 | 数据集根目录（根据 `DATASET_TYPE` 自动设置） |
+| `DATASET_LOADER` | `wai` | 数据集加载器：`wai`=WAI 格式；`ace`=ACE CamLocDatasetDINOv2 |
 | `N_VIEWS` | `20` | 记忆视角数量 |
 | `GPU_ID` | `3` | GPU 编号（`CUDA_VISIBLE_DEVICES`） |
+| `DATASET_LOADER` | `wai` | 数据集加载器：`wai`（MapAnything WAI）或 `ace`（ACE CamLocDatasetDINOv2） |
 
 **数据集路径自动推导：**
 
 | DATASET_TYPE | `DATASET_PATH`（传给 Python 的根路径） | 说明 |
 |--------------|----------------------------------------|------|
-| `7scenes` | `/data/xwh/mapanything-dataset/wai_data/7scenes`（或 `DATASET_ROOT`） | `SCENE_TRAIN=chess_train` 等由数据集类解析 |
-| `indoor6` | `/data/xwh/mapanything-dataset/wai_data/indoor6`（或 `DATASET_ROOT`） | WAI Indoor6 ROOT；`SCENE_TRAIN=scene2a_train` 指定场景划分 |
+| `7scenes` | `/mnt/storage/xwh/mapanything-dataset/wai_data/7scenes`（或 `DATASET_ROOT`） | `SCENE_TRAIN=chess_train` 等由数据集类解析 |
+| `indoor6` | `/mnt/storage/xwh/mapanything-dataset/wai_data/indoor6`（或 `DATASET_ROOT`） | WAI Indoor6 ROOT；`SCENE_TRAIN=scene2a_train` 指定场景划分 |
 | `custom` | `$DATASET_ROOT` | 用户自定义 |
 
 **深度范围自动适配：**
@@ -146,7 +223,7 @@ memory_extract/
 | `USE_MODEL` | `mapanything` | 特征提取器：`mapanything`（默认）或 `dinov2` |
 | `USE_PATCH_BASED` | `false` | Patch 方式（网格）vs 双线性上采样 |
 | `USE_L2_NORMALIZATION` | `true` | 拼接前对特征做 L2 归一化 |
-| `DINOV2_CHECKPOINT` | `/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth` | DINOv2 权重（fallback 时使用） |
+| `DINOV2_CHECKPOINT` | `/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth` | DINOv2 权重（fallback 时使用） |
 
 ### 输出
 
@@ -170,7 +247,10 @@ memory_extract/
 | `--depth_valid_range` | 0.1 6.0 | 有效深度范围（最小 最大）；Indoor6 建议命令行与脚本一致设为 `0.1 100` |
 | `--patch_depth_sampling` | `nearest_valid` | `nearest` / `median` / `nearest_valid`，与 map-anything 网格深度语义一致 |
 | `--enable_sor` | 开关 | 启用 SOR 过滤 |
-| `--dinov2_checkpoint` | /data/xwh/checkpoints/... | DINOv2 权重（fallback 时使用） |
+| `--sor_k` | `20` | SOR 近邻个数 k |
+| `--sor_std_ratio` | `2.0` | SOR 标准差倍数阈值（越小越严格） |
+| `--dataset_loader` | `wai` | 数据集加载器：`wai`（MapAnything WAI 格式，需 `--scene_name`）或 `ace`（ACE CamLocDataset 格式，`dataset_path` 直接指向含 `rgb/` 的目录） |
+| `--dinov2_checkpoint` | /mnt/storage/xwh/checkpoints/... | DINOv2 权重（fallback 时使用） |
 | `--use_model` | `mapanything` | 特征提取器：`mapanything`（默认）或 `dinov2` |
 
 ## 输出格式

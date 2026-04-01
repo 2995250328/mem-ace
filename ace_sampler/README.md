@@ -61,7 +61,7 @@ Skip training entirely and evaluate a downloaded head directly:
 
 ```bash
 python test_ace.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/ace_models/7Scenes_pgt/pgt_7scenes_chess.pt \
     --device cuda:0
 ```
@@ -99,7 +99,7 @@ Results are saved to the same directory as the `.pt` file:
 
 ```bash
 python train_ace_sampler.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/ace_models/7Scenes_pgt/pgt_7scenes_chess.pt \
     chess_sampler.pt \
     --device cuda:0
@@ -110,7 +110,7 @@ python train_ace_sampler.py \
 
 ```bash
 python train_ace_sampler.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/ace_models/7Scenes_pgt/pgt_7scenes_chess.pt \
     chess_sampler_mc.pt \
     --device cuda:0 \
@@ -128,7 +128,7 @@ Pass `--eval_after_train False` to skip.
 
 ```bash
 python train_ace.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/chess_guided.pt \
     --sampler_path output/chess_sampler_mc.pt \
     --sampler_ratio 0.7
@@ -227,7 +227,7 @@ python train_ace_sampler_multi.py \
 
 ```bash
 python train_ace.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/chess_guided.pt \
     --sampler_path ace_sampler/04_evaluation/universal/<timestamp>_universal_sampler_all.pt \
     --sampler_ratio 0.7
@@ -279,7 +279,7 @@ Inspect what the trained SamplerNet has learned by overlaying its confidence map
 
 ```bash
 python ace_sampler/visualize_sampler.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/ace_models/7Scenes_pgt/pgt_7scenes_chess.pt \
     ace_sampler/04_evaluation/universal/<timestamp>_universal_sampler.pt \
     --out_dir ace_sampler/04_evaluation/vis_chess \

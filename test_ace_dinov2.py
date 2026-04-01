@@ -303,7 +303,7 @@ if __name__ == '__main__':
     parser.add_argument('network', type=Path, help='path to a network trained for the scene (just the head weights)')
 
     parser.add_argument('--dinov2_path', type=Path,
-                        default=Path('/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth'),
+                        default=Path('/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth'),
                         help='path to DINOv2 pretrained encoder weights')
 
     parser.add_argument('--session', '-sid', default='',

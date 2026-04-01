@@ -35,14 +35,14 @@
 
 ### 7-Scenes Chess (vanilla)
 ```bash
-python train_ace_lmc.py /data/xwh/7Scenes/pgt_7scenes_chess output/chess.pt \
+python train_ace_lmc.py /mnt/storage/xwh/7Scenes/pgt_7scenes_chess output/chess.pt \
     --encoder_path ace_encoder_pretrained.pt --device cuda:0 \
     --training_buffer_size 2560000 --epochs 24 --batch_size 5120
 ```
 
 ### Indoor6 Scene3 (LMC, surpasses ACE-G)
 ```bash
-./train_ace_lmc.py /data/xwh/indoor6_ace/scene3 scene3_lmc.pt \
+./train_ace_lmc.py /mnt/storage/xwh/indoor6_ace/scene3 scene3_lmc.pt \
     --encoder_path ace_encoder_pretrained.pt --device cuda:1 \
     --use_lmc True \
     --memory_path /path/to/Indoor6_scene3_train_pooled_GT.pt \

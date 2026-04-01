@@ -5,7 +5,7 @@ from pathlib import Path
 
 # --- 配置区域 ---
 # 源文件夹路径
-SOURCE_DIR = Path("/data/xwh/Cambridge/GreatCourt/seq1")
+SOURCE_DIR = Path("/mnt/storage/xwh/Cambridge/GreatCourt/seq1")
 # 目标文件夹路径 (注意：这里使用的是你要求的 ace_depth，如果是笔误请自行修改为 ace_depth)
 DEST_DIR = Path("/home/xwh/project/ace_depth/test_images")
 # 需要提取的图片数量

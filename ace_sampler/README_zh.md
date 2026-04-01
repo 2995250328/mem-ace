@@ -61,7 +61,7 @@ conf = exp(-(α × repro_error + β × mc_variance))
 
 ```bash
 python test_ace.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/ace_models/7Scenes_pgt/pgt_7scenes_chess.pt \
     --device cuda:0
 ```
@@ -93,7 +93,7 @@ python test_ace.py \
 
 ```bash
 python train_ace_sampler.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/ace_models/7Scenes_pgt/pgt_7scenes_chess.pt \
     chess_sampler.pt \
     --device cuda:0
@@ -104,7 +104,7 @@ python train_ace_sampler.py \
 
 ```bash
 python train_ace_sampler.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/ace_models/7Scenes_pgt/pgt_7scenes_chess.pt \
     chess_sampler_mc.pt \
     --device cuda:0 \
@@ -121,7 +121,7 @@ python train_ace_sampler.py \
 
 ```bash
 python train_ace.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/chess_guided.pt \
     --sampler_path output/chess_sampler_mc.pt \
     --sampler_ratio 0.7
@@ -216,7 +216,7 @@ python train_ace_sampler_multi.py \
 
 ```bash
 python train_ace.py \
-    /data/xwh/Cambridge/Cambridge_GreatCourt \
+    /mnt/storage/xwh/Cambridge/Cambridge_GreatCourt \
     output/GreatCourt_guided.pt \
     --device cuda:0 \
     --sampler_path ace_sampler/04_evaluation/universal/20260323_223249_universal_sampler_all.pt \
@@ -270,7 +270,7 @@ Part B 保证当前模型尚未学好的区域仍有机会被采到（冷启动�
 
 ```bash
 python ace_sampler/visualize_sampler.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/ace_models/7Scenes_pgt/pgt_7scenes_chess.pt \
     ace_sampler/04_evaluation/universal/20260323_223249_universal_sampler_all.pt \
     --out_dir ace_sampler/04_evaluation/vis_chess \

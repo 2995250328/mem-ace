@@ -24,7 +24,7 @@ When `--use_lmc False` (or `--memory_path` not provided):
 
 ## 📋 Dataset Verified
 
-- Path: `/data/xwh/7Scenes/pgt_7scenes_chess/`
+- Path: `/mnt/storage/xwh/7Scenes/pgt_7scenes_chess/`
 - Structure: train/ and test/ with rgb/, poses/, calibration/
 - Ready for training
 
@@ -36,7 +36,7 @@ source ~/miniforge3/bin/activate mapanything
 cd /home/xwh/project/ace_depth
 
 ./train_ace_dinov2_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/chess_vanilla.pt \
     --device cuda:0 \
     --use_lmc False
@@ -45,7 +45,7 @@ cd /home/xwh/project/ace_depth
 ### With LMC (requires pre-saved memory)
 ```bash
 ./train_ace_dinov2_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/chess_lmc.pt \
     --device cuda:0 \
     --use_lmc True \
@@ -57,7 +57,7 @@ cd /home/xwh/project/ace_depth
 ### Testing
 ```bash
 ./test_ace_dinov2_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/chess_lmc.pt \
     --device cuda:0
 ```

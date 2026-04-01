@@ -87,7 +87,7 @@ class TrainerACE:
         }
         self.depth_anything = DepthAnythingV2(**model_configs[self.options.depth_encoder])
         self.depth_anything.load_state_dict(
-            torch.load(f'/data/xwh/checkpoints/depth_anything_v2_{self.options.depth_encoder}.pth', map_location='cpu'))
+            torch.load(f'/mnt/storage/xwh/checkpoints/depth_anything_v2_{self.options.depth_encoder}.pth', map_location='cpu'))
         self.depth_anything = self.depth_anything.to(self.device).eval()
 
         # Optimizer & Scheduler

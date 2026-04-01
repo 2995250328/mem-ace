@@ -20,34 +20,83 @@
 set -e
 
 # =============================================================================
-# 配置参数
+# 配置参数（与 run_memory_extraction.py 的 ExtractionConfig / parse_args 对应）
 # =============================================================================
+# 说明：下方「环境变量」可通过命令行覆盖，例如：
+#   N_VIEWS=50 GPU_ID=0 USE_MODEL=dinov2 bash extract_memory.sh
+# 未传入 Python 的参数见各变量注释（如 USE_L2_NORMALIZATION 仅用于目录标签与 JSON 快照）。
 
 # --- 数据集与场景 ---
-# DATASET_TYPE: 7scenes | indoor6 | custom
-# SCENE_TRAIN:  场景名，如 chess_train, scene2a_train
-# SCENE_TEST:   测试场景名；留空则自动推断（chess_train → chess_test）
-# DATASET_LOADER: wai | ace  (数据集加载器：WAI格式或ACE格式)
+# DATASET_TYPE — 传给 --dataset_type：7scenes / indoor6 / custom（影响默认深度范围与采样默认值）
+# SCENE_TRAIN  — 传给 --scene_name：WAI 完整场景名，如 chess_train（含 _train 后缀）
+# SCENE_TEST   — 仅写入 extraction_config.json，供实验记录；Python 提取训练 memory 不直接使用
+# DATASET_LOADER — 传给 --dataset_loader：wai=WAI 目录结构；ace=ACE CamLocDatasetDINOv2
+# 约定：严格分流，不做自动检测。
+# - DATASET_LOADER=ace  => 仅走 ACE loader 逻辑
+# - DATASET_LOADER=wai  => 仅走 MapAnything/WAI loader 逻辑
 DATASET_TYPE="${DATASET_TYPE:-7scenes}"
 SCENE_TRAIN="${SCENE_TRAIN:-chess_train}"
 SCENE_TEST="${SCENE_TEST:-}"
 DATASET_LOADER="${DATASET_LOADER:-wai}"
 
-# --- 数据集根目录（根据 DATASET_TYPE 自动选择） ---
-# WAI 格式数据集的 ROOT 目录（包含 <scene>_train/ 子目录）
-# SevenScenesWAI(ROOT=..., specific_scene_name=chess_train, ...)
+# 清理场景名中的不可见字符（如复制粘贴带入的 zero-width space）
+SCENE_TRAIN="${SCENE_TRAIN//$'\u200b'/}"
+SCENE_TRAIN="${SCENE_TRAIN//$'\u200c'/}"
+SCENE_TRAIN="${SCENE_TRAIN//$'\u200d'/}"
+SCENE_TRAIN="${SCENE_TRAIN//$'\ufeff'/}"
+
+# --- 数据集根目录（根据 DATASET_TYPE 在未设置 DATASET_ROOT 时自动选择） ---
+# DATASET_PATH 将作为 Python 第一个位置参数：WAI 时为数据集 ROOT（其下含各 scene 子目录）
+# SevenScenesWAI(ROOT=DATASET_PATH, specific_scene_name=SCENE_TRAIN, ...)
 if [ -z "$DATASET_ROOT" ]; then
     case "$DATASET_TYPE" in
-        7scenes)  DATASET_ROOT="/data/xwh/mapanything-dataset/wai_data/7scenes" ;;
-        indoor6)  DATASET_ROOT="/data/xwh/mapanything-dataset/wai_data/indoor6" ;;
-        *)        DATASET_ROOT="/data/xwh" ;;
+        7scenes)  DATASET_ROOT="/mnt/storage/xwh/mapanything-dataset/wai_data/7scenes" ;;
+        indoor6)  DATASET_ROOT="/mnt/storage/xwh/mapanything-dataset/wai_data/indoor6" ;;
+        *)        DATASET_ROOT="/mnt/storage/xwh" ;;
     esac
 fi
 
-# --- DATASET_PATH = DATASET_ROOT（WAI dataset 的 ROOT） ---
+# DATASET_PATH — 与 Python 的 dataset_path 一致，默认等于 DATASET_ROOT
+# 当 DATASET_LOADER=ace 时，DATASET_PATH 需要直接指向含 rgb/ 的目录（如 scene/train/），
+# 脚本会在下方自动拼接 SCENE_TRAIN（若路径尚不含 rgb/ 子目录）
 DATASET_PATH="$DATASET_ROOT"
 
-# --- 自动推导 SCENE_TEST ---
+# --- ACE 数据集路径修正 ---
+# ACE 加载器 (CamLocDatasetDINOv2) 要求 dataset_path 直接指向含 rgb/ 的目录。
+# 若用户传入的是 scene 根目录（如 pgt_7scenes_chess/），自动拼接 /${SCENE_TRAIN}
+if [ "$DATASET_LOADER" = "ace" ]; then
+    if [ ! -d "$DATASET_PATH/rgb" ] && [ -d "$DATASET_PATH/${SCENE_TRAIN}/rgb" ]; then
+        DATASET_PATH="$DATASET_PATH/${SCENE_TRAIN}"
+        echo "[ACE loader] Auto-appended /${SCENE_TRAIN} → $DATASET_PATH"
+    fi
+fi
+
+# --- 严格分流校验（避免 wai/ace 路径混用） ---
+if [ "$DATASET_LOADER" = "ace" ]; then
+    if [ ! -d "$DATASET_PATH/rgb" ]; then
+        echo "ERROR: DATASET_LOADER=ace 但未找到 '$DATASET_PATH/rgb'"
+        echo "  请将 DATASET_ROOT/DATASET_PATH 指向 ACE 场景目录（包含 rgb/, poses/, depth/）。"
+        echo "  示例: DATASET_LOADER=ace DATASET_ROOT=/path/to/pgt_7scenes_chess SCENE_TRAIN=train ..."
+        exit 1
+    fi
+fi
+
+if [ "$DATASET_LOADER" = "wai" ]; then
+    if [ -d "$DATASET_PATH/rgb" ] || [ -d "$DATASET_PATH/train/rgb" ]; then
+        echo "ERROR: DATASET_LOADER=wai 但检测到 ACE 风格目录（rgb/）。"
+        echo "  当前路径更像 ACE 数据集，请改用 DATASET_LOADER=ace。"
+        echo "  示例: DATASET_LOADER=ace DATASET_ROOT=$DATASET_ROOT SCENE_TRAIN=$SCENE_TRAIN ..."
+        exit 1
+    fi
+    if [ ! -d "$DATASET_PATH/$SCENE_TRAIN" ]; then
+        echo "ERROR: DATASET_LOADER=wai 但场景目录不存在: $DATASET_PATH/$SCENE_TRAIN"
+        echo "  请检查 SCENE_TRAIN 是否拼写正确，且不包含不可见字符。"
+        echo "  常见值示例: chess_train, stairs_train, fire_train ..."
+        exit 1
+    fi
+fi
+
+# --- 自动推导 SCENE_TEST（仅文档/JSON，不参与 Python CLI）---
 if [ -z "$SCENE_TEST" ]; then
     case "$SCENE_TRAIN" in
         *_train) SCENE_TEST="${SCENE_TRAIN%_train}_test" ;;
@@ -57,66 +106,82 @@ if [ -z "$SCENE_TEST" ]; then
     esac
 fi
 
-# --- 推导场景短名（用于输出目录） ---
-SCENE_NAME="${SCENE_TRAIN%_train}"
+# SCENE_NAME — 输出目录的“场景名”层级
+# - WAI：通常直接用 SCENE_TRAIN 去掉 _train（chess_train → chess）
+# - ACE：很多数据集用 train/val/test 作为 split 目录名；此时用 SCENE_TRAIN 会导致输出落到 .../train/，
+#        不利于按真实场景归档。因此默认改为从 DATASET_ROOT 推导（例如 pgt_7scenes_chess → chess）。
+# 你也可以显式设置 OUTPUT_SCENE_NAME 来覆盖该逻辑。
+if [ -n "$OUTPUT_SCENE_NAME" ]; then
+    SCENE_NAME="$OUTPUT_SCENE_NAME"
+else
+    if [ "$DATASET_LOADER" = "ace" ] && { [ "$SCENE_TRAIN" = "train" ] || [ "$SCENE_TRAIN" = "val" ] || [ "$SCENE_TRAIN" = "test" ]; }; then
+        _base="$(basename "$DATASET_ROOT")"
+        # 常见前缀清理：pgt_7scenes_chess → chess
+        SCENE_NAME="${_base#pgt_7scenes_}"
+        SCENE_NAME="${SCENE_NAME#pgt_indoor6_}"
+        SCENE_NAME="${SCENE_NAME#pgt_}"
+    else
+        SCENE_NAME="${SCENE_TRAIN%_train}"
+    fi
+fi
 
-# --- Memory 视角数 ---
+# N_VIEWS — 传给 --n_memory：参与 memory 提取的帧数
 N_VIEWS="${N_VIEWS:-20}"
 
-# --- GPU ---
-GPU_ID="${GPU_ID:-3}"
+# GPU_ID — 仅设置 CUDA_VISIBLE_DEVICES；Python 仍使用 --device cuda:0（即「可见 GPU 列表中的第 0 块」）
+GPU_ID="${GPU_ID:-1}"
 
 # =============================================================================
-# 特征提取配置
+# 特征提取配置（映射到 Python 的同名/同类参数）
 # =============================================================================
 
-# BSE pooling
-VOXEL_SIZE="${VOXEL_SIZE:-0.05}"
+# VOXEL_SIZE — --voxel_size：BSE 体素边长（米）
+# USE_OTSU — 记录在 JSON；当前脚本未传 --use_otsu/--no-use_otsu，Python 默认 use_otsu=True
 USE_OTSU="${USE_OTSU:-true}"
-ENABLE_SOR="${ENABLE_SOR:-false}"
+VOXEL_SIZE="${VOXEL_SIZE:-0.05}"
+# ENABLE_SOR — 为 true 时追加 --enable_sor，并打开 SOR_K/STD（Python 内 sor_k、sor_std_ratio 用默认值）
+ENABLE_SOR="${ENABLE_SOR:-true}"
 
-# 深度有效范围（米）
-# 7Scenes: max=6.0 | Indoor6: max=100.0（COLMAP 稀疏深度，远距几何不裁）
+# DEPTH_MIN / DEPTH_MAX — 组成 --depth_valid_range：反投影保留的深度区间（米）
+# 7Scenes 常用 max=6.0；Indoor6 COLMAP 稀疏深度常用 max=100 避免裁掉远点
 if [ "$DATASET_TYPE" = "indoor6" ]; then
-    DEPTH_MIN="${DEPTH_MIN:-0.1}"
+    DEPTH_MIN="${DEPTH_MIN:-0.02}"
     DEPTH_MAX="${DEPTH_MAX:-100.0}"
-    # 与 map-anything fps_memory.sh 一致：稀疏深度在网格邻域内取有效深度中位数
+    # PATCH_DEPTH_SAMPLING — --patch_depth_sampling：Indoor6 默认 nearest_valid（邻域最近有效深度）
     PATCH_DEPTH_SAMPLING="${PATCH_DEPTH_SAMPLING:-nearest_valid}"
 else
-    DEPTH_MIN="${DEPTH_MIN:-0.1}"
+    DEPTH_MIN="${DEPTH_MIN:-0.02}"
     DEPTH_MAX="${DEPTH_MAX:-6.0}"
     PATCH_DEPTH_SAMPLING="${PATCH_DEPTH_SAMPLING:-nearest}"
 fi
 
-# 特征提取方式
+# USE_PATCH_BASED — --use_patch_based：是否走 patch 网格提取路径
 USE_PATCH_BASED="${USE_PATCH_BASED:-false}"
+# USE_L2_NORMALIZATION — 仅写入 config_tag 与 extraction_config.json；Python 当前未接 CLI（内部特征融合另有 apply_l2_norm 开关）
 USE_L2_NORMALIZATION="${USE_L2_NORMALIZATION:-true}"
 
-# Ray pooling策略
+# RAY_POOL_STRATEGY — --ray_pool_strategy：体素内视线方向池化（mean/dominant/first/all）
 RAY_POOL_STRATEGY="${RAY_POOL_STRATEGY:-mean}"
 
-# DINOv2 权重
-DINOV2_CHECKPOINT="${DINOV2_CHECKPOINT:-/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth}"
+# DINOV2_CHECKPOINT — --dinov2_checkpoint（脚本始终传入；mapanything 模式也会带上路径，Python 仅在 dinov2 模式使用）
+DINOV2_CHECKPOINT="${DINOV2_CHECKPOINT:-/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth}"
 
-# 特征提取模型选择
-# use_model: mapanything (默认，与 fps_memory.sh 对齐) | dinov2 (DPT-style 多尺度)
+# USE_MODEL — --use_model：mapanything | dinov2
 USE_MODEL="${USE_MODEL:-mapanything}"
 
-# MapAnything 模型配置（use_model=mapanything 时使用）
+# MODEL_STR / MODEL_CHECKPOINT — --model_str / --model_checkpoint（仅 USE_MODEL=mapanything 时追加）
+# MODEL_CONFIG — 可选；若设置则追加 --model_config（Hydra YAML 路径）
 MODEL_STR="${MODEL_STR:-mapanything_store_intermediates_ace}"
-MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-/data/xwh/checkpoints/facebook_map-anything.pth}"
+MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-/mnt/storage/xwh/checkpoints/facebook_map-anything.pth}"
 
-# DINOv2 多尺度配置（use_model=dinov2 时使用）
-# 中间层 block 索引，默认 DPT-style 8 层；留空使用默认值
+# DINOV2_INTERMEDIATE_LAYERS — 空格分隔的整数，传给 --dinov2_intermediate_layers；空则 Python 用默认 8 层
 DINOV2_INTERMEDIATE_LAYERS="${DINOV2_INTERMEDIATE_LAYERS:-}"
 
 # =============================================================================
-# 输出路径
+# 输出路径（与 Python 第二个位置参数 output_path 对应：memory_bse.pt）
 # =============================================================================
-# 结构: <OUTPUT_ROOT>/<scene>/<Nviews>_<config_tag>/<timestamp>/
-#   config_tag 编码关键配置：voxel size, patch/bilinear, sor
-# 例: memory_extraction/04_evaluation/memory_extract/chess/20v_v0.05_bilinear/<timestamp>/
-# 默认根目录为本脚本所在目录 memory_extraction/ 下的 04_evaluation/memory_extract
+# OUTPUT_DIR = OUTPUT_ROOT / SCENE_NAME / ${N_VIEWS}v_${CONFIG_TAG} / TIMESTAMP
+# CONFIG_TAG — 由 VOXEL_SIZE、USE_PATCH_BASED、ENABLE_SOR、USE_L2_NORMALIZATION 编码，便于区分实验目录
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-$(cd "$(dirname "$0")" && pwd)/04_evaluation/memory_extract}"
 
@@ -210,12 +275,15 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 # =============================================================================
-# 构建 Python 参数
+# 构建 Python 参数（与 python -m ... run_memory_extraction 一致）
 # =============================================================================
+# 未在此列出的 ExtractionConfig 项将使用 Python 默认值，例如：
+#   --temp_dir /dev/shm, --save_all_ray_strategies, pose_eval_*, --use_bse/--use_otsu 等
 PYTHON_ARGS=""
 PYTHON_ARGS="$PYTHON_ARGS $DATASET_PATH"
 PYTHON_ARGS="$PYTHON_ARGS $OUTPUT_FILE"
 PYTHON_ARGS="$PYTHON_ARGS --n_memory $N_VIEWS"
+# 固定 cuda:0：配合上方 CUDA_VISIBLE_DEVICES=$GPU_ID，即使用物理 GPU_ID 对应的那块卡
 PYTHON_ARGS="$PYTHON_ARGS --device cuda:0"
 PYTHON_ARGS="$PYTHON_ARGS --voxel_size $VOXEL_SIZE"
 PYTHON_ARGS="$PYTHON_ARGS --dataset_type $DATASET_TYPE"
@@ -226,6 +294,17 @@ PYTHON_ARGS="$PYTHON_ARGS --patch_depth_sampling $PATCH_DEPTH_SAMPLING"
 PYTHON_ARGS="$PYTHON_ARGS --dinov2_checkpoint $DINOV2_CHECKPOINT"
 PYTHON_ARGS="$PYTHON_ARGS --ray_pool_strategy $RAY_POOL_STRATEGY"
 PYTHON_ARGS="$PYTHON_ARGS --use_model $USE_MODEL"
+
+# Debug dump (optional)
+if [ "$DEBUG_DUMP" = "true" ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --debug_dump"
+    if [ -n "$DEBUG_DUMP_MAX_VIEWS" ]; then
+        PYTHON_ARGS="$PYTHON_ARGS --debug_dump_max_views $DEBUG_DUMP_MAX_VIEWS"
+    fi
+    if [ "$DEBUG_DUMP_SAVE_NPZ" = "true" ]; then
+        PYTHON_ARGS="$PYTHON_ARGS --debug_dump_save_npz"
+    fi
+fi
 
 if [ "$ENABLE_SOR" = "true" ]; then
     PYTHON_ARGS="$PYTHON_ARGS --enable_sor"

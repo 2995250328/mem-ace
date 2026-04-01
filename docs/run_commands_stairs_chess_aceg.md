@@ -10,13 +10,13 @@
 cd /home/xwh/project/ace_depth
 
 python train_ace_dinov2_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_stairs \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_stairs \
     stairs_aceg_full_refill.pt \
     --device cuda:2 \
     --run_name stairs_aceg_full_refill \
     --use_lmc True \
     --memory_path /home/xwh/project/map-anything-experiments/memory_extract/stairs_train/20views/20260126_234545/7Scenes_stairs_train_pooled_GT.pt \
-    --dinov2_path /data/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
+    --dinov2_path /mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
     --lmc_mode global \
     --num_latent_tokens 64 \
     --lmc_iterations 28 \
@@ -59,13 +59,13 @@ python train_ace_dinov2_lmc.py \
 cd /home/xwh/project/ace_depth
 
 python train_ace_dinov2_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     chess_aceg_full_refill.pt \
     --device cuda:3 \
     --run_name chess_aceg_full_refill \
     --use_lmc True \
     --memory_path /home/xwh/project/map-anything-experiments/memory_extract/chess_train/40views/20260227_232518/7Scenes_chess_train_pooled_GT_sparse_removal1000.pt \
-    --dinov2_path /data/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
+    --dinov2_path /mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
     --lmc_mode global \
     --num_latent_tokens 64 \
     --lmc_iterations 28 \

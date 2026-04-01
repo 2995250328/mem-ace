@@ -174,6 +174,117 @@ def load_memory_features(path: str, device: torch.device) -> Dict[str, Any]:
             return val.to(device)
         return val
 
+    # === BSE format detection ===
+    if "points" in payload and "features" in payload and "schema_version" in payload:
+        _logger.info("[LMC] Detected BSE memory format at %s", path)
+
+        def _to_tensor(x):
+            if isinstance(x, torch.Tensor):
+                return x.to(device)
+            return torch.tensor(x, device=device)
+
+        # Field mapping: BSE → pooled format
+        pooled_points = _to_tensor(payload["points"])
+        pooled_features = _to_tensor(payload["features"])
+
+        # Cast fp16 → fp32 if needed
+        if pooled_features.dtype == torch.float16:
+            pooled_features = pooled_features.float()
+
+        # Shape validation (reuse pooled logic)
+        if pooled_points.ndim != 2 or pooled_points.shape[1] < 3:
+            raise ValueError(
+                f"[LMC] BSE points has invalid shape {tuple(pooled_points.shape)}; expected (N, >=3)."
+            )
+        if pooled_features.ndim != 2:
+            raise ValueError(
+                f"[LMC] BSE features has invalid shape {tuple(pooled_features.shape)}; expected (N, D)."
+            )
+        N_pts = pooled_points.shape[0]
+        N_feats = pooled_features.shape[0]
+        if N_pts != N_feats:
+            raise ValueError(
+                f"[LMC] BSE points has {N_pts} rows but features has {N_feats}; they must match."
+            )
+        if N_pts == 0:
+            raise ValueError("[LMC] BSE memory has 0 points (empty).")
+
+        feature_dim = pooled_features.shape[1]
+
+        # NaN/Inf checks
+        if torch.isnan(pooled_points).any():
+            raise ValueError(f"[LMC] BSE points contains NaN values.")
+        if torch.isinf(pooled_points).any():
+            raise ValueError(f"[LMC] BSE points contains Inf values.")
+        if torch.isnan(pooled_features).any():
+            raise ValueError(f"[LMC] BSE features contains NaN values.")
+        if torch.isinf(pooled_features).any():
+            raise ValueError(f"[LMC] BSE features contains Inf values.")
+
+        # Map optional fields
+        pooled_colors = safe_to_device("colors")
+        scene_center = safe_to_device("mu")
+        all_scale_tokens = safe_to_device("all_scale_tokens")
+
+        # Construct all_poses from view metadata if available
+        all_poses = None
+        if "view_camera_rotations" in payload and "view_camera_centers" in payload:
+            rots = _to_tensor(payload["view_camera_rotations"])  # [M, 3, 3]
+            centers = _to_tensor(payload["view_camera_centers"])  # [M, 3]
+            if rots.ndim == 3 and centers.ndim == 2:
+                M = rots.shape[0]
+                all_poses = torch.zeros(M, 3, 4, device=device)
+                all_poses[:, :, :3] = rots
+                all_poses[:, :, 3] = centers
+
+        # Construct all_intrinsics if available
+        all_intrinsics = safe_to_device("view_camera_intrinsics")
+
+        # Point cloud stats
+        xyz = pooled_points[:, :3].float()
+        xyz_min = xyz.min(dim=0)[0]
+        xyz_max = xyz.max(dim=0)[0]
+        xyz_center = xyz.mean(dim=0)
+        xyz_range = xyz_max - xyz_min
+        _logger.info(
+            "[LMC] BSE memory: num_points=%d, feature_dim=%d, "
+            "xyz_range=(%.3f, %.3f, %.3f), xyz_center=(%.3f, %.3f, %.3f)",
+            N_pts, feature_dim,
+            float(xyz_range[0]), float(xyz_range[1]), float(xyz_range[2]),
+            float(xyz_center[0]), float(xyz_center[1]), float(xyz_center[2]),
+        )
+
+        _meta = {
+            "source_path": str(path),
+            "load_timestamp": time.time(),
+            "num_points": int(N_pts),
+            "feature_dim": int(feature_dim),
+            "format": "bse",
+            "schema_version": payload.get("schema_version", "unknown"),
+        }
+
+        t_elapsed = time.time() - t_start
+        _logger.info("[LMC] BSE memory loaded in %.2fs", t_elapsed)
+
+        return {
+            "type": "pooled",
+            "pooled_points": pooled_points,
+            "pooled_features": pooled_features,
+            "pooled_colors": pooled_colors,
+            "all_poses": all_poses,
+            "all_intrinsics": all_intrinsics,
+            "all_scale_tokens": all_scale_tokens,
+            "scene_center": scene_center,
+            "ref_pose": None,
+            "patch_stride": payload.get("patch_stride", 14.0),
+            "voxel_size": payload.get("voxel_size", 0.05),
+            "original_views": payload.get("n_views", 0),
+            "scene": payload.get("scene", "unknown"),
+            "layers_idx": [],
+            "_meta": _meta,
+        }
+
+    # === Pooled format detection ===
     if "pooled_points" in payload and "pooled_features" in payload:
         _logger.info("[LMC] Detected POOLED memory bank at %s", path)
         def _to_tensor(x):

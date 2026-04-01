@@ -31,7 +31,7 @@ The current LMC uses GeoLMC with pre-saved memory. Use the following patterns:
 
 ```bash
 MEMORY=/path/to/memory.pt
-SCENE=/data/xwh/7Scenes/pgt_7scenes_chess
+SCENE=/mnt/storage/xwh/7Scenes/pgt_7scenes_chess
 OUTPUT=output/ablation_mode
 
 for mode in global local hierarchical learned; do

@@ -12,7 +12,7 @@
 cd /home/xwh/project/ace_depth
 
 python train_ace_dinov2_lmc.py \
-    /data/xwh/indoor6_ace/scene1 \
+    /mnt/storage/xwh/indoor6_ace/scene1 \
     scene1_dino_iterbase.pt \
     --experiment_root output \
     --device cuda:2 \
@@ -43,7 +43,7 @@ python train_ace_dinov2_lmc.py \
 cd /home/xwh/project/ace_depth
 
 python train_ace_dinov2_lmc.py \
-    /data/xwh/indoor6_ace/scene1 \
+    /mnt/storage/xwh/indoor6_ace/scene1 \
     scene1_lmc_local.pt \
     --experiment_root output \
     --device cuda:3 \
@@ -70,6 +70,6 @@ python train_ace_dinov2_lmc.py \
 
 ## 说明
 
-- **数据路径**：`/data/xwh/indoor6_ace/scene1`
+- **数据路径**：`/mnt/storage/xwh/indoor6_ace/scene1`
 - **输出**：在 `--experiment_root output` 下为 hierarchical，即 `output/indoor6_ace/scene1/dino_ace_baseline/` 或 `dino_ace_lmc_s1s2/` 下带时间戳的 run 目录。
 - **Baseline** 与 **LMC** 的 buffer/迭代数/分辨率等一致，便于直接对比 pct5。

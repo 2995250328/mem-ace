@@ -42,18 +42,30 @@ ACE（加速坐标编码）结合 DINOv2 ViT-L/14 骨干网络与 GeoLMC（几�
 
 ### ACE-G flow（主要用法）
 
-实验中使用的标准配置，需要预构建的 pooled memory 文件（GT patch 格式）。
+<!-- Updated 2026-03-30: clarified memory file format and training stages -->
+实验中使用的标准配置，**需要预构建的 pooled memory 文件**（由 `memory_extraction/extract_memory.sh` 输出，通常命名为 `memory_bse.pt`）。部分旧脚本中 `*_GT_patch.pt` 命名指同一格式。
+
+**S1/S2 迭代训练说明：**
+- **S1（记忆对齐）**：训练 GeoLMC 压缩器 + 特征融合，将记忆与 backbone 特征对齐
+- **S2（重投影精化）**：在融合特征上训练回归头，使用重投影损失
+- 交替循环 `--lmc_iterations`（默认 28）轮，每轮结束后评估并保留最优 checkpoint
+
+**示例中未列出的常用参数：**
+- `--buffer_on_cpu True`：训练缓冲区放 CPU 节省显存（默认 True）
+- `--data_backend ace/wai`：数据集格式（默认 ace）
+- `--use_half True`：半精度训练（默认 True）
+- `--best_metric {pct5,pct10_5,composite,rt_error}`：最优 checkpoint 选择指标（默认 pct5）
 
 **7-Scenes 示例：**
 ```bash
 python train_ace_dinov2_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_heads \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
     heads_aceg_full_refill.pt \
     --device cuda:3 \
     --run_name heads_aceg_full_refill \
     --use_lmc True \
     --memory_path /home/xwh/project/map-anything-experiments/memory_extract/heads_train/20views/20260127_235757/7Scenes_heads_train_pooled_GT_patch.pt \
-    --dinov2_path /data/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
+    --dinov2_path /mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
     --lmc_flow ace_g \
     --lmc_mode global \
     --num_latent_tokens 64 \
@@ -89,14 +101,14 @@ python train_ace_dinov2_lmc.py \
 **Indoor6 示例**（大场景，额外加 `--lmc_scene_center_max_distance 4.0`）：
 ```bash
 python train_ace_dinov2_lmc.py \
-    /data/xwh/indoor6_ace/scene3 \
+    /mnt/storage/xwh/indoor6_ace/scene3 \
     scene3_aceg_full_refill.pt \
     --device cuda:3 \
     --run_name scene3_aceg_full_refill \
     --use_lmc True \
     --memory_path /home/xwh/project/map-anything-experiments/memory_extract/scene3_train/40views/20260315_105429/Indoor6_scene3_train_pooled_GT.pt \
     --lmc_scene_center_max_distance 4.0 \
-    --dinov2_path /data/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
+    --dinov2_path /mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
     --lmc_flow ace_g \
     --lmc_mode global \
     --num_latent_tokens 64 \
@@ -133,7 +145,7 @@ python train_ace_dinov2_lmc.py \
 
 ```bash
 python train_ace_dinov2_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     chess_vanilla.pt \
     --use_lmc False \
     --device cuda:0
@@ -143,7 +155,7 @@ python train_ace_dinov2_lmc.py \
 
 ```bash
 python test_ace_dinov2_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_heads \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
     output/.../best_K64_it28_heads_aceg_full_refill.pt \
     --device cuda:0 \
     --session lmc_test

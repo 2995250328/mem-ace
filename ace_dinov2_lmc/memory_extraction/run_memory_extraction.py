@@ -55,12 +55,55 @@ except Exception:
     _VIS_USE_MA = False
 
 
-def _fallback_save_pcd_with_open3d(points, filename, colors=None):
-    try:
-        import open3d as o3d  # type: ignore[import-not-found]
-    except ImportError:
-        print(f"[Vis] open3d not installed; skip PLY: {filename}", flush=True)
+def _colors_to_uint8_n3(colors: Any, n: int) -> Optional[np.ndarray]:
+    """Return [N,3] uint8 RGB or None if invalid."""
+    if colors is None:
+        return None
+    if isinstance(colors, torch.Tensor):
+        c = np.asarray(colors.detach().cpu().numpy())
+    else:
+        c = np.asarray(colors)
+    if c.size == 0 or c.shape[0] != n:
+        return None
+    if c.ndim == 1:
+        return None
+    if c.shape[-1] < 3:
+        return None
+    c = c.reshape(n, -1)[:, :3].astype(np.float64)
+    mx = float(np.nanmax(c)) if c.size else 0.0
+    if mx <= 1.01:
+        c = np.clip(c, 0.0, 1.0) * 255.0
+    else:
+        c = np.clip(c, 0.0, 255.0)
+    return c.astype(np.uint8)
+
+
+def _write_ply_ascii_xyz_rgb(points_np: np.ndarray, filename: str, colors_u8: Optional[np.ndarray]) -> None:
+    """Write ASCII PLY with x,y,z and optional uchar red,green,blue (no Open3D)."""
+    pts = np.asarray(points_np, dtype=np.float64).reshape(-1, 3)
+    n = pts.shape[0]
+    if n == 0:
         return
+    cu8 = colors_u8
+    if cu8 is not None and (cu8.shape[0] != n or cu8.shape[-1] != 3):
+        cu8 = None
+    with open(filename, "w", encoding="ascii") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {n}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        if cu8 is not None:
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        f.write("end_header\n")
+        for i in range(n):
+            x, y, z = pts[i]
+            if cu8 is not None:
+                r, g, b = int(cu8[i, 0]), int(cu8[i, 1]), int(cu8[i, 2])
+                f.write(f"{x:.6f} {y:.6f} {z:.6f} {r} {g} {b}\n")
+            else:
+                f.write(f"{x:.6f} {y:.6f} {z:.6f}\n")
+
+
+def _fallback_save_pcd_with_open3d(points, filename, colors=None):
     if isinstance(points, torch.Tensor):
         points_np = np.asarray(points.detach().cpu().numpy())
     else:
@@ -70,23 +113,36 @@ def _fallback_save_pcd_with_open3d(points, filename, colors=None):
         print(f"[Vis] Skipping PLY save (zero points): {filename}", flush=True)
         return
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_np.astype(np.float64))
+    points_np = points_np.reshape(-1, 3)
+    n = points_np.shape[0]
+    colors_u8 = _colors_to_uint8_n3(colors, n)
 
-    if colors is not None:
-        if isinstance(colors, torch.Tensor):
-            colors_np = np.asarray(colors.detach().cpu().numpy())
-        else:
-            colors_np = np.asarray(colors)
-        if colors_np.size > 0 and colors_np.shape[0] == points_np.shape[0]:
-            if np.nanmax(colors_np) > 1.1:
-                colors_np = colors_np / 255.0
-            colors_np = np.clip(colors_np, 0.0, 1.0)
-            pcd.colors = o3d.utility.Vector3dVector(colors_np.astype(np.float64))
+    o3d_ok = False
+    try:
+        import open3d as o3d  # type: ignore[import-not-found]
 
-    success = o3d.io.write_point_cloud(filename, pcd, write_ascii=False, print_progress=False)
-    if success:
-        print(f"[Vis] Point cloud saved to: {filename}", flush=True)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points_np.astype(np.float64))
+        if colors_u8 is not None:
+            c = (colors_u8.astype(np.float64) / 255.0)
+            pcd.colors = o3d.utility.Vector3dVector(np.clip(c, 0.0, 1.0))
+        success = o3d.io.write_point_cloud(filename, pcd, write_ascii=False, print_progress=False)
+        o3d_ok = bool(success)
+        if o3d_ok:
+            print(f"[Vis] Point cloud saved (Open3D): {filename}", flush=True)
+    except Exception as e:
+        print(f"[Vis] Open3D PLY failed ({type(e).__name__}: {e}); trying ASCII PLY...", flush=True)
+
+    if not o3d_ok:
+        try:
+            _write_ply_ascii_xyz_rgb(points_np, filename, colors_u8)
+            if os.path.isfile(filename) and os.path.getsize(filename) > 0:
+                suf = " with RGB" if colors_u8 is not None else ""
+                print(f"[Vis] Point cloud saved (ASCII PLY{suf}): {filename}", flush=True)
+            else:
+                print(f"[Vis] Failed to write PLY: {filename}", flush=True)
+        except Exception as e:
+            print(f"[Vis] ASCII PLY write failed ({type(e).__name__}: {e}): {filename}", flush=True)
 
 
 def _fallback_save_model_input_vis(img_tensor, save_path, percentile_low=2, percentile_high=98):
@@ -126,10 +182,25 @@ def _fallback_save_raw_rgb(rgb_data, save_path):
         if t.ndim != 3 or t.shape[2] not in (3, 4):
             return
         if t.dtype != np.uint8:
-            if t.max() <= 1.01:
-                t = (np.clip(t, 0, 1) * 255).astype(np.uint8)
+            # If the tensor looks like ImageNet-normalized (has negatives / mean around 0),
+            # unnormalize to [0,1] before saving; otherwise treat as [0,1] or [0,255].
+            t_f = t.astype(np.float32)
+            if np.isfinite(t_f).any() and (float(np.nanmin(t_f)) < -0.05 or float(np.nanmax(t_f)) > 1.5):
+                mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+                std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+                t_rgb = t_f[..., :3] * std[None, None, :] + mean[None, None, :]
+                t_rgb = np.clip(t_rgb, 0.0, 1.0)
+                if t_f.shape[2] == 4:
+                    a = np.clip(t_f[..., 3:4], 0.0, 1.0)
+                    t_f = np.concatenate([t_rgb, a], axis=2)
+                else:
+                    t_f = t_rgb
+                t = (t_f * 255.0).astype(np.uint8)
             else:
-                t = np.clip(t, 0, 255).astype(np.uint8)
+                if t_f.max() <= 1.01:
+                    t = (np.clip(t_f, 0, 1) * 255).astype(np.uint8)
+                else:
+                    t = np.clip(t_f, 0, 255).astype(np.uint8)
         PILImage.fromarray(t).save(save_path)
     except Exception as e:
         print(f"[Vis] Failed to save raw RGB to {save_path}: {e}", flush=True)
@@ -199,7 +270,98 @@ def _tensor_or_array_to_hw3_uint8(t: Any, H: int, W: int) -> Optional[np.ndarray
         return None
 
 
-def _save_depth_on_rgb_vis_dense(depth_np, save_dir, prefix, rgb_tensor=None, rgb_path=None, point_radius=6):
+def _save_turbo_depth_colorbar_png(
+    d_min: float, d_max: float, out_path: str, label: str = "depth (m)"
+) -> None:
+    """Standalone vertical colorbar: turbo colormap ↔ depth value (meters)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib as mpl
+    except ImportError:
+        return
+    fig, ax = plt.subplots(figsize=(1.35, 4.8))
+    cmap = plt.get_cmap("turbo")
+    norm = mpl.colors.Normalize(vmin=float(d_min), vmax=float(d_max))
+    mpl.colorbar.ColorbarBase(ax, cmap=cmap, norm=norm, orientation="vertical")
+    ax.set_ylabel(label, fontsize=9)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_depth_overlay_with_colorbar_png(
+    overlay_rgb_u8: np.ndarray,
+    d_min: float,
+    d_max: float,
+    out_path: str,
+    title: str = "depth on RGB (turbo)",
+) -> None:
+    """Side-by-side: RGB overlay image + turbo colorbar (depth in meters)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib as mpl
+    except ImportError:
+        return
+    if overlay_rgb_u8.ndim != 3 or overlay_rgb_u8.shape[2] != 3:
+        return
+    H, W = overlay_rgb_u8.shape[:2]
+    fig_w = max(9.0, min(16.0, W / 95.0 + 1.4))
+    fig_h = max(5.0, min(14.0, H / 95.0))
+    fig = plt.figure(figsize=(fig_w, fig_h))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 0.07], wspace=0.08)
+    ax0 = fig.add_subplot(gs[0, 0])
+    ax0.imshow(overlay_rgb_u8)
+    ax0.axis("off")
+    ax0.set_title(title, fontsize=10)
+    ax1 = fig.add_subplot(gs[0, 1])
+    cmap = plt.get_cmap("turbo")
+    norm = mpl.colors.Normalize(vmin=float(d_min), vmax=float(d_max))
+    cb = mpl.colorbar.ColorbarBase(ax1, cmap=cmap, norm=norm, orientation="vertical")
+    cb.set_label("depth (m)", fontsize=9)
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _compute_dynamic_depth_range(
+    depth_np: np.ndarray,
+    valid: np.ndarray,
+    q_low: float = 2.0,
+    q_high: float = 98.0,
+) -> Tuple[float, float]:
+    """Compute per-view depth range using percentiles over valid pixels.
+
+    This makes small depth ranges visually discriminative (avoids a nearly-flat colormap).
+    """
+    if depth_np.size == 0 or not np.any(valid):
+        return 0.0, 1.0
+    d = depth_np[valid].astype(np.float64)
+    d = d[np.isfinite(d)]
+    if d.size == 0:
+        return 0.0, 1.0
+    lo = float(np.percentile(d, q_low))
+    hi = float(np.percentile(d, q_high))
+    if not np.isfinite(lo):
+        lo = float(np.nanmin(d))
+    if not np.isfinite(hi):
+        hi = float(np.nanmax(d))
+    if hi <= lo:
+        hi = lo + 1e-3
+    return lo, hi
+
+
+def _save_depth_on_rgb_vis_dense(
+    depth_np,
+    save_dir,
+    prefix,
+    rgb_tensor=None,
+    rgb_path=None,
+    point_radius=6,
+    d_min: Optional[float] = None,
+    d_max: Optional[float] = None,
+):
     """
     Dense-depth fast path: turbo colormap on full H×W + PIL (same palette as map-anything).
     """
@@ -222,10 +384,8 @@ def _save_depth_on_rgb_vis_dense(depth_np, save_dir, prefix, rgb_tensor=None, rg
         PILImage.fromarray(gray_bg).save(os.path.join(save_dir, f"{prefix}_depth_on_rgb.png"))
         return
 
-    d_min = float(depth_np[valid].min())
-    d_max = float(depth_np[valid].max())
-    if d_max <= d_min:
-        d_max = d_min + 1.0
+    if d_min is None or d_max is None:
+        d_min, d_max = _compute_dynamic_depth_range(depth_np, valid, q_low=2.0, q_high=98.0)
 
     norm = np.zeros((H, W), dtype=np.float32)
     norm[valid] = (depth_np[valid].astype(np.float32) - d_min) / (d_max - d_min)
@@ -255,7 +415,120 @@ def _save_depth_on_rgb_vis_dense(depth_np, save_dir, prefix, rgb_tensor=None, rg
     ov = depth_rgb.astype(np.float32)
     blended = np.where(valid[:, :, None], comp * (1.0 - alpha) + ov * alpha, comp)
     on_rgb = np.clip(blended, 0.0, 255.0).astype(np.uint8)
-    PILImage.fromarray(on_rgb).save(os.path.join(save_dir, f"{prefix}_depth_on_rgb.png"))
+    out_combined = os.path.join(save_dir, f"{prefix}_depth_on_rgb.png")
+    # Combined: overlay + colorbar in one image (no separate bar file).
+    _save_depth_overlay_with_colorbar_png(
+        on_rgb, d_min, d_max, out_combined,
+        title=f"{prefix} depth on RGB (dense turbo)",
+    )
+
+
+def _save_depth_on_rgb_vis_scatter_local(
+    depth_np,
+    save_dir,
+    prefix,
+    rgb_tensor=None,
+    rgb_path=None,
+    point_radius=6,
+    d_min: Optional[float] = None,
+    d_max: Optional[float] = None,
+):
+    """
+    Local scatter-style visualization for sparse depth (Indoor6).
+    Matches map-anything behaviour: draw colored depth points over RGB with a radius,
+    so sparse depth does not look like "no overlay".
+    """
+    try:
+        from PIL import Image as PILImage
+        from PIL import ImageDraw
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[Vis] PIL/matplotlib not installed; skip depth-on-RGB figures", flush=True)
+        return
+
+    H, W = depth_np.shape
+    valid = (depth_np > 0) & np.isfinite(depth_np)
+    gray_bg = np.full((H, W, 3), 240, dtype=np.uint8)
+
+    # Resolve RGB background
+    rgb_bg = gray_bg.copy()
+    if rgb_path and os.path.exists(rgb_path):
+        try:
+            rgb_bg = np.array(PILImage.open(rgb_path).convert("RGB"))
+            if rgb_bg.shape[:2] != (H, W):
+                rgb_bg = np.array(PILImage.fromarray(rgb_bg).resize((W, H), resample=PILImage.BILINEAR))
+        except Exception:
+            rgb_bg = gray_bg.copy()
+    elif rgb_tensor is not None:
+        arr = _tensor_or_array_to_hw3_uint8(rgb_tensor, H, W)
+        if arr is not None:
+            rgb_bg = arr
+
+    if not np.any(valid):
+        PILImage.fromarray(gray_bg).save(os.path.join(save_dir, f"{prefix}_depth_vis.png"))
+        PILImage.fromarray(rgb_bg).save(os.path.join(save_dir, f"{prefix}_depth_on_rgb.png"))
+        return
+
+    ys, xs = np.nonzero(valid)
+    d = depth_np[ys, xs].astype(np.float32)
+    if d_min is None or d_max is None:
+        d_min, d_max = _compute_dynamic_depth_range(depth_np, valid, q_low=2.0, q_high=98.0)
+    t = np.clip((d - d_min) / (d_max - d_min), 0.0, 1.0)
+
+    cmap = plt.get_cmap("turbo")
+    colors = (np.clip(cmap(t)[:, :3], 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    # Depth-only visualization: draw points on gray background
+    depth_vis_img = PILImage.fromarray(gray_bg)
+    draw_depth = ImageDraw.Draw(depth_vis_img)
+
+    # Depth-on-RGB visualization: draw points on RGB
+    on_rgb_img = PILImage.fromarray(rgb_bg)
+    draw_on = ImageDraw.Draw(on_rgb_img)
+
+    # Make sparse points visually salient:
+    # - draw a colored ring (not a 1px dot)
+    # - add a high-contrast outline so points remain visible on dark/bright areas
+    n_valid = int(len(xs))
+    # adaptive radius for sparse depth: keep it visible even when n_valid is tiny
+    r = int(max(point_radius, 4 if n_valid < 2_000 else 3))
+    r_out = int(max(r + 2, r))
+    outline_dark = (0, 0, 0)
+    outline_light = (255, 255, 255)
+
+    for (y, x), c in zip(zip(ys.tolist(), xs.tolist()), colors.tolist()):
+        col = tuple(int(v) for v in c)
+        # Solid dot with high-contrast outline:
+        # 1) outer black filled disk (halo)
+        x0, y0 = x - r_out, y - r_out
+        x1, y1 = x + r_out, y + r_out
+        draw_depth.ellipse([x0, y0, x1, y1], outline=None, fill=outline_dark)
+        draw_on.ellipse([x0, y0, x1, y1], outline=None, fill=outline_dark)
+        # 2) inner white filled disk (thin rim for contrast)
+        x0, y0 = x - (r_out - 1), y - (r_out - 1)
+        x1, y1 = x + (r_out - 1), y + (r_out - 1)
+        draw_depth.ellipse([x0, y0, x1, y1], outline=None, fill=outline_light)
+        draw_on.ellipse([x0, y0, x1, y1], outline=None, fill=outline_light)
+        # 3) main colored filled disk
+        x0, y0 = x - r, y - r
+        x1, y1 = x + r, y + r
+        draw_depth.ellipse([x0, y0, x1, y1], outline=None, fill=col)
+        draw_on.ellipse([x0, y0, x1, y1], outline=None, fill=col)
+
+    out_vis = os.path.join(save_dir, f"{prefix}_depth_vis.png")
+    out_combined = os.path.join(save_dir, f"{prefix}_depth_on_rgb.png")
+    depth_vis_img.save(out_vis)
+
+    # Combined: overlay + colorbar in one image (no separate bar file).
+    _save_depth_overlay_with_colorbar_png(
+        np.asarray(on_rgb_img),
+        d_min,
+        d_max,
+        out_combined,
+        title=f"{prefix} depth on RGB (sparse scatter)",
+    )
 
 
 def _save_depth_on_rgb_vis(depth_np, save_dir, prefix, rgb_tensor=None, rgb_path=None, point_radius=6):
@@ -265,21 +538,22 @@ def _save_depth_on_rgb_vis(depth_np, save_dir, prefix, rgb_tensor=None, rgb_path
     """
     valid = (depth_np > 0) & np.isfinite(depth_np)
     n_valid = int(np.sum(valid))
-    if _MA_DEPTH_SCATTER is not None and n_valid <= _SCATTER_SAFE_MAX_VALID:
-        _MA_DEPTH_SCATTER(
+    # Use per-view dynamic depth range for the colorbar to make small depth variations visible.
+    d_min, d_max = _compute_dynamic_depth_range(depth_np, valid, q_low=2.0, q_high=98.0)
+
+    # Prefer scatter for sparse depth; dense colormap for very dense valid masks.
+    if n_valid <= _SCATTER_SAFE_MAX_VALID:
+        _save_depth_on_rgb_vis_scatter_local(
             depth_np, save_dir, prefix,
             rgb_tensor=rgb_tensor, rgb_path=rgb_path, point_radius=point_radius,
+            d_min=d_min, d_max=d_max,
         )
         return
-    if _MA_DEPTH_SCATTER is not None and n_valid > _SCATTER_SAFE_MAX_VALID:
-        print(
-            f"[Vis] {prefix}: {n_valid} valid depth pixels (>{_SCATTER_SAFE_MAX_VALID}) — "
-            f"using dense turbo colormap (map-anything scatter would be too slow here)",
-            flush=True,
-        )
+
     _save_depth_on_rgb_vis_dense(
         depth_np, save_dir, prefix,
         rgb_tensor=rgb_tensor, rgb_path=rgb_path, point_radius=point_radius,
+        d_min=d_min, d_max=d_max,
     )
 
 
@@ -325,13 +599,18 @@ def export_memory_views_visualization(
         if isinstance(depth, (list, tuple)):
             depth = depth[0]
         if isinstance(depth, torch.Tensor):
-            depth = depth.detach().float().cpu()
-            depth = normalize_depth_to_hw(depth).numpy()
+            depth_np = depth.detach().float().cpu()
+            depth_np = normalize_depth_to_hw(depth_np).numpy()
         else:
-            depth = np.asarray(depth, dtype=np.float32).squeeze()
-        if depth.ndim != 2:
-            print(f"[Vis] view_{i:02d}: depth squeeze to 2D failed, shape={depth.shape}; skip", flush=True)
+            depth_np = np.asarray(depth, dtype=np.float32).squeeze()
+        if depth_np.ndim != 2:
+            print(f"[Vis] view_{i:02d}: depth squeeze to 2D failed, shape={depth_np.shape}; skip", flush=True)
             continue
+
+        # Clamp depth used for visualization / raw PLY to the configured valid range.
+        depth_vis_np = depth_np.copy()
+        invalid_mask = (~np.isfinite(depth_vis_np)) | (depth_vis_np <= depth_min) | (depth_vis_np >= depth_max)
+        depth_vis_np[invalid_mask] = 0.0
 
         intr = raw_data.get("camera_intrinsics", raw_data.get("intrinsics"))
         pose = raw_data.get("camera_pose", raw_data.get("pose"))
@@ -341,15 +620,54 @@ def export_memory_views_visualization(
             pose = pose[0]
         if intr is not None and pose is not None:
             n_pts, pts_world = _raw_depth_to_point_cloud_count(
-                depth, intr, pose, depth_min=depth_min, depth_max=depth_max
+                depth_vis_np, intr, pose, depth_min=depth_min, depth_max=depth_max
             )
             raw_depth_point_counts.append((i, n_pts))
             if i == 0 and pts_world is not None and len(pts_world) > 0:
                 raw_ply_path = os.path.join(depth_vis_dir, "view_00_raw_depth_pointcloud.ply")
-                save_pcd_with_open3d(torch.from_numpy(pts_world), raw_ply_path, colors=None)
-                print(f"[Vis] View 0: raw depth -> {n_pts} points (range [{depth_min}, {depth_max}] m), saved to {raw_ply_path}", flush=True)
+                colors_for_ply = None
+                try:
+                    # Try to align colors with the same valid-depth mask used in
+                    # _raw_depth_to_point_cloud_count (ravel() row-major order).
+                    H, W = depth_vis_np.shape
+                    rgb_img = None
+                    if rgb_tensor is not None:
+                        rgb_img = _tensor_or_array_to_hw3_uint8(rgb_tensor, H, W)
+                    if rgb_img is None and rgb_raw is not None:
+                        # rgb_raw may be PIL/numpy/tensor; best-effort conversion
+                        if hasattr(rgb_raw, "convert"):
+                            from PIL import Image as PILImage  # local import for safety
+                            rgb_img = np.asarray(rgb_raw.convert("RGB"))
+                        else:
+                            rgb_img = np.asarray(rgb_raw)
+                    if rgb_img is not None and rgb_img.ndim == 3 and rgb_img.shape[2] >= 3:
+                        rgb_img = rgb_img[:, :, :3]
+                        valid_depth = (depth_vis_np > depth_min) & (depth_vis_np < depth_max) & np.isfinite(depth_vis_np)
+                        valid_flat = valid_depth.reshape(-1)
+                        rgb_flat = rgb_img.reshape(-1, 3)
+                        if valid_flat.shape[0] == rgb_flat.shape[0] and valid_flat.sum() > 0:
+                            colors_for_ply = rgb_flat[valid_flat]
+                except Exception:
+                    # 颜色兜底：保持 None，不影响深度/RGB 的导出
+                    colors_for_ply = None
+                try:
+                    save_pcd_with_open3d(
+                        torch.from_numpy(pts_world),
+                        raw_ply_path,
+                        colors=(torch.from_numpy(colors_for_ply) if colors_for_ply is not None else None),
+                    )
+                    if os.path.isfile(raw_ply_path) and os.path.getsize(raw_ply_path) > 0:
+                        print(
+                            f"[Vis] View 0: raw depth -> {n_pts} points (range [{depth_min}, {depth_max}] m), saved to {raw_ply_path}",
+                            flush=True,
+                        )
+                    else:
+                        print(f"[Vis] View 0: PLY not written (empty/missing): {raw_ply_path}", flush=True)
+                except Exception as e:
+                    # 点云可视化失败不应影响后续 depth/RGB 图片导出
+                    print(f"[Vis] View 0 PLY export failed ({type(e).__name__}: {e}); continue", flush=True)
 
-        _save_depth_on_rgb_vis(depth, depth_vis_dir, f"view_{i:02d}", rgb_tensor=rgb_tensor, rgb_path=rgb_path)
+        _save_depth_on_rgb_vis(depth_vis_np, depth_vis_dir, f"view_{i:02d}", rgb_tensor=rgb_tensor, rgb_path=rgb_path)
 
     if raw_depth_point_counts:
         raw_counts_only = [c for _, c in raw_depth_point_counts]
@@ -390,36 +708,73 @@ CHECKPOINT_FILE = "extraction_checkpoint.json"
 
 @dataclass
 class ExtractionConfig:
-    """Configuration for memory extraction."""
+    """Memory 提取流水线配置（与 parse_args / extract_memory.sh 一一对应）。
+
+    数据流概览：load_dataset → select_memory_views → prepare_batch_input →
+    特征提取器(MapAnything/DINOv2) → 反投影+BSE 体素池化 → save_memory。
+    """
+
+    # 数据集根目录（WAI 时为含各 scene 子目录的 ROOT；ace loader 时为 ACE 数据根）
     dataset_path: str
+    # 输出的 memory 文件路径（通常为 .pt，含特征与元数据）
     output_path: str
+    # 参与提取的 memory 视角数量（均匀从训练集中抽样）
     n_memory: int = 100
+    # PyTorch 设备，如 cuda:0（配合 shell 中 CUDA_VISIBLE_DEVICES 时，0 表示可见的第一块卡）
     device: str = "cuda:0"
+    # BSE 体素边长（米）；越小点越密、显存/时间越大
     voxel_size: float = 0.05
+    # 是否使用 BSE（边界感知）池化；当前关闭会 NotImplementedError
     use_bse: bool = True
+    # BSE 内是否用 Otsu 自动估计深度分箱阈值（与稀疏/噪声深度相关）
     use_otsu: bool = True
+    # 反投影与可视化时保留的深度范围 (min_m, max_m)，单位米
     depth_valid_range: Tuple[float, float] = (0.1, 6.0)
-    # Grid depth sampling (same semantics as map-anything generate_patch_point_cloud / fps_memory.sh)
+    # 网格中心深度采样：与 map-anything generate_patch_point_cloud / fps_memory 语义一致
+    # nearest_valid 适合 Indoor6 稀疏深度；nearest 适合稠密 GT；median 为 3×3 邻域
     patch_depth_sampling: str = "nearest_valid"
+    # 两遍处理时 chunk/checkpoint 临时目录（建议 /dev/shm 加速 IO）
     temp_dir: str = "/dev/shm"
+    # MapAnything Hydra 模型名（如 mapanything_store_intermediates_ace）
     model_str: Optional[str] = None
+    # 自定义 YAML 配置路径；None 时用内置 default
     model_config: Optional[str] = None
+    # MapAnything 权重 .pth；None 时 main 里可能有默认路径
     model_checkpoint: Optional[str] = None
-    dinov2_checkpoint: str = "/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth"
+    # DINOv2 预训练权重路径（仅 use_model=dinov2）
+    dinov2_checkpoint: str = "/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth"
+    # 是否走 patch 网格提取路径（与双线性采样路径二选一语义）
     use_patch_based: bool = False
+    # 是否对反投影点云做统计离群点剔除（SOR）
     enable_sor: bool = False
+    # SOR：每个点的 k 近邻数量
     sor_k: int = 20
+    # SOR：距离超过 mean + ratio*std 的点剔除
     sor_std_ratio: float = 2.0
+    # 数据集类型：auto 则 detect_dataset_type；或 7scenes/indoor6/custom
     dataset_type: str = "auto"
-    scene_name: Optional[str] = None  # WAI scene name (e.g. chess_train, scene2a_train)
-    dataset_loader: str = "wai"  # 'wai' (MapAnything WAI) or 'ace' (CamLocDatasetDINOv2)
-    ray_pool_strategy: str = "mean"  # 'mean', 'dominant', 'first', 'all'
-    save_all_ray_strategies: bool = True  # Save all ray representations for comparison
-    use_model: str = "mapanything"  # 'mapanything', 'dinov2' — feature extractor to use
-    dinov2_intermediate_layers: Optional[List[int]] = None  # DINOv2 block indices for DPT-style multi-scale; None=auto [2,5,8,11,14,17,20,23]
-    # Post-infer pose check (same logic as mapanything/tasks/run_memory_extraction.py Prediction Evaluation)
+    # WAI 场景名（如 chess_train）；None 时用 dataset_path  basename
+    scene_name: Optional[str] = None
+    # 加载器：wai=MapAnything WAI 格式；ace=CamLocDatasetDINOv2（ACE 管线）
+    dataset_loader: str = "wai"
+    # 体素内多条视线方向池化：mean/dominant/first/all
+    ray_pool_strategy: str = "mean"
+    # 是否保存多种 ray 表示供对比（BSEPooler）
+    save_all_ray_strategies: bool = True
+    # 特征骨干：mapanything（与 fps_memory 对齐）或 dinov2（DPT 式多尺度）
+    use_model: str = "mapanything"
+    # DINOv2 取的 block 索引列表；None 则默认 8 层 [2,5,8,11,14,17,20,23]
+    dinov2_intermediate_layers: Optional[List[int]] = None
+    # MapAnything infer 后：预测位姿相对 GT 的平移阈值（米），用于 OK/HIGH 分级
     pose_eval_translation_ok_m: float = 0.1
-    pose_eval_strict: bool = False  # If True, exit non-zero when any non-ref view exceeds translation threshold
+    # 为 True 时：任一非参考视角超阈值则进程以退出码 1 结束
+    pose_eval_strict: bool = False
+    # Debug：将关键中间数据/统计 dump 到输出目录（用于对齐 ace vs wai）
+    debug_dump: bool = False
+    # Debug：最多 dump 前 N 个视角（避免目录过大）
+    debug_dump_max_views: int = 3
+    # Debug：是否额外保存少量数值快照（npz），体积更大
+    debug_dump_save_npz: bool = False
 
 
 # =============================================================================
@@ -461,7 +816,8 @@ class MapAnythingExtractor:
     """
 
     # Target intermediate layers for multi-scale feature extraction
-    TARGET_INTERM_LAYERS = [2, 5, 8, 11, 14, 17, 20, 23]
+    # Must match original MapAnything: [0, 6, 12, 18] + final = 5 layers × 768 = 3840D
+    TARGET_INTERM_LAYERS = [0, 6, 12, 18]
 
     def __init__(self, model_str: str = "mapanything", model_config: str = "default",
                  checkpoint: Optional[str] = None, device: str = "cuda:0"):
@@ -526,7 +882,7 @@ class MapAnythingExtractor:
                 "size": "large",
                 "with_registers": False,
                 "uses_torch_hub": False,
-                "pretrained_checkpoint_path": "/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth",
+                "pretrained_checkpoint_path": "/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth",
                 "gradient_checkpointing": False,
             },
             "info_sharing_config": {
@@ -717,15 +1073,35 @@ class MapAnythingExtractor:
                 'cls_token': None,  # Populated below
             }
 
-            # Extract CLS / scale token from raw_final (same as map-anything's additional_token_features)
+            # CLS / scale / register tokens from raw_final (align with map-anything ace/utils.py):
+            # - additional_token_features: fused scale token, often batch dim 1 for the whole MV batch
+            # - additional_token_features_per_view: list of per-view tensors (preferred when present)
             if raw_final:
-                token_feat = None
-                if isinstance(raw_final, dict) and "additional_token_features" in raw_final:
-                    token_feat = raw_final["additional_token_features"]
-                elif hasattr(raw_final, 'additional_token_features'):
-                    token_feat = raw_final.additional_token_features
-                if token_feat is not None and isinstance(token_feat, torch.Tensor):
-                    result[i]['cls_token'] = token_feat[i].detach().cpu().view(-1)
+                tpv = None
+                if isinstance(raw_final, dict):
+                    tpv = raw_final.get("additional_token_features_per_view")
+                if tpv is None and hasattr(raw_final, "additional_token_features_per_view"):
+                    tpv = raw_final.additional_token_features_per_view
+                if tpv is not None and isinstance(tpv, (list, tuple)) and i < len(tpv):
+                    tv = tpv[i]
+                    if isinstance(tv, torch.Tensor):
+                        result[i]["cls_token"] = tv.detach().cpu().view(-1)
+                else:
+                    token_feat = None
+                    if isinstance(raw_final, dict) and "additional_token_features" in raw_final:
+                        token_feat = raw_final["additional_token_features"]
+                    elif hasattr(raw_final, "additional_token_features"):
+                        token_feat = raw_final.additional_token_features
+                    if token_feat is not None and isinstance(token_feat, torch.Tensor):
+                        tb = token_feat.shape[0]
+                        if tb >= n_views:
+                            result[i]["cls_token"] = token_feat[i].detach().cpu().view(-1)
+                        elif tb == 1:
+                            # Fused scale token: same for all views
+                            result[i]["cls_token"] = token_feat[0].detach().cpu().view(-1)
+                        else:
+                            idx = min(i, tb - 1)
+                            result[i]["cls_token"] = token_feat[idx].detach().cpu().view(-1)
 
         return result
 
@@ -771,15 +1147,34 @@ class DINOv2Extractor:
         self.model = self._load_dinov2(checkpoint_path)
 
     def _load_dinov2(self, checkpoint_path: str) -> torch.nn.Module:
-        """Load DINOv2 model."""
-        try:
-            # Try torch.hub first
-            model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
-        except Exception:
-            # Fallback to local checkpoint
-            model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=False)
-            state = torch.load(checkpoint_path, map_location='cpu')
+        """Load DINOv2 model, preferring local checkpoint to avoid hub compatibility issues."""
+        if os.path.exists(checkpoint_path):
+            print(f"[DINOv2] Loading from local checkpoint: {checkpoint_path}")
+            # Build model from cached hub code but skip downloading weights
+            try:
+                model = torch.hub.load(
+                    'facebookresearch/dinov2', 'dinov2_vitl14',
+                    pretrained=False, verbose=False
+                )
+            except (TypeError, SyntaxError, Exception) as e:
+                print(f"[DINOv2] Hub load failed ({e}), building DINOv2 from timm")
+                import timm
+                model = timm.create_model('vit_large_patch14_dinov2', pretrained=False, dynamic_img_size=True)
+            state = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+            # Handle different checkpoint formats
+            if isinstance(state, dict) and 'state_dict' in state:
+                state = state['state_dict']
+            # Convert any half-precision weights to float32 for consistency
+            state = {k: v.float() if v.is_floating_point() else v for k, v in state.items()}
             model.load_state_dict(state, strict=False)
+        else:
+            try:
+                model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
+            except (TypeError, SyntaxError, Exception) as e:
+                raise RuntimeError(
+                    f"DINOv2 hub load failed ({e}) and no local checkpoint at {checkpoint_path}. "
+                    "Please provide a valid --dinov2_checkpoint path."
+                )
 
         model = model.to(self.device)
         model.eval()
@@ -828,9 +1223,18 @@ class DINOv2Extractor:
                 # Run full forward — hooks capture intermediate outputs
                 out = self.model.forward_features(images)
 
-                # Also get the final layer's patch tokens (after norm)
-                x_norm_patchtokens = out["x_norm_patchtokens"]  # [B, N, C]
-                x_norm_clstoken = out.get("x_norm_clstoken")    # [B, C] or None
+                # Handle both dict (facebookresearch/dinov2 hub) and tensor (timm) returns
+                n_registers = getattr(self.model, 'num_register_tokens', 0)
+                n_prefix = 1 + n_registers  # CLS + registers
+
+                if isinstance(out, dict):
+                    # facebookresearch/dinov2 hub format
+                    x_norm_patchtokens = out["x_norm_patchtokens"]  # [B, N, C]
+                    x_norm_clstoken = out.get("x_norm_clstoken")    # [B, C] or None
+                else:
+                    # timm format: [B, N_total, C] where N_total = 1(CLS) + N_patches
+                    x_norm_clstoken = out[:, 0]                     # [B, C]
+                    x_norm_patchtokens = out[:, 1:]                  # [B, N, C]
 
                 # Collect hooked intermediate features
                 # Strip CLS token (and register tokens) from intermediate outputs
@@ -845,10 +1249,9 @@ class DINOv2Extractor:
                         else:
                             layer_outputs[idx] = raw
 
-                # For the last block (if not already hooked), use the normed output
-                last_idx = self.intermediate_layers[-1]
-                if last_idx not in layer_outputs or len(layer_outputs[last_idx]) == 0:
-                    layer_outputs[last_idx] = x_norm_patchtokens
+                # Always add final layer (x_norm_patchtokens) as a separate feature
+                # This matches MapAnything's behavior: intermediate layers + final
+                layer_outputs['final'] = x_norm_patchtokens
 
             # Build result per view
             features_dict = {}
@@ -972,9 +1375,15 @@ def prepare_batch_input(
         img_raw = img_raw[0]
 
     if isinstance(img_raw, np.ndarray):
-        img = torch.from_numpy(img_raw).to(device)
+        img = torch.from_numpy(img_raw)
     else:
-        img = img_raw.to(device)
+        img = img_raw
+
+    # Force float32 BEFORE device transfer (ACE path may have float16)
+    if isinstance(img, torch.Tensor) and img.dtype != torch.float32:
+        img = img.float()
+
+    img = img.to(device)
 
     if img.ndim == 3:
         img = img.unsqueeze(0)
@@ -1181,7 +1590,10 @@ def print_pose_prediction_vs_gt(
 
 def process_multiscale_features_to_grid(
     feat_list: List[torch.Tensor],
-    apply_l2_norm: bool = False
+    apply_l2_norm: bool = False,
+    patch_size: int = 14,
+    img_H: Optional[int] = None,
+    img_W: Optional[int] = None,
 ) -> Tuple[torch.Tensor, int, int]:
     """
     Process multi-scale features (DPT-style): align to max grid resolution and concatenate.
@@ -1208,31 +1620,65 @@ def process_multiscale_features_to_grid(
         if feat.ndim == 2:
             # (N, C) -> (1, C, H, W) — single-view features from DINOv2 hooks
             N, C = feat.shape
+            # Strip CLS token if present (try N-1 as perfect square/rect)
+            _strip_cls_single = False
             S = int(math.sqrt(N))
+            if S * S != N:
+                # Try stripping 1 CLS token
+                N_minus = N - 1
+                S_m = int(math.sqrt(N_minus))
+                if S_m * S_m == N_minus:
+                    N = N_minus
+                    _strip_cls_single = True
+                    S = S_m
             if S * S == N:
                 H_p, W_p = S, S
             else:
-                # Try aspect ratio
+                # Try aspect ratio (non-square grid, e.g. 37×49)
                 W_p = int(math.sqrt(N))
                 H_p = N // W_p
                 if H_p * W_p != N:
-                    H_p, W_p = S, S
+                    # Try stripping CLS for rect
+                    N_minus = N - 1 if not _strip_cls_single else N
+                    W_p = int(math.sqrt(N_minus))
+                    H_p = N_minus // W_p
+                    if H_p * W_p == N_minus:
+                        N = N_minus
+                        _strip_cls_single = True
+                    else:
+                        H_p, W_p = S, S  # fallback
+            if _strip_cls_single:
+                feat = feat[1:]  # strip CLS
             feat = feat.reshape(1, C, H_p, W_p)
 
         elif feat.ndim == 3:
             # (B, L, C) -> (B, C, H, W)
             B, L, C = feat.shape
-            # Try to infer spatial dimensions
+            # Strip CLS token if present
+            _strip_cls_batch = False
             S = int(math.sqrt(L))
+            if S * S != L:
+                L_minus = L - 1
+                S_m = int(math.sqrt(L_minus))
+                if S_m * S_m == L_minus:
+                    L = L_minus
+                    _strip_cls_batch = True
+                    S = S_m
             if S * S == L:
                 H_p, W_p = S, S
             else:
-                # Try aspect ratio
-                ratio = 1.0
-                W_p = int(math.sqrt(L / ratio))
+                # Try aspect ratio (non-square grid)
+                W_p = int(math.sqrt(L))
                 H_p = L // W_p
                 if H_p * W_p != L:
-                    H_p, W_p = S, S
+                    L_minus = L - 1 if not _strip_cls_batch else L
+                    W_p = int(math.sqrt(L_minus))
+                    H_p = L_minus // W_p
+                    if H_p * W_p == L_minus:
+                        L = L_minus
+                        _strip_cls_batch = True
+                    else:
+                        H_p, W_p = S, S  # fallback
             feat = feat.transpose(1, 2).reshape(B, C, H_p, W_p)
 
         if feat.ndim == 4:
@@ -1439,22 +1885,47 @@ def unproject_with_grid_features(
     ray_dirs = F.normalize(ray_dirs, dim=-1, eps=1e-6)
 
     # Extract colors at grid centers
-    if 'images' in view_data:
-        rgb = view_data['images'][0]  # [3, H, W]
+    # Prefer `images` (same contract as map-anything). If absent, try common keys.
+    if 'images' in view_data or 'img' in view_data or 'image' in view_data:
+        rgb = None
+        if 'images' in view_data:
+            rgb = view_data['images'][0]  # [3, H, W]
+        elif 'img' in view_data:
+            rgb = view_data['img']
+            if rgb.ndim == 4:
+                rgb = rgb[0]
+        elif 'image' in view_data:
+            rgb = view_data['image']
+            if rgb.ndim == 4:
+                rgb = rgb[0]
+
+        # Ensure [3,H,W] and match depth resolution
+        if rgb is not None and isinstance(rgb, torch.Tensor):
+            if rgb.ndim == 3 and rgb.shape[0] == 3:
+                pass
+            elif rgb.ndim == 3 and rgb.shape[-1] == 3:
+                rgb = rgb.permute(2, 0, 1)
+            else:
+                rgb = None
+        if rgb is not None and isinstance(rgb, torch.Tensor) and rgb.shape[-2:] != (img_H, img_W):
+            rgb = F.interpolate(rgb.unsqueeze(0), size=(img_H, img_W), mode='bilinear', align_corners=False)[0]
         # Sample colors using bilinear interpolation
         # Normalize u, v to [-1, 1] for grid_sample
         u_norm = 2.0 * grid_u[valid_mask] / (img_W - 1) - 1.0
         v_norm = 2.0 * grid_v[valid_mask] / (img_H - 1) - 1.0
         grid_coords = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0).unsqueeze(0)  # [1, 1, N, 2]
-        rgb_dev = rgb.unsqueeze(0).to(depth.device)
-        grid_coords = grid_coords.to(depth.device)
+        if rgb is None:
+            colors = torch.ones(len(pts_world), 3, device=depth.device) * 0.5
+        else:
+            rgb_dev = rgb.unsqueeze(0).to(depth.device)
+            grid_coords = grid_coords.to(depth.device)
 
-        rgb_sampled = F.grid_sample(
-            rgb_dev, grid_coords,
-            mode='bilinear', align_corners=False, padding_mode='border'
-        )  # [1, 3, 1, N]
+            rgb_sampled = F.grid_sample(
+                rgb_dev, grid_coords,
+                mode='bilinear', align_corners=False, padding_mode='border'
+            )  # [1, 3, 1, N]
 
-        colors = rgb_sampled[0, :, 0, :].T  # [N, 3]
+            colors = rgb_sampled[0, :, 0, :].T  # [N, 3]
     else:
         colors = torch.ones(len(pts_world), 3, device=depth.device) * 0.5
 
@@ -1672,8 +2143,24 @@ def two_pass_processing(
     # Check for resume
     completed_views, existing_chunks = load_checkpoint(checkpoint_path)
     if completed_views:
-        print(f"[Resume] Found {len(completed_views)} completed views")
-        chunk_paths = existing_chunks
+        # Validate checkpoint: /dev/shm is volatile and chunk files may be missing.
+        existing_chunks = [p for p in existing_chunks if isinstance(p, str)]
+        missing = [p for p in existing_chunks if not os.path.exists(p)]
+        if missing:
+            print(
+                f"[Resume] Checkpoint found but {len(missing)}/{len(existing_chunks)} chunk files are missing; "
+                f"discarding resume state and restarting.",
+                flush=True,
+            )
+            completed_views = []
+            chunk_paths = []
+            try:
+                os.remove(checkpoint_path)
+            except Exception:
+                pass
+        else:
+            print(f"[Resume] Found {len(completed_views)} completed views", flush=True)
+            chunk_paths = existing_chunks
 
     try:
         # Pass 1: Extract + pool + accumulate
@@ -1715,6 +2202,77 @@ def two_pass_processing(
                     if isinstance(val, (list, tuple)): val = val[0]
                     if isinstance(val, np.ndarray): val = torch.from_numpy(val)
                     if isinstance(val, torch.Tensor): batch_gpu[key] = val.to(device)
+
+            # Add RGB for color sampling (required for colored PLY, esp. Indoor6).
+            # Prefer raw uint8 if present; otherwise fall back to processed model input.
+            if "images" not in batch_gpu:
+                img_src = raw_batch.get("img_uint8", raw_batch.get("img", raw_batch.get("image")))
+                if isinstance(img_src, (list, tuple)):
+                    img_src = img_src[0] if img_src else None
+                img_t = None
+                if isinstance(img_src, torch.Tensor):
+                    img_t = img_src.detach()
+                elif isinstance(img_src, np.ndarray):
+                    img_t = torch.from_numpy(img_src)
+                if img_t is None and isinstance(view_data, dict) and "img" in view_data and isinstance(view_data["img"], torch.Tensor):
+                    img_t = view_data["img"].detach()
+
+                if img_t is not None:
+                    # Normalize to float [0,1], shape [1,3,H,W]
+                    if img_t.ndim == 4:
+                        img_t = img_t[0]
+                    if img_t.ndim == 3 and img_t.shape[0] == 3:
+                        pass
+                    elif img_t.ndim == 3 and img_t.shape[-1] == 3:
+                        img_t = img_t.permute(2, 0, 1)
+                    else:
+                        img_t = None
+                if img_t is not None:
+                    img_t = img_t.to(device).float()
+                    if img_t.max() > 1.01:
+                        img_t = img_t / 255.0
+                    img_t = torch.clamp(img_t, 0.0, 1.0)
+                    batch_gpu["images"] = img_t.unsqueeze(0)
+
+            # Provide RGB to unprojection for colored PLY (used by unproject_with_grid_features via 'images')
+            # Keep this strictly local to visualization/color sampling; does not affect model inputs.
+            if "images" not in batch_gpu:
+                rgb_src = raw_batch.get("img_uint8", raw_batch.get("img", raw_batch.get("image")))
+                if isinstance(rgb_src, (list, tuple)):
+                    rgb_src = rgb_src[0] if rgb_src else None
+                try:
+                    if rgb_src is not None:
+                        if hasattr(rgb_src, "convert"):
+                            rgb_np = np.asarray(rgb_src.convert("RGB"))
+                            rgb_t = torch.from_numpy(rgb_np)
+                        elif isinstance(rgb_src, np.ndarray):
+                            rgb_t = torch.from_numpy(rgb_src)
+                        elif isinstance(rgb_src, torch.Tensor):
+                            rgb_t = rgb_src
+                        else:
+                            rgb_t = torch.as_tensor(rgb_src)
+
+                        # Normalize layout to [1,3,H,W]
+                        if rgb_t.ndim == 4:
+                            rgb_t = rgb_t[0]
+                        if rgb_t.ndim == 3 and rgb_t.shape[0] == 3:
+                            rgb_chw = rgb_t
+                        elif rgb_t.ndim == 3 and rgb_t.shape[-1] in (3, 4):
+                            rgb_chw = rgb_t[..., :3].permute(2, 0, 1)
+                        else:
+                            rgb_chw = None
+
+                        if rgb_chw is not None:
+                            rgb_chw = rgb_chw.contiguous()
+                            if rgb_chw.dtype != torch.float32:
+                                rgb_chw = rgb_chw.float()
+                            if rgb_chw.max() > 1.1:
+                                rgb_chw = rgb_chw / 255.0
+                            rgb_chw = torch.clamp(rgb_chw, 0.0, 1.0)
+                            batch_gpu["images"] = rgb_chw.unsqueeze(0).to(device)
+                except Exception:
+                    # If RGB extraction fails, fall back to gray colors in unproject_with_grid_features
+                    pass
 
             # Debug: Check depth data
             depth_val = batch_gpu.get('depth', batch_gpu.get('depthmap', batch_gpu.get('depth_z')))
@@ -1832,6 +2390,11 @@ def two_pass_processing(
         all_cluster_sizes = []
 
         for chunk_path in tqdm(chunk_paths):
+            if not os.path.exists(chunk_path):
+                raise FileNotFoundError(
+                    f"Missing chunk file during Pass2: {chunk_path}. "
+                    f"If you changed N_VIEWS or temp_dir was cleared, remove {checkpoint_path} and rerun."
+                )
             pooled = torch.load(chunk_path)
             # Normalize points
             pooled['points'] = (pooled['points'] - mu_scene) / sigma_scene
@@ -1907,7 +2470,8 @@ def save_memory(
     result: Dict[str, torch.Tensor],
     mu: torch.Tensor,
     sigma: float,
-    view_info: Dict[str, torch.Tensor] = None
+    view_info: Dict[str, torch.Tensor] = None,
+    layers_idx: Optional[List] = None
 ) -> None:
     """
     Save memory to .pt file with extended schema and versioning.
@@ -1962,6 +2526,10 @@ def save_memory(
         if view_info.get('all_scale_tokens') is not None:
             memory_dict['all_scale_tokens'] = view_info['all_scale_tokens'].cpu().float()  # [M, D]
 
+    # Add layers_idx (for compatibility with pooled memory format)
+    if layers_idx is not None:
+        memory_dict['layers_idx'] = layers_idx
+
     # Ensure output directory exists
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
 
@@ -2012,29 +2580,90 @@ def save_ply(
         colors = colors / 255.0
     colors = np.clip(colors, 0, 1).astype(np.float64)
 
-    # Write PLY
-    with open(ply_path, 'w') as f:
-        # Header
-        f.write("ply\n")
-        f.write("format ascii 1.0\n")
-        f.write(f"element vertex {len(points)}\n")
-        f.write("property float x\n")
-        f.write("property float y\n")
-        f.write("property float z\n")
-        f.write("property uchar red\n")
-        f.write("property uchar green\n")
-        f.write("property uchar blue\n")
-        f.write("end_header\n")
+    def _write_xyz_rgb_ply(path: str, pts_xyz: np.ndarray, cols01: np.ndarray) -> None:
+        with open(path, 'w') as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {len(pts_xyz)}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+            f.write("end_header\n")
+            for i in range(len(pts_xyz)):
+                x, y, z = pts_xyz[i]
+                r, g, b = (cols01[i] * 255).astype(np.uint8)
+                f.write(f"{x:.6f} {y:.6f} {z:.6f} {r} {g} {b}\n")
 
-        # Vertices
-        for i in range(len(points)):
-            x, y, z = points[i]
-            r, g, b = (colors[i] * 255).astype(np.uint8)
-            f.write(f"{x:.6f} {y:.6f} {z:.6f} {r} {g} {b}\n")
+    # Write base PLY
+    _write_xyz_rgb_ply(ply_path, points, colors)
+
+    # Optional: visualization-only "splat" PLY to make points look larger in viewers.
+    # PLY itself has no point-size attribute; viewers usually control it. This file is for quick inspection.
+    splat = float(os.environ.get("PLY_VIS_SPLAT_RADIUS", "0") or "0")
+    splat_k = int(os.environ.get("PLY_VIS_SPLAT_K", "12") or "12")
+    if splat > 0:
+        rng = np.random.default_rng(0)
+        k = max(1, splat_k)
+        offs = rng.normal(size=(k, 3)).astype(np.float64)
+        norms = np.linalg.norm(offs, axis=1, keepdims=True) + 1e-12
+        offs = offs / norms
+        radii = rng.random(size=(k, 1)).astype(np.float64) ** (1.0 / 3.0)
+        offs = offs * radii * float(splat)
+        offs = np.vstack([np.zeros((1, 3), dtype=np.float64), offs])
+
+        pts_vis = (points[:, None, :] + offs[None, :, :]).reshape(-1, 3)
+        cols_vis = np.repeat(colors, repeats=offs.shape[0], axis=0)
+        ply_vis_path = ply_path.replace(".ply", "_vis_splat.ply")
+        _write_xyz_rgb_ply(ply_vis_path, pts_vis, cols_vis)
+        print(f"[PLY] Vis splat PLY saved to {ply_vis_path} (radius={splat}, k={k})")
 
     print(f"[PLY] Point cloud saved to {ply_path}")
     print(f"[PLY] Points: {len(points):,}")
 
+
+# =============================================================================
+# ACE Dataset Wrapper
+# =============================================================================
+
+class ACEDatasetWithDepth:
+    """Wrapper for CamLocDatasetDINOv2 that adds depth loading from depth/ directory."""
+    def __init__(self, base_dataset):
+        self.base_dataset = base_dataset
+        self.depth_dir = Path(base_dataset.rgb_files[0].parent.parent) / 'depth'
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        from skimage import io
+        # Get base data (image, mask, pose, intrinsics, etc.)
+        data = self.base_dataset[idx]
+
+        # Load depth from depth/ directory
+        rgb_file = self.base_dataset.rgb_files[self.base_dataset.valid_file_indices[idx]]
+        depth_file = self.depth_dir / rgb_file.name.replace('.color.png', '.depth.png')
+
+        if depth_file.exists():
+            depth = io.imread(str(depth_file))
+            depth = depth.astype(np.float32) / 1000.0  # mm to meters
+        else:
+            depth = np.zeros((self.base_dataset.image_height,
+                            data[0].shape[2] if data[0].ndim == 3 else data[0].shape[1]),
+                           dtype=np.float32)
+
+        # Return as dict compatible with WAI format
+        return {
+            'img': data[0],
+            'depthmap': depth,
+            'camera_pose': data[2],
+            'camera_intrinsics': data[4],
+            'image': data[0],
+            'pose': data[2],
+            'intrinsics': data[4],
+        }
 
 # =============================================================================
 # Dataset Detection
@@ -2082,7 +2711,7 @@ def load_dataset(
     if dataset_type == "auto":
         dataset_type = detect_dataset_type(dataset_path)
 
-    # === ACE dataset loader branch (NEW) ===
+    # === ACE dataset loader branch ===
     if dataset_loader == "ace":
         print(f"[Dataset] Using ACE loader (CamLocDatasetDINOv2)")
         # Add parent directory to path for imports
@@ -2090,76 +2719,522 @@ def load_dataset(
         if parent_dir not in sys.path:
             sys.path.insert(0, parent_dir)
         from dataset_dinov2 import CamLocDatasetDINOv2
-        return CamLocDatasetDINOv2(dataset_path, mode=2)
+        base_ds = CamLocDatasetDINOv2(dataset_path, mode=2)
+        return ACEDatasetWithDepth(base_ds)
 
-    # === WAI dataset loader branch (EXISTING) ===
+    # === WAI / MapAnything dataset loader branch ===
+    if dataset_loader != "wai":
+        raise ValueError(f"Unsupported dataset_loader={dataset_loader!r}. Use 'wai' or 'ace'.")
+
+    from mapanything.datasets.wai.seven_scenes import SevenScenesWAI  # pyright: ignore[reportMissingImports]
+    from mapanything.datasets.wai.indoor6 import Indoor6WAI  # pyright: ignore[reportMissingImports]
+
+    # Determine dataset_metadata_dir
+    metadata_dir = os.environ.get(
+        "MAPANYTHING_DATASET_METADATA_DIR",
+        "/mnt/storage/xwh/map-anything/mapanything_dataset_metadata"
+    )
+
+    # Common kwargs for BaseDataset
+    base_kwargs = dict(
+        resolution=518,
+        data_norm_type='dinov2',
+        transform='imgnorm',
+    )
+
+    if dataset_type == "7scenes":
+        return SevenScenesWAI(
+            ROOT=dataset_path,
+            dataset_metadata_dir=metadata_dir,
+            split='train',
+            sample_specific_scene=True,
+            specific_scene_name=scene_name,
+            sequential_view_mode=True,
+            num_views=n_views,
+            **base_kwargs,
+        )
+    if dataset_type == "indoor6":
+        return Indoor6WAI(
+            ROOT=dataset_path,
+            dataset_metadata_dir=metadata_dir,
+            split='train',
+            sample_specific_scene=True,
+            specific_scene_name=scene_name,
+            sequential_view_mode=True,
+            num_views=n_views,
+            **base_kwargs,
+        )
+    raise ValueError(f"Unsupported dataset_type={dataset_type!r} for WAI loader.")
+
+
+def _pose_to_center_np(pose: Any) -> Optional[np.ndarray]:
+    """pose [4,4] -> camera center [3] in world coords, or None."""
+    if pose is None:
+        return None
+    if isinstance(pose, torch.Tensor):
+        p = pose.detach().cpu().float().numpy()
+    else:
+        p = np.asarray(pose)
+    if p.size == 16:
+        p = p.reshape(4, 4)
+    if p.shape != (4, 4):
+        return None
+    R = p[:3, :3]
+    t = p[:3, 3]
+    c = -R.T @ t
+    if not np.isfinite(c).all():
+        return None
+    return c.astype(np.float64)
+
+
+def _to_numpy_safe(x: Any) -> Optional[np.ndarray]:
+    """Best-effort tensor/array -> numpy (CPU), without changing values."""
+    if x is None:
+        return None
     try:
-        from mapanything.datasets.wai.seven_scenes import SevenScenesWAI  # pyright: ignore[reportMissingImports]
-        from mapanything.datasets.wai.indoor6 import Indoor6WAI  # pyright: ignore[reportMissingImports]
-
-        # Determine dataset_metadata_dir
-        metadata_dir = os.environ.get(
-            "MAPANYTHING_DATASET_METADATA_DIR",
-            "/data/xwh/map-anything/mapanything_dataset_metadata"
-        )
-
-        # Common kwargs for BaseDataset
-        base_kwargs = dict(
-            resolution=518,
-            data_norm_type='dinov2',
-            transform='imgnorm',
-        )
-
-        if dataset_type == "7scenes":
-            return SevenScenesWAI(
-                ROOT=dataset_path,
-                dataset_metadata_dir=metadata_dir,
-                split='train',
-                sample_specific_scene=True,
-                specific_scene_name=scene_name,
-                sequential_view_mode=True,
-                num_views=n_views,
-                **base_kwargs,
-            )
-        elif dataset_type == "indoor6":
-            return Indoor6WAI(
-                ROOT=dataset_path,
-                dataset_metadata_dir=metadata_dir,
-                split='train',
-                sample_specific_scene=True,
-                specific_scene_name=scene_name,
-                sequential_view_mode=True,
-                num_views=n_views,
-                **base_kwargs,
-            )
-        else:
-            raise ImportError("custom dataset type, falling back")
-    except (ImportError, Exception) as e:
-        print(f"[Warning] WAI dataset loading failed ({e}), using ACE dataset loader")
-        from dataset_dinov2 import CamLocDatasetDINOv2
-        return CamLocDatasetDINOv2(dataset_path, mode=2)
+        if isinstance(x, torch.Tensor):
+            return x.detach().cpu().numpy()
+        if isinstance(x, np.ndarray):
+            return x
+        return np.asarray(x)
+    except Exception:
+        return None
 
 
-def select_memory_views(dataset, n_memory: int) -> List[int]:
+def _stat_np(arr: Optional[np.ndarray]) -> Dict[str, Any]:
+    if arr is None:
+        return {"present": False}
+    a = np.asarray(arr)
+    out: Dict[str, Any] = {"present": True, "shape": list(a.shape), "dtype": str(a.dtype)}
+    try:
+        if a.size > 0 and np.issubdtype(a.dtype, np.number):
+            finite = np.isfinite(a)
+            out["finite_ratio"] = float(finite.mean()) if finite.size else None
+            if finite.any():
+                af = a[finite]
+                out.update(
+                    min=float(np.min(af)),
+                    max=float(np.max(af)),
+                    mean=float(np.mean(af)),
+                    std=float(np.std(af)),
+                )
+    except Exception:
+        pass
+    return out
+
+
+def _pose_stats(pose_4x4: Optional[np.ndarray]) -> Dict[str, Any]:
+    """Summarize pose; supports [4,4] or [1,4,4]."""
+    p = pose_4x4
+    if p is None:
+        return {"present": False}
+    p = np.asarray(p)
+    if p.size == 16:
+        p = p.reshape(4, 4)
+    if p.ndim == 3 and p.shape[0] == 1 and p.shape[1:] == (4, 4):
+        p = p[0]
+    if p.shape != (4, 4):
+        return {"present": True, "shape": list(p.shape), "error": "not_4x4"}
+    R = p[:3, :3]
+    t = p[:3, 3]
+    c = -R.T @ t
+    return {
+        "present": True,
+        "t": [float(x) for x in t.tolist()],
+        "c": [float(x) for x in c.tolist()],
+        "R_det": float(np.linalg.det(R)),
+        "R_orth_err": float(np.linalg.norm(R.T @ R - np.eye(3))),
+    }
+
+
+def debug_dump_views(
+    output_run_dir: str,
+    config: "ExtractionConfig",
+    raw_batches: List[Any],
+    memory_views: List[Dict[str, Any]],
+    depth_min: float,
+    depth_max: float,
+) -> Optional[str]:
+    """Dump raw/processed per-view stats to <run_dir>/debug_dump for ace vs wai comparison."""
+    if not getattr(config, "debug_dump", False):
+        return None
+    dump_dir = os.path.join(output_run_dir, "debug_dump")
+    os.makedirs(dump_dir, exist_ok=True)
+
+    n = min(len(raw_batches), len(memory_views), int(getattr(config, "debug_dump_max_views", 3)))
+    meta: Dict[str, Any] = {
+        "schema": 1,
+        "dataset_loader": config.dataset_loader,
+        "dataset_type": config.dataset_type,
+        "scene_name": config.scene_name,
+        "dataset_path": config.dataset_path,
+        "n_dump": n,
+        "depth_valid_range": [float(depth_min), float(depth_max)],
+        "patch_depth_sampling": config.patch_depth_sampling,
+        "use_patch_based": bool(config.use_patch_based),
+        "voxel_size": float(config.voxel_size),
+        "ray_pool_strategy": config.ray_pool_strategy,
+        "use_model": config.use_model,
+        "model_str": config.model_str,
+    }
+
+    views_out: List[Dict[str, Any]] = []
+    for i in range(n):
+        raw = raw_batches[i]
+        proc = memory_views[i]
+
+        raw_dict = raw if isinstance(raw, dict) else {}
+
+        raw_img = raw_dict.get("img", raw_dict.get("image", raw_dict.get("img_uint8")))
+        raw_depth = raw_dict.get("depthmap", raw_dict.get("depth", raw_dict.get("depth_z")))
+        raw_intr = raw_dict.get("camera_intrinsics", raw_dict.get("intrinsics"))
+        raw_pose = raw_dict.get("camera_pose", raw_dict.get("pose"))
+        raw_fn = raw_dict.get("filename")
+
+        proc_img = proc.get("img")
+        proc_depth = proc.get("depth_z")
+        proc_intr = proc.get("intrinsics")
+        proc_pose = proc.get("camera_poses")
+
+        raw_depth_np = _to_numpy_safe(raw_depth)
+        if raw_depth_np is not None and raw_depth_np.ndim == 4:
+            # tolerate [B,H,W,1] etc
+            raw_depth_np = np.squeeze(raw_depth_np)
+
+        depth_valid_ratio = None
+        try:
+            if raw_depth_np is not None and raw_depth_np.ndim >= 2:
+                d = np.asarray(raw_depth_np, dtype=np.float64)
+                d = d.reshape(d.shape[0], d.shape[1])
+                valid = np.isfinite(d) & (d > depth_min) & (d < depth_max)
+                depth_valid_ratio = float(valid.mean())
+        except Exception:
+            depth_valid_ratio = None
+
+        one = {
+            "i": i,
+            "raw": {
+                "filename": raw_fn,
+                "img": _stat_np(_to_numpy_safe(raw_img)),
+                "depth": _stat_np(raw_depth_np),
+                "intrinsics": _stat_np(_to_numpy_safe(raw_intr)),
+                "pose": _pose_stats(_to_numpy_safe(raw_pose)),
+                "depth_valid_ratio": depth_valid_ratio,
+            },
+            "processed": {
+                "img": _stat_np(_to_numpy_safe(proc_img)),
+                "depth_z": _stat_np(_to_numpy_safe(proc_depth)),
+                "intrinsics": _stat_np(_to_numpy_safe(proc_intr)),
+                "camera_poses": _pose_stats(_to_numpy_safe(proc_pose)),
+            },
+        }
+        views_out.append(one)
+
+        if getattr(config, "debug_dump_save_npz", False):
+            # 只保存少量关键张量，避免太大：img(第一张)、depth(2D)、K、pose
+            try:
+                npz_path = os.path.join(dump_dir, f"view_{i:02d}.npz")
+                img_np = _to_numpy_safe(proc_img)
+                if img_np is not None and img_np.ndim == 4:
+                    img_np = img_np[0]
+                dz_np = _to_numpy_safe(proc_depth)
+                if dz_np is not None:
+                    dz_np = np.squeeze(dz_np)
+                np.savez_compressed(
+                    npz_path,
+                    img=img_np,
+                    depth_z=dz_np,
+                    intrinsics=_to_numpy_safe(proc_intr),
+                    camera_poses=_to_numpy_safe(proc_pose),
+                )
+            except Exception:
+                pass
+
+    out_path = os.path.join(dump_dir, "debug_dump.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump({"meta": meta, "views": views_out}, f, ensure_ascii=False, indent=2)
+    return dump_dir
+
+
+def _extract_centers_from_pose_dir(dataset_path: str, scene_name: Optional[str] = None) -> Optional[np.ndarray]:
+    """Fast path: read pose txt from disk into centers [N,3].
+
+    Supports both layouts:
+    - ACE: <dataset_path>/poses
+    - WAI: <dataset_path>/<scene_name>/poses   (dataset_path is the ROOT)
     """
-    Select optimal memory views from dataset.
+    from pathlib import Path
 
-    Args:
-        dataset: Dataset object
-        n_memory: Number of views to select
+    root = Path(dataset_path)
+    candidates: List[Path] = []
+    # ACE style
+    candidates.append(root / "poses")
+    # WAI style (ROOT + scene subdir)
+    if scene_name:
+        candidates.append(root / scene_name / "poses")
 
-    Returns:
-        List of selected indices
+    pose_dir = None
+    for c in candidates:
+        if c.exists():
+            pose_dir = c
+            break
+    if pose_dir is None:
+        return None
+    pose_files = sorted([p for p in pose_dir.iterdir() if p.is_file()])
+    if not pose_files:
+        return None
+
+    centers: List[np.ndarray] = []
+    for pth in pose_files:
+        try:
+            pose = np.loadtxt(str(pth), dtype=np.float64)
+        except Exception:
+            continue
+        c = _pose_to_center_np(pose)
+        if c is not None:
+            centers.append(c)
+    if not centers:
+        return None
+    return np.stack(centers, axis=0)
+
+
+def _extract_centers_from_wai_scene_meta(dataset_root: str, scene_name: str) -> Optional[np.ndarray]:
+    """Fast path for WAI: read <dataset_root>/<scene_name>/scene_meta.json and extract camera centers.
+
+    Indices must align with WAI sequential_view_mode ordering, which uses sorted(frame_names).
+    We therefore sort by scene_meta['frame_names'] keys (fallback: frame['frame_name'] list).
+    """
+    from pathlib import Path
+
+    meta_path = Path(dataset_root) / scene_name / "scene_meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            scene_meta = json.load(f)
+    except Exception:
+        return None
+
+    frames = scene_meta.get("frames", [])
+    if not isinstance(frames, list) or not frames:
+        return None
+
+    # Map frame_name -> frame dict for stable ordering
+    name_to_frame: Dict[str, Any] = {}
+    for fr in frames:
+        if isinstance(fr, dict) and "frame_name" in fr:
+            name_to_frame[str(fr["frame_name"])] = fr
+
+    frame_names = scene_meta.get("frame_names")
+    if isinstance(frame_names, dict) and frame_names:
+        ordered_names = sorted([str(k) for k in frame_names.keys()])
+    else:
+        ordered_names = sorted(list(name_to_frame.keys()))
+
+    centers: List[np.ndarray] = []
+    for nm in ordered_names:
+        fr = name_to_frame.get(nm)
+        if not isinstance(fr, dict):
+            continue
+        pose = fr.get("transform_matrix") or fr.get("extrinsics")
+        if pose is None:
+            continue
+        c2w = np.asarray(pose, dtype=np.float64)
+        if c2w.size == 16:
+            c2w = c2w.reshape(4, 4)
+        if c2w.shape != (4, 4):
+            continue
+        # WAI stores cam2world; camera center is translation component.
+        c = c2w[:3, 3]
+        if np.isfinite(c).all():
+            centers.append(c.astype(np.float64))
+
+    if not centers:
+        return None
+    return np.stack(centers, axis=0)
+
+
+def _extract_centers_from_dataset_items(dataset) -> np.ndarray:
+    """Slow fallback: iterate dataset and grab pose only (may still trigger IO in __getitem__)."""
+    from tqdm import tqdm
+
+    centers: List[np.ndarray] = []
+    for idx in tqdm(range(len(dataset)), desc="Extracting camera centers (FPS)", leave=False):
+        sample = dataset[idx]
+        pose = None
+        if isinstance(sample, dict):
+            pose = sample.get("camera_pose", sample.get("pose"))
+        elif isinstance(sample, tuple):
+            # ACE CamLocDatasetDINOv2: (image, mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, filename)
+            if len(sample) > 2:
+                pose = sample[2]
+        elif isinstance(sample, list):
+            # WAI: list[dict] views, take first
+            if sample and isinstance(sample[0], dict):
+                pose = sample[0].get("camera_pose", sample[0].get("pose"))
+        c = _pose_to_center_np(pose)
+        if c is not None:
+            centers.append(c)
+
+    if not centers:
+        raise RuntimeError("FPS view selection failed: no valid camera poses found.")
+    return np.stack(centers, axis=0)
+
+
+def fps_select_views(centers: np.ndarray, n_select: int, seed: int = 42) -> List[int]:
+    """Furthest Point Sampling on camera centers for spatial coverage."""
+    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+    n_total = int(centers.shape[0])
+    if n_select >= n_total:
+        return list(range(n_total))
+
+    rng = np.random.RandomState(seed)
+    selected: List[int] = [int(rng.randint(0, n_total))]
+    min_dist = np.full(n_total, np.inf, dtype=np.float64)
+    for _ in range(n_select - 1):
+        last = selected[-1]
+        d = np.linalg.norm(centers - centers[last], axis=1)
+        min_dist = np.minimum(min_dist, d)
+        selected.append(int(np.argmax(min_dist)))
+    return selected
+
+
+def select_memory_views(
+    dataset,
+    n_memory: int,
+    dataset_path: Optional[str] = None,
+    scene_name: Optional[str] = None,
+) -> List[int]:
+    """
+    选择 memory 视角（优先 FPS）。
+
+    优先级：
+    1) 若可用：map-anything 的 select_optimal_memory_indices（它本身就是最优选帧逻辑）
+    2) 否则：读取 <dataset_path>/poses 做 FPS（最快，不加载图像/深度）
+    3) 再否则：遍历 dataset item 抽 pose 做 FPS（慢）
     """
     try:
         from mapanything.tasks.ace.memory_selection import select_optimal_memory_indices  # pyright: ignore[reportMissingImports]
         memory_indices, _ = select_optimal_memory_indices(dataset, n_memory)
         return memory_indices
     except ImportError:
-        # Fallback: uniform sampling
-        total = len(dataset)
-        step = max(1, total // n_memory)
-        return list(range(0, total, step))[:n_memory]
+        pass
+
+    centers = None
+    if dataset_path is not None:
+        # WAI fastest path: scene_meta.json already contains per-frame c2w.
+        if scene_name:
+            centers = _extract_centers_from_wai_scene_meta(dataset_path, scene_name)
+        # ACE / generic path: poses/ directory
+        if centers is None:
+            centers = _extract_centers_from_pose_dir(dataset_path, scene_name=scene_name)
+    if centers is None:
+        centers = _extract_centers_from_dataset_items(dataset)
+
+    indices = fps_select_views(centers, n_memory)
+    indices.sort()  # 顺序化索引，利于后续按序 IO
+    return indices
+
+
+def convert_ace_tuple_to_dict(
+    sample: tuple,
+    dataset_path: str,
+    image_height: int = 518,
+) -> Dict[str, Any]:
+    """
+    Convert CamLocDatasetDINOv2 tuple output to dict format expected by
+    prepare_batch_input and two_pass_processing.
+
+    ACE dataset __getitem__ returns:
+        (image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, filename)
+
+    Depth is NOT in the tuple — it must be loaded separately from the depth/ directory.
+
+    Args:
+        sample: Tuple from CamLocDatasetDINOv2.__getitem__
+        dataset_path: Root path to the scene dataset (contains rgb/, depth/, poses/, etc.)
+        image_height: Target image height (for depth scaling)
+
+    Returns:
+        Dict with keys: img, camera_pose, camera_intrinsics, depthmap, filename
+    """
+    if len(sample) != 8:
+        raise ValueError(
+            f"ACE 样本应为 8 元组，实际 len={len(sample)}。"
+            "若数据为 WAI（list[dict]），请使用 --dataset_loader wai，勿走 convert_ace_tuple_to_dict。"
+        )
+    image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, filename = sample
+
+    # Derive depth file path from the rgb filename.
+    # filename is like ".../rgb/seq-02-frame-000102.color.png"
+    # depth is at   ".../depth/seq-02-frame-000102.depth.png"
+    depth = None
+    # 目标分辨率：与 CamLocDatasetDINOv2 输出的图像保持一致，确保 depth 与 intrinsics 对齐
+    target_hw: Optional[Tuple[int, int]] = None
+    try:
+        if isinstance(image, torch.Tensor):
+            target_hw = tuple(int(x) for x in image.shape[-2:])
+        elif isinstance(image, np.ndarray):
+            target_hw = tuple(int(x) for x in image.shape[-2:])
+    except Exception:
+        target_hw = None
+    if filename and isinstance(filename, str):
+        # Replace /rgb/ with /depth/ in the path
+        depth_path = filename.replace("/rgb/", "/depth/")
+        # Replace .color.png → .depth.png (or just strip extension and add .depth.png)
+        base, ext = os.path.splitext(depth_path)
+        if base.endswith(".color"):
+            base = base[:-6]  # strip ".color"
+        depth_path = base + ".depth" + ext
+
+        if not os.path.exists(depth_path):
+            # Try just replacing /rgb/ without renaming the suffix
+            alt_path = filename.replace("/rgb/", "/depth/")
+            if os.path.exists(alt_path):
+                depth_path = alt_path
+
+        if os.path.exists(depth_path):
+            from skimage import io as skio
+
+            depth_np = skio.imread(depth_path).astype(np.float64) / 1000.0  # mm -> meters
+
+            # 若深度分辨率与图像不一致，则使用最近邻重采样到图像分辨率，使其与 intrinsics 一致
+            if target_hw is not None and depth_np.shape[:2] != target_hw:
+                try:
+                    import torch.nn.functional as F
+
+                    d = torch.from_numpy(depth_np).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+                    d_resized = F.interpolate(d, size=target_hw, mode="nearest")
+                    depth = d_resized.squeeze(0).squeeze(0)  # [H,W]
+                except Exception as e:
+                    print(
+                        f"[Warning] Depth resize to {target_hw} failed ({type(e).__name__}: {e}); "
+                        f"falling back to original depth resolution {depth_np.shape[:2]}",
+                        flush=True,
+                    )
+                    depth = torch.from_numpy(depth_np).float()
+            else:
+                depth = torch.from_numpy(depth_np).float()
+        else:
+            print(f"[Warning] Depth file not found (tried {depth_path})")
+
+    result = {
+        "img": image,                        # [3, H, W] tensor (ImageNet normalized)
+        "image_mask": image_mask,             # [1, H, W] bool
+        "camera_pose": pose,                  # [4, 4] tensor
+        "pose": pose,
+        "pose_inv": pose_inv,
+        "camera_intrinsics": intrinsics,      # [3, 3] tensor
+        "intrinsics": intrinsics,
+        "intrinsics_inv": intrinsics_inv,
+        "coords": coords,
+        "filename": filename,
+    }
+    if depth is not None:
+        result["depthmap"] = depth            # [H, W] tensor in meters
+        result["depth"] = depth
+
+    return result
 
 
 # =============================================================================
@@ -2167,89 +3242,208 @@ def select_memory_views(dataset, n_memory: int) -> List[int]:
 # =============================================================================
 
 def parse_args() -> ExtractionConfig:
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='BSE-enhanced memory extraction')
+    """解析命令行，构建 ExtractionConfig。"""
+    parser = argparse.ArgumentParser(
+        description='BSE memory extraction — 从多视角 RGB-D 提取 3D memory（体素特征 + 归一化统计）。'
+    )
 
-    # Required arguments
-    parser.add_argument('dataset_path', type=str, help='Dataset path')
-    parser.add_argument('output_path', type=str, help='Output .pt file')
+    # 位置参数
+    parser.add_argument(
+        'dataset_path',
+        type=str,
+        help='数据集路径：WAI 时为数据集 ROOT；ace loader 时为 ACE 数据根目录。',
+    )
+    parser.add_argument(
+        'output_path',
+        type=str,
+        help='输出 memory 文件路径（.pt），含 pooled 特征与 view 元数据。',
+    )
 
-    # Memory selection
-    parser.add_argument('--n_memory', type=int, default=100, help='Number of memory views')
+    parser.add_argument(
+        '--n_memory',
+        type=int,
+        default=100,
+        help='抽取多少个训练帧作为 memory 视角（均匀步长遍历数据集索引）。',
+    )
 
-    # Model configuration
-    parser.add_argument('--use_model', type=str, default='mapanything',
-                        choices=['mapanything', 'dinov2'],
-                        help='Feature extractor: mapanything (default, align with fps_memory) or dinov2')
-    parser.add_argument('--model_str', type=str, default=None, help='Model architecture string')
-    parser.add_argument('--model_config', type=str, default=None, help='Model config path')
-    parser.add_argument('--model_checkpoint', type=str, default=None, help='Model checkpoint path')
-    parser.add_argument('--dinov2_checkpoint', type=str,
-                        default='/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth',
-                        help='DINOv2 checkpoint path (for dinov2 mode)')
-    parser.add_argument('--dinov2_intermediate_layers', type=int, nargs='*', default=None,
-                        help='DINOv2 block indices for DPT-style multi-scale. '
-                             'Default: [2,5,8,11,14,17,20,23] (8 evenly-spaced layers). '
-                             'Use [23] for single-scale (last block only).')
+    parser.add_argument(
+        '--use_model',
+        type=str,
+        default='mapanything',
+        choices=['mapanything', 'dinov2'],
+        help='特征提取器：mapanything（默认，与 fps_memory 一致，中间层多尺度）；'
+        'dinov2（DINOv2 块特征，DPT 式融合）。',
+    )
+    parser.add_argument(
+        '--model_str',
+        type=str,
+        default=None,
+        help='MapAnything 注册的模型名字符串（如 mapanything_store_intermediates_ace）。',
+    )
+    parser.add_argument(
+        '--model_config',
+        type=str,
+        default=None,
+        help='Hydra/OmegaConf 模型 YAML 路径；省略则用内置 default。',
+    )
+    parser.add_argument(
+        '--model_checkpoint',
+        type=str,
+        default=None,
+        help='MapAnything 权重文件；省略时 main() 可能使用固定默认路径。',
+    )
+    parser.add_argument(
+        '--dinov2_checkpoint',
+        type=str,
+        default='/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth',
+        help='DINOv2 ViT 预训练权重（仅 --use_model dinov2）。',
+    )
+    parser.add_argument(
+        '--dinov2_intermediate_layers',
+        type=int,
+        nargs='*',
+        default=None,
+        help='DINOv2 参与融合的 block 索引；默认 8 层 [2,5,8,11,14,17,20,23]；'
+        '仅传 23 表示只用最后一层（单尺度）。',
+    )
 
-    # BSE configuration
-    parser.add_argument('--use_bse', action='store_true', default=True, help='Use BSE pooling')
-    parser.add_argument('--voxel_size', type=float, default=0.05, help='BSE voxel size')
-    parser.add_argument('--use_otsu', action='store_true', default=True, help='Use Otsu threshold')
+    parser.add_argument(
+        '--use_bse',
+        action='store_true',
+        default=True,
+        help='启用 BSE（边界感知）体素池化；关闭时当前实现会报错未实现。',
+    )
+    parser.add_argument(
+        '--voxel_size',
+        type=float,
+        default=0.05,
+        help='体素网格边长（米）；越小越细、内存与时间开销越大。',
+    )
+    parser.add_argument(
+        '--use_otsu',
+        action='store_true',
+        default=True,
+        help='BSE 内对深度分箱使用 Otsu 自动阈值（适应稀疏/不均匀深度）。',
+    )
 
-    # Processing configuration
-    parser.add_argument('--device', type=str, default='cuda:0', help='Device')
-    parser.add_argument('--use_patch_based', action='store_true', default=False,
-                        help='Use patch-based extraction')
-    parser.add_argument('--depth_valid_range', type=float, nargs=2,
-                        default=(0.1, 6.0), help='Valid depth range (min, max)')
+    parser.add_argument(
+        '--device',
+        type=str,
+        default='cuda:0',
+        help='计算设备，如 cuda:0；若 shell 设置 CUDA_VISIBLE_DEVICES，则 0 表示可见首卡。',
+    )
+    parser.add_argument(
+        '--use_patch_based',
+        action='store_true',
+        default=False,
+        help='使用基于 patch 的提取路径（与双线性网格路径相对，见 two_pass_processing）。',
+    )
+    parser.add_argument(
+        '--depth_valid_range',
+        type=float,
+        nargs=2,
+        default=(0.1, 6.0),
+        help='有效深度区间 (最小米, 最大米)；反投影与可视化时过滤。',
+    )
     parser.add_argument(
         '--patch_depth_sampling',
         type=str,
         default='nearest_valid',
         choices=['nearest', 'median', 'nearest_valid'],
-        help='Grid-center depth: nearest (dense GT), median (3×3), nearest_valid (Indoor6 sparse; '
-             'same as fps_memory PATCH_DEPTH_SAMPLING)',
+        help='每个特征网格中心的深度：nearest 最近像素；median 3×3 中位数；'
+        'nearest_valid 在邻域找最近有效深度（稀疏 Indoor6 常用，对齐 fps_memory）。',
     )
 
-    # SOR filtering
-    parser.add_argument('--enable_sor', action='store_true', default=False,
-                        help='Enable Statistical Outlier Removal')
-    parser.add_argument('--sor_k', type=int, default=20, help='SOR k neighbors')
-    parser.add_argument('--sor_std_ratio', type=float, default=2.0, help='SOR std ratio')
+    parser.add_argument(
+        '--enable_sor',
+        action='store_true',
+        default=False,
+        help='对反投影得到的点云做统计离群点剔除（Statistical Outlier Removal）。',
+    )
+    parser.add_argument(
+        '--sor_k',
+        type=int,
+        default=20,
+        help='SOR：每个点考虑的近邻个数 k。',
+    )
+    parser.add_argument(
+        '--sor_std_ratio',
+        type=float,
+        default=2.0,
+        help='SOR：到 k 邻域均值的距离超过 std_ratio 倍标准差则剔除。',
+    )
 
-    # Advanced
-    parser.add_argument('--temp_dir', type=str, default='/dev/shm',
-                        help='Temporary directory for chunks')
-    parser.add_argument('--dataset_type', type=str, default='auto',
-                        choices=['auto', '7scenes', 'indoor6', 'custom'],
-                        help='Dataset type (auto-detect by default)')
-    parser.add_argument('--scene_name', type=str, default=None,
-                        help='Scene name for WAI datasets (e.g. chess_train, scene2a_train). '
-                             'If not provided, auto-derived from dataset_path.')
-    parser.add_argument('--dataset_loader', type=str, default='wai',
-                        choices=['wai', 'ace'],
-                        help='Dataset loader: "wai" (MapAnything WAI format, default) or "ace" (ACE CamLocDatasetDINOv2)')
+    parser.add_argument(
+        '--temp_dir',
+        type=str,
+        default='/dev/shm',
+        help='两遍处理时各 view 的 chunk 与断点文件目录（建议内存盘减少 IO）。',
+    )
+    parser.add_argument(
+        '--dataset_type',
+        type=str,
+        default='auto',
+        choices=['auto', '7scenes', 'indoor6', 'custom'],
+        help='数据集类型；auto 时根据路径启发式检测。',
+    )
+    parser.add_argument(
+        '--scene_name',
+        type=str,
+        default=None,
+        help='WAI 场景名（如 chess_train）；省略则用 dataset_path 的最后一段目录名。',
+    )
+    parser.add_argument(
+        '--dataset_loader',
+        type=str,
+        default='wai',
+        choices=['wai', 'ace'],
+        help='数据加载：wai=MapAnything WAI；ace=ACE CamLocDatasetDINOv2。',
+    )
 
-    # Ray pooling configuration
-    parser.add_argument('--ray_pool_strategy', type=str, default='mean',
-                        choices=['mean', 'dominant', 'first', 'all'],
-                        help='Strategy for pooling ray directions')
-    parser.add_argument('--save_all_ray_strategies', action='store_true', default=True,
-                        help='Save all ray representations for comparison')
+    parser.add_argument(
+        '--ray_pool_strategy',
+        type=str,
+        default='mean',
+        choices=['mean', 'dominant', 'first', 'all'],
+        help='同一体素内多条视线方向的聚合方式（mean 平均方向等）。',
+    )
+    parser.add_argument(
+        '--save_all_ray_strategies',
+        action='store_true',
+        default=True,
+        help='为 true 时保存多种 ray 池化结果便于对比实验。',
+    )
 
-    # MapAnything infer() 后：预测位姿 vs 数据集 GT（与 fps_memory / map-anything run_memory_extraction 一致）
     parser.add_argument(
         '--pose_eval_translation_ok_m',
         type=float,
         default=0.1,
-        help='Per-view translation error threshold (m) for OK vs HIGH; ref view is always REF',
+        help='MapAnything infer 后：预测位姿相对 GT 的平移误差（米）低于此视为 OK，否则 HIGH。',
     )
     parser.add_argument(
         '--pose_eval_strict',
         action='store_true',
         default=False,
-        help='If set, exit with code 1 when any non-reference view exceeds --pose_eval_translation_ok_m',
+        help='为 true 时：任一非参考视角平移误差超阈值则进程以退出码 1 结束。',
+    )
+
+    parser.add_argument(
+        '--debug_dump',
+        action='store_true',
+        default=False,
+        help='在输出目录下导出 debug_dump（raw/processed 的关键统计与可选数值快照），用于对齐不同 loader 的数据差异。',
+    )
+    parser.add_argument(
+        '--debug_dump_max_views',
+        type=int,
+        default=3,
+        help='debug_dump 最多导出多少个视角（默认 3，建议 1~5）。',
+    )
+    parser.add_argument(
+        '--debug_dump_save_npz',
+        action='store_true',
+        default=False,
+        help='debug_dump 额外保存少量数值快照（.npz），方便离线精确对比；会显著增大输出体积。',
     )
 
     args = parser.parse_args()
@@ -2282,6 +3476,9 @@ def parse_args() -> ExtractionConfig:
         dinov2_intermediate_layers=args.dinov2_intermediate_layers,
         pose_eval_translation_ok_m=args.pose_eval_translation_ok_m,
         pose_eval_strict=args.pose_eval_strict,
+        debug_dump=args.debug_dump,
+        debug_dump_max_views=int(args.debug_dump_max_views),
+        debug_dump_save_npz=args.debug_dump_save_npz,
     )
 
 
@@ -2294,6 +3491,12 @@ def main():
     scene_name = config.scene_name
     if scene_name is None:
         scene_name = os.path.basename(config.dataset_path.rstrip('/'))
+        # ACE loader: dataset_path is like .../pgt_7scenes_heads/train → use parent dir name "pgt_7scenes_heads"
+        # Strip common suffixes like _train, _test, _val, or plain train/test/val
+        if config.dataset_loader == "ace" and scene_name in ("train", "test", "val"):
+            parent = os.path.basename(os.path.dirname(config.dataset_path.rstrip('/')))
+            if parent:
+                scene_name = parent
     dataset_type = config.dataset_type
     if dataset_type == "auto":
         dataset_type = detect_dataset_type(config.dataset_path)
@@ -2338,7 +3541,12 @@ def main():
 
     # Select memory views
     print("[BSE Memory] Selecting memory views...", flush=True)
-    memory_indices = select_memory_views(train_dataset, config.n_memory)
+    memory_indices = select_memory_views(
+        train_dataset,
+        config.n_memory,
+        dataset_path=config.dataset_path,
+        scene_name=scene_name,
+    )
     print(f"[BSE Memory] Selected {len(memory_indices)} views", flush=True)
     print(f"[Data] Selected memory indices ({len(memory_indices)}): {memory_indices}", flush=True)
 
@@ -2347,19 +3555,91 @@ def main():
     raw_batches = []  # Store original data for depth/intrinsics access
     memory_views = []  # Store processed data for model input
     memory_gt_poses: List[torch.Tensor] = []  # For post-infer pose vs GT check (MapAnything)
+    did_print_compare = False
+
+    def _stat_any(x: Any) -> str:
+        try:
+            if isinstance(x, torch.Tensor):
+                t = x.detach()
+                mn = float(t.min()) if t.numel() else float("nan")
+                mx = float(t.max()) if t.numel() else float("nan")
+                mean = float(t.float().mean()) if t.numel() else float("nan")
+                return f"tensor dtype={t.dtype} shape={tuple(t.shape)} min={mn:.4g} max={mx:.4g} mean={mean:.4g}"
+            a = np.asarray(x)
+            if a.size == 0:
+                return f"array dtype={a.dtype} shape={a.shape} (empty)"
+            return (
+                f"array dtype={a.dtype} shape={a.shape} "
+                f"min={float(np.nanmin(a)):.4g} max={float(np.nanmax(a)):.4g} mean={float(np.nanmean(a)):.4g}"
+            )
+        except Exception as e:
+            return f"<stat failed: {type(e).__name__}: {e}>"
+
+    def _pick_first(raw: Any) -> Any:
+        return raw[0] if isinstance(raw, (list, tuple)) and raw else raw
+
+    def _print_loader_compare(raw_view: Dict[str, Any], processed: Dict[str, Any]) -> None:
+        nonlocal did_print_compare
+        if did_print_compare:
+            return
+        did_print_compare = True
+
+        def _keys(d: Dict[str, Any]) -> List[str]:
+            return sorted([str(k) for k in d.keys()])
+
+        print("\n===================== LoaderCompare (view_00) =====================", flush=True)
+        print(f"[Compare] dataset_loader={config.dataset_loader}, dataset_type={dataset_type}, scene_name={scene_name}", flush=True)
+        print(f"[Compare] raw keys: {_keys(raw_view)}", flush=True)
+        print(f"[Compare] processed keys: {_keys(processed)}", flush=True)
+
+        raw_img = _pick_first(raw_view.get("img", raw_view.get("image", raw_view.get("img_uint8"))))
+        print(f"[Compare] raw img: {_stat_any(raw_img)}", flush=True)
+        if "img" in processed:
+            print(f"[Compare] processed img: {_stat_any(processed['img'])}", flush=True)
+
+        raw_depth = _pick_first(
+            raw_view.get("depthmap", raw_view.get("depth", raw_view.get("gt_depth", raw_view.get("depth_z"))))
+        )
+        print(f"[Compare] raw depth: {_stat_any(raw_depth) if raw_depth is not None else '<None>'}", flush=True)
+
+        raw_intr = _pick_first(raw_view.get("camera_intrinsics", raw_view.get("intrinsics")))
+        raw_pose = _pick_first(raw_view.get("camera_pose", raw_view.get("pose")))
+        if raw_intr is not None:
+            print(f"[Compare] raw intrinsics: {_stat_any(raw_intr)}", flush=True)
+        if raw_pose is not None:
+            print(f"[Compare] raw pose: {_stat_any(raw_pose)}", flush=True)
+
+        if "depth_z" in processed:
+            print(f"[Compare] processed depth_z: {_stat_any(processed['depth_z'])}", flush=True)
+        if "intrinsics" in processed:
+            print(f"[Compare] processed intrinsics: {_stat_any(processed['intrinsics'])}", flush=True)
+        if "camera_poses" in processed:
+            print(f"[Compare] processed camera_poses: {_stat_any(processed['camera_poses'])}", flush=True)
+        print("==================================================================\n", flush=True)
     t0 = time.time()
     for i, idx in enumerate(memory_indices):
         if len(raw_batches) >= config.n_memory:
             break
         raw_data = train_dataset[idx]
-        # WAI datasets return a list of view dicts; flatten to single views
-        views = raw_data if isinstance(raw_data, list) else [raw_data]
+
+        # ACE loader: CamLocDatasetDINOv2 returns an 8-tuple per frame.
+        # WAI loader: often returns list[dict] (one dict per view) — must NOT pass that to convert_ace_tuple_to_dict.
+        if config.dataset_loader == "ace" and isinstance(raw_data, tuple):
+            view = convert_ace_tuple_to_dict(raw_data, config.dataset_path)
+            views = [view]
+        elif isinstance(raw_data, list):
+            views = raw_data
+        else:
+            views = [raw_data]
+
         for view in views:
             if len(raw_batches) >= config.n_memory:
                 break
             raw_batches.append(view)  # Save original data
             processed = prepare_batch_input(view, device)
             memory_views.append(processed)
+            if i == 0 and isinstance(view, dict) and isinstance(processed, dict):
+                _print_loader_compare(view, processed)
             if "camera_poses" in processed:
                 memory_gt_poses.append(processed["camera_poses"])
         if i == 0 or (i + 1) % 10 == 0:
@@ -2372,14 +3652,32 @@ def main():
     print(f"  [All {len(memory_views)} views loaded in {time.time()-t0:.1f}s]", flush=True)
 
     output_run_dir = os.path.dirname(os.path.abspath(config.output_path))
-    print(f"[Vis] Exporting depth/RGB validation under run dir: {output_run_dir}", flush=True)
-    export_memory_views_visualization(
-        raw_batches,
-        memory_views,
-        output_run_dir,
-        depth_min=config.depth_valid_range[0],
-        depth_max=config.depth_valid_range[1],
-    )
+    try:
+        print(f"[Vis] Exporting depth/RGB validation under run dir: {output_run_dir}", flush=True)
+        export_memory_views_visualization(
+            raw_batches,
+            memory_views,
+            output_run_dir,
+            depth_min=config.depth_valid_range[0],
+            depth_max=config.depth_valid_range[1],
+        )
+    except Exception as e:
+        print(f"[Vis] Visualization skipped ({type(e).__name__}: {e})", flush=True)
+
+    # Optional debug dump for ace vs wai alignment
+    try:
+        dump_dir = debug_dump_views(
+            output_run_dir,
+            config,
+            raw_batches,
+            memory_views,
+            depth_min=float(config.depth_valid_range[0]),
+            depth_max=float(config.depth_valid_range[1]),
+        )
+        if dump_dir:
+            print(f"[DebugDump] Saved debug dump to: {dump_dir}", flush=True)
+    except Exception as e:
+        print(f"[DebugDump] Skipped ({type(e).__name__}: {e})", flush=True)
 
     # Initialize feature extractor
     print("[BSE Memory] Initializing feature extractor...", flush=True)
@@ -2390,7 +3688,7 @@ def main():
             extractor = MapAnythingExtractor(
                 config.model_str or "mapanything_store_intermediates_ace",
                 config.model_config or "default",
-                config.model_checkpoint or "/data/xwh/checkpoints/facebook_map-anything.pth",
+                config.model_checkpoint or "/mnt/storage/xwh/checkpoints/facebook_map-anything.pth",
                 device=str(device),
             )
             print("[BSE Memory] Using MapAnything extractor (default)")
@@ -2409,6 +3707,24 @@ def main():
             device=str(device),
             intermediate_layers=layers,
         )
+        # Save layers_idx for memory file (add 'final' to match pooled format)
+        layers_idx = layers + ['final']
+    else:
+        # MapAnything uses [0, 6, 12, 18, 'final'] by default
+        layers_idx = [0, 6, 12, 18, 'final']
+
+    # Before feature extraction, ensure depth entering the model respects the configured valid range.
+    if config.depth_valid_range:
+        d_lo, d_hi = float(config.depth_valid_range[0]), float(config.depth_valid_range[1])
+        for v in memory_views:
+            dz = v.get("depth_z")
+            if isinstance(dz, torch.Tensor):
+                # depth_z is [B,H,W,1]; zero-out values outside [d_lo, d_hi] or non-finite.
+                mask_invalid = (~torch.isfinite(dz)) | (dz <= d_lo) | (dz >= d_hi)
+                if mask_invalid.any():
+                    dz = dz.clone()
+                    dz[mask_invalid] = 0.0
+                    v["depth_z"] = dz
 
     # Extract features
     print("[BSE Memory] Extracting features...", flush=True)
@@ -2448,7 +3764,7 @@ def main():
         features_dict = extractor._process_saved_features(stored_features, len(memory_views))
     else:
         # DINOv2: batch tensors
-        all_images = torch.cat([v['img'] for v in memory_views], dim=0)
+        all_images = torch.cat([v['img'] for v in memory_views], dim=0).float()  # Ensure float32 for DINOv2
         all_depths = torch.cat([v['depth_z'] for v in memory_views], dim=0) if 'depth_z' in memory_views[0] else None
         all_poses = torch.cat([v['camera_poses'] for v in memory_views], dim=0)
         all_intrinsics = torch.cat([v['intrinsics'] for v in memory_views], dim=0)
@@ -2461,7 +3777,7 @@ def main():
     )
 
     # Save memory
-    save_memory(config.output_path, result, mu, sigma, view_info)
+    save_memory(config.output_path, result, mu, sigma, view_info, layers_idx)
 
     # Save PLY for visualization
     save_ply(config.output_path, result, mu, sigma)

@@ -2,27 +2,27 @@
 # format: scene_path  head_path  num_clusters  cluster_idx
 # Using 4-cluster split (matches ACE paper main experiments)
 
-/data/xwh/Cambridge/Cambridge_GreatCourt    output/ace_models/Cambridge_Ensemble/Cambridge_GreatCourt/0_4.pt    4  0
-/data/xwh/Cambridge/Cambridge_GreatCourt    output/ace_models/Cambridge_Ensemble/Cambridge_GreatCourt/1_4.pt    4  1
-/data/xwh/Cambridge/Cambridge_GreatCourt    output/ace_models/Cambridge_Ensemble/Cambridge_GreatCourt/2_4.pt    4  2
-/data/xwh/Cambridge/Cambridge_GreatCourt    output/ace_models/Cambridge_Ensemble/Cambridge_GreatCourt/3_4.pt    4  3
+/mnt/storage/xwh/Cambridge/Cambridge_GreatCourt    output/ace_models/Cambridge_Ensemble/Cambridge_GreatCourt/0_4.pt    4  0
+/mnt/storage/xwh/Cambridge/Cambridge_GreatCourt    output/ace_models/Cambridge_Ensemble/Cambridge_GreatCourt/1_4.pt    4  1
+/mnt/storage/xwh/Cambridge/Cambridge_GreatCourt    output/ace_models/Cambridge_Ensemble/Cambridge_GreatCourt/2_4.pt    4  2
+/mnt/storage/xwh/Cambridge/Cambridge_GreatCourt    output/ace_models/Cambridge_Ensemble/Cambridge_GreatCourt/3_4.pt    4  3
 
-/data/xwh/Cambridge/Cambridge_KingsCollege  output/ace_models/Cambridge_Ensemble/Cambridge_KingsCollege/0_4.pt  4  0
-/data/xwh/Cambridge/Cambridge_KingsCollege  output/ace_models/Cambridge_Ensemble/Cambridge_KingsCollege/1_4.pt  4  1
-/data/xwh/Cambridge/Cambridge_KingsCollege  output/ace_models/Cambridge_Ensemble/Cambridge_KingsCollege/2_4.pt  4  2
-/data/xwh/Cambridge/Cambridge_KingsCollege  output/ace_models/Cambridge_Ensemble/Cambridge_KingsCollege/3_4.pt  4  3
+/mnt/storage/xwh/Cambridge/Cambridge_KingsCollege  output/ace_models/Cambridge_Ensemble/Cambridge_KingsCollege/0_4.pt  4  0
+/mnt/storage/xwh/Cambridge/Cambridge_KingsCollege  output/ace_models/Cambridge_Ensemble/Cambridge_KingsCollege/1_4.pt  4  1
+/mnt/storage/xwh/Cambridge/Cambridge_KingsCollege  output/ace_models/Cambridge_Ensemble/Cambridge_KingsCollege/2_4.pt  4  2
+/mnt/storage/xwh/Cambridge/Cambridge_KingsCollege  output/ace_models/Cambridge_Ensemble/Cambridge_KingsCollege/3_4.pt  4  3
 
-/data/xwh/Cambridge/Cambridge_OldHospital   output/ace_models/Cambridge_Ensemble/Cambridge_OldHospital/0_4.pt   4  0
-/data/xwh/Cambridge/Cambridge_OldHospital   output/ace_models/Cambridge_Ensemble/Cambridge_OldHospital/1_4.pt   4  1
-/data/xwh/Cambridge/Cambridge_OldHospital   output/ace_models/Cambridge_Ensemble/Cambridge_OldHospital/2_4.pt   4  2
-/data/xwh/Cambridge/Cambridge_OldHospital   output/ace_models/Cambridge_Ensemble/Cambridge_OldHospital/3_4.pt   4  3
+/mnt/storage/xwh/Cambridge/Cambridge_OldHospital   output/ace_models/Cambridge_Ensemble/Cambridge_OldHospital/0_4.pt   4  0
+/mnt/storage/xwh/Cambridge/Cambridge_OldHospital   output/ace_models/Cambridge_Ensemble/Cambridge_OldHospital/1_4.pt   4  1
+/mnt/storage/xwh/Cambridge/Cambridge_OldHospital   output/ace_models/Cambridge_Ensemble/Cambridge_OldHospital/2_4.pt   4  2
+/mnt/storage/xwh/Cambridge/Cambridge_OldHospital   output/ace_models/Cambridge_Ensemble/Cambridge_OldHospital/3_4.pt   4  3
 
-/data/xwh/Cambridge/Cambridge_ShopFacade    output/ace_models/Cambridge_Ensemble/Cambridge_ShopFacade/0_4.pt    4  0
-/data/xwh/Cambridge/Cambridge_ShopFacade    output/ace_models/Cambridge_Ensemble/Cambridge_ShopFacade/1_4.pt    4  1
-/data/xwh/Cambridge/Cambridge_ShopFacade    output/ace_models/Cambridge_Ensemble/Cambridge_ShopFacade/2_4.pt    4  2
-/data/xwh/Cambridge/Cambridge_ShopFacade    output/ace_models/Cambridge_Ensemble/Cambridge_ShopFacade/3_4.pt    4  3
+/mnt/storage/xwh/Cambridge/Cambridge_ShopFacade    output/ace_models/Cambridge_Ensemble/Cambridge_ShopFacade/0_4.pt    4  0
+/mnt/storage/xwh/Cambridge/Cambridge_ShopFacade    output/ace_models/Cambridge_Ensemble/Cambridge_ShopFacade/1_4.pt    4  1
+/mnt/storage/xwh/Cambridge/Cambridge_ShopFacade    output/ace_models/Cambridge_Ensemble/Cambridge_ShopFacade/2_4.pt    4  2
+/mnt/storage/xwh/Cambridge/Cambridge_ShopFacade    output/ace_models/Cambridge_Ensemble/Cambridge_ShopFacade/3_4.pt    4  3
 
-/data/xwh/Cambridge/Cambridge_StMarysChurch output/ace_models/Cambridge_Ensemble/Cambridge_StMarysChurch/0_4.pt 4  0
-/data/xwh/Cambridge/Cambridge_StMarysChurch output/ace_models/Cambridge_Ensemble/Cambridge_StMarysChurch/1_4.pt 4  1
-/data/xwh/Cambridge/Cambridge_StMarysChurch output/ace_models/Cambridge_Ensemble/Cambridge_StMarysChurch/2_4.pt 4  2
-/data/xwh/Cambridge/Cambridge_StMarysChurch output/ace_models/Cambridge_Ensemble/Cambridge_StMarysChurch/3_4.pt 4  3
+/mnt/storage/xwh/Cambridge/Cambridge_StMarysChurch output/ace_models/Cambridge_Ensemble/Cambridge_StMarysChurch/0_4.pt 4  0
+/mnt/storage/xwh/Cambridge/Cambridge_StMarysChurch output/ace_models/Cambridge_Ensemble/Cambridge_StMarysChurch/1_4.pt 4  1
+/mnt/storage/xwh/Cambridge/Cambridge_StMarysChurch output/ace_models/Cambridge_Ensemble/Cambridge_StMarysChurch/2_4.pt 4  2
+/mnt/storage/xwh/Cambridge/Cambridge_StMarysChurch output/ace_models/Cambridge_Ensemble/Cambridge_StMarysChurch/3_4.pt 4  3

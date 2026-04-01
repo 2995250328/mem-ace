@@ -327,18 +327,18 @@ def main():
     parser.add_argument(
         "ace_scene_dir",
         type=Path,
-        help="ACE 场景目录，如 /data/xwh/indoor6_ace/scene1",
+        help="ACE 场景目录，如 /mnt/storage/xwh/indoor6_ace/scene1",
     )
     parser.add_argument(
         "--indoor6_root",
         type=Path,
-        default=Path("/data/xwh/indoor6"),
+        default=Path("/mnt/storage/xwh/indoor6"),
         help="indoor6 原始根目录",
     )
     parser.add_argument(
         "--colmap_root",
         type=Path,
-        default=Path("/data/xwh/indoor6/indoor6-colmap"),
+        default=Path("/mnt/storage/xwh/indoor6/indoor6-colmap"),
         help="COLMAP 根目录 (indoor6-colmap)",
     )
     parser.add_argument(

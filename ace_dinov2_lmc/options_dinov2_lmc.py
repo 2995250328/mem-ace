@@ -103,7 +103,7 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--dinov2_path',
         type=Path,
-        default=Path('/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth'),
+        default=Path('/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth'),
         help='DINOv2 ViT-L/14 预训练权重路径。',
     )
     parser.add_argument(

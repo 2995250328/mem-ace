@@ -44,8 +44,8 @@ The output is a `.pt` file containing:
 │                        STEP 2: FEATURE EXTRACTION                           │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │ Input: M RGB images                                                  │   │
-│  │ Model: DINOv2 ViT-L/14 (pretrained)                                  │   │
-│  │ Output: M feature maps [1024, H/14, W/14]                            │   │
+│  │ Model: DINOv2 ViT-L/14 (pretrained) → MapAnything multi-scale concat │   │
+│  │ Output: M feature maps [~5000-9000, H/14, W/14] (multi-scale concat) │   │
 │  └──────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────┬───────────────────────────────────────┘
                                       │
@@ -62,7 +62,7 @@ The output is a `.pt` file containing:
 │  │                                                                      │   │
 │  │ Output per view:                                                      │   │
 │  │   - points: [N_i, 3] 3D coordinates                                   │   │
-│  │   - features: [N_i, 1024] DINOv2 features                            │   │
+│  │   - features: [N_i, C] multi-scale DINOv2 features (C ~ 5000-9000)  │   │
 │  │   - colors: [N_i, 3] RGB colors                                      │   │
 │  │   - ray_dirs: [N_i, 3] unit ray directions                           │   │
 │  │   - camera_centers: [N_i, 3] camera center (repeated)                │   │
@@ -140,7 +140,7 @@ The output is a `.pt` file containing:
 │  │                                                                      │   │
 │  │ Point-level Data (N = total clusters):                               │   │
 │  │   - points: [N, 3] normalized 3D coordinates                         │   │
-│  │   - features: [N, 1024] DINOv2 features (fp16)                       │   │
+│  │   - features: [N, C] multi-scale DINOv2 features (fp16, C ~ 5000-9000) │   │
 │  │   - colors: [N, 3] RGB colors                                        │   │
 │  │   - cluster_sizes: [N] points per cluster                            │   │
 │  │   - ray_dirs: [N, 3] primary ray directions                          │   │
@@ -185,6 +185,9 @@ The output is a `.pt` file containing:
 - Outputs 8 intermediate transformer layers (DPT-style) + final layer
 - Uses layers [2, 5, 8, 11, 14, 17, 20, 23] + final layer
 - Each layer outputs 1024-dimensional features
+- **Multi-scale features are concatenated** → total dimension is ~5000-9000 (not 1024)
+
+<!-- Updated 2026-03-30: corrected feature dimension from 1024 to multi-scale concat -->
 
 **Fallback Model**: DINOv2 standalone
 - Automatically falls back when MapAnything unavailable
@@ -551,7 +554,7 @@ where:
 
 ```bash
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/chess_memory.pt \
     --n_memory 100 \
     --voxel_size 0.05 \
@@ -562,7 +565,7 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 
 **Expected output**:
 ```
-[BSE Memory] Dataset: /data/xwh/7Scenes/pgt_7scenes_chess
+[BSE Memory] Dataset: /mnt/storage/xwh/7Scenes/pgt_7scenes_chess
 [BSE Memory] Output: output/chess_memory.pt
 [BSE Memory] N_MEMORY: 100, BSE: True
 [BSE Memory] Voxel size: 0.05, Otsu: True
@@ -577,7 +580,7 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 [Save] Memory saved to output/chess_memory.pt
 [Save] Schema version: 1.2
 [Save] Total points: 52341
-[Save] Feature dim: 1024
+[Save] Feature dim: ~5000-9000 (multi-scale concat, not 1024)
 [Save] Scene mean: [1.234, -0.567, 2.345]
 [Save] Scene sigma: 1.2345
 [Save] View count: 100

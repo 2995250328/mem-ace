@@ -145,12 +145,12 @@ def main():
     parser.add_argument(
         "indoor6_root",
         type=Path,
-        help="Root of indoor6 dataset (e.g. /data/xwh/indoor6)",
+        help="Root of indoor6 dataset (e.g. /mnt/storage/xwh/indoor6)",
     )
     parser.add_argument(
         "out_root",
         type=Path,
-        help="Output root (e.g. /data/xwh/indoor6_ace). Each scene will be out_root/<scene>/train|test/...",
+        help="Output root (e.g. /mnt/storage/xwh/indoor6_ace). Each scene will be out_root/<scene>/train|test/...",
     )
     parser.add_argument(
         "--scenes",

@@ -4,8 +4,8 @@
 #
 # 前置步骤：
 #   1. 运行 adapt_indoor6_to_ace.py 将 indoor6 转为 ACE 格式
-#      python scripts/adapt_indoor6_to_ace.py /data/xwh/indoor6 /data/xwh/indoor6_ace
-#   2. 校验各场景：python check_dataset_dinov2.py /data/xwh/indoor6_ace/<scene>
+#      python scripts/adapt_indoor6_to_ace.py /mnt/storage/xwh/indoor6 /mnt/storage/xwh/indoor6_ace
+#   2. 校验各场景：python check_dataset_dinov2.py /mnt/storage/xwh/indoor6_ace/<scene>
 #
 # ─── Vanilla 训练（不启用 LMC）─────────────────────────────────────────────────
 #   ./scripts/train_indoor6_lmc.sh
@@ -32,7 +32,7 @@ scenes=("scene1" "scene2a" "scene3" "scene4a" "scene5" "scene6")
 training_exe="${REPO_PATH}/train_ace_dinov2_lmc.py"
 
 # 转换后的 ACE 格式数据根目录
-ace_root="${ACE_ROOT:-/data/xwh/indoor6_ace}"
+ace_root="${ACE_ROOT:-/mnt/storage/xwh/indoor6_ace}"
 
 # 是否启用 LMC
 use_lmc="${USE_LMC:-False}"

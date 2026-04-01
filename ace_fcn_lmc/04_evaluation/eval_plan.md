@@ -41,14 +41,14 @@ cp -r output/7Scenes/pgt_7scenes_chess/ace_fcn_lmc_aceg/*/  ace_fcn_lmc/04_evalu
 ```bash
 # 7-Scenes Chess
 python ace_fcn_lmc/test_ace_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     <checkpoint.pt> \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 --session eval_chess
 
 # Indoor6 Scene3
 python ace_fcn_lmc/test_ace_lmc.py \
-    /data/xwh/indoor6_ace/scene3 \
+    /mnt/storage/xwh/indoor6_ace/scene3 \
     <checkpoint.pt> \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 --session eval_scene3

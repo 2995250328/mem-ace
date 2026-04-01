@@ -161,7 +161,7 @@ def main():
 ### 完整命令示例对比
 
   python train_ace_lmc.py \                                                                
-      /data/xwh/7Scenes/pgt_7scenes_chess \                                                
+      /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \                                                
       output/chess_lmc_simple.pt \                                                         
       --encoder_path ace_encoder_pretrained.pt \                                           
       --device cuda:0 \
@@ -230,7 +230,7 @@ def main():
 
 ```bash
 ./train_ace_lmc.py \
-    /data/xwh/7scenes_chess \
+    /mnt/storage/xwh/7scenes_chess \
     output/chess_vanilla_quick.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 \
@@ -252,7 +252,7 @@ def main():
 
 ```bash
 ./train_ace_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/chess_vanilla_full.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 \
@@ -277,7 +277,7 @@ def main():
 
 ```bash
 ./train_ace_lmc.py \
-    /data/xwh/7scenes_chess \
+    /mnt/storage/xwh/7scenes_chess \
     output/chess_vanilla_iter.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 \
@@ -304,7 +304,7 @@ def main():
 
 ```bash
 python train_ace_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/chess_lmc_simple.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 \
@@ -335,7 +335,7 @@ python train_ace_lmc.py \
 
 ```bash
 ./train_ace_lmc.py \
-    /data/xwh/indoor6_ace/scene3 \
+    /mnt/storage/xwh/indoor6_ace/scene3 \
     scene3_lmc_full.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:1 \
@@ -387,7 +387,7 @@ python train_ace_lmc.py \
 
 ```bash
 ./test_ace_lmc.py \
-    /data/xwh/7scenes_chess \
+    /mnt/storage/xwh/7scenes_chess \
     output/chess_lmc_full.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 \
@@ -574,7 +574,7 @@ output/
   "algorithm": "ace_fcn_lmc",
   "dataset": "7scenes",
   "scene": "chess",
-  "scene_path": "/data/xwh/7scenes_chess",
+  "scene_path": "/mnt/storage/xwh/7scenes_chess",
   "encoder_path": "ace_encoder_pretrained.pt",
   "device": "cuda:0",
   "use_lmc": true,
@@ -750,12 +750,12 @@ from result_manager import ResultManager
 mgr = ResultManager(experiment_root="output")
 
 # 1. 解析场景信息
-scene_info = mgr.parse_scene_info("/data/xwh/7scenes_chess")
+scene_info = mgr.parse_scene_info("/mnt/storage/xwh/7scenes_chess")
 # 返回: {'dataset': '7scenes', 'scene': 'chess'}
 
 # 2. 构建层级化目录
 run_dir = mgr.build_hierarchical_path(
-    scene_path="/data/xwh/7scenes_chess",
+    scene_path="/mnt/storage/xwh/7scenes_chess",
     algorithm="ace_fcn_lmc",
     config_tag="global_buf2.6M_K64_it28_bs5120",
     timestamp=None  # 使用当前时间戳
@@ -806,7 +806,7 @@ mgr.print_results_summary()
 
 ```bash
 ./train_ace_lmc.py \
-    /data/xwh/7scenes_chess \
+    /mnt/storage/xwh/7scenes_chess \
     output/chess_lmc.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 \

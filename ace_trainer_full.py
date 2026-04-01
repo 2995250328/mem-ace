@@ -34,7 +34,7 @@ def set_seed(seed):
 # 1. SegFormer Sky Estimator
 # ==========================================
 class SegFormerSkyEstimator:
-    def __init__(self, device='cuda', model_path='/data/xwh/checkpoints/segformer_b0'):
+    def __init__(self, device='cuda', model_path='/mnt/storage/xwh/checkpoints/segformer_b0'):
         self.device = device
         _logger.info(f"Initializing SegFormer from local path: {model_path} ...")
         try:
@@ -117,7 +117,7 @@ class TrainerACE:
         )
 
         # SegFormer
-        segformer_path = getattr(self.options, 'segformer_path', '/data/xwh/checkpoints/segformer_b0')
+        segformer_path = getattr(self.options, 'segformer_path', '/mnt/storage/xwh/checkpoints/segformer_b0')
         self.sky_estimator = SegFormerSkyEstimator(device=self.device, model_path=segformer_path)
 
         # Sobel Kernels
@@ -133,7 +133,7 @@ class TrainerACE:
         }
         self.depth_anything = DepthAnythingV2(**model_configs[self.options.depth_encoder])
         self.depth_anything.load_state_dict(
-            torch.load(f'/data/xwh/checkpoints/depth_anything_v2_{self.options.depth_encoder}.pth', map_location='cpu'))
+            torch.load(f'/mnt/storage/xwh/checkpoints/depth_anything_v2_{self.options.depth_encoder}.pth', map_location='cpu'))
         self.depth_anything = self.depth_anything.to(self.device).eval()
 
         # Optimizer & Scheduler

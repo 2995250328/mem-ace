@@ -16,7 +16,7 @@ def test_network():
 
         # Test encoder
         print("  Creating DINOv2Encoder...")
-        dinov2_path = Path('/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth')
+        dinov2_path = Path('/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth')
 
         if not dinov2_path.exists():
             print(f"  ⊘ Skipping (weights not found at {dinov2_path})")

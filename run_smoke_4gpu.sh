@@ -9,9 +9,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="${ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 TRAIN_PY="$SCRIPT_DIR/train_ace_dinov2_lmc.py"
 
-SCENE="${SCENE:-/data/xwh/7Scenes/pgt_7scenes_heads}"
+SCENE="${SCENE:-/mnt/storage/xwh/7Scenes/pgt_7scenes_heads}"
 MEM="${MEM:-/home/xwh/project/map-anything-experiments/memory_extract/heads_train/20views/20260127_235757/7Scenes_heads_train_pooled_GT_patch.pt}"
-DINO="${DINO:-/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth}"
+DINO="${DINO:-/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth}"
 ITER_S1BUF_REFILL_MODE="${ITER_S1BUF_REFILL_MODE:-partial}"
 ITER_S1BUF_KEEP_RATIO="${ITER_S1BUF_KEEP_RATIO:-0.5}"
 

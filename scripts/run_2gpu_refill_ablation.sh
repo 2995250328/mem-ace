@@ -14,9 +14,9 @@
 # 可选环境变量：
 #   GPU0=cuda:0
 #   GPU1=cuda:1
-#   SCENE_PATH=/data/xwh/7Scenes/pgt_7scenes_heads
+#   SCENE_PATH=/mnt/storage/xwh/7Scenes/pgt_7scenes_heads
 #   MEMORY_PATH=/home/xwh/project/map-anything-experiments/memory_extract/heads_train/20views/20260127_235757/7Scenes_heads_train_pooled_GT_patch.pt
-#   DINO_PATH=/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth
+#   DINO_PATH=/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth
 #   RUN_PREFIX=refill_ablation
 #   LMC_MODE=global
 #   LMC_ITERS=28
@@ -45,9 +45,9 @@ cd "$REPO_PATH" || exit 1
 
 GPU0="${GPU0:-cuda:2}"
 GPU1="${GPU1:-cuda:3}"
-SCENE_PATH="${SCENE_PATH:-/data/xwh/7Scenes/pgt_7scenes_heads}"
+SCENE_PATH="${SCENE_PATH:-/mnt/storage/xwh/7Scenes/pgt_7scenes_heads}"
 MEMORY_PATH="${MEMORY_PATH:-/home/xwh/project/map-anything-experiments/memory_extract/heads_train/20views/20260127_235757/7Scenes_heads_train_pooled_GT_patch.pt}"
-DINO_PATH="${DINO_PATH:-/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth}"
+DINO_PATH="${DINO_PATH:-/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth}"
 RUN_PREFIX="${RUN_PREFIX:-refill_ablation}"
 
 LMC_MODE="${LMC_MODE:-global}"

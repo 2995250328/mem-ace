@@ -241,7 +241,7 @@ S2 为 head-only 训练，学习率由 **S2 专用** `s2_learning_rate_max` 控�
 
 ```bash
 python train_ace_dinov2_lmc.py \
-  /data/xwh/7Scenes/pgt_7scenes_chess \
+  /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
   output/chess_lmc.pt \
   --device cuda:0 \
   --use_lmc True \
@@ -274,7 +274,7 @@ python train_ace_dinov2_lmc.py \
 
 ```bash
 python train_ace_dinov2_lmc.py \
-  /data/xwh/7Scenes/pgt_7scenes_chess \
+  /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
   output/chess_baseline.pt \
   --device cuda:0 \
   --buffer_batch_size 10 \
@@ -290,7 +290,7 @@ python train_ace_dinov2_lmc.py \
 
 ```bash
 python train_ace_dinov2_lmc.py \
-  /data/xwh/7Scenes/pgt_7scenes_chess \
+  /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
   output/smoke.pt \
   --device cuda:0 \
   --use_lmc True \

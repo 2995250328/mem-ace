@@ -98,7 +98,7 @@ def main():
 
     # Check DINOv2 weights
     print("Checking DINOv2 weights...")
-    dinov2_path = Path('/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth')
+    dinov2_path = Path('/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth')
     if dinov2_path.exists():
         if not check_dinov2_weights(dinov2_path):
             all_checks_passed = False

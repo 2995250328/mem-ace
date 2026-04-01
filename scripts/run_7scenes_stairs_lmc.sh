@@ -21,7 +21,7 @@ DEVICE="${DEVICE:-cuda:0}"
 MEMORY_PATH="${MEMORY_PATH:-/home/xwh/project/map-anything-experiments/memory_extract/stairs_train/20views/20260126_234545/7Scenes_stairs_train_pooled_GT.pt}"
 
 python train_ace_dinov2_lmc.py \
-  /data/xwh/7Scenes/pgt_7scenes_stairs \
+  /mnt/storage/xwh/7Scenes/pgt_7scenes_stairs \
   output/chess_lmc.pt \
   --device "$DEVICE" \
   --use_lmc True \

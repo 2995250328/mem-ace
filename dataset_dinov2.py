@@ -352,13 +352,19 @@ class CamLocDatasetDINOv2(Dataset):
         # Load ground truth scene coordinates if needed
         if self.init:
             if self.sparse:
-                coords = torch.load(self.coord_files[idx])
+                try:
+                    coords = torch.load(self.coord_files[idx], weights_only=True)
+                except TypeError:
+                    coords = torch.load(self.coord_files[idx])
             else:
                 depth = io.imread(self.coord_files[idx])
                 depth = depth.astype(np.float64)
                 depth /= 1000
         elif self.eye:
-            coords = torch.load(self.coord_files[idx])
+            try:
+                coords = torch.load(self.coord_files[idx], weights_only=True)
+            except TypeError:
+                coords = torch.load(self.coord_files[idx])
         else:
             coords = 0
 

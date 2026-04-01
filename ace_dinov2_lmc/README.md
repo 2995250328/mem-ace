@@ -42,18 +42,36 @@ All commands run from the **project root** (`ace_depth/`).
 
 ### ACE-G flow (main use case)
 
-The standard configuration used in experiments. Requires a pre-built pooled memory file (GT patch format).
+<!-- Updated 2026-03-30: clarified memory file naming and training stages -->
+
+The standard configuration used in experiments. **Requires a pre-built pooled memory file** (output of `memory_extraction/` pipeline, typically named `memory_bse.pt`). The `*_GT_patch.pt` naming in some older scripts refers to the same pooled format.
+
+<!-- Updated 2026-03-30: added S1/S2 explanation and parameter context -->
+
+**S1/S2 iterative training:**
+- **S1 (memory alignment)**: Trains GeoLMC compressor + LMCFeatureFusion to align latent memory with backbone features
+- **S2 (reprojection refinement)**: Trains regression head on fused features; optionally continues fusion training (`--ace_g_fusion_in_s2 True`)
+- Cycles alternate for `--lmc_iterations` (default 28) rounds, with evaluation after each cycle
+
+**Key parameter groups not shown in examples:**
+- `--head_reset_strategy {first_only,every,output_only,none}`: How regression head resets between S1/S2 cycles (default: `first_only`)
+- `--best_metric {pct5,pct10_5,composite,rt_error}`: Metric for best checkpoint selection (default: `pct5`)
+- `--use_half`: Half-precision training (default: True)
+- `--buffer_on_cpu`: Keep training buffer on CPU to save GPU memory (default: True)
+- `--data_backend {ace,wai}`: Dataset format (default: `ace`)
+
+**Memory file note:** The `--memory_path` must point to a pooled memory `.pt` file produced by the extraction pipeline (`memory_extraction/extract_memory.sh`). This file contains pooled 3D points, multi-scale features, ray directions, and camera info.
 
 **7-Scenes example:**
 ```bash
 python train_ace_dinov2_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_heads \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
     heads_aceg_full_refill.pt \
     --device cuda:3 \
     --run_name heads_aceg_full_refill \
     --use_lmc True \
     --memory_path /path/to/7Scenes_heads_train_pooled_GT_patch.pt \
-    --dinov2_path /data/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
+    --dinov2_path /mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
     --lmc_flow ace_g \
     --lmc_mode global \
     --num_latent_tokens 64 \
@@ -89,7 +107,7 @@ python train_ace_dinov2_lmc.py \
 **Indoor6 example** (large scene, add `--lmc_scene_center_max_distance 4.0`):
 ```bash
 python train_ace_dinov2_lmc.py \
-    /data/xwh/indoor6_ace/scene3 \
+    /mnt/storage/xwh/indoor6_ace/scene3 \
     scene3_aceg_full_refill.pt \
     --device cuda:1 \
     --run_name scene3_aceg_full_refill \
@@ -103,7 +121,7 @@ python train_ace_dinov2_lmc.py \
 
 ```bash
 python train_ace_dinov2_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     chess_vanilla.pt \
     --use_lmc False \
     --device cuda:0
@@ -113,7 +131,7 @@ python train_ace_dinov2_lmc.py \
 
 ```bash
 python test_ace_dinov2_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_heads \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
     output/.../best_K64_it28_heads_aceg_full_refill.pt \
     --device cuda:0 \
     --session lmc_test

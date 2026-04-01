@@ -44,7 +44,7 @@ pip install timm
 
 确保DINOv2预训练权重位于：
 ```
-/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth
+/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth
 ```
 
 如果权重在其他位置，使用`--dinov2_path`参数指定。
@@ -65,7 +65,7 @@ pip install timm
 ./train_ace_dinov2.py \
     datasets/7scenes_chess \
     output/chess_dinov2.pt \
-    --dinov2_path /data/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
+    --dinov2_path /mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
     --freeze_backbone True \
     --device cuda:3 \
     --image_resolution 518 \
@@ -90,7 +90,7 @@ pip install timm
 ./test_ace_dinov2.py \
     datasets/7scenes_chess \
     output/chess_dinov2.pt \
-    --dinov2_path /data/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
+    --dinov2_path /mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
     --device cuda:3 \
     --image_resolution 518 \
     --hypotheses 64 \

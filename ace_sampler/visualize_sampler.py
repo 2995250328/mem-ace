@@ -2,7 +2,7 @@
 
 Usage:
     python ace_sampler/visualize_sampler.py \
-        /data/xwh/7Scenes/pgt_7scenes_chess \
+        /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
         output/ace_models/7Scenes_pgt/pgt_7scenes_chess.pt \
         ace_sampler/04_evaluation/universal/20260323_223249_universal_sampler_all.pt \
         --out_dir ace_sampler/04_evaluation/vis_chess \

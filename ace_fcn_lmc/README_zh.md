@@ -44,7 +44,7 @@
 
 ```bash
 python train_ace_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     chess_quick.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 \
@@ -61,7 +61,7 @@ python train_ace_lmc.py \
 
 ```bash
 python train_ace_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_heads \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
     heads_vanilla.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:2 \
@@ -83,7 +83,7 @@ python train_ace_lmc.py \
 
 ```bash
 python train_ace_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     chess_iter.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 \
@@ -107,7 +107,7 @@ python train_ace_lmc.py \
 
 ```bash
 python train_ace_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     chess_lmc_quick.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 \
@@ -141,7 +141,7 @@ python train_ace_lmc.py \
 
 ```bash
 python train_ace_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_heads \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
     heads_lmc.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:2 \
@@ -191,7 +191,7 @@ python train_ace_lmc.py \
 
 ```bash
 python test_ace_lmc.py \
-    /data/xwh/7Scenes/pgt_7scenes_chess \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
     output/7Scenes/pgt_7scenes_chess/ace_fcn_lmc_aceg/.../best_K64_it28_scene3_lmc.pt \
     --encoder_path ace_encoder_pretrained.pt \
     --device cuda:0 \

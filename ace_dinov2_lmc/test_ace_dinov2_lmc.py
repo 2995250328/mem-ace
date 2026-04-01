@@ -348,7 +348,7 @@ if __name__ == '__main__':
     parser.add_argument('scene', type=Path)
     parser.add_argument('network', type=Path, help='Path to checkpoint')
     parser.add_argument('--dinov2_path', type=Path,
-                        default=Path('/data/xwh/checkpoints/dinov2_vitl14_pretrain.pth'))
+                        default=Path('/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth'))
     parser.add_argument('--session', '-sid', default='')
     parser.add_argument('--image_resolution', type=int, default=518)
     parser.add_argument('--device', type=str, default='cuda')
