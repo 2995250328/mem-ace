@@ -98,7 +98,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         # --- Load pre-saved memory (same as map-anything train_ace + load_memory_features) ---
         _logger.info("[LMC] Loading memory from %s", memory_path)
-        bank_data = load_memory_features(str(memory_path), self.device)
+        _bse_denorm = bool(getattr(options, "bse_denorm_to_world", False))
+        bank_data = load_memory_features(str(memory_path), self.device, bse_denorm_to_world=_bse_denorm)
         if bool(getattr(options, "lmc_memory_preflight", True)):
             preflight_report = preflight_memory_features(
                 bank_data,
@@ -216,6 +217,36 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         backbone_feature_dim = getattr(self.regressor.encoder, 'feature_dim', 1024)
         _logger.info("[LMC] backbone_feature_dim=%d (from regressor.encoder)", backbone_feature_dim)
 
+        # --- Full-pipeline normalization: store mu/sigma for config ---
+        norm_mu = bank_data.get("normalization_mu")   # [3] or None
+        norm_sigma = bank_data.get("normalization_sigma")  # scalar or None
+
+        if norm_mu is None or norm_sigma is None:
+            # Non-BSE or pooled format — no normalization, use world coords
+            self.coord_sigma = None
+            self.coord_mu = None
+            self._depth_min_eff = self.options.depth_min
+            self._depth_max_eff = self.options.depth_max
+            self._depth_target_eff = self.options.depth_target
+            _logger.info("[LMC] No normalization metadata — using raw world coordinates and depth thresholds.")
+        else:
+            self.coord_sigma = float(norm_sigma.detach().cpu().item())
+            self.coord_mu = norm_mu.detach().cpu()  # [3]
+            self._depth_min_eff = self.options.depth_min / self.coord_sigma
+            self._depth_max_eff = self.options.depth_max / self.coord_sigma
+            self._depth_target_eff = self.options.depth_target / self.coord_sigma
+            # Override options so all loss functions use scaled thresholds automatically
+            self.options.depth_min = self._depth_min_eff
+            self.options.depth_max = self._depth_max_eff
+            self.options.depth_target = self._depth_target_eff
+            _logger.info(
+                "[LMC] Normalization active: sigma=%.4f, mu=(%.3f, %.3f, %.3f), "
+                "depth_min_eff=%.4f, depth_max_eff=%.4f, depth_target_eff=%.4f (scaled by 1/sigma)",
+                self.coord_sigma,
+                float(self.coord_mu[0]), float(self.coord_mu[1]), float(self.coord_mu[2]),
+                self._depth_min_eff, self._depth_max_eff, self._depth_target_eff,
+            )
+
         self.lmc_config = {
             'use_lmc': True,
             'lmc_mode': lmc_mode,
@@ -226,6 +257,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'num_layers': num_layers,
             'scale_token_dim': scale_token_dim,
             'memory_path': str(memory_path),
+            # Normalization metadata for test-time de-normalization
+            'normalization_mu': self.coord_mu.cpu().tolist() if self.coord_mu is not None else None,
+            'normalization_sigma': self.coord_sigma if self.coord_sigma is not None else None,
         }
 
         # --- Build compressor (same as map-anything: input_dim/compress_dim = per-layer feature_dim) ---
@@ -542,7 +576,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         dataset_center = self.dataset.mean_cam_center.detach().float().view(-1).cpu()
         mem_center = scene_center.detach().float().view(-1).cpu()
-        if dataset_center.numel() >= 3 and mem_center.numel() >= 3:
+
+        # Skip center distance check when using normalized coordinates (scene_center=0)
+        if hasattr(self, 'coord_sigma') and self.coord_sigma is not None:
+            _logger.info(
+                "[LMC] Skipping center distance check (normalized coordinates, scene_center=0). "
+                "dataset.mean_cam_center=(%.3f, %.3f, %.3f)",
+                float(dataset_center[0]), float(dataset_center[1]), float(dataset_center[2]),
+            )
+        elif dataset_center.numel() >= 3 and mem_center.numel() >= 3:
             center_dist = float(torch.linalg.norm(mem_center[:3] - dataset_center[:3]).item())
             _logger.info(
                 "[LMC] Center consistency: ||memory.scene_center - dataset.mean_cam_center|| = %.4f m "
@@ -630,6 +672,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         sc = sc.detach().to(self.device, dtype=self.regressor.heads.mean.dtype)
         if sc.dim() == 1:
             sc = sc.unsqueeze(0)
+
+        # Full-pipeline normalization: scene_center is zeros, head.mean should be zeros
+        # Skip the shift check since ||zeros - dataset.mean_cam_center|| will be large
+        if hasattr(self, 'coord_sigma') and self.coord_sigma is not None:
+            self.regressor.heads.mean.copy_(sc.view(1, 3, 1, 1))
+            _logger.info(
+                "[LMC] Head mean set to scene_center (normalized coords, shift check skipped). target=(%.3f,%.3f,%.3f)",
+                float(sc.view(-1)[0]), float(sc.view(-1)[1]), float(sc.view(-1)[2]),
+            )
+            return
+
         target = sc.view(-1)[:3].detach().float().cpu()
         dataset_center = self.dataset.mean_cam_center.detach().float().view(-1).cpu()[:3]
         shift = float(torch.linalg.norm(target - dataset_center).item())
@@ -777,6 +830,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 schema_name="fused_buffer",
                 expected_size=target_buf_size,
             )
+        # Normalize poses for full-pipeline normalization
+        self._normalize_buffer_poses()
 
     # ------------------------------------------------------------------
     # Override: create_training_buffer_ace_g (raw backbone features, no fusion)
@@ -816,6 +871,52 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 schema_name="raw_buffer",
                 expected_size=target_buf_size,
             )
+        # Normalize poses for full-pipeline normalization
+        self._normalize_buffer_poses()
+
+    # ------------------------------------------------------------------
+    # Full-pipeline normalization: normalize buffer poses
+    # ------------------------------------------------------------------
+
+    def _normalize_buffer_poses(self):
+        """Normalize gt_poses_inv in training_buffer for normalized scene coordinates.
+
+        When memory uses normalized coords (raw-mu)/sigma, the inverse pose
+        translation must also be normalized so that reprojection math stays
+        consistent:
+            inv_pose_norm @ x_norm = R^T @ (x_norm - C_norm) = R^T @ (x_world - C) / sigma
+        Since pixel projection is px = cam_x/cam_z, sigma cancels, so pixel errors are identical.
+
+        Formula: t_norm = (t + R @ mu) / sigma  where t = original translation = -R^T @ C
+        """
+        if not self.use_lmc or self.coord_sigma is None:
+            return  # No normalization active, or not LMC mode
+
+        if self.training_buffer is None or 'gt_poses_inv' not in self.training_buffer:
+            return
+
+        buf = self.training_buffer
+        gt_poses = buf['gt_poses_inv']  # (B, 3, 4)
+        mu = self.coord_mu.to(gt_poses.device)  # [3]
+        sigma = self.coord_sigma
+
+        R = gt_poses[:, :, :3]   # (B, 3, 3) — unchanged
+        t = gt_poses[:, :, 3]    # (B, 3) — needs normalization
+
+        # t_norm = (t + R @ mu) / sigma
+        # R: (B, 3, 3), mu: (3,) → mu_broadcast: (B, 3, 1) → R @ mu: (B, 3, 1) → squeeze: (B, 3)
+        R_mu = torch.bmm(R, mu.view(1, 3, 1).expand(R.shape[0], -1, -1)).squeeze(-1)  # (B, 3)
+        t_norm = (t + R_mu) / sigma
+
+        gt_poses_norm = torch.cat([R, t_norm.unsqueeze(-1)], dim=-1)
+        buf['gt_poses_inv'] = gt_poses_norm
+        _logger.info(
+            "[LMC] Buffer poses normalized: sigma=%.4f, translation_before=(%.3f,%.3f,%.3f), "
+            "translation_after=(%.3f,%.3f,%.3f) [sample 0]",
+            sigma,
+            float(t[0, 0]), float(t[0, 1]), float(t[0, 2]),
+            float(t_norm[0, 0]), float(t_norm[0, 1]), float(t_norm[0, 2]),
+        )
 
     # ------------------------------------------------------------------
     # S1: Train compressor for a few steps
@@ -1748,8 +1849,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     def _setup_s2_optimizer_and_schedule(self, iteration_idx, is_last):
         """Build head-only optimizer and scheduler for this S2 phase; set rewind and local step."""
         current_buffer_size = self.buffer_size_final if is_last else self.options.training_buffer_size
-        self.steps_per_s2_phase = self.options.epochs * (current_buffer_size // self.options.batch_size)
-        self.steps_per_s2_phase = max(self.steps_per_s2_phase, 1)
+        steps_per_epoch = max(1, current_buffer_size // self.options.batch_size)
+        self.steps_per_s2_phase = max(1, self.options.epochs * steps_per_epoch)
+        _logger.info(
+            "[S2] steps_per_s2_phase=%d (epochs=%d, buffer=%d, batch=%d, steps_per_epoch=%d)",
+            self.steps_per_s2_phase, self.options.epochs, current_buffer_size,
+            self.options.batch_size, steps_per_epoch,
+        )
 
         if self.mapany_flow_profile:
             rewind_ratio = 0.0
@@ -1792,11 +1898,36 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         warmup_ratio = (self.s2_lr_warmup_steps / self.steps_per_s2_phase) if self.s2_lr_warmup_steps else 0.1
         warmup_ratio = min(0.5, max(0.0, warmup_ratio))
+        # PyTorch OneCycleLR: first phase ends at pct_start * total_steps - 1. If
+        # pct_start * total_steps == 1, phase 1 has zero width → (end_step - start_step)==0
+        # and get_lr() divides by zero. Clamp pct_start into (1/ts, 1 - 1/ts).
+        ts = max(int(self.steps_per_s2_phase), 1)
+        _eps = 1e-5
+        _lo = 1.0 / ts + _eps
+        _hi = 1.0 - 1.0 / ts - _eps
+        if ts <= 2 or not (_lo < _hi):
+            warmup_ratio_clamped = 0.3
+            _logger.warning(
+                "[S2] OneCycleLR: total_steps=%d too small for a non-degenerate two-phase "
+                "schedule; using pct_start=%.3f",
+                ts,
+                warmup_ratio_clamped,
+            )
+        else:
+            warmup_ratio_clamped = min(_hi, max(_lo, warmup_ratio))
+            if abs(warmup_ratio_clamped - warmup_ratio) > 1e-6:
+                _logger.info(
+                    "[S2] OneCycleLR: pct_start clamped %.4f → %.4f (total_steps=%d, "
+                    "avoid PyTorch div-by-zero when pct_start*steps≈1)",
+                    warmup_ratio,
+                    warmup_ratio_clamped,
+                    ts,
+                )
         self.scheduler_head = optim.lr_scheduler.OneCycleLR(
             self.optimizer_head,
             max_lr=[head_lr, fusion_lr] if ace_g_fusion_in_s2 else head_lr,
             total_steps=self.steps_per_s2_phase,
-            pct_start=warmup_ratio,
+            pct_start=warmup_ratio_clamped,
             anneal_strategy='cos',
         )
         _logger.info(

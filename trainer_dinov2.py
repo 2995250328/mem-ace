@@ -46,7 +46,9 @@ class TrainerACEDINOv2:
         self.iteration = 0
         self.epoch = 0
         self.training_start = None
-        self.num_data_loader_workers = 12
+        self.num_data_loader_workers = max(
+            0, int(getattr(self.options, "num_data_loader_workers", 12))
+        )
 
         # Dataset (DINOv2: RGB, resolution multiple of 14)
         self.dataset = self._build_train_dataset(

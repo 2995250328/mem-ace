@@ -19,12 +19,16 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple, Protocol, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Add map-anything to path (optional - can use adapter instead)
-MAP_ANYTHING_PATH = Path(__file__).parent.parent.parent.parent / "map-anything"
+_WORKSPACE_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+MAP_ANYTHING_PATH = _WORKSPACE_ROOT / "map-anything"
 if MAP_ANYTHING_PATH.exists():
     sys.path.insert(0, str(MAP_ANYTHING_PATH))
+# 与 ~/project/uniception 软链配合：优先用可编辑副本，避免只改 conda 里一份
+if (_WORKSPACE_ROOT / "uniception" / "__init__.py").is_file():
+    sys.path.insert(0, str(_WORKSPACE_ROOT))
 
 # Local modules
 from .bse_pooling import BSEPooler
@@ -698,8 +702,37 @@ def export_memory_views_visualization(
 # Schema Versioning
 # =============================================================================
 
-MEMORY_SCHEMA_VERSION = "1.2"  # Added view-level camera information (pose, intrinsics, Plücker main rays)
+MEMORY_SCHEMA_VERSION = "1.3"  # Added world-coordinate points alongside normalized coordinates
 CHECKPOINT_FILE = "extraction_checkpoint.json"
+
+# ace_depth/checkpoints/dinov2_vitl14_pretrain.pth → 常指向共享存储的软链接
+_ACE_DEPTH_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_dinov2_checkpoint_path(explicit: Optional[str] = None) -> str:
+    """解析 DINOv2 权重路径：环境变量 > explicit > 仓库内软链接 > 共享存储 > 旧路径。"""
+    for key in ("DINOV2_CHECKPOINT", "DINOV2_PRETRAINED_PATH"):
+        p = os.environ.get(key, "").strip()
+        if p and os.path.isfile(p):
+            return p
+    if explicit:
+        p = explicit.strip()
+        if p and os.path.isfile(p):
+            return p
+    repo_link = _ACE_DEPTH_ROOT / "checkpoints" / "dinov2_vitl14_pretrain.pth"
+    if repo_link.is_file():
+        return str(repo_link)
+    candidates = (
+        "/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth",
+        "/Data/xwh/checkpoints/dinov2_vitl14_pretrain.pth",
+    )
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return str(candidates[0])
+
+
+_DEFAULT_DINO_CHECKPOINT = resolve_dinov2_checkpoint_path(None)
 
 
 # =============================================================================
@@ -726,8 +759,14 @@ class ExtractionConfig:
     voxel_size: float = 0.05
     # 是否使用 BSE（边界感知）池化；当前关闭会 NotImplementedError
     use_bse: bool = True
+    # Pooling 模式：bse=voxel hash + Otsu split；simple=简单 voxel mean
+    pool_mode: str = "bse"
+    # 预池化模式：per_view=每个 view 先池化；global_only=直接缓存 raw points，Pass 2 再全局池化
+    prepool_mode: str = "per_view"
     # BSE 内是否用 Otsu 自动估计深度分箱阈值（与稀疏/噪声深度相关）
     use_otsu: bool = True
+    # Pass 2 完成逐 view 拼接后，是否做跨 view 的全局体素合并
+    global_merge: bool = True
     # 反投影与可视化时保留的深度范围 (min_m, max_m)，单位米
     depth_valid_range: Tuple[float, float] = (0.1, 6.0)
     # 网格中心深度采样：与 map-anything generate_patch_point_cloud / fps_memory 语义一致
@@ -741,8 +780,8 @@ class ExtractionConfig:
     model_config: Optional[str] = None
     # MapAnything 权重 .pth；None 时 main 里可能有默认路径
     model_checkpoint: Optional[str] = None
-    # DINOv2 预训练权重路径（仅 use_model=dinov2）
-    dinov2_checkpoint: str = "/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth"
+    # DINOv2 预训练权重路径（dinov2 模式；mapanything 的 encoder 也复用同一解析结果）
+    dinov2_checkpoint: str = field(default_factory=lambda: resolve_dinov2_checkpoint_path(None))
     # 是否走 patch 网格提取路径（与双线性采样路径二选一语义）
     use_patch_based: bool = False
     # 是否对反投影点云做统计离群点剔除（SOR）
@@ -819,8 +858,14 @@ class MapAnythingExtractor:
     # Must match original MapAnything: [0, 6, 12, 18] + final = 5 layers × 768 = 3840D
     TARGET_INTERM_LAYERS = [0, 6, 12, 18]
 
-    def __init__(self, model_str: str = "mapanything", model_config: str = "default",
-                 checkpoint: Optional[str] = None, device: str = "cuda:0"):
+    def __init__(
+        self,
+        model_str: str = "mapanything",
+        model_config: str = "default",
+        checkpoint: Optional[str] = None,
+        device: str = "cuda:0",
+        dinov2_checkpoint: Optional[str] = None,
+    ):
         """
         Initialize Map-Anything model adapter.
 
@@ -828,23 +873,26 @@ class MapAnythingExtractor:
         Falls back to YAML loading + partial resolution if manual config fails.
 
         Args:
-            model_str: Model architecture string (e.g. "mapanything")
+            model_str: 仅用于兼容；实际注册名必须是 mapanything（见 init_model）。
             model_config: "default" to use built-in config, or path to custom YAML
-            checkpoint: Path to pretrained checkpoint
+            checkpoint: Path to pretrained MapAnything checkpoint
             device: Device to run on
+            dinov2_checkpoint: DINOv2 预训练权重（encoder）；省略则与 run_memory_extraction 同一解析逻辑
         """
         self.device = device
         try:
             from mapanything.models import init_model  # pyright: ignore[reportMissingImports]
 
+            dino_path = resolve_dinov2_checkpoint_path(dinov2_checkpoint)
             # Build model config manually (bypasses Hydra interpolation issues)
-            model_config_dict = self._build_manual_config()
+            model_config_dict = self._build_manual_config(dino_path)
 
             # Try init_model first (wraps model_factory → MapAnything)
             try:
                 from omegaconf import OmegaConf  # pyright: ignore[reportMissingImports]
                 cfg = OmegaConf.create(model_config_dict)
-                self.model = init_model(model_str, cfg)
+                # MODEL_CONFIGS 仅包含 "mapanything"，Hydra 名如 mapanything_store_intermediates_ace 会失败
+                self.model = init_model("mapanything", cfg)
             except Exception:
                 # Fallback: direct MapAnything construction
                 from mapanything.models.mapanything import MapAnything  # pyright: ignore[reportMissingImports]
@@ -871,7 +919,7 @@ class MapAnythingExtractor:
             )
 
     @staticmethod
-    def _build_manual_config() -> dict:
+    def _build_manual_config(dinov2_checkpoint_path: str) -> dict:
         """Build complete MapAnything config dict with all Hydra interpolations resolved."""
         return {
             "name": "mapanything",
@@ -882,7 +930,7 @@ class MapAnythingExtractor:
                 "size": "large",
                 "with_registers": False,
                 "uses_torch_hub": False,
-                "pretrained_checkpoint_path": "/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth",
+                "pretrained_checkpoint_path": dinov2_checkpoint_path,
                 "gradient_checkpointing": False,
             },
             "info_sharing_config": {
@@ -2098,6 +2146,73 @@ def load_checkpoint(checkpoint_path: str) -> Tuple[List[int], List[str]]:
     return data.get('completed', []), data.get('paths', [])
 
 
+def global_voxel_merge(
+    *,
+    points: torch.Tensor,
+    features: torch.Tensor,
+    colors: torch.Tensor,
+    ray_dirs: torch.Tensor,
+    ray_dirs_mean: torch.Tensor,
+    cluster_sizes: torch.Tensor,
+    voxel_size: float,
+    ray_dirs_dominant: Optional[torch.Tensor] = None,
+    ray_dirs_first: Optional[torch.Tensor] = None,
+    plucker_rays: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """Merge cross-view duplicates in world coordinates by voxel averaging."""
+    if points.ndim != 2 or points.shape[1] < 3:
+        raise ValueError(f"global_voxel_merge expects points shape (N, >=3), got {tuple(points.shape)}")
+    if points.shape[0] == 0:
+        raise ValueError("global_voxel_merge received empty points tensor.")
+    if voxel_size <= 0:
+        raise ValueError(f"global_voxel_merge expects voxel_size > 0, got {voxel_size}")
+
+    quantized = torch.floor(points[:, :3] / float(voxel_size)).to(torch.int64)
+    _, inverse = torch.unique(quantized, dim=0, return_inverse=True)
+    n_voxels = int(inverse.max().item()) + 1
+
+    def _scatter_mean(src: torch.Tensor) -> torch.Tensor:
+        if src.ndim != 2:
+            raise ValueError(f"scatter mean expects rank-2 tensor, got shape {tuple(src.shape)}")
+        acc_dtype = torch.float32 if src.dtype in (torch.float16, torch.bfloat16) else src.dtype
+        out = torch.zeros(n_voxels, src.shape[1], device=src.device, dtype=acc_dtype)
+        out.index_add_(0, inverse, src.to(acc_dtype))
+        cnt = torch.zeros(n_voxels, 1, device=src.device, dtype=acc_dtype)
+        cnt.index_add_(0, inverse, torch.ones(src.shape[0], 1, device=src.device, dtype=acc_dtype))
+        return out / cnt.clamp(min=1)
+
+    def _scatter_sum(src: torch.Tensor) -> torch.Tensor:
+        if src.ndim != 1:
+            raise ValueError(f"scatter sum expects rank-1 tensor, got shape {tuple(src.shape)}")
+        out = torch.zeros(n_voxels, device=src.device, dtype=src.dtype)
+        out.index_add_(0, inverse, src)
+        return out
+
+    merged = {
+        "points": _scatter_mean(points.float()),
+        "features": _scatter_mean(features.float()),
+        "colors": _scatter_mean(colors.float()),
+        "ray_dirs": torch.nn.functional.normalize(_scatter_mean(ray_dirs.float()), dim=1, eps=1e-6),
+        "ray_dirs_mean": torch.nn.functional.normalize(_scatter_mean(ray_dirs_mean.float()), dim=1, eps=1e-6),
+        "cluster_sizes": _scatter_sum(cluster_sizes.to(torch.long)),
+    }
+
+    if ray_dirs_dominant is not None:
+        merged["ray_dirs_dominant"] = torch.nn.functional.normalize(
+            _scatter_mean(ray_dirs_dominant.float()), dim=1, eps=1e-6
+        )
+    if ray_dirs_first is not None:
+        merged["ray_dirs_first"] = torch.nn.functional.normalize(
+            _scatter_mean(ray_dirs_first.float()), dim=1, eps=1e-6
+        )
+    if plucker_rays is not None:
+        pooled_plucker = _scatter_mean(plucker_rays.float())
+        pooled_plucker[:, :3] = torch.nn.functional.normalize(pooled_plucker[:, :3], dim=1, eps=1e-6)
+        merged["plucker_rays"] = pooled_plucker
+
+    return merged
+
+
 def two_pass_processing(
     memory_views: List[Dict[str, torch.Tensor]],
     raw_batches: List[Dict[str, Any]],  # Original data for depth/intrinsics
@@ -2107,10 +2222,16 @@ def two_pass_processing(
     config: ExtractionConfig
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, float, Dict[str, torch.Tensor]]:
     """
-    Two-pass BSE + Welford normalization with HIGH priority fixes.
+    Two-pass extraction with configurable per-view pre-pooling.
 
-    Pass 1: Extract -> Unproject -> Pool -> Accumulate statistics -> Save chunks
-    Pass 2: Finalize statistics -> Load chunks -> Normalize -> Concatenate
+    Pass 1:
+      - prepool_mode=per_view: Extract -> Unproject -> Pool -> Save per-view pooled chunks
+      - prepool_mode=global_only: Extract -> Unproject -> Save raw per-view chunks
+    Pass 2:
+      - Assemble chunks
+      - If global_only: run one-shot global pooling
+      - Optional global voxel merge
+      - Recompute mu/sigma -> normalize
 
     Also collects view-level camera information (pose, intrinsics, Plücker rays).
 
@@ -2163,8 +2284,8 @@ def two_pass_processing(
             chunk_paths = existing_chunks
 
     try:
-        # Pass 1: Extract + pool + accumulate
-        print("[Pass 1] Extracting and pooling...")
+        # Pass 1: extract -> optional per-view pool -> save chunks
+        print(f"[Pass 1] Extracting with prepool_mode={config.prepool_mode}...")
 
         # Collect view-level camera information
         view_camera_centers = []
@@ -2312,14 +2433,24 @@ def two_pass_processing(
             # Validate inputs
             validate_inputs(points, features_flat, colors, ray_dirs)
 
-            # BSE pooling (with camera_centers for Plücker encoding)
-            pooled = pooler.pool(
-                points, features_flat, colors, ray_dirs,
-                camera_centers=camera_centers
-            )
-
-            # Accumulate statistics
-            welford.update(pooled['points'])
+            if config.prepool_mode == "per_view":
+                chunk_payload = pooler.pool(
+                    points, features_flat, colors, ray_dirs,
+                    camera_centers=camera_centers
+                )
+                # Log-only stats before any global merge.
+                welford.update(chunk_payload['points'])
+            elif config.prepool_mode == "global_only":
+                chunk_payload = {
+                    'points': points.detach().cpu(),
+                    'features': features_flat.detach().cpu(),
+                    'colors': colors.detach().cpu(),
+                    'ray_dirs': ray_dirs.detach().cpu(),
+                    'camera_centers': camera_centers.detach().cpu(),
+                }
+                welford.update(points)
+            else:
+                raise ValueError(f"Unsupported prepool_mode={config.prepool_mode!r}")
 
             # Collect view-level camera information from raw_batch
             pose = raw_batch.get("camera_pose", raw_batch.get("pose"))
@@ -2364,7 +2495,7 @@ def two_pass_processing(
 
             # Save temporary chunk
             chunk_path = os.path.join(config.temp_dir, f"chunk_{view_idx}.pt")
-            torch.save(pooled, chunk_path)
+            torch.save(chunk_payload, chunk_path)
             chunk_paths.append(chunk_path)
 
             # Save checkpoint for resume
@@ -2374,19 +2505,24 @@ def two_pass_processing(
             # HIGH Priority: GPU memory cleanup between views
             torch.cuda.empty_cache()
 
-        # Pass 2: Normalize + assemble
-        print("[Pass 2] Normalizing and assembling...")
-        mu_scene, sigma_scene = welford.finalize()
+        # Pass 2: assemble chunks -> optional global pool/merge -> normalize once
+        print("[Pass 2] Assembling raw chunks...")
+        if welford.count > 0:
+            premerge_mu, premerge_sigma = welford.finalize()
+            print(
+                f"[Pass 2] Pre-merge stats (log only): mu={premerge_mu.tolist()}, sigma={premerge_sigma:.6f}",
+                flush=True,
+            )
 
         all_points = []
         all_ray_dirs = []
+        all_features = []
+        all_colors = []
+        all_camera_centers = []
         all_ray_dirs_mean = []
         all_ray_dirs_dominant = []
         all_ray_dirs_first = []
-        all_features = []
-        all_colors = []
         all_plucker_rays = []
-        all_camera_centers = []
         all_cluster_sizes = []
 
         for chunk_path in tqdm(chunk_paths):
@@ -2395,33 +2531,110 @@ def two_pass_processing(
                     f"Missing chunk file during Pass2: {chunk_path}. "
                     f"If you changed N_VIEWS or temp_dir was cleared, remove {checkpoint_path} and rerun."
                 )
-            pooled = torch.load(chunk_path)
-            # Normalize points
-            pooled['points'] = (pooled['points'] - mu_scene) / sigma_scene
-            all_points.append(pooled['points'])
-            all_ray_dirs.append(pooled['ray_dirs'])
-            all_ray_dirs_mean.append(pooled['ray_dirs_mean'])
-            all_features.append(pooled['features'])
-            all_colors.append(pooled['colors'])
-            all_cluster_sizes.append(pooled['cluster_sizes'])
+            chunk = torch.load(chunk_path)
+            all_points.append(chunk['points'])
+            all_features.append(chunk['features'])
+            all_colors.append(chunk['colors'])
 
-            # Optional ray representations
-            if 'ray_dirs_dominant' in pooled:
-                all_ray_dirs_dominant.append(pooled['ray_dirs_dominant'])
-            if 'ray_dirs_first' in pooled:
-                all_ray_dirs_first.append(pooled['ray_dirs_first'])
-            if 'plucker_rays' in pooled:
-                all_plucker_rays.append(pooled['plucker_rays'])
-            if 'camera_centers' in pooled:
-                all_camera_centers.append(pooled['camera_centers'])
+            if config.prepool_mode == "global_only":
+                all_ray_dirs.append(chunk['ray_dirs'])
+                all_camera_centers.append(chunk['camera_centers'])
+            else:
+                all_ray_dirs.append(chunk['ray_dirs'])
+                all_ray_dirs_mean.append(chunk['ray_dirs_mean'])
+                all_cluster_sizes.append(chunk['cluster_sizes'])
 
-        # Concatenate all chunks
-        final_points = torch.cat(all_points, dim=0)
-        final_ray_dirs = torch.cat(all_ray_dirs, dim=0)
-        final_ray_dirs_mean = torch.cat(all_ray_dirs_mean, dim=0)
-        final_features = torch.cat(all_features, dim=0)
-        final_colors = torch.cat(all_colors, dim=0)
-        final_cluster_sizes = torch.cat(all_cluster_sizes, dim=0)
+                # Optional ray representations
+                if 'ray_dirs_dominant' in chunk:
+                    all_ray_dirs_dominant.append(chunk['ray_dirs_dominant'])
+                if 'ray_dirs_first' in chunk:
+                    all_ray_dirs_first.append(chunk['ray_dirs_first'])
+                if 'plucker_rays' in chunk:
+                    all_plucker_rays.append(chunk['plucker_rays'])
+
+        if config.prepool_mode == "global_only":
+            print(f"[Pass 2] Running one-shot global pooling with pool_mode={config.pool_mode}...", flush=True)
+            pooled_global = pooler.pool(
+                torch.cat(all_points, dim=0).float().to(device),
+                torch.cat(all_features, dim=0).float().to(device),
+                torch.cat(all_colors, dim=0).float().to(device),
+                torch.cat(all_ray_dirs, dim=0).float().to(device),
+                camera_centers=torch.cat(all_camera_centers, dim=0).float().to(device),
+            )
+            final_points_world = pooled_global['points'].float().cpu()
+            final_ray_dirs = pooled_global['ray_dirs'].float().cpu()
+            final_ray_dirs_mean = pooled_global['ray_dirs_mean'].float().cpu()
+            final_features = pooled_global['features'].float().cpu()
+            final_colors = pooled_global['colors'].float().cpu()
+            final_cluster_sizes = pooled_global['cluster_sizes'].long().cpu()
+            optional_world = {}
+            if 'ray_dirs_dominant' in pooled_global:
+                optional_world['ray_dirs_dominant'] = pooled_global['ray_dirs_dominant'].float().cpu()
+            if 'ray_dirs_first' in pooled_global:
+                optional_world['ray_dirs_first'] = pooled_global['ray_dirs_first'].float().cpu()
+            if 'plucker_rays' in pooled_global:
+                optional_world['plucker_rays'] = pooled_global['plucker_rays'].float().cpu()
+        else:
+            # Concatenate per-view pooled chunks in world coordinates
+            final_points_world = torch.cat(all_points, dim=0).float()
+            final_ray_dirs = torch.cat(all_ray_dirs, dim=0).float()
+            final_ray_dirs_mean = torch.cat(all_ray_dirs_mean, dim=0).float()
+            final_features = torch.cat(all_features, dim=0).float()
+            final_colors = torch.cat(all_colors, dim=0).float()
+            final_cluster_sizes = torch.cat(all_cluster_sizes, dim=0).long()
+            optional_world = {}
+            if all_ray_dirs_dominant:
+                optional_world['ray_dirs_dominant'] = torch.cat(all_ray_dirs_dominant, dim=0).float()
+            if all_ray_dirs_first:
+                optional_world['ray_dirs_first'] = torch.cat(all_ray_dirs_first, dim=0).float()
+            if all_plucker_rays:
+                optional_world['plucker_rays'] = torch.cat(all_plucker_rays, dim=0).float()
+
+        n_before_merge = int(final_points_world.shape[0])
+        if config.global_merge:
+            merged = global_voxel_merge(
+                points=final_points_world,
+                features=final_features,
+                colors=final_colors,
+                ray_dirs=final_ray_dirs,
+                ray_dirs_mean=final_ray_dirs_mean,
+                cluster_sizes=final_cluster_sizes,
+                voxel_size=config.voxel_size,
+                ray_dirs_dominant=optional_world.get('ray_dirs_dominant'),
+                ray_dirs_first=optional_world.get('ray_dirs_first'),
+                plucker_rays=optional_world.get('plucker_rays'),
+            )
+            final_points_world = merged['points']
+            final_features = merged['features']
+            final_colors = merged['colors']
+            final_ray_dirs = merged['ray_dirs']
+            final_ray_dirs_mean = merged['ray_dirs_mean']
+            final_cluster_sizes = merged['cluster_sizes']
+            if 'ray_dirs_dominant' in merged:
+                optional_world['ray_dirs_dominant'] = merged['ray_dirs_dominant']
+            if 'ray_dirs_first' in merged:
+                optional_world['ray_dirs_first'] = merged['ray_dirs_first']
+            if 'plucker_rays' in merged:
+                optional_world['plucker_rays'] = merged['plucker_rays']
+            print(
+                f"[Global Merge] {n_before_merge} -> {final_points_world.shape[0]} points "
+                f"(removed {n_before_merge - int(final_points_world.shape[0])} cross-view duplicates)",
+                flush=True,
+            )
+        else:
+            print(f"[Global Merge] disabled; keeping {n_before_merge} points", flush=True)
+
+        # Recompute normalization from final merged point cloud.
+        mu_scene = final_points_world.mean(dim=0)
+        centered = final_points_world - mu_scene.unsqueeze(0)
+        sigma_scene = torch.sqrt((centered.pow(2).mean(dim=0)).mean()).item()
+        if not np.isfinite(sigma_scene) or sigma_scene <= 1e-12:
+            raise ValueError(f"Invalid sigma after global merge: {sigma_scene}")
+        final_points = centered / sigma_scene
+        print(
+            f"[Pass 2] Final stats after merge: mu={mu_scene.tolist()}, sigma={sigma_scene:.6f}",
+            flush=True,
+        )
 
         # Build result dict with all ray representations
         result = {
@@ -2434,23 +2647,26 @@ def two_pass_processing(
         }
 
         # Add optional ray representations
-        if all_ray_dirs_dominant:
-            result['ray_dirs_dominant'] = torch.cat(all_ray_dirs_dominant, dim=0)
-        if all_ray_dirs_first:
-            result['ray_dirs_first'] = torch.cat(all_ray_dirs_first, dim=0)
-        if all_plucker_rays:
-            result['plucker_rays'] = torch.cat(all_plucker_rays, dim=0)
+        if 'ray_dirs_dominant' in optional_world:
+            result['ray_dirs_dominant'] = optional_world['ray_dirs_dominant']
+        if 'ray_dirs_first' in optional_world:
+            result['ray_dirs_first'] = optional_world['ray_dirs_first']
+        if 'plucker_rays' in optional_world:
+            result['plucker_rays'] = optional_world['plucker_rays']
         # NOTE: We remove pooled camera_centers since we now have view-level camera info
         # if all_camera_centers:
         #     result['camera_centers'] = torch.cat(all_camera_centers, dim=0)
 
         # Assemble view-level camera information
+        camera_centers_stack = torch.stack(view_camera_centers, dim=0)      # [M, 3]
+        scene_center_cam = camera_centers_stack.mean(dim=0)                 # [3] — mean camera center
         view_info = {
-            'camera_centers': torch.stack(view_camera_centers, dim=0),      # [M, 3]
+            'camera_centers': camera_centers_stack,                          # [M, 3]
             'camera_rotations': torch.stack(view_camera_rotations, dim=0),  # [M, 3, 3]
             'camera_intrinsics': torch.stack(view_camera_intrinsics, dim=0), # [M, 3, 3]
             'plucker_main_rays': torch.stack(view_plucker_main_rays, dim=0), # [M, 6]
             'all_scale_tokens': torch.stack(all_cls_tokens, dim=0) if all_cls_tokens else None,  # [M, D]
+            'scene_center_cam': scene_center_cam,                           # [3] — mean camera center (for head.mean)
         }
 
         return result, mu_scene, sigma_scene, view_info
@@ -2471,7 +2687,8 @@ def save_memory(
     mu: torch.Tensor,
     sigma: float,
     view_info: Dict[str, torch.Tensor] = None,
-    layers_idx: Optional[List] = None
+    layers_idx: Optional[List] = None,
+    scene_center: Optional[torch.Tensor] = None,
 ) -> None:
     """
     Save memory to .pt file with extended schema and versioning.
@@ -2497,9 +2714,12 @@ def save_memory(
         sigma: scene std
         view_info: Dict containing view-level camera information (optional)
     """
+    points_world = result['points'].cpu().float() * float(sigma) + mu.cpu().float().view(1, 3)
+
     memory_dict = {
         'schema_version': MEMORY_SCHEMA_VERSION,
         'points': result['points'].cpu().float(),           # [N, 3]
+        'points_world': points_world,                       # [N, 3] world coordinates, avoids runtime de-normalization
         'ray_dirs': result['ray_dirs'].cpu().float(),       # [N, 3]
         'ray_dirs_mean': result['ray_dirs_mean'].cpu().float(),  # [N, 3]
         'features': result['features'].cpu().half(),        # [N, C] fp16
@@ -2508,6 +2728,9 @@ def save_memory(
         'mu': mu.cpu().float(),                             # [3]
         'sigma': sigma                                      # scalar
     }
+
+    if scene_center is not None:
+        memory_dict['scene_center'] = scene_center.cpu().float()  # [3] pooled-compatible scene anchor
 
     # Add optional ray representations
     if 'ray_dirs_dominant' in result:
@@ -2525,6 +2748,8 @@ def save_memory(
         memory_dict['view_plucker_main_rays'] = view_info['plucker_main_rays']    # [M, 6]
         if view_info.get('all_scale_tokens') is not None:
             memory_dict['all_scale_tokens'] = view_info['all_scale_tokens'].cpu().float()  # [M, D]
+        if view_info.get('scene_center_cam') is not None:
+            memory_dict['scene_center_cam'] = view_info['scene_center_cam'].cpu().float()  # [3]
 
     # Add layers_idx (for compatibility with pooled memory format)
     if layers_idx is not None:
@@ -2540,6 +2765,9 @@ def save_memory(
     print(f"[Save] Feature dim: {result['features'].shape[1]}")
     print(f"[Save] Scene mean: {mu.tolist()}")
     print(f"[Save] Scene sigma: {sigma:.4f}")
+    if scene_center is not None:
+        print(f"[Save] Scene center: {scene_center.cpu().float().tolist()}")
+    print(f"[Save] World points: {tuple(memory_dict['points_world'].shape)}")
     print(f"[Save] Ray representations: {[k for k in memory_dict.keys() if 'ray' in k or 'plucker' in k]}")
     if view_info is not None:
         print(f"[Save] View count: {len(view_info['camera_centers'])}")
@@ -2873,6 +3101,8 @@ def debug_dump_views(
         "patch_depth_sampling": config.patch_depth_sampling,
         "use_patch_based": bool(config.use_patch_based),
         "voxel_size": float(config.voxel_size),
+        "pool_mode": config.pool_mode,
+        "prepool_mode": config.prepool_mode,
         "ray_pool_strategy": config.ray_pool_strategy,
         "use_model": config.use_model,
         "model_str": config.model_str,
@@ -3081,21 +3311,50 @@ def _extract_centers_from_dataset_items(dataset) -> np.ndarray:
     return np.stack(centers, axis=0)
 
 
-def fps_select_views(centers: np.ndarray, n_select: int, seed: int = 42) -> List[int]:
-    """Furthest Point Sampling on camera centers for spatial coverage."""
+def fps_select_views(centers: np.ndarray, n_select: int, seed: int = 42,
+                     force_include: Optional[List[int]] = None) -> List[int]:
+    """Furthest Point Sampling on camera centers for spatial coverage.
+
+    Args:
+        force_include: List of frame indices that MUST be in the selection.
+            Typical use: ``force_include=[0]`` to guarantee the scene origin frame
+            is selected, so that MapAnything's internal reference frame aligns
+            with the world origin.
+    """
     centers = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
     n_total = int(centers.shape[0])
     if n_select >= n_total:
         return list(range(n_total))
 
-    rng = np.random.RandomState(seed)
-    selected: List[int] = [int(rng.randint(0, n_total))]
+    if force_include is None:
+        force_include = []
+
+    # Validate force_include
+    for idx in force_include:
+        if idx < 0 or idx >= n_total:
+            raise ValueError(f"force_include index {idx} out of range [0, {n_total})")
+
+    n_forced = min(len(force_include), n_select)
+    selected: List[int] = list(force_include[:n_forced])
+
+    # If all slots are forced, return early
+    if len(selected) >= n_select:
+        return sorted(selected[:n_select])
+
+    # Initialize min_dist from all forced seeds
     min_dist = np.full(n_total, np.inf, dtype=np.float64)
-    for _ in range(n_select - 1):
-        last = selected[-1]
-        d = np.linalg.norm(centers - centers[last], axis=1)
+    for s in selected:
+        d = np.linalg.norm(centers - centers[s], axis=1)
         min_dist = np.minimum(min_dist, d)
-        selected.append(int(np.argmax(min_dist)))
+
+    # Fill remaining slots with standard FPS
+    while len(selected) < n_select:
+        next_idx = int(np.argmax(min_dist))
+        selected.append(next_idx)
+        if len(selected) < n_select:
+            d = np.linalg.norm(centers - centers[next_idx], axis=1)
+            min_dist = np.minimum(min_dist, d)
+
     return selected
 
 
@@ -3104,7 +3363,8 @@ def select_memory_views(
     n_memory: int,
     dataset_path: Optional[str] = None,
     scene_name: Optional[str] = None,
-) -> List[int]:
+    force_include_origin: bool = True,
+) -> Tuple[List[int], Optional[np.ndarray]]:
     """
     选择 memory 视角（优先 FPS）。
 
@@ -3112,11 +3372,17 @@ def select_memory_views(
     1) 若可用：map-anything 的 select_optimal_memory_indices（它本身就是最优选帧逻辑）
     2) 否则：读取 <dataset_path>/poses 做 FPS（最快，不加载图像/深度）
     3) 再否则：遍历 dataset item 抽 pose 做 FPS（慢）
+
+    Args:
+        force_include_origin: When True (default), frame index 0 (scene origin) is
+            always included in the selection. This ensures MapAnything's internal
+            reference frame aligns with the scene world origin, eliminating
+            implicit coordinate offsets between features and point cloud.
     """
     try:
         from mapanything.tasks.ace.memory_selection import select_optimal_memory_indices  # pyright: ignore[reportMissingImports]
-        memory_indices, _ = select_optimal_memory_indices(dataset, n_memory)
-        return memory_indices
+        memory_indices, scene_center = select_optimal_memory_indices(dataset, n_memory)
+        return memory_indices, scene_center
     except ImportError:
         pass
 
@@ -3131,9 +3397,11 @@ def select_memory_views(
     if centers is None:
         centers = _extract_centers_from_dataset_items(dataset)
 
-    indices = fps_select_views(centers, n_memory)
+    force_include = [0] if force_include_origin else None
+    indices = fps_select_views(centers, n_memory, force_include=force_include)
     indices.sort()  # 顺序化索引，利于后续按序 IO
-    return indices
+    scene_center = centers.mean(axis=0).astype(np.float32) if centers is not None and len(centers) > 0 else None
+    return indices, scene_center
 
 
 def convert_ace_tuple_to_dict(
@@ -3295,8 +3563,8 @@ def parse_args() -> ExtractionConfig:
     parser.add_argument(
         '--dinov2_checkpoint',
         type=str,
-        default='/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth',
-        help='DINOv2 ViT 预训练权重（仅 --use_model dinov2）。',
+        default=_DEFAULT_DINO_CHECKPOINT,
+        help='DINOv2 ViT 预训练权重（--use_model dinov2；mapanything 的 encoder 也使用同一解析路径）。',
     )
     parser.add_argument(
         '--dinov2_intermediate_layers',
@@ -3320,10 +3588,30 @@ def parse_args() -> ExtractionConfig:
         help='体素网格边长（米）；越小越细、内存与时间开销越大。',
     )
     parser.add_argument(
+        '--pool_mode',
+        type=str,
+        default='bse',
+        choices=['bse', 'simple'],
+        help='pooling 模式：bse=voxel hash + Otsu split；simple=简单 voxel mean。',
+    )
+    parser.add_argument(
+        '--prepool_mode',
+        type=str,
+        default='per_view',
+        choices=['per_view', 'global_only'],
+        help='预池化模式：per_view=每个 view 先池化；global_only=直接缓存 raw points，Pass 2 再全局池化。',
+    )
+    parser.add_argument(
         '--use_otsu',
         action='store_true',
         default=True,
         help='BSE 内对深度分箱使用 Otsu 自动阈值（适应稀疏/不均匀深度）。',
+    )
+    parser.add_argument(
+        '--global_merge',
+        type=lambda x: str(x).strip().lower() in ('1', 'true', 'yes', 'on'),
+        default=True,
+        help='Pass 2 对所有 view 的 pooled 点做一次全局体素合并（默认 True）。',
     )
 
     parser.add_argument(
@@ -3455,14 +3743,17 @@ def parse_args() -> ExtractionConfig:
         device=args.device,
         voxel_size=args.voxel_size,
         use_bse=args.use_bse,
+        pool_mode=args.pool_mode,
+        prepool_mode=args.prepool_mode,
         use_otsu=args.use_otsu,
+        global_merge=bool(args.global_merge),
         depth_valid_range=tuple(args.depth_valid_range),
         patch_depth_sampling=args.patch_depth_sampling,
         temp_dir=args.temp_dir,
         model_str=args.model_str,
         model_config=args.model_config,
         model_checkpoint=args.model_checkpoint,
-        dinov2_checkpoint=args.dinov2_checkpoint,
+        dinov2_checkpoint=resolve_dinov2_checkpoint_path(args.dinov2_checkpoint),
         use_patch_based=args.use_patch_based,
         enable_sor=args.enable_sor,
         sor_k=args.sor_k,
@@ -3505,7 +3796,10 @@ def main():
     print(f"[BSE Memory] Scene: {scene_name} (type={dataset_type})")
     print(f"[BSE Memory] Output: {config.output_path}")
     print(f"[BSE Memory] N_MEMORY: {config.n_memory}, BSE: {config.use_bse}")
+    print(f"[BSE Memory] Pool mode: {config.pool_mode}")
+    print(f"[BSE Memory] Prepool mode: {config.prepool_mode}")
     print(f"[BSE Memory] Voxel size: {config.voxel_size}, Otsu: {config.use_otsu}")
+    print(f"[BSE Memory] Global merge: {config.global_merge}")
     print(
         f"[Config] patch_depth_sampling: {config.patch_depth_sampling} "
         f"(align map-anything fps_memory: nearest_valid for sparse Indoor6 depth)",
@@ -3521,6 +3815,7 @@ def main():
     if config.use_bse:
         pooler = BSEPooler(
             voxel_size=config.voxel_size,
+            pool_mode=config.pool_mode,
             use_otsu=config.use_otsu,
             ray_pool_strategy=config.ray_pool_strategy,
             save_all_ray_strategies=config.save_all_ray_strategies
@@ -3541,7 +3836,7 @@ def main():
 
     # Select memory views
     print("[BSE Memory] Selecting memory views...", flush=True)
-    memory_indices = select_memory_views(
+    memory_indices, scene_center_from_cameras = select_memory_views(
         train_dataset,
         config.n_memory,
         dataset_path=config.dataset_path,
@@ -3686,14 +3981,17 @@ def main():
     if use_mapanything:
         try:
             extractor = MapAnythingExtractor(
-                config.model_str or "mapanything_store_intermediates_ace",
+                "mapanything",
                 config.model_config or "default",
                 config.model_checkpoint or "/mnt/storage/xwh/checkpoints/facebook_map-anything.pth",
                 device=str(device),
+                dinov2_checkpoint=config.dinov2_checkpoint,
             )
             print("[BSE Memory] Using MapAnything extractor (default)")
         except (ImportError, Exception) as e:
-            print(f"[BSE Memory] MapAnything unavailable ({e}), falling back to DINOv2 multi-scale")
+            import traceback
+            print(f"[BSE Memory] MapAnything unavailable: {e}")
+            print(f"[BSE Memory] Full traceback:\n{traceback.format_exc()}")
             use_mapanything = False
 
     if not use_mapanything:
@@ -3777,7 +4075,19 @@ def main():
     )
 
     # Save memory
-    save_memory(config.output_path, result, mu, sigma, view_info, layers_idx)
+    pooled_scene_center = None
+    if scene_center_from_cameras is not None:
+        pooled_scene_center = torch.as_tensor(scene_center_from_cameras, dtype=torch.float32)
+
+    save_memory(
+        config.output_path,
+        result,
+        mu,
+        sigma,
+        view_info,
+        layers_idx,
+        scene_center=pooled_scene_center,
+    )
 
     # Save PLY for visualization
     save_ply(config.output_path, result, mu, sigma)

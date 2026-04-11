@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Literal
 
 # Ray pooling strategies
 RayPoolStrategy = Literal['mean', 'dominant', 'first', 'all']
+PoolMode = Literal['bse', 'simple']
 
 
 def compute_plucker_rays(
@@ -54,6 +55,7 @@ class BSEPooler:
         use_otsu: bool = True,
         otsu_bins: int = 256,
         unimodal_threshold: float = 0.02,
+        pool_mode: PoolMode = 'bse',
         ray_pool_strategy: RayPoolStrategy = 'mean',
         save_all_ray_strategies: bool = True
     ):
@@ -63,6 +65,9 @@ class BSEPooler:
             use_otsu: Use Otsu adaptive thresholding (else fixed tau=0.90)
             otsu_bins: Number of bins for Otsu histogram
             unimodal_threshold: Skip split if std(sim) < threshold
+            pool_mode: Pooling mode
+                - 'bse': voxel hash + Otsu split (current default)
+                - 'simple': simple voxel mean without Otsu/boundary split
             ray_pool_strategy: Strategy for pooling ray directions
                 - 'mean': Average + L2 normalize (may lose multi-view info)
                 - 'dominant': Use ray with highest feature similarity
@@ -74,6 +79,7 @@ class BSEPooler:
         self.use_otsu = use_otsu
         self.otsu_bins = otsu_bins
         self.unimodal_threshold = unimodal_threshold
+        self.pool_mode = pool_mode
         self.ray_pool_strategy = ray_pool_strategy
         self.save_all_ray_strategies = save_all_ray_strategies
 
@@ -104,8 +110,15 @@ class BSEPooler:
                 - plucker_rays: [N_pooled, 6] Plücker coordinates (if camera_centers provided)
                 - cluster_sizes: [N_pooled] number of points per cluster
         """
-        # Step 1: Coarse voxel hash
         cluster_ids = self._voxel_hash(points)
+
+        if self.pool_mode == 'simple':
+            return self._scatter_mean_all(
+                points, features, colors, ray_dirs, cluster_ids,
+                camera_centers=camera_centers,
+                features_original=features.float(),
+                similarity=None,
+            )
 
         # Step 2: Compute cluster mean features (fp32 for stability)
         F_mean = self._scatter_mean(features.float(), cluster_ids)
@@ -339,4 +352,3 @@ class BSEPooler:
             pooled[cluster_id] = ray_dirs[first_idx]
 
         return pooled
-

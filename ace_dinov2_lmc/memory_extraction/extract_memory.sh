@@ -19,6 +19,10 @@
 
 set -e
 
+# ace_depth 根目录（用于默认 checkpoint 软链接：checkpoints/dinov2_vitl14_pretrain.pth）
+_EXTRACT_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_ACE_DEPTH_ROOT="$(cd "$_EXTRACT_SCRIPT_DIR/../.." && pwd)"
+
 # =============================================================================
 # 配置参数（与 run_memory_extraction.py 的 ExtractionConfig / parse_args 对应）
 # =============================================================================
@@ -136,9 +140,14 @@ GPU_ID="${GPU_ID:-1}"
 # =============================================================================
 
 # VOXEL_SIZE — --voxel_size：BSE 体素边长（米）
+# POOL_MODE — --pool_mode：bse=voxel hash + Otsu split；simple=简单 voxel mean
+# PREPOOL_MODE — --prepool_mode：per_view=每个 view 先池化；global_only=直接缓存 raw points，Pass 2 再全局池化
 # USE_OTSU — 记录在 JSON；当前脚本未传 --use_otsu/--no-use_otsu，Python 默认 use_otsu=True
+POOL_MODE="${POOL_MODE:-bse}"
+PREPOOL_MODE="${PREPOOL_MODE:-per_view}"
 USE_OTSU="${USE_OTSU:-true}"
 VOXEL_SIZE="${VOXEL_SIZE:-0.05}"
+GLOBAL_MERGE="${GLOBAL_MERGE:-true}"
 # ENABLE_SOR — 为 true 时追加 --enable_sor，并打开 SOR_K/STD（Python 内 sor_k、sor_std_ratio 用默认值）
 ENABLE_SOR="${ENABLE_SOR:-true}"
 
@@ -163,8 +172,14 @@ USE_L2_NORMALIZATION="${USE_L2_NORMALIZATION:-true}"
 # RAY_POOL_STRATEGY — --ray_pool_strategy：体素内视线方向池化（mean/dominant/first/all）
 RAY_POOL_STRATEGY="${RAY_POOL_STRATEGY:-mean}"
 
-# DINOV2_CHECKPOINT — --dinov2_checkpoint（脚本始终传入；mapanything 模式也会带上路径，Python 仅在 dinov2 模式使用）
-DINOV2_CHECKPOINT="${DINOV2_CHECKPOINT:-/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth}"
+# DINOV2_CHECKPOINT — --dinov2_checkpoint（mapanything / dinov2 均传入；优先仓库内软链接再回退共享存储）
+if [ -z "${DINOV2_CHECKPOINT:-}" ] || [ ! -f "$DINOV2_CHECKPOINT" ]; then
+    if [ -f "$_ACE_DEPTH_ROOT/checkpoints/dinov2_vitl14_pretrain.pth" ]; then
+        DINOV2_CHECKPOINT="$_ACE_DEPTH_ROOT/checkpoints/dinov2_vitl14_pretrain.pth"
+    else
+        DINOV2_CHECKPOINT="/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth"
+    fi
+fi
 
 # USE_MODEL — --use_model：mapanything | dinov2
 USE_MODEL="${USE_MODEL:-mapanything}"
@@ -192,8 +207,21 @@ if [ "$USE_PATCH_BASED" = "true" ]; then
 else
     CONFIG_TAG="${CONFIG_TAG}_bilinear"
 fi
+if [ "$POOL_MODE" = "simple" ]; then
+    CONFIG_TAG="${CONFIG_TAG}_simple"
+else
+    CONFIG_TAG="${CONFIG_TAG}_bse"
+fi
+if [ "$PREPOOL_MODE" = "global_only" ]; then
+    CONFIG_TAG="${CONFIG_TAG}_globalonly"
+fi
 if [ "$ENABLE_SOR" = "true" ]; then
     CONFIG_TAG="${CONFIG_TAG}_sor"
+fi
+if [ "$GLOBAL_MERGE" = "true" ]; then
+    CONFIG_TAG="${CONFIG_TAG}_gm"
+else
+    CONFIG_TAG="${CONFIG_TAG}_nogm"
 fi
 if [ "$USE_L2_NORMALIZATION" = "true" ]; then
     CONFIG_TAG="${CONFIG_TAG}_l2"
@@ -208,6 +236,8 @@ OUTPUT_FILE="${OUTPUT_DIR}/memory_bse.pt"
 # =============================================================================
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# ace_depth 的上一级（如 ~/project），其下可有软链 uniception/ 覆盖 site-packages 便于改源码
+WORKSPACE_ROOT="$(cd "$PROJECT_ROOT/.." && pwd)"
 MAP_ANYTHING_PATH="/home/xwh/project/map-anything"
 
 PYTHONPATH_ADDITIONS=""
@@ -216,6 +246,10 @@ if [ -d "$MAP_ANYTHING_PATH" ]; then
 fi
 # 确保 ace_depth 根目录也在 path 中
 PYTHONPATH_ADDITIONS="${PROJECT_ROOT}:${PYTHONPATH_ADDITIONS}"
+# 优先使用 WORKSPACE_ROOT/uniception（软链到 conda 里的包），便于本地改 UniCeption
+if [ -e "$WORKSPACE_ROOT/uniception/__init__.py" ]; then
+    PYTHONPATH_ADDITIONS="${WORKSPACE_ROOT}:${PYTHONPATH_ADDITIONS}"
+fi
 export PYTHONPATH="${PYTHONPATH_ADDITIONS}:${PYTHONPATH:-}"
 
 # =============================================================================
@@ -235,8 +269,11 @@ echo "    n_views:    $N_VIEWS"
 echo ""
 echo "  BSE Config:"
 echo "    voxel_size: $VOXEL_SIZE"
+echo "    pool_mode:  $POOL_MODE"
+echo "    prepool_mode: $PREPOOL_MODE"
 echo "    otsu:       $USE_OTSU"
 echo "    sor:        $ENABLE_SOR"
+echo "    global_merge: $GLOBAL_MERGE"
 echo "    ray_pool:   $RAY_POOL_STRATEGY"
 echo ""
 echo "  Depth:"
@@ -286,6 +323,9 @@ PYTHON_ARGS="$PYTHON_ARGS --n_memory $N_VIEWS"
 # 固定 cuda:0：配合上方 CUDA_VISIBLE_DEVICES=$GPU_ID，即使用物理 GPU_ID 对应的那块卡
 PYTHON_ARGS="$PYTHON_ARGS --device cuda:0"
 PYTHON_ARGS="$PYTHON_ARGS --voxel_size $VOXEL_SIZE"
+PYTHON_ARGS="$PYTHON_ARGS --pool_mode $POOL_MODE"
+PYTHON_ARGS="$PYTHON_ARGS --prepool_mode $PREPOOL_MODE"
+PYTHON_ARGS="$PYTHON_ARGS --global_merge $GLOBAL_MERGE"
 PYTHON_ARGS="$PYTHON_ARGS --dataset_type $DATASET_TYPE"
 PYTHON_ARGS="$PYTHON_ARGS --dataset_loader $DATASET_LOADER"
 PYTHON_ARGS="$PYTHON_ARGS --scene_name $SCENE_TRAIN"
@@ -337,8 +377,11 @@ cat > "${OUTPUT_DIR}/extraction_config.json" <<EOF
     "scene_test": "$SCENE_TEST",
     "n_views": $N_VIEWS,
     "voxel_size": $VOXEL_SIZE,
+    "pool_mode": "$POOL_MODE",
+    "prepool_mode": "$PREPOOL_MODE",
     "use_otsu": "$USE_OTSU",
     "enable_sor": "$ENABLE_SOR",
+    "global_merge": "$GLOBAL_MERGE",
     "depth_valid_range": [$DEPTH_MIN, $DEPTH_MAX],
     "patch_depth_sampling": "$PATCH_DEPTH_SAMPLING",
     "use_patch_based": "$USE_PATCH_BASED",

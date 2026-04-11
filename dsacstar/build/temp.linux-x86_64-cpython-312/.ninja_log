@@ -1,3 +1,5 @@
 # ninja log v5
 0	420	1774971609845654396	/home/xwh/project/ace_depth/dsacstar/build/temp.linux-x86_64-cpython-312/thread_rand.o	229c500edd4e20d
 0	21509	1774971630905725813	/home/xwh/project/ace_depth/dsacstar/build/temp.linux-x86_64-cpython-312/dsacstar.o	c90c2448d3bf7bc8
+17	563	1775096885873482655	/home/xwh/project/ace_depth/dsacstar/build/temp.linux-x86_64-cpython-312/thread_rand.o	3eec8dde62149829
+17	21013	1775096906293612494	/home/xwh/project/ace_depth/dsacstar/build/temp.linux-x86_64-cpython-312/dsacstar.o	adf61240060fc354

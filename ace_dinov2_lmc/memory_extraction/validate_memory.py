@@ -80,21 +80,31 @@ def validate_memory(memory_path: str, save_ply: bool = False):
         print(f"  Range: [{colors.min():.3f}, {colors.max():.3f}]")
 
     # Validate scene normalization
-    scene_mean = memory.get('scene_mean')
-    scene_sigma = memory.get('scene_sigma')
+    scene_mean = memory.get('mu', memory.get('scene_mean'))
+    scene_sigma = memory.get('sigma', memory.get('scene_sigma'))
     if scene_mean is not None and scene_sigma is not None:
         print(f"\n[Scene Normalization]")
-        print(f"  Mean: {scene_mean.tolist()}")
-        print(f"  Sigma: {scene_sigma:.4f}")
+        if isinstance(scene_mean, torch.Tensor):
+            print(f"  Mean: {scene_mean.tolist()}")
+        else:
+            print(f"  Mean: {scene_mean}")
+        if isinstance(scene_sigma, torch.Tensor):
+            scene_sigma = float(scene_sigma.item())
+        print(f"  Sigma: {float(scene_sigma):.4f}")
 
     # Validate view info
-    camera_centers = memory.get('camera_centers')
+    camera_centers = memory.get('view_camera_centers', memory.get('camera_centers'))
     if camera_centers is not None:
         print(f"\n[Camera Centers]")
         print(f"  Count: {camera_centers.shape[0]}")
         print(f"  Range X: [{camera_centers[:, 0].min():.3f}, {camera_centers[:, 0].max():.3f}]")
         print(f"  Range Y: [{camera_centers[:, 1].min():.3f}, {camera_centers[:, 1].max():.3f}]")
         print(f"  Range Z: [{camera_centers[:, 2].min():.3f}, {camera_centers[:, 2].max():.3f}]")
+
+    all_scale_tokens = memory.get('all_scale_tokens')
+    if all_scale_tokens is not None:
+        print(f"\n[Scale Tokens]")
+        print(f"  Shape: {all_scale_tokens.shape}")
 
     # Validate ray directions
     ray_dirs = memory.get('ray_dirs')

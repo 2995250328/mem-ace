@@ -263,12 +263,102 @@ Training outputs go to `ace_dinov2_lmc/04_evaluation/`:
         └── extraction_log.txt
 ```
 
+## Automatic Parameter Profiles
+
+### Baseline Contract (`--apply_baseline_contract`, default True)
+
+When `--use_lmc False`, the training entry point automatically applies vanilla DINO ACE defaults (LR=0.001, buffer=10M, epochs=16) so behavior matches `train_ace_dinov2.py`. Explicit CLI overrides are preserved — the contract only applies when the value is still at the parser default.
+
+### LMC Profiles (`--lmc_profile`)
+
+Controls S2 repro rewind ratios, LR boost factors, and buffer sampling for LMC mode:
+
+| Parameter | `legacy` (default) | `mapany_flow_v1` |
+|-----------|-------------------|-------------------|
+| `s2_repro_rewind_first_ratio` | 0.20 | 0.00 |
+| `s2_repro_rewind_later_ratio` | 0.08 | 0.00 |
+| `s2_lr_boost_first` | 1.2 | 1.0 |
+| `s2_lr_boost_later` | 1.0 | 1.0 |
+| `s1_lr_scale_later` | 0.2 | 1.0 |
+| `buffer_sampling_replacement` | True | False |
+
+Explicit CLI flags always override profile defaults.
+
+## Testing Auto-Detection
+
+The test script (`test_ace_dinov2_lmc.py`) auto-detects checkpoint type by checking for `lmc_config` key in the saved dict. If present, it loads compressor + fusion modules and compresses memory once for reuse across all test frames. No special flags needed. Memory loading uses `load_memory_features()` which supports both pooled and BSE formats.
+
+## Root-Level Stubs
+
+`../train_ace_dinov2_lmc.py` and `../test_ace_dinov2_lmc.py` are thin stubs that use `importlib` to forward to the real implementations in this directory. Running either path works identically.
+
 ## Key Constraints
 
 1. **Working Directory**: Always run commands from `/home/xwh/project/ace_depth` (parent directory)
 2. **Image Resolution**: Must be multiple of 14 (DINOv2 patch size). Default: 518 (37x14)
 3. **Memory File Required**: LMC mode requires pre-built memory file (pooled format with `pooled_points`/`pooled_features` keys)
-4. **GPU Memory**: ~12-16GB VRAM for training with default settings
+4. **Memory Preflight**: `--lmc_memory_preflight True` validates memory file dimensions match the model before training starts
+5. **GPU Memory**: ~12-16GB VRAM for training with default settings
+
+## Development & Debugging
+
+### Quick Iteration Cycle
+
+```bash
+# 1. Extract memory (one-time per scene)
+SCENE_TRAIN=heads_train N_VIEWS=20 bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+
+# 2. Train with reduced iterations for debugging
+python ace_dinov2_lmc/train_ace_dinov2_lmc.py \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads debug_run.pt \
+    --device cuda:0 --use_lmc True \
+    --memory_path <extracted_memory.pt> \
+    --dinov2_path /mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
+    --lmc_iterations 2 --epochs 2 --training_buffer_size 500000 \
+    --run_name debug
+
+# 3. Test checkpoint
+python ace_dinov2_lmc/test_ace_dinov2_lmc.py \
+    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
+    ace_dinov2_lmc/04_evaluation/debug/<timestamp>/best_*.pt \
+    --device cuda:0 --session debug
+```
+
+### Testing Metrics
+
+The test script reports:
+- **Median rotation/translation error** (lower is better)
+- **% frames < 5deg/5cm** (`pct5`, primary metric for checkpoint selection)
+- **% frames < 10deg/5cm** (`pct10_5`)
+- Per-frame poses written to `poses_<map_name>_<session>.txt`
+
+### Debugging Utility Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `compare_memory_formats.py` | Compare BSE vs pooled memory files — feature stats, dimensions, distributions |
+| `check_layers_idx.py` | Check `layers_idx` field in memory files for consistency |
+| `memory_extraction/validate_memory.py` | Validate extracted memory file integrity, optional PLY export |
+
+### Memory File Formats
+
+The memory pipeline produces and consumes files in `.pt` format with these schemas:
+
+**Pooled format** (used by LMC trainer via `--memory_path`):
+- Keys: `pooled_points`, `pooled_features`, `scene_center`
+- Optional: `pooled_colors`, `ray_directions`, `layers_idx`
+
+**BSE format** (output of `memory_extraction/` pipeline, typically `memory_bse.pt`):
+- Keys: `points`, `features`, `scene_center`, plus BSE metadata
+- `load_memory_features()` in `utils_lmc.py` auto-detects and converts both formats
+
+The `*_GT_patch.pt` naming in older scripts refers to the same pooled format. The naming convention is historical — all formats are consumed identically by the trainer.
+
+## Sibling Directories
+
+- `ace_fcn_lmc/` — FCN-encoder variant of LMC (uses original ACE encoder instead of DINOv2). Shares the same GeoLMC compressor and fusion modules from parent `ace_depth/`.
+- `ace_sampler/` — Memory sampling utilities.
+- `depth_anything_v2/` — Depth Anything V2 integration (used by ACE Depth variant, not by DINOv2-LMC).
 
 ## Known Issues
 

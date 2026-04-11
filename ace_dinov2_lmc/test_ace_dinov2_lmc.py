@@ -143,26 +143,30 @@ def run_evaluation_lmc(opt):
         fusion.load_state_dict(checkpoint['fusion_state_dict'])
         fusion.eval()
 
-        # Load memory
+        # Load memory (supports both pooled and BSE formats)
+        from utils_lmc import load_memory_features
+
         _logger.info(f"[LMC] Loading memory from {memory_path}")
-        raw = torch.load(str(memory_path), map_location='cpu')
-        memory_dict = {}
-        for k in ('pooled_points', 'pooled_features', 'scene_center'):
-            v = raw[k]
-            if not isinstance(v, torch.Tensor):
-                v = torch.tensor(v)
-            if k == 'scene_center' and v.dim() == 1:
-                v = v.unsqueeze(0)
-            elif v.dim() == 2:
-                v = v.unsqueeze(0)
-            memory_dict[k] = v.to(device)
-        if 'all_scale_tokens' in raw and raw['all_scale_tokens'] is not None:
-            st = raw['all_scale_tokens']
-            if not isinstance(st, torch.Tensor):
-                st = torch.tensor(st)
-            if st.dim() == 2:
-                st = st.unsqueeze(0)
-            memory_dict['all_scale_tokens'] = st.to(device)
+        bank_data = load_memory_features(str(memory_path), device)
+
+        def _unsqueeze0(t):
+            if t is None:
+                return None
+            if not isinstance(t, torch.Tensor):
+                t = torch.tensor(t, device=device)
+            if t.dim() == 1:
+                return t.unsqueeze(0)
+            if t.dim() == 2:
+                return t.unsqueeze(0)
+            return t
+
+        memory_dict = {
+            'pooled_points': _unsqueeze0(bank_data['pooled_points']),
+            'pooled_features': _unsqueeze0(bank_data['pooled_features']),
+            'scene_center': _unsqueeze0(bank_data.get('scene_center')),
+        }
+        if bank_data.get('all_scale_tokens') is not None:
+            memory_dict['all_scale_tokens'] = _unsqueeze0(bank_data['all_scale_tokens'])
 
         # Compress memory once; reuse the same latent for all test frames (no per-frame compression).
         with torch.no_grad():
@@ -227,6 +231,19 @@ def run_evaluation_lmc(opt):
                 scene_coordinates_B3HW = network.get_scene_coordinates(features)
 
             scene_coordinates_B3HW = scene_coordinates_B3HW.float().cpu()
+
+            # De-normalize predictions if full-pipeline normalization was used during training
+            if is_lmc and lmc_config is not None:
+                norm_mu = lmc_config.get('normalization_mu')
+                norm_sigma = lmc_config.get('normalization_sigma')
+                if norm_mu is not None and norm_sigma is not None:
+                    mu_t = torch.tensor(norm_mu, dtype=torch.float32).view(1, 3, 1, 1)
+                    sigma_t = float(norm_sigma)
+                    scene_coordinates_B3HW = scene_coordinates_B3HW * sigma_t + mu_t
+                    _logger.debug(
+                        "[LMC] De-normalized scene coords: sigma=%.4f, mu=(%.3f,%.3f,%.3f)",
+                        sigma_t, float(mu_t[0, 0, 0, 0]), float(mu_t[0, 1, 0, 0]), float(mu_t[0, 2, 0, 0]),
+                    )
 
             if isinstance(filenames, str):
                 filenames = (filenames,)

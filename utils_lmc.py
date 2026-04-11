@@ -56,16 +56,14 @@ def _format_buf_million(x: int) -> str:
 
 def build_lmc_run_folder_config_tag(args: Any) -> str:
     """
-    用于 LMC 实验目录名的配置指纹，区分：
-    - iterative vs ace_g；ACE-G 下 S2 是否训 fusion (fS2/fS1)、是否 cross-iter eval (cie)
-    - lmc_mode、分辨率、buffer 初值/末值、K、迭代轮数、S2 epochs、batch
-    - S1：loss 模式 (fm/spi/spool) + 是否 s1 buffer (s1buf/s1enc)
-    - samples_per_image、LR 调度、非 legacy 的 lmc_profile
+    配置指纹，用于区分不同实验的输出目录。
+    - vanilla: 仅包含分辨率、buffer、epochs、batch 等基础参数
+    - LMC: 额外包含 flow、K、iterations、S1 loss mode 等 LMC 特有参数
     """
-    mode_tag = _sanitize_tag(getattr(args, "lmc_mode", "global"))
+    use_lmc = getattr(args, "use_lmc", False)
     sched_tag = _sanitize_tag(getattr(args, "lmc_lr_scheduler_type", "onecycle_improved"))
     profile_tag = ""
-    if getattr(args, "lmc_profile", "legacy") != "legacy":
+    if use_lmc and getattr(args, "lmc_profile", "legacy") != "legacy":
         profile_tag = f"_pf{_sanitize_tag(args.lmc_profile)}"
 
     buf_tag = _format_buf_million(int(getattr(args, "training_buffer_size", 2_560_000)))
@@ -75,6 +73,18 @@ def build_lmc_run_folder_config_tag(args: Any) -> str:
         bufff = tbs * 3
     bufff_tag = _format_buf_million(int(bufff))
 
+    if not use_lmc:
+        return "_".join([
+            "vanilla",
+            f"res{int(getattr(args, 'image_resolution', 518))}",
+            f"buf{buf_tag}M",
+            f"ep{int(getattr(args, 'epochs', 16))}",
+            f"bs{int(getattr(args, 'batch_size', 5120))}",
+            f"sp{int(getattr(args, 'samples_per_image', 512))}",
+            sched_tag,
+        ])
+
+    mode_tag = _sanitize_tag(getattr(args, "lmc_mode", "global"))
     flow = str(getattr(args, "lmc_flow", "iterative"))
     if flow == "ace_g":
         flow_part = "aceg"
@@ -91,7 +101,7 @@ def build_lmc_run_folder_config_tag(args: Any) -> str:
     parts = [
         flow_part,
         mode_tag,
-        f"res{int(getattr(args, 'image_resolution', 480))}",
+        f"res{int(getattr(args, 'image_resolution', 518))}",
         f"buf{buf_tag}M_F{bufff_tag}M",
         f"K{int(getattr(args, 'num_latent_tokens', 64))}",
         f"it{int(getattr(args, 'lmc_iterations', 1))}",
@@ -153,7 +163,7 @@ def estimate_memory_front_visibility(
     }
 
 
-def load_memory_features(path: str, device: torch.device) -> Dict[str, Any]:
+def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: bool = False) -> Dict[str, Any]:
     """
     Load memory tensors from disk (same contract as map-anything load_memory_features).
     Supports POOLED memory bank format; unknown format raises with available keys.
@@ -184,7 +194,83 @@ def load_memory_features(path: str, device: torch.device) -> Dict[str, Any]:
             return torch.tensor(x, device=device)
 
         # Field mapping: BSE → pooled format
-        pooled_points = _to_tensor(payload["points"])
+        points_normalized = _to_tensor(payload["points"])  # (raw-mu)/sigma
+        points_world = _to_tensor(payload["points_world"]) if payload.get("points_world") is not None else None
+        mu_tensor = _to_tensor(payload["mu"])              # centroid [3]
+        sigma_val = payload.get("sigma")
+        sigma_tensor = _to_tensor(sigma_val) if sigma_val is not None else None
+
+        if bse_denorm_to_world and points_world is not None:
+            pooled_points = points_world
+            _scene_center = payload.get("scene_center")
+            _scene_center_cam = payload.get("scene_center_cam")
+            if _scene_center is not None:
+                scene_center = _to_tensor(_scene_center)
+                _sc_src = "scene_center=pooled-compatible camera mean"
+            elif _scene_center_cam is not None:
+                scene_center = _to_tensor(_scene_center_cam)
+                _sc_src = "scene_center_cam=selected-view mean(camera_centers)"
+            else:
+                scene_center = mu_tensor.clone()
+                _sc_src = "mu=mean(pooled_points)"
+            norm_mu_out = None
+            norm_sigma_out = None
+            _logger.info(
+                "[LMC] BSE WORLD-POINTS path: using saved points_world directly. "
+                "scene_center=%s=(%.3f, %.3f, %.3f). Pipeline matches pooled world-coordinate behavior.",
+                _sc_src,
+                float(scene_center[0]), float(scene_center[1]), float(scene_center[2]),
+            )
+        elif bse_denorm_to_world and sigma_tensor is not None:
+            # --- Denormalize: world = normalized * sigma + mu ---
+            pooled_points = points_normalized * sigma_tensor + mu_tensor
+            # Prefer pooled-compatible scene_center saved by extraction. Fall back to
+            # legacy selected-view mean, then point-cloud centroid for old files.
+            _scene_center = payload.get("scene_center")
+            _scene_center_cam = payload.get("scene_center_cam")
+            if _scene_center is not None:
+                scene_center = _to_tensor(_scene_center)
+                _sc_src = "scene_center=pooled-compatible camera mean"
+            elif _scene_center_cam is not None:
+                scene_center = _to_tensor(_scene_center_cam)
+                _sc_src = "scene_center_cam=selected-view mean(camera_centers)"
+            else:
+                scene_center = mu_tensor.clone()
+                _sc_src = "mu=mean(pooled_points)"
+            norm_mu_out = None
+            norm_sigma_out = None
+            _logger.info(
+                "[LMC] BSE DENORM→WORLD: de-normalized points back to world coords. "
+                "scene_center=%s=(%.3f, %.3f, %.3f), sigma=%.4f. "
+                "Pipeline now identical to pooled version.",
+                _sc_src,
+                float(scene_center[0]), float(scene_center[1]), float(scene_center[2]),
+                float(sigma_tensor),
+            )
+        elif bse_denorm_to_world and sigma_tensor is None:
+            # Requested denorm but no sigma — fall back to normalized path with warning
+            pooled_points = points_normalized
+            scene_center = torch.zeros(3, device=device)
+            norm_mu_out = mu_tensor
+            norm_sigma_out = sigma_tensor
+            _logger.warning(
+                "[LMC] bse_denorm_to_world=True but no sigma field in memory; "
+                "falling back to normalized-pipeline path."
+            )
+        else:
+            # Keep normalized points as-is (full-pipeline normalization design)
+            pooled_points = points_normalized
+            scene_center = torch.zeros(3, device=device)
+            norm_mu_out = mu_tensor
+            norm_sigma_out = sigma_tensor
+            if sigma_tensor is not None:
+                _logger.info(
+                    "[LMC] BSE normalized points: sigma=%.4f, mu=(%.3f, %.3f, %.3f)",
+                    float(sigma_tensor), float(mu_tensor[0]), float(mu_tensor[1]), float(mu_tensor[2]),
+                )
+            else:
+                _logger.warning("[LMC] BSE memory has no sigma field; using points without normalization info.")
+
         pooled_features = _to_tensor(payload["features"])
 
         # Cast fp16 → fp32 if needed
@@ -223,7 +309,12 @@ def load_memory_features(path: str, device: torch.device) -> Dict[str, Any]:
 
         # Map optional fields
         pooled_colors = safe_to_device("colors")
-        scene_center = safe_to_device("mu")
+        # scene_center is set in the normalization/denorm branch above
+        # (zeros for normalized, mu for denorm-to-world)
+        if not bse_denorm_to_world or sigma_tensor is None:
+            # Normalized path: scene_center=0, coords already centered
+            scene_center = torch.zeros(3, device=device)
+        # else: scene_center was already set to mu_tensor in the denorm branch above
         all_scale_tokens = safe_to_device("all_scale_tokens")
 
         # Construct all_poses from view metadata if available
@@ -268,20 +359,24 @@ def load_memory_features(path: str, device: torch.device) -> Dict[str, Any]:
 
         return {
             "type": "pooled",
-            "pooled_points": pooled_points,
+            "pooled_points": pooled_points,          # NORMALIZED or WORLD (if bse_denorm_to_world)
             "pooled_features": pooled_features,
             "pooled_colors": pooled_colors,
             "all_poses": all_poses,
             "all_intrinsics": all_intrinsics,
             "all_scale_tokens": all_scale_tokens,
-            "scene_center": scene_center,
+            "scene_center": scene_center,             # zeros(3) for normalized, mu for denorm
             "ref_pose": None,
             "patch_stride": payload.get("patch_stride", 14.0),
             "voxel_size": payload.get("voxel_size", 0.05),
             "original_views": payload.get("n_views", 0),
             "scene": payload.get("scene", "unknown"),
-            "layers_idx": [],
+            "layers_idx": payload.get("layers_idx", []),
             "_meta": _meta,
+            # Normalization metadata: None when bse_denorm_to_world=True (pooled-equivalent mode)
+            "normalization_mu": norm_mu_out,          # [3] centroid or None
+            "normalization_sigma": norm_sigma_out,    # scalar std or None
+            "points_world": points_world,
         }
 
     # === Pooled format detection ===

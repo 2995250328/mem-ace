@@ -90,6 +90,8 @@ if __name__ == '__main__':
                        help='Training buffer size')
     parser.add_argument('--buffer_batch_size', type=int, default=1,
                        help='Number of images per forward when filling buffer (1=original ACE one-by-one)')
+    parser.add_argument('--num_data_loader_workers', type=int, default=12,
+                       help='DataLoader worker 数；遇 Errno 24 Too many open files 时可改为 0–4 或提高 ulimit -n')
     parser.add_argument('--buffer_image_width', type=int, default=None,
                        help='Fixed image width for buffer when buffer_batch_size>1 (default: 4:3 from height)')
     parser.add_argument('--samples_per_image', type=int, default=512,

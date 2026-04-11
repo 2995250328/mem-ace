@@ -172,6 +172,15 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        '--num_data_loader_workers',
+        type=int,
+        default=12,
+        help=(
+            'DataLoader 子进程数量。过大且系统/会话 open files 上限低时可能触发 '
+            'OSError: [Errno 24] Too many open files；可改为 0（主进程加载）或 2–4，或执行 ulimit -n 提高上限。'
+        ),
+    )
+    parser.add_argument(
         '--samples_per_image',
         type=int,
         default=512,
@@ -391,6 +400,14 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=float,
         default=3.0,
         help='允许 ||memory.scene_center - dataset.mean_cam_center|| 的最大偏差（米）。',
+    )
+    parser.add_argument(
+        '--bse_denorm_to_world',
+        type=_strtobool,
+        default=False,
+        help='BSE memory: 将归一化坐标 (raw-mu)/sigma 还原为世界坐标 raw，'
+             '后续 pipeline 与 pooled 版本完全一致（scene_center=mu，head.mean=mu，无 depth scaling）。'
+             '用于验证归一化是否为性能下降根因。',
     )
     parser.add_argument(
         '--lmc_head_mean_max_shift',
