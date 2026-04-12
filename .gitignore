@@ -1,16 +1,72 @@
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 .idea/
+.vscode/
 
 # Dataset files.
+data/
+dataset/
 datasets/
 ace_models/
 depth_checkpoints/
 
-# Outputs.
-output/
+# Model weights and generated artifacts.
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.engine
+*.tflite
+*.pb
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.joblib
+*.npy
+*.npz
+checkpoints/
+checkpoints_link
+weights/
+pretrained/
+models/
 
-wtconv/
-wtconvnext/
+# Runtime outputs.
+output/
+outputs/
+output_images/
+runs/
+wandb/
+logs/
+tmp/
+temp/
+*.log
+debug_raw_output.png
+test_images/
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
 
 # Evaluation outputs.
 **/04_evaluation/
+visualization_results*/
+
+# Build artifacts.
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.ninja
+.ninja_*
+
+wtconv/
+wtconvnext/
