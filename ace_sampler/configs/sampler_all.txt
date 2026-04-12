@@ -1,0 +1,44 @@
+# All scenes: 7Scenes(3) + 12Scenes(12) + Cambridge(5×4 clusters) = 35 entries
+# Cambridge uses ensemble cluster heads for more accurate error maps.
+# format: scene_path  head_path  [num_clusters  cluster_idx]
+
+# ── 7Scenes pgt ──────────────────────────────────────────────────────────────
+/mnt/storage/xwh/7Scenes/pgt_7scenes_chess   output/ace_models/7Scenes_pgt/pgt_7scenes_chess.pt
+/mnt/storage/xwh/7Scenes/pgt_7scenes_heads   output/ace_models/7Scenes_pgt/pgt_7scenes_heads.pt
+/mnt/storage/xwh/7Scenes/pgt_7scenes_stairs  output/ace_models/7Scenes_pgt/pgt_7scenes_stairs.pt
+
+# ── 12Scenes pgt ─────────────────────────────────────────────────────────────
+/mnt/storage/xwh/12Scenes/pgt_12scenes_apt1_kitchen    output/ace_models/12Scenes_pgt/pgt_12scenes_apt1_kitchen.pt
+/mnt/storage/xwh/12Scenes/pgt_12scenes_apt1_living     output/ace_models/12Scenes_pgt/pgt_12scenes_apt1_living.pt
+/mnt/storage/xwh/12Scenes/pgt_12scenes_apt2_bed        output/ace_models/12Scenes_pgt/pgt_12scenes_apt2_bed.pt
+/mnt/storage/xwh/12Scenes/pgt_12scenes_apt2_kitchen    output/ace_models/12Scenes_pgt/pgt_12scenes_apt2_kitchen.pt
+/mnt/storage/xwh/12Scenes/pgt_12scenes_apt2_living     output/ace_models/12Scenes_pgt/pgt_12scenes_apt2_living.pt
+/mnt/storage/xwh/12Scenes/pgt_12scenes_apt2_luke       output/ace_models/12Scenes_pgt/pgt_12scenes_apt2_luke.pt
+/mnt/storage/xwh/12Scenes/pgt_12scenes_office1_gates362  output/ace_models/12Scenes_pgt/pgt_12scenes_office1_gates362.pt
+/mnt/storage/xwh/12Scenes/pgt_12scenes_office1_gates381  output/ace_models/12Scenes_pgt/pgt_12scenes_office1_gates381.pt
+/mnt/storage/xwh/12Scenes/pgt_12scenes_office1_lounge    output/ace_models/12Scenes_pgt/pgt_12scenes_office1_lounge.pt
+/mnt/storage/xwh/12Scenes/pgt_12scenes_office1_manolis   output/ace_models/12Scenes_pgt/pgt_12scenes_office1_manolis.pt
+/mnt/storage/xwh/12Scenes/pgt_12scenes_office2_5a        output/ace_models/12Scenes_pgt/pgt_12scenes_office2_5a.pt
+/mnt/storage/xwh/12Scenes/pgt_12scenes_office2_5b        output/ace_models/12Scenes_pgt/pgt_12scenes_office2_5b.pt
+
+# ── Cambridge — ensemble cluster heads (4 clusters, more accurate error maps) ─
+/mnt/storage/xwh/Cambridge/Cambridge_GreatCourt    output/ace_models/Cambridge_Ensemble/Cambridge_GreatCourt/0_4.pt    4  0
+/mnt/storage/xwh/Cambridge/Cambridge_GreatCourt    output/ace_models/Cambridge_Ensemble/Cambridge_GreatCourt/1_4.pt    4  1
+/mnt/storage/xwh/Cambridge/Cambridge_GreatCourt    output/ace_models/Cambridge_Ensemble/Cambridge_GreatCourt/2_4.pt    4  2
+/mnt/storage/xwh/Cambridge/Cambridge_GreatCourt    output/ace_models/Cambridge_Ensemble/Cambridge_GreatCourt/3_4.pt    4  3
+/mnt/storage/xwh/Cambridge/Cambridge_KingsCollege  output/ace_models/Cambridge_Ensemble/Cambridge_KingsCollege/0_4.pt  4  0
+/mnt/storage/xwh/Cambridge/Cambridge_KingsCollege  output/ace_models/Cambridge_Ensemble/Cambridge_KingsCollege/1_4.pt  4  1
+/mnt/storage/xwh/Cambridge/Cambridge_KingsCollege  output/ace_models/Cambridge_Ensemble/Cambridge_KingsCollege/2_4.pt  4  2
+/mnt/storage/xwh/Cambridge/Cambridge_KingsCollege  output/ace_models/Cambridge_Ensemble/Cambridge_KingsCollege/3_4.pt  4  3
+/mnt/storage/xwh/Cambridge/Cambridge_OldHospital   output/ace_models/Cambridge_Ensemble/Cambridge_OldHospital/0_4.pt   4  0
+/mnt/storage/xwh/Cambridge/Cambridge_OldHospital   output/ace_models/Cambridge_Ensemble/Cambridge_OldHospital/1_4.pt   4  1
+/mnt/storage/xwh/Cambridge/Cambridge_OldHospital   output/ace_models/Cambridge_Ensemble/Cambridge_OldHospital/2_4.pt   4  2
+/mnt/storage/xwh/Cambridge/Cambridge_OldHospital   output/ace_models/Cambridge_Ensemble/Cambridge_OldHospital/3_4.pt   4  3
+/mnt/storage/xwh/Cambridge/Cambridge_ShopFacade    output/ace_models/Cambridge_Ensemble/Cambridge_ShopFacade/0_4.pt    4  0
+/mnt/storage/xwh/Cambridge/Cambridge_ShopFacade    output/ace_models/Cambridge_Ensemble/Cambridge_ShopFacade/1_4.pt    4  1
+/mnt/storage/xwh/Cambridge/Cambridge_ShopFacade    output/ace_models/Cambridge_Ensemble/Cambridge_ShopFacade/2_4.pt    4  2
+/mnt/storage/xwh/Cambridge/Cambridge_ShopFacade    output/ace_models/Cambridge_Ensemble/Cambridge_ShopFacade/3_4.pt    4  3
+/mnt/storage/xwh/Cambridge/Cambridge_StMarysChurch output/ace_models/Cambridge_Ensemble/Cambridge_StMarysChurch/0_4.pt 4  0
+/mnt/storage/xwh/Cambridge/Cambridge_StMarysChurch output/ace_models/Cambridge_Ensemble/Cambridge_StMarysChurch/1_4.pt 4  1
+/mnt/storage/xwh/Cambridge/Cambridge_StMarysChurch output/ace_models/Cambridge_Ensemble/Cambridge_StMarysChurch/2_4.pt 4  2
+/mnt/storage/xwh/Cambridge/Cambridge_StMarysChurch output/ace_models/Cambridge_Ensemble/Cambridge_StMarysChurch/3_4.pt 4  3

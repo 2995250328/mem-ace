@@ -1,0 +1,9 @@
+# 7Scenes pgt — all 7 scenes
+# format: scene_path  head_path
+/mnt/storage/xwh/7Scenes/pgt_7scenes_chess      output/ace_models/7Scenes_pgt/pgt_7scenes_chess.pt
+/mnt/storage/xwh/7Scenes/pgt_7scenes_fire       output/ace_models/7Scenes_pgt/pgt_7scenes_fire.pt
+/mnt/storage/xwh/7Scenes/pgt_7scenes_heads      output/ace_models/7Scenes_pgt/pgt_7scenes_heads.pt
+/mnt/storage/xwh/7Scenes/pgt_7scenes_office     output/ace_models/7Scenes_pgt/pgt_7scenes_office.pt
+/mnt/storage/xwh/7Scenes/pgt_7scenes_pumpkin    output/ace_models/7Scenes_pgt/pgt_7scenes_pumpkin.pt
+/mnt/storage/xwh/7Scenes/pgt_7scenes_redkitchen output/ace_models/7Scenes_pgt/pgt_7scenes_redkitchen.pt
+/mnt/storage/xwh/7Scenes/pgt_7scenes_stairs     output/ace_models/7Scenes_pgt/pgt_7scenes_stairs.pt
