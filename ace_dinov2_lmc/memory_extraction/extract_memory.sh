@@ -142,12 +142,19 @@ GPU_ID="${GPU_ID:-1}"
 # VOXEL_SIZE — --voxel_size：BSE 体素边长（米）
 # POOL_MODE — --pool_mode：bse=voxel hash + Otsu split；simple=简单 voxel mean
 # PREPOOL_MODE — --prepool_mode：per_view=每个 view 先池化；global_only=直接缓存 raw points，Pass 2 再全局池化
-# USE_OTSU — 记录在 JSON；当前脚本未传 --use_otsu/--no-use_otsu，Python 默认 use_otsu=True
+# USE_OTSU — --use_otsu：true=使用 Otsu adaptive split；false=固定 tau=0.90
+# UNIMODAL_THRESHOLD — --unimodal_threshold：std(sim) 低于该值时跳过 split
 POOL_MODE="${POOL_MODE:-bse}"
 PREPOOL_MODE="${PREPOOL_MODE:-per_view}"
 USE_OTSU="${USE_OTSU:-true}"
+UNIMODAL_THRESHOLD="${UNIMODAL_THRESHOLD:-0.02}"
 VOXEL_SIZE="${VOXEL_SIZE:-0.05}"
 GLOBAL_MERGE="${GLOBAL_MERGE:-true}"
+GLOBAL_MERGE_VOXEL_SIZE="${GLOBAL_MERGE_VOXEL_SIZE:-}"
+# Hybrid 模式参数：只对高不一致全局 voxel 做选择性 split
+HYBRID_SPLIT_MIN_STD="${HYBRID_SPLIT_MIN_STD:-0.05}"
+HYBRID_MIN_CLUSTER_SIZE="${HYBRID_MIN_CLUSTER_SIZE:-4}"
+HYBRID_MIN_SPLIT_POINTS="${HYBRID_MIN_SPLIT_POINTS:-2}"
 # ENABLE_SOR — 为 true 时追加 --enable_sor，并打开 SOR_K/STD（Python 内 sor_k、sor_std_ratio 用默认值）
 ENABLE_SOR="${ENABLE_SOR:-true}"
 
@@ -209,8 +216,16 @@ else
 fi
 if [ "$POOL_MODE" = "simple" ]; then
     CONFIG_TAG="${CONFIG_TAG}_simple"
+elif [ "$POOL_MODE" = "hybrid" ]; then
+    CONFIG_TAG="${CONFIG_TAG}_hybrid_hstd${HYBRID_SPLIT_MIN_STD}_hmin${HYBRID_MIN_CLUSTER_SIZE}_hsplit${HYBRID_MIN_SPLIT_POINTS}"
 else
     CONFIG_TAG="${CONFIG_TAG}_bse"
+fi
+if [ "$USE_OTSU" = "false" ]; then
+    CONFIG_TAG="${CONFIG_TAG}_nootsu"
+fi
+if [ "$POOL_MODE" = "bse" ]; then
+    CONFIG_TAG="${CONFIG_TAG}_ut${UNIMODAL_THRESHOLD}"
 fi
 if [ "$PREPOOL_MODE" = "global_only" ]; then
     CONFIG_TAG="${CONFIG_TAG}_globalonly"
@@ -220,6 +235,9 @@ if [ "$ENABLE_SOR" = "true" ]; then
 fi
 if [ "$GLOBAL_MERGE" = "true" ]; then
     CONFIG_TAG="${CONFIG_TAG}_gm"
+    if [ -n "$GLOBAL_MERGE_VOXEL_SIZE" ]; then
+        CONFIG_TAG="${CONFIG_TAG}v${GLOBAL_MERGE_VOXEL_SIZE}"
+    fi
 else
     CONFIG_TAG="${CONFIG_TAG}_nogm"
 fi
@@ -227,9 +245,21 @@ if [ "$USE_L2_NORMALIZATION" = "true" ]; then
     CONFIG_TAG="${CONFIG_TAG}_l2"
 fi
 
+if [ "$POOL_MODE" = "hybrid" ]; then
+    if [ "$PREPOOL_MODE" != "global_only" ]; then
+        echo "ERROR: POOL_MODE=hybrid requires PREPOOL_MODE=global_only, got '$PREPOOL_MODE'"
+        exit 1
+    fi
+    if [ "$GLOBAL_MERGE" = "true" ]; then
+        echo "ERROR: POOL_MODE=hybrid requires GLOBAL_MERGE=false"
+        exit 1
+    fi
+fi
+
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="${OUTPUT_ROOT}/${SCENE_NAME}/${N_VIEWS}v_${CONFIG_TAG}/${TIMESTAMP}"
 OUTPUT_FILE="${OUTPUT_DIR}/memory_bse.pt"
+TEMP_DIR="/dev/shm/ace_bse_${SCENE_NAME}_${N_VIEWS}v_${CONFIG_TAG}_${TIMESTAMP}_gpu${GPU_ID}_pid$$"
 
 # =============================================================================
 # PYTHONPATH 设置
@@ -266,14 +296,22 @@ echo "    root:       $DATASET_ROOT"
 echo "    path:       $DATASET_PATH"
 echo "    scene:      $SCENE_TRAIN → $SCENE_TEST"
 echo "    n_views:    $N_VIEWS"
+echo "    temp_dir:   $TEMP_DIR"
 echo ""
 echo "  BSE Config:"
 echo "    voxel_size: $VOXEL_SIZE"
 echo "    pool_mode:  $POOL_MODE"
 echo "    prepool_mode: $PREPOOL_MODE"
 echo "    otsu:       $USE_OTSU"
+echo "    unimodal_threshold: $UNIMODAL_THRESHOLD"
+if [ "$POOL_MODE" = "hybrid" ]; then
+echo "    hybrid_split_min_std: $HYBRID_SPLIT_MIN_STD"
+echo "    hybrid_min_cluster_size: $HYBRID_MIN_CLUSTER_SIZE"
+echo "    hybrid_min_split_points: $HYBRID_MIN_SPLIT_POINTS"
+fi
 echo "    sor:        $ENABLE_SOR"
 echo "    global_merge: $GLOBAL_MERGE"
+echo "    global_merge_voxel_size: ${GLOBAL_MERGE_VOXEL_SIZE:-$VOXEL_SIZE}"
 echo "    ray_pool:   $RAY_POOL_STRATEGY"
 echo ""
 echo "  Depth:"
@@ -322,10 +360,21 @@ PYTHON_ARGS="$PYTHON_ARGS $OUTPUT_FILE"
 PYTHON_ARGS="$PYTHON_ARGS --n_memory $N_VIEWS"
 # 固定 cuda:0：配合上方 CUDA_VISIBLE_DEVICES=$GPU_ID，即使用物理 GPU_ID 对应的那块卡
 PYTHON_ARGS="$PYTHON_ARGS --device cuda:0"
+PYTHON_ARGS="$PYTHON_ARGS --temp_dir $TEMP_DIR"
 PYTHON_ARGS="$PYTHON_ARGS --voxel_size $VOXEL_SIZE"
 PYTHON_ARGS="$PYTHON_ARGS --pool_mode $POOL_MODE"
 PYTHON_ARGS="$PYTHON_ARGS --prepool_mode $PREPOOL_MODE"
+PYTHON_ARGS="$PYTHON_ARGS --use_otsu $USE_OTSU"
+PYTHON_ARGS="$PYTHON_ARGS --unimodal_threshold $UNIMODAL_THRESHOLD"
 PYTHON_ARGS="$PYTHON_ARGS --global_merge $GLOBAL_MERGE"
+if [ -n "$GLOBAL_MERGE_VOXEL_SIZE" ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --global_merge_voxel_size $GLOBAL_MERGE_VOXEL_SIZE"
+fi
+if [ "$POOL_MODE" = "hybrid" ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --hybrid_split_min_std $HYBRID_SPLIT_MIN_STD"
+    PYTHON_ARGS="$PYTHON_ARGS --hybrid_min_cluster_size $HYBRID_MIN_CLUSTER_SIZE"
+    PYTHON_ARGS="$PYTHON_ARGS --hybrid_min_split_points $HYBRID_MIN_SPLIT_POINTS"
+fi
 PYTHON_ARGS="$PYTHON_ARGS --dataset_type $DATASET_TYPE"
 PYTHON_ARGS="$PYTHON_ARGS --dataset_loader $DATASET_LOADER"
 PYTHON_ARGS="$PYTHON_ARGS --scene_name $SCENE_TRAIN"
@@ -367,6 +416,12 @@ fi
 # =============================================================================
 # 保存配置快照
 # =============================================================================
+if [ -n "$GLOBAL_MERGE_VOXEL_SIZE" ]; then
+    GLOBAL_MERGE_VOXEL_SIZE_JSON="$GLOBAL_MERGE_VOXEL_SIZE"
+else
+    GLOBAL_MERGE_VOXEL_SIZE_JSON="null"
+fi
+
 cat > "${OUTPUT_DIR}/extraction_config.json" <<EOF
 {
     "dataset_type": "$DATASET_TYPE",
@@ -380,8 +435,13 @@ cat > "${OUTPUT_DIR}/extraction_config.json" <<EOF
     "pool_mode": "$POOL_MODE",
     "prepool_mode": "$PREPOOL_MODE",
     "use_otsu": "$USE_OTSU",
+    "unimodal_threshold": $UNIMODAL_THRESHOLD,
+    "hybrid_split_min_std": $HYBRID_SPLIT_MIN_STD,
+    "hybrid_min_cluster_size": $HYBRID_MIN_CLUSTER_SIZE,
+    "hybrid_min_split_points": $HYBRID_MIN_SPLIT_POINTS,
     "enable_sor": "$ENABLE_SOR",
     "global_merge": "$GLOBAL_MERGE",
+    "global_merge_voxel_size": $GLOBAL_MERGE_VOXEL_SIZE_JSON,
     "depth_valid_range": [$DEPTH_MIN, $DEPTH_MAX],
     "patch_depth_sampling": "$PATCH_DEPTH_SAMPLING",
     "use_patch_based": "$USE_PATCH_BASED",
@@ -393,6 +453,7 @@ cat > "${OUTPUT_DIR}/extraction_config.json" <<EOF
     "model_checkpoint": "$MODEL_CHECKPOINT",
     "dinov2_intermediate_layers": "$DINOV2_INTERMEDIATE_LAYERS",
     "gpu_id": $GPU_ID,
+    "temp_dir": "$TEMP_DIR",
     "config_tag": "$CONFIG_TAG",
     "timestamp": "$TIMESTAMP"
 }

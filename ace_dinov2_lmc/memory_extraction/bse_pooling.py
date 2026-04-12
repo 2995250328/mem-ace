@@ -10,11 +10,11 @@ Ray direction handling strategies:
 
 import torch
 from torch import Tensor
-from typing import Dict, List, Optional, Literal
+from typing import Dict, List, Optional, Literal, Tuple
 
 # Ray pooling strategies
 RayPoolStrategy = Literal['mean', 'dominant', 'first', 'all']
-PoolMode = Literal['bse', 'simple']
+PoolMode = Literal['bse', 'simple', 'hybrid']
 
 
 def compute_plucker_rays(
@@ -57,7 +57,10 @@ class BSEPooler:
         unimodal_threshold: float = 0.02,
         pool_mode: PoolMode = 'bse',
         ray_pool_strategy: RayPoolStrategy = 'mean',
-        save_all_ray_strategies: bool = True
+        save_all_ray_strategies: bool = True,
+        hybrid_split_min_std: float = 0.05,
+        hybrid_min_cluster_size: int = 4,
+        hybrid_min_split_points: int = 2,
     ):
         """
         Args:
@@ -68,12 +71,19 @@ class BSEPooler:
             pool_mode: Pooling mode
                 - 'bse': voxel hash + Otsu split (current default)
                 - 'simple': simple voxel mean without Otsu/boundary split
+                - 'hybrid': simple voxel mean, with selective per-voxel split
             ray_pool_strategy: Strategy for pooling ray directions
                 - 'mean': Average + L2 normalize (may lose multi-view info)
                 - 'dominant': Use ray with highest feature similarity
                 - 'first': Use first ray in cluster
                 - 'all': Keep all rays per cluster
             save_all_ray_strategies: If True, save all strategy results for comparison
+            hybrid_split_min_std: Hybrid mode; split voxels only when per-voxel
+                cosine-similarity std is at least this threshold
+            hybrid_min_cluster_size: Hybrid mode; minimum points in a voxel to
+                consider splitting
+            hybrid_min_split_points: Hybrid mode; minimum points in each Otsu
+                branch to accept the split
         """
         self.voxel_size = voxel_size
         self.use_otsu = use_otsu
@@ -82,6 +92,9 @@ class BSEPooler:
         self.pool_mode = pool_mode
         self.ray_pool_strategy = ray_pool_strategy
         self.save_all_ray_strategies = save_all_ray_strategies
+        self.hybrid_split_min_std = hybrid_split_min_std
+        self.hybrid_min_cluster_size = hybrid_min_cluster_size
+        self.hybrid_min_split_points = hybrid_min_split_points
 
     def pool(
         self,
@@ -118,6 +131,18 @@ class BSEPooler:
                 camera_centers=camera_centers,
                 features_original=features.float(),
                 similarity=None,
+            )
+
+        if self.pool_mode == 'hybrid':
+            F_mean = self._scatter_mean(features.float(), cluster_ids)
+            sim = self._cosine_similarity(features.float(), F_mean[cluster_ids])
+            sub_ids, hybrid_stats = self._hybrid_selective_split(cluster_ids, sim)
+            self._log_hybrid_stats(hybrid_stats, len(points))
+            return self._scatter_mean_all(
+                points, features, colors, ray_dirs, sub_ids,
+                camera_centers=camera_centers,
+                features_original=features.float(),
+                similarity=sim
             )
 
         # Step 2: Compute cluster mean features (fp32 for stability)
@@ -169,10 +194,15 @@ class BSEPooler:
         means_norm = torch.nn.functional.normalize(cluster_means, dim=1, eps=1e-6)
         return (features_norm * means_norm).sum(dim=1)
 
-    def _otsu_threshold(self, sim: Tensor) -> float:
+    def _otsu_threshold(self, sim: Tensor, check_unimodal: bool = True) -> float:
         """Otsu's method for adaptive threshold selection."""
+        sim = sim[torch.isfinite(sim)]
+        if sim.numel() == 0:
+            return 0.90
+        sim = sim.clamp(0.0, 1.0)
+
         # Check for unimodal distribution
-        if sim.std().item() < self.unimodal_threshold:
+        if check_unimodal and sim.std(unbiased=False).item() < self.unimodal_threshold:
             return 0.90  # Fallback to fixed threshold
 
         # Build histogram
@@ -181,6 +211,8 @@ class BSEPooler:
 
         # Compute weights and means
         weight_total = hist.sum()
+        if weight_total <= 0:
+            return 0.90
         mean_total = (hist * bin_centers).sum() / weight_total
 
         # Find threshold that maximizes inter-class variance
@@ -210,6 +242,88 @@ class BSEPooler:
                 best_threshold = bin_centers[i].item()
 
         return best_threshold
+
+    def _hybrid_selective_split(
+        self,
+        cluster_ids: Tensor,
+        sim: Tensor,
+    ) -> Tuple[Tensor, Dict[str, float]]:
+        """Per-voxel selective Otsu split for hybrid mode."""
+        num_clusters = cluster_ids.max().item() + 1
+        device = cluster_ids.device
+
+        cluster_count = torch.zeros(num_clusters, dtype=torch.long, device=device)
+        cluster_count.index_add_(0, cluster_ids, torch.ones_like(cluster_ids))
+
+        # Default: every point keeps its original voxel assignment.
+        sub_ids = cluster_ids.clone()
+        next_sub_id = num_clusters
+        split_count = 0
+        split_points = 0
+
+        candidate_ids = (cluster_count >= self.hybrid_min_cluster_size).nonzero(as_tuple=True)[0]
+
+        for vid in candidate_ids:
+            vid_val = int(vid.item())
+            mask = cluster_ids == vid_val
+            voxel_sim = sim[mask]
+
+            voxel_std = voxel_sim.std(unbiased=False).item()
+            if voxel_std < self.hybrid_split_min_std:
+                continue
+
+            tau = self._otsu_threshold(voxel_sim, check_unimodal=False) if self.use_otsu else 0.90
+            is_outlier = voxel_sim < tau
+            n_inlier = int((~is_outlier).sum().item())
+            n_outlier = int(is_outlier.sum().item())
+
+            if (
+                n_inlier < self.hybrid_min_split_points
+                or n_outlier < self.hybrid_min_split_points
+            ):
+                continue
+
+            global_indices = mask.nonzero(as_tuple=True)[0]
+            sub_ids[global_indices[~is_outlier]] = next_sub_id
+            sub_ids[global_indices[is_outlier]] = next_sub_id + 1
+            next_sub_id += 2
+            split_count += 1
+            split_points += int(mask.sum().item())
+
+        # Critical: _scatter_mean_all expects dense ids, otherwise sparse split
+        # ids would produce empty zero clusters.
+        unique_ids, dense_sub_ids = torch.unique(sub_ids, sorted=True, return_inverse=True)
+        final_points = int(unique_ids.numel())
+        raw_points = int(cluster_ids.numel())
+        simple_points = raw_points - split_points
+
+        stats = {
+            'total_voxels': int(num_clusters),
+            'candidate_voxels': int(candidate_ids.numel()),
+            'split_voxels': int(split_count),
+            'split_ratio': float(split_count / max(num_clusters, 1)),
+            'simple_points': int(simple_points),
+            'split_points': int(split_points),
+            'final_points': int(final_points),
+        }
+        return dense_sub_ids, stats
+
+    def _log_hybrid_stats(self, stats: Dict[str, float], raw_points: int) -> None:
+        """Print concise hybrid split statistics for extraction logs."""
+        print(
+            f"[Hybrid] raw_points={raw_points} "
+            f"global_voxels={stats['total_voxels']} "
+            f"candidate_voxels={stats['candidate_voxels']} "
+            f"split_voxels={stats['split_voxels']} "
+            f"split_ratio={stats['split_ratio']:.4f}",
+            flush=True,
+        )
+        print(
+            f"[Hybrid] final_points={stats['final_points']} "
+            f"(simple={stats['simple_points']} + split={stats['split_points']} raw) "
+            f"mean_cluster_size={raw_points / max(int(stats['final_points']), 1):.1f}",
+            flush=True,
+        )
 
     def _scatter_mean_all(
         self,

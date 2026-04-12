@@ -765,8 +765,18 @@ class ExtractionConfig:
     prepool_mode: str = "per_view"
     # BSE 内是否用 Otsu 自动估计深度分箱阈值（与稀疏/噪声深度相关）
     use_otsu: bool = True
+    # BSE 内 feature similarity 分布近似单峰时跳过 split 的 std 阈值
+    unimodal_threshold: float = 0.02
+    # Hybrid mode: per-voxel cosine-sim std threshold for selective split
+    hybrid_split_min_std: float = 0.05
+    # Hybrid mode: minimum points in a voxel to consider splitting
+    hybrid_min_cluster_size: int = 4
+    # Hybrid mode: minimum points in each Otsu branch to accept split
+    hybrid_min_split_points: int = 2
     # Pass 2 完成逐 view 拼接后，是否做跨 view 的全局体素合并
     global_merge: bool = True
+    # Pass 2 全局合并体素边长；None 时沿用 voxel_size
+    global_merge_voxel_size: Optional[float] = None
     # 反投影与可视化时保留的深度范围 (min_m, max_m)，单位米
     depth_valid_range: Tuple[float, float] = (0.1, 6.0)
     # 网格中心深度采样：与 map-anything generate_patch_point_cloud / fps_memory 语义一致
@@ -2267,9 +2277,10 @@ def two_pass_processing(
         # Validate checkpoint: /dev/shm is volatile and chunk files may be missing.
         existing_chunks = [p for p in existing_chunks if isinstance(p, str)]
         missing = [p for p in existing_chunks if not os.path.exists(p)]
-        if missing:
+        if missing or len(existing_chunks) != len(completed_views):
             print(
-                f"[Resume] Checkpoint found but {len(missing)}/{len(existing_chunks)} chunk files are missing; "
+                f"[Resume] Checkpoint found but chunks are inconsistent "
+                f"(completed={len(completed_views)}, paths={len(existing_chunks)}, missing={len(missing)}); "
                 f"discarding resume state and restarting.",
                 flush=True,
             )
@@ -2592,6 +2603,11 @@ def two_pass_processing(
 
         n_before_merge = int(final_points_world.shape[0])
         if config.global_merge:
+            merge_voxel_size = (
+                float(config.global_merge_voxel_size)
+                if config.global_merge_voxel_size is not None
+                else float(config.voxel_size)
+            )
             merged = global_voxel_merge(
                 points=final_points_world,
                 features=final_features,
@@ -2599,7 +2615,7 @@ def two_pass_processing(
                 ray_dirs=final_ray_dirs,
                 ray_dirs_mean=final_ray_dirs_mean,
                 cluster_sizes=final_cluster_sizes,
-                voxel_size=config.voxel_size,
+                voxel_size=merge_voxel_size,
                 ray_dirs_dominant=optional_world.get('ray_dirs_dominant'),
                 ray_dirs_first=optional_world.get('ray_dirs_first'),
                 plucker_rays=optional_world.get('plucker_rays'),
@@ -2618,7 +2634,8 @@ def two_pass_processing(
                 optional_world['plucker_rays'] = merged['plucker_rays']
             print(
                 f"[Global Merge] {n_before_merge} -> {final_points_world.shape[0]} points "
-                f"(removed {n_before_merge - int(final_points_world.shape[0])} cross-view duplicates)",
+                f"(removed {n_before_merge - int(final_points_world.shape[0])} cross-view duplicates, "
+                f"voxel_size={merge_voxel_size})",
                 flush=True,
             )
         else:
@@ -3103,6 +3120,16 @@ def debug_dump_views(
         "voxel_size": float(config.voxel_size),
         "pool_mode": config.pool_mode,
         "prepool_mode": config.prepool_mode,
+        "use_otsu": bool(config.use_otsu),
+        "unimodal_threshold": float(config.unimodal_threshold),
+        "hybrid_split_min_std": float(config.hybrid_split_min_std),
+        "hybrid_min_cluster_size": int(config.hybrid_min_cluster_size),
+        "hybrid_min_split_points": int(config.hybrid_min_split_points),
+        "global_merge_voxel_size": (
+            float(config.global_merge_voxel_size)
+            if config.global_merge_voxel_size is not None
+            else None
+        ),
         "ray_pool_strategy": config.ray_pool_strategy,
         "use_model": config.use_model,
         "model_str": config.model_str,
@@ -3591,8 +3618,8 @@ def parse_args() -> ExtractionConfig:
         '--pool_mode',
         type=str,
         default='bse',
-        choices=['bse', 'simple'],
-        help='pooling 模式：bse=voxel hash + Otsu split；simple=简单 voxel mean。',
+        choices=['bse', 'simple', 'hybrid'],
+        help='pooling 模式：bse=voxel hash + Otsu split；simple=简单 voxel mean；hybrid=全局 simple mean + 选择性 split。',
     )
     parser.add_argument(
         '--prepool_mode',
@@ -3603,15 +3630,47 @@ def parse_args() -> ExtractionConfig:
     )
     parser.add_argument(
         '--use_otsu',
-        action='store_true',
+        type=lambda x: str(x).strip().lower() in ('1', 'true', 'yes', 'on'),
+        nargs='?',
+        const='true',
         default=True,
         help='BSE 内对深度分箱使用 Otsu 自动阈值（适应稀疏/不均匀深度）。',
+    )
+    parser.add_argument(
+        '--unimodal_threshold',
+        type=float,
+        default=0.02,
+        help='BSE 内 feature similarity std 低于该值时认为近似单峰并跳过 split。',
+    )
+    parser.add_argument(
+        '--hybrid_split_min_std',
+        type=float,
+        default=0.05,
+        help='Hybrid: per-voxel cosine-sim std 阈值，低于此值不 split（默认 0.05）。',
+    )
+    parser.add_argument(
+        '--hybrid_min_cluster_size',
+        type=int,
+        default=4,
+        help='Hybrid: voxel 内点数低于此值不 split（默认 4）。',
+    )
+    parser.add_argument(
+        '--hybrid_min_split_points',
+        type=int,
+        default=2,
+        help='Hybrid: Otsu 后任一分支点数低于此值则回退 simple mean（默认 2）。',
     )
     parser.add_argument(
         '--global_merge',
         type=lambda x: str(x).strip().lower() in ('1', 'true', 'yes', 'on'),
         default=True,
         help='Pass 2 对所有 view 的 pooled 点做一次全局体素合并（默认 True）。',
+    )
+    parser.add_argument(
+        '--global_merge_voxel_size',
+        type=float,
+        default=None,
+        help='Pass 2 全局体素合并的 voxel size；默认 None 时沿用 --voxel_size。',
     )
 
     parser.add_argument(
@@ -3746,7 +3805,12 @@ def parse_args() -> ExtractionConfig:
         pool_mode=args.pool_mode,
         prepool_mode=args.prepool_mode,
         use_otsu=args.use_otsu,
+        unimodal_threshold=args.unimodal_threshold,
+        hybrid_split_min_std=args.hybrid_split_min_std,
+        hybrid_min_cluster_size=args.hybrid_min_cluster_size,
+        hybrid_min_split_points=args.hybrid_min_split_points,
         global_merge=bool(args.global_merge),
+        global_merge_voxel_size=args.global_merge_voxel_size,
         depth_valid_range=tuple(args.depth_valid_range),
         patch_depth_sampling=args.patch_depth_sampling,
         temp_dir=args.temp_dir,
@@ -3799,7 +3863,12 @@ def main():
     print(f"[BSE Memory] Pool mode: {config.pool_mode}")
     print(f"[BSE Memory] Prepool mode: {config.prepool_mode}")
     print(f"[BSE Memory] Voxel size: {config.voxel_size}, Otsu: {config.use_otsu}")
+    print(f"[BSE Memory] Unimodal threshold: {config.unimodal_threshold}")
     print(f"[BSE Memory] Global merge: {config.global_merge}")
+    print(
+        f"[BSE Memory] Global merge voxel size: "
+        f"{config.global_merge_voxel_size if config.global_merge_voxel_size is not None else config.voxel_size}"
+    )
     print(
         f"[Config] patch_depth_sampling: {config.patch_depth_sampling} "
         f"(align map-anything fps_memory: nearest_valid for sparse Indoor6 depth)",
@@ -3810,6 +3879,25 @@ def main():
         flush=True,
     )
 
+    if config.pool_mode == "hybrid":
+        if config.prepool_mode != "global_only":
+            raise ValueError(
+                f"pool_mode=hybrid requires prepool_mode=global_only, "
+                f"got prepool_mode={config.prepool_mode}"
+            )
+        if config.global_merge:
+            raise ValueError(
+                "pool_mode=hybrid requires global_merge=False. "
+                "Global merge would undo selective splits."
+            )
+        print(
+            f"[BSE Memory] Hybrid config: "
+            f"split_min_std={config.hybrid_split_min_std}, "
+            f"min_cluster_size={config.hybrid_min_cluster_size}, "
+            f"min_split_points={config.hybrid_min_split_points}",
+            flush=True,
+        )
+
     # Initialize modules
     welford = WelfordNormalizer()
     if config.use_bse:
@@ -3817,8 +3905,12 @@ def main():
             voxel_size=config.voxel_size,
             pool_mode=config.pool_mode,
             use_otsu=config.use_otsu,
+            unimodal_threshold=config.unimodal_threshold,
             ray_pool_strategy=config.ray_pool_strategy,
-            save_all_ray_strategies=config.save_all_ray_strategies
+            save_all_ray_strategies=config.save_all_ray_strategies,
+            hybrid_split_min_std=config.hybrid_split_min_std,
+            hybrid_min_cluster_size=config.hybrid_min_cluster_size,
+            hybrid_min_split_points=config.hybrid_min_split_points,
         )
     else:
         raise NotImplementedError("Vanilla voxel pooling not implemented")
