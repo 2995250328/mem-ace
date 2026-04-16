@@ -567,6 +567,7 @@ def export_memory_views_visualization(
     output_run_dir: str,
     depth_min: float,
     depth_max: float,
+    view_records: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """
     After memory views are chosen and loaded: save RGB, depth colormap, RGB+depth overlay,
@@ -689,11 +690,46 @@ def export_memory_views_visualization(
         )
     print(f"[Vis] Depth validation: {depth_vis_dir} (rgb_raw, _depth_vis, _depth_on_rgb per view)", flush=True)
 
+    def _annotate_png(path: str, lines: List[str]) -> None:
+        try:
+            from PIL import Image as PILImage, ImageDraw
+
+            img = PILImage.open(path).convert("RGB")
+            draw = ImageDraw.Draw(img)
+            text = "\n".join([line for line in lines if line])
+            if not text:
+                img.save(path)
+                return
+            bbox = draw.multiline_textbbox((0, 0), text, spacing=2)
+            pad = 4
+            x0, y0 = 4, 4
+            x1 = min(img.width, x0 + (bbox[2] - bbox[0]) + pad * 2)
+            y1 = min(img.height, y0 + (bbox[3] - bbox[1]) + pad * 2)
+            draw.rectangle([x0, y0, x1, y1], fill=(0, 0, 0))
+            draw.multiline_text((x0 + pad, y0 + pad), text, fill=(255, 255, 255), spacing=2)
+            img.save(path)
+        except Exception as e:
+            print(f"[Vis] Failed to annotate model input {path}: {e}", flush=True)
+
     for i, view in enumerate(memory_views):
         if "img" in view:
+            out_path = os.path.join(model_input_dir, f"view_{i:02d}_model_input.png")
             _save_model_input_vis(
                 view["img"],
-                os.path.join(model_input_dir, f"view_{i:02d}_model_input.png"),
+                out_path,
+            )
+            rec = view_records[i] if view_records is not None and i < len(view_records) else {}
+            source = str(rec.get("source", "unknown"))
+            actual_idx = rec.get("actual_flat_idx", None)
+            fps_idx = rec.get("fps_idx_at_view_position", None)
+            _annotate_png(
+                out_path,
+                [
+                    f"view={i:02d}",
+                    f"src={os.path.basename(source)}",
+                    f"actual_idx={actual_idx} fps_idx={fps_idx}",
+                    f"outer={rec.get('outer_index')} inner={rec.get('inner_index')}",
+                ],
             )
     print(f"[Vis] Model input images (normalized) saved to: {model_input_dir}", flush=True)
 
@@ -806,6 +842,40 @@ class ExtractionConfig:
     scene_name: Optional[str] = None
     # 加载器：wai=MapAnything WAI 格式；ace=CamLocDatasetDINOv2（ACE 管线）
     dataset_loader: str = "wai"
+    # WAI view loading protocol:
+    # fps_flat: dataset[idx] returns one view so actual model inputs match the
+    #           original FPS-style memory list.
+    # original_multiview: dataset[idx] returns n_memory covisibility views for
+    #                     the first FPS anchor, matching map-anything fps_memory.sh.
+    # anchor_support: reference-aware Anchor+Support selection in a single
+    #                 MapAnything forward.
+    wai_view_mode: str = "fps_flat"
+    # anchor_support scoring knobs.
+    anchor_support_alpha: float = 1.0
+    anchor_support_eps: float = 1e-6
+    anchor_support_tau: float = -1.0
+    # anchor_support soft penalty exp(-lambda * dist_to_ref / ref_scale).
+    covis_ref_lambda: float = 0.0
+    # 0 auto-selects a conservative anchor count.
+    covis_anchor_count: int = 0
+    covis_support_per_anchor: int = 3
+    covis_support_tau: float = 1e-4
+    covis_support_min_neighbors: int = 3
+    covis_safe_dist_to_ref: float = 3.0
+    covis_far_view_budget: int = 8
+    covis_far_anchor_budget: int = 2
+    covis_coverage_beta: float = 1.0
+    covis_candidate_pool_ratio: float = 1.0
+    covis_adaptive_asb: bool = False
+    covis_adaptive_scene_stats: bool = True
+    covis_adaptive_view_count: bool = False
+    covis_adaptive_min_views: int = 28
+    covis_ref_dist_max_limit: float = 4.2
+    covis_ref_dist_mean_limit: float = 2.7
+    covis_min_coverage_gain: float = 0.01
+    covis_gain_patience: int = 2
+    covis_target_coverage_mean: float = 0.55
+    covis_target_coverage_max: float = 2.0
     # 体素内多条视线方向池化：mean/dominant/first/all
     ray_pool_strategy: str = "mean"
     # 是否保存多种 ray 表示供对比（BSEPooler）
@@ -818,12 +888,25 @@ class ExtractionConfig:
     pose_eval_translation_ok_m: float = 0.1
     # 为 True 时：任一非参考视角超阈值则进程以退出码 1 结束
     pose_eval_strict: bool = False
+    # PoseEval 自检剪枝：第一次 MapAnything infer 后删除最差 view 并重新 infer。
+    pose_prune_after_infer: bool = False
+    pose_prune_min_views: int = 20
+    pose_prune_min_keep_ratio: float = 0.70
+    pose_prune_mad_k: float = 2.5
     # Debug：将关键中间数据/统计 dump 到输出目录（用于对齐 ace vs wai）
     debug_dump: bool = False
     # Debug：最多 dump 前 N 个视角（避免目录过大）
     debug_dump_max_views: int = 3
     # Debug：是否额外保存少量数值快照（npz），体积更大
     debug_dump_save_npz: bool = False
+    # Diagnostics：保存 BSE 生成阶段的 feature 相似度统计，默认关闭
+    feature_diagnostics: bool = False
+    # Diagnostics：每个空间 voxel 最多取多少个 raw points 做 pairwise 统计
+    feature_diag_max_points_per_voxel: int = 32
+    # Diagnostics：最多保存多少条 same-voxel cross-view pair 样本
+    feature_diag_max_pair_samples: int = 200000
+    # Diagnostics：直方图 bin 数
+    feature_diag_bins: int = 100
 
 
 # =============================================================================
@@ -1509,7 +1592,8 @@ def print_pose_prediction_vs_gt(
     memory_gt_poses: List[torch.Tensor],
     predictions: Any,
     translation_ok_m: float = 0.1,
-) -> bool:
+    return_errors: bool = False,
+) -> Any:
     """
     After MapAnything infer(), compare predicted camera_poses to dataset GT.
     Same SE(3) alignment as mapanything/tasks/run_memory_extraction.py (Prediction Evaluation):
@@ -1525,10 +1609,10 @@ def print_pose_prediction_vs_gt(
     )
     if not has_preds:
         print("[PoseEval] Skipped: infer() output has no per-view 'camera_poses'.")
-        return True
+        return (True, [], []) if return_errors else True
     if len(memory_gt_poses) == 0:
         print("[PoseEval] Skipped: no GT poses in prepared views (camera_poses missing in batch).")
-        return True
+        return (True, [], []) if return_errors else True
 
     n = min(len(memory_gt_poses), len(predictions))
     if n < len(memory_gt_poses) or n < len(predictions):
@@ -1643,7 +1727,64 @@ def print_pose_prediction_vs_gt(
             f"({translation_ok_m} m); check calibration / depth / model weights."
         )
     print("=" * 60 + "\n")
+    if return_errors:
+        return all_trans_ok, t_errs, r_errs
     return all_trans_ok
+
+
+def _pose_prune_keep_indices(
+    trans_errors: List[float],
+    translation_ok_m: float,
+    min_views: int,
+    min_keep_ratio: float,
+    mad_k: float,
+    max_views: Optional[int] = None,
+) -> Tuple[List[int], Dict[str, Any]]:
+    """Keep reference plus the lower-error non-reference views."""
+    n = len(trans_errors)
+    if n <= 1:
+        return list(range(n)), {"reason": "not_enough_views"}
+
+    errs = np.asarray(trans_errors, dtype=np.float64)
+    nonref = np.arange(1, n, dtype=np.int64)
+    nonref_errs = errs[nonref]
+    finite = np.isfinite(nonref_errs)
+    if not finite.any():
+        return list(range(n)), {"reason": "no_finite_errors"}
+
+    valid_errs = nonref_errs[finite]
+    median = float(np.nanmedian(valid_errs))
+    mad = float(np.nanmedian(np.abs(valid_errs - median)))
+    robust_sigma = 1.4826 * mad
+    robust_threshold = median + max(float(mad_k), 0.0) * robust_sigma
+    if not np.isfinite(robust_threshold) or robust_threshold <= 0:
+        robust_threshold = float(translation_ok_m)
+
+    min_keep = max(1, int(np.ceil(float(n) * max(float(min_keep_ratio), 0.0))), int(min_views))
+    min_keep = min(min_keep, n)
+    target_keep = min_keep
+    if max_views is not None and int(max_views) > 0:
+        target_keep = max(min_keep, min(int(max_views), n))
+    drop_budget = max(0, n - target_keep)
+
+    drop_candidates = [int(i) for i in nonref if np.isfinite(errs[int(i)])]
+    drop_candidates.sort(key=lambda i: float(errs[i]), reverse=True)
+    drop = set(drop_candidates[:drop_budget])
+    keep = [i for i in range(n) if i not in drop]
+    stats = {
+        "n": int(n),
+        "min_keep": int(min_keep),
+        "target_keep": int(target_keep),
+        "max_views": int(max_views) if max_views is not None and int(max_views) > 0 else None,
+        "drop_budget": int(drop_budget),
+        "median": median,
+        "mad": mad,
+        "robust_threshold": float(robust_threshold),
+        "translation_ok_m": float(translation_ok_m),
+        "dropped": sorted(drop),
+        "dropped_errors": {int(i): float(errs[int(i)]) for i in sorted(drop)},
+    }
+    return keep, stats
 
 
 def process_multiscale_features_to_grid(
@@ -1764,6 +1905,77 @@ def process_multiscale_features_to_grid(
     return aligned_features, max_H, max_W
 
 
+def _infer_feature_hw(num_tokens: int, target_H: int, target_W: int) -> Tuple[int, int, bool]:
+    """Infer feature map size, optionally stripping one CLS token."""
+    import math
+
+    if num_tokens <= 0:
+        raise ValueError(f"Cannot infer feature grid from num_tokens={num_tokens}")
+
+    ratio = float(target_H) / max(float(target_W), 1.0)
+
+    def _try(n: int) -> Optional[Tuple[int, int]]:
+        w = max(1, int(math.sqrt(n / ratio)))
+        h = n // w
+        if h * w == n:
+            return h, w
+        s = int(math.sqrt(n))
+        if s * s == n:
+            return s, s
+        return None
+
+    direct = _try(num_tokens)
+    if direct is not None:
+        return direct[0], direct[1], False
+
+    stripped = _try(num_tokens - 1)
+    if stripped is not None:
+        return stripped[0], stripped[1], True
+
+    s = int(math.sqrt(num_tokens))
+    return s, max(1, num_tokens // max(s, 1)), False
+
+
+def process_multiscale_features_to_image(
+    feat_list: List[torch.Tensor],
+    target_H: int,
+    target_W: int,
+) -> Tuple[torch.Tensor, int, int]:
+    """
+    Original pooled baseline: align every feature level to image resolution.
+
+    This mirrors mapanything/tasks/run_memory_extraction.py
+    ``process_multiscale_features`` used by fps_memory.sh when
+    USE_PATCH_BASED_EXTRACTION=False.
+    """
+    aligned_list = []
+    for feat in feat_list:
+        if feat.ndim == 2:
+            n_tokens, channels = feat.shape
+            H_p, W_p, strip_cls = _infer_feature_hw(n_tokens, target_H, target_W)
+            if strip_cls:
+                feat = feat[1:]
+            feat = feat.reshape(1, H_p, W_p, channels).permute(0, 3, 1, 2)
+
+        elif feat.ndim == 3:
+            B, n_tokens, channels = feat.shape
+            H_p, W_p, strip_cls = _infer_feature_hw(n_tokens, target_H, target_W)
+            if strip_cls:
+                feat = feat[:, 1:]
+            feat = feat.transpose(1, 2).reshape(B, channels, H_p, W_p)
+
+        if feat.ndim != 4:
+            raise ValueError(f"Unsupported feature tensor shape for image alignment: {tuple(feat.shape)}")
+
+        if feat.shape[-2:] != (target_H, target_W):
+            feat = F.interpolate(feat, size=(target_H, target_W), mode='bilinear', align_corners=False)
+
+        feat_flat = feat.permute(0, 2, 3, 1).reshape(-1, feat.shape[1])
+        aligned_list.append(feat_flat)
+
+    return torch.cat(aligned_list, dim=1), target_H, target_W
+
+
 def process_multiscale_features(
     feat_list: List[torch.Tensor],
     target_size: Optional[Tuple[int, int]] = None
@@ -1816,6 +2028,120 @@ def normalize_depth_to_hw(depth: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unsupported depth tensor ndim={d.ndim}, shape={tuple(depth.shape)}")
 
 
+def unproject_with_pixel_features(
+    view_data: Dict[str, torch.Tensor],
+    features_flat: torch.Tensor,
+    image_H: int,
+    image_W: int,
+    depth_valid_range: Tuple[float, float] = (0.1, 6.0),
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Original pooled baseline: use all valid depth pixels and image-resolution features.
+
+    Point generation mirrors mapanything/tasks/run_memory_extraction.py
+    ``generate_gt_point_cloud`` for USE_PATCH_BASED_EXTRACTION=False.
+    """
+    depth_min, depth_max = float(depth_valid_range[0]), float(depth_valid_range[1])
+
+    if "scene_coords" in view_data:
+        coords = view_data["scene_coords"].float()
+        if coords.ndim == 3:
+            coords = coords.unsqueeze(0)
+        if coords.shape[-2:] != (image_H, image_W):
+            coords = F.interpolate(coords, size=(image_H, image_W), mode='nearest')
+        points_world = coords[0].permute(1, 2, 0).reshape(-1, 3)
+        valid_mask = torch.ones(points_world.shape[0], dtype=torch.bool, device=points_world.device)
+    else:
+        depth = view_data.get('depth', view_data.get('depthmap', view_data.get('depth_z', view_data.get('gt_depth'))))
+        if depth is None:
+            raise KeyError("No depth found in view_data (tried 'depth', 'depthmap', 'depth_z', 'gt_depth')")
+        depth = normalize_depth_to_hw(depth).float()
+        if depth.shape != (image_H, image_W):
+            depth = F.interpolate(
+                depth.view(1, 1, *depth.shape),
+                size=(image_H, image_W),
+                mode='nearest',
+            )[0, 0]
+
+        pose = view_data.get('camera_pose', view_data.get('pose'))
+        if pose is None:
+            raise KeyError("No pose found in view_data (tried 'camera_pose', 'pose')")
+        if pose.ndim == 3:
+            pose = pose[0]
+
+        K = view_data.get('camera_intrinsics', view_data.get('intrinsics'))
+        if K is None:
+            raise KeyError("No intrinsics found in view_data (tried 'camera_intrinsics' and 'intrinsics')")
+        if K.ndim == 3:
+            K = K[0]
+
+        v, u = torch.meshgrid(
+            torch.arange(image_H, device=depth.device),
+            torch.arange(image_W, device=depth.device),
+            indexing='ij',
+        )
+        u = u.flatten().float()
+        v = v.flatten().float()
+        z = depth.flatten()
+        valid_mask = (z > depth_min) & (z < depth_max)
+
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+        x_cam = (u - cx) * z / fx
+        y_cam = (v - cy) * z / fy
+        pts_cam = torch.stack([x_cam, y_cam, z], dim=-1)
+
+        R = pose[:3, :3]
+        t = pose[:3, 3]
+        points_world = pts_cam @ R.T + t.unsqueeze(0)
+
+    valid_mask_feat = valid_mask.to(features_flat.device)
+    points_world = points_world[valid_mask]
+    features_filtered = features_flat[valid_mask_feat].to(points_world.device)
+
+    pose = view_data.get('camera_pose', view_data.get('pose'))
+    if pose is not None and pose.ndim == 3:
+        pose = pose[0]
+    if pose is not None:
+        camera_center = pose[:3, 3].to(points_world.device)
+    else:
+        camera_center = points_world.mean(dim=0) if len(points_world) else torch.zeros(3, device=points_world.device)
+
+    if len(points_world) == 0:
+        return (
+            torch.zeros(0, 3, device=features_filtered.device),
+            torch.zeros(0, 3, device=features_filtered.device),
+            torch.zeros(0, 3, device=features_filtered.device),
+            features_filtered,
+            torch.zeros(0, 3, device=features_filtered.device),
+        )
+
+    ray_dirs = F.normalize(points_world - camera_center.unsqueeze(0), dim=-1, eps=1e-6)
+    camera_centers = camera_center.unsqueeze(0).expand(len(points_world), -1)
+
+    if 'images' in view_data or 'img' in view_data or 'image' in view_data:
+        rgb = view_data.get('images', view_data.get('img', view_data.get('image')))
+        if isinstance(rgb, torch.Tensor):
+            if rgb.ndim == 4:
+                rgb = rgb[0]
+            if rgb.ndim == 3 and rgb.shape[-1] == 3:
+                rgb = rgb.permute(2, 0, 1)
+            if rgb.ndim == 3 and rgb.shape[0] == 3:
+                rgb = rgb.to(points_world.device).float()
+                if rgb.shape[-2:] != (image_H, image_W):
+                    rgb = F.interpolate(rgb.unsqueeze(0), size=(image_H, image_W), mode='bilinear', align_corners=False)[0]
+                colors_all = rgb.permute(1, 2, 0).reshape(-1, 3)
+                colors = colors_all[valid_mask.to(colors_all.device)]
+            else:
+                colors = torch.ones(len(points_world), 3, device=points_world.device) * 0.5
+        else:
+            colors = torch.ones(len(points_world), 3, device=points_world.device) * 0.5
+    else:
+        colors = torch.ones(len(points_world), 3, device=points_world.device) * 0.5
+
+    return points_world, ray_dirs, colors, features_filtered, camera_centers
+
+
 def unproject_with_grid_features(
     view_data: Dict[str, torch.Tensor],
     features_flat: torch.Tensor,
@@ -1861,10 +2187,11 @@ def unproject_with_grid_features(
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
 
-    # Extract rotation and translation
+    # Extract rotation and translation. WAI/MapAnything poses are c2w, so
+    # translation is already the camera center in world coordinates.
     R = pose[:3, :3]  # [3, 3]
     t = pose[:3, 3]   # [3]
-    camera_center = -R.T @ t  # [3]
+    camera_center = t  # [3]
 
     # Grid centers — same as generate_patch_point_cloud (indexing='ij' → [grid_H, grid_W])
     grid_centers_v = torch.linspace(0, img_H - 1, grid_H, device=depth.device)
@@ -2130,6 +2457,37 @@ def sor_filter(
     return mean_knn_dists < threshold
 
 
+def sor_filter_mapanything_compatible(
+    points: torch.Tensor,
+    nb_neighbors: int,
+    std_ratio: float,
+) -> torch.Tensor:
+    """SOR mask matching map-anything's Open3D path, with torch fallback."""
+    try:
+        import open3d as o3d  # type: ignore[import-not-found]
+
+        pts_cpu = points.detach().float().cpu()
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts_cpu.numpy())
+        _, ind = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
+        mask_np = np.zeros(len(pts_cpu), dtype=bool)
+        mask_np[ind] = True
+        return torch.from_numpy(mask_np).to(points.device)
+    except Exception as e:
+        print(
+            f"[SOR] Open3D SOR unavailable ({type(e).__name__}: {e}); using torch fallback.",
+            flush=True,
+        )
+        return sor_filter(points, k=nb_neighbors, std_ratio=std_ratio)
+
+
+def mapanything_sor_params(num_points: int) -> Tuple[int, float]:
+    """Original fps_memory.sh SOR schedule used before voxel pooling."""
+    if num_points < 5000:
+        return min(20, max(5, num_points // 100)), 2.5
+    return 50, 1.5
+
+
 # =============================================================================
 # Two-Pass Processing with HIGH Priority Fixes
 # =============================================================================
@@ -2321,11 +2679,6 @@ def two_pass_processing(
             if cls_token is not None:
                 all_cls_tokens.append(cls_token)
 
-            # Process features: align to grid and concatenate
-            features_flat, _, _ = process_multiscale_features_to_grid(
-                feat_list, apply_l2_norm=False
-            )
-
             # Prepare geometry data from raw_batch (original data)
             batch_gpu = {}
             for key in ["depth", "depthmap", "depth_z", "gt_depth", "intrinsics", "camera_intrinsics", "camera_pose", "pose", "scene_coords"]:
@@ -2334,6 +2687,22 @@ def two_pass_processing(
                     if isinstance(val, (list, tuple)): val = val[0]
                     if isinstance(val, np.ndarray): val = torch.from_numpy(val)
                     if isinstance(val, torch.Tensor): batch_gpu[key] = val.to(device)
+
+            # Process features: use_patch_based=False keeps the original
+            # fps_memory pixel-based path; patch experiments use grid centers.
+            if config.use_patch_based:
+                features_flat, grid_H, grid_W = process_multiscale_features_to_grid(
+                    feat_list, apply_l2_norm=False
+                )
+            else:
+                depth_for_hw = batch_gpu.get('depth', batch_gpu.get('depthmap', batch_gpu.get('depth_z', batch_gpu.get('gt_depth'))))
+                if depth_for_hw is not None:
+                    image_H, image_W = normalize_depth_to_hw(depth_for_hw).shape
+                else:
+                    image_H, image_W = view_data['img'].shape[-2:]
+                features_flat, grid_H, grid_W = process_multiscale_features_to_image(
+                    feat_list, int(image_H), int(image_W)
+                )
 
             # Add RGB for color sampling (required for colored PLY, esp. Indoor6).
             # Prefer raw uint8 if present; otherwise fall back to processed model input.
@@ -2415,15 +2784,24 @@ def two_pass_processing(
                 print(f"  [View {view_idx}] WARNING: No depth data found in raw_batch!", flush=True)
                 print(f"  Available keys: {list(raw_batch.keys())}", flush=True)
 
-            # Unproject with grid features (samples depth at grid centers)
-            points, ray_dirs, colors, features_flat, camera_centers = unproject_with_grid_features(
-                batch_gpu,
-                features_flat,
-                grid_H,
-                grid_W,
-                config.depth_valid_range,
-                sampling_method=config.patch_depth_sampling,
-            )
+            # Geometry path: match map-anything pooled baseline when not patch-based.
+            if config.use_patch_based:
+                points, ray_dirs, colors, features_flat, camera_centers = unproject_with_grid_features(
+                    batch_gpu,
+                    features_flat,
+                    grid_H,
+                    grid_W,
+                    config.depth_valid_range,
+                    sampling_method=config.patch_depth_sampling,
+                )
+            else:
+                points, ray_dirs, colors, features_flat, camera_centers = unproject_with_pixel_features(
+                    batch_gpu,
+                    features_flat,
+                    grid_H,
+                    grid_W,
+                    config.depth_valid_range,
+                )
 
             # Skip if no valid points
             if len(points) == 0:
@@ -2431,7 +2809,7 @@ def two_pass_processing(
                 continue
 
             # Optional: SOR filtering (MEDIUM priority)
-            if config.enable_sor:
+            if config.enable_sor and config.pool_mode != "pooled":
                 inlier_mask = sor_filter(
                     points, k=config.sor_k, std_ratio=config.sor_std_ratio
                 )
@@ -2458,6 +2836,7 @@ def two_pass_processing(
                     'colors': colors.detach().cpu(),
                     'ray_dirs': ray_dirs.detach().cpu(),
                     'camera_centers': camera_centers.detach().cpu(),
+                    'view_ids': torch.full((points.shape[0],), int(view_idx), dtype=torch.long).cpu(),
                 }
                 welford.update(points)
             else:
@@ -2484,11 +2863,10 @@ def two_pass_processing(
                 intrinsics = intrinsics.unsqueeze(0)
             intrinsics = intrinsics[0]  # [3, 3]
 
-            # Extract camera center and rotation from pose
-            # pose = [R | t; 0 0 0 1], center = -R^T @ t
+            # Extract camera center and rotation from c2w pose.
             R = pose[:3, :3]  # [3, 3]
             t = pose[:3, 3]   # [3]
-            camera_center = -R.T @ t  # [3]
+            camera_center = t  # [3]
 
             # Main ray direction (camera forward direction: look along -Z axis in OpenGL convention)
             # In our coordinate system, the camera looks along +Z axis (after R transformation)
@@ -2530,6 +2908,7 @@ def two_pass_processing(
         all_features = []
         all_colors = []
         all_camera_centers = []
+        all_view_ids = []
         all_ray_dirs_mean = []
         all_ray_dirs_dominant = []
         all_ray_dirs_first = []
@@ -2550,6 +2929,8 @@ def two_pass_processing(
             if config.prepool_mode == "global_only":
                 all_ray_dirs.append(chunk['ray_dirs'])
                 all_camera_centers.append(chunk['camera_centers'])
+                if 'view_ids' in chunk:
+                    all_view_ids.append(chunk['view_ids'])
             else:
                 all_ray_dirs.append(chunk['ray_dirs'])
                 all_ray_dirs_mean.append(chunk['ray_dirs_mean'])
@@ -2565,12 +2946,53 @@ def two_pass_processing(
 
         if config.prepool_mode == "global_only":
             print(f"[Pass 2] Running one-shot global pooling with pool_mode={config.pool_mode}...", flush=True)
+            raw_points_global = torch.cat(all_points, dim=0).float()
+            raw_features_global = torch.cat(all_features, dim=0).float()
+            raw_colors_global = torch.cat(all_colors, dim=0).float()
+            raw_ray_dirs_global = torch.cat(all_ray_dirs, dim=0).float()
+            raw_camera_centers_global = torch.cat(all_camera_centers, dim=0).float()
+            raw_view_ids_global = (
+                torch.cat(all_view_ids, dim=0).long()
+                if all_view_ids
+                else torch.zeros(raw_points_global.shape[0], dtype=torch.long)
+            )
+            if config.pool_mode == "pooled" and config.enable_sor:
+                sor_k, sor_std = mapanything_sor_params(int(raw_points_global.shape[0]))
+                print(
+                    f"[Pool] Running map-anything-compatible global SOR before pooled voxel mean "
+                    f"(n={raw_points_global.shape[0]}, nb_neighbors={sor_k}, std_ratio={sor_std})...",
+                    flush=True,
+                )
+                inlier_mask = sor_filter_mapanything_compatible(
+                    raw_points_global.to(device),
+                    nb_neighbors=sor_k,
+                    std_ratio=sor_std,
+                ).cpu()
+                print(
+                    f"[Pool] Global SOR removed {int((~inlier_mask).sum().item())} / "
+                    f"{int(inlier_mask.numel())} raw points.",
+                    flush=True,
+                )
+                raw_points_global = raw_points_global[inlier_mask]
+                raw_features_global = raw_features_global[inlier_mask]
+                raw_colors_global = raw_colors_global[inlier_mask]
+                raw_ray_dirs_global = raw_ray_dirs_global[inlier_mask]
+                raw_camera_centers_global = raw_camera_centers_global[inlier_mask]
+                raw_view_ids_global = raw_view_ids_global[inlier_mask]
+            save_feature_similarity_diagnostics(
+                os.path.dirname(os.path.abspath(config.output_path)),
+                config,
+                pooler,
+                raw_points_global,
+                raw_features_global,
+                raw_view_ids_global,
+            )
             pooled_global = pooler.pool(
-                torch.cat(all_points, dim=0).float().to(device),
-                torch.cat(all_features, dim=0).float().to(device),
-                torch.cat(all_colors, dim=0).float().to(device),
-                torch.cat(all_ray_dirs, dim=0).float().to(device),
-                camera_centers=torch.cat(all_camera_centers, dim=0).float().to(device),
+                raw_points_global.to(device),
+                raw_features_global.to(device),
+                raw_colors_global.to(device),
+                raw_ray_dirs_global.to(device),
+                camera_centers=raw_camera_centers_global.to(device),
             )
             final_points_world = pooled_global['points'].float().cpu()
             final_ray_dirs = pooled_global['ray_dirs'].float().cpu()
@@ -2706,12 +3128,18 @@ def save_memory(
     view_info: Dict[str, torch.Tensor] = None,
     layers_idx: Optional[List] = None,
     scene_center: Optional[torch.Tensor] = None,
+    config: Optional[ExtractionConfig] = None,
 ) -> None:
     """
     Save memory to .pt file with extended schema and versioning.
 
     Output schema includes:
     - Point-level data:
+        - points: [N, 3] normalized coordinates, (points_world - mu) / sigma
+        - points_norm: [N, 3] explicit normalized-coordinate alias
+        - points_world: [N, 3] world coordinates
+        - pooled_points: [N, 3] legacy pooled-format alias, kept in world coordinates
+        - features / pooled_features: pooled feature tensor and legacy alias
         - ray_dirs: Primary ray directions (based on ray_pool_strategy)
         - ray_dirs_mean: Mean + normalized (baseline)
         - ray_dirs_dominant: Dominant ray per cluster (optional)
@@ -2731,20 +3159,62 @@ def save_memory(
         sigma: scene std
         view_info: Dict containing view-level camera information (optional)
     """
-    points_world = result['points'].cpu().float() * float(sigma) + mu.cpu().float().view(1, 3)
+    points_norm = result['points'].cpu().float()
+    points_world = points_norm * float(sigma) + mu.cpu().float().view(1, 3)
+    preserve_pooled_dtype = config is not None and config.pool_mode == "pooled"
+    features = result['features'].cpu().float() if preserve_pooled_dtype else result['features'].cpu().half()
+    mu_cpu = mu.cpu().float()
+    sigma_tensor = torch.as_tensor(float(sigma), dtype=torch.float32)
 
     memory_dict = {
         'schema_version': MEMORY_SCHEMA_VERSION,
-        'points': result['points'].cpu().float(),           # [N, 3]
-        'points_world': points_world,                       # [N, 3] world coordinates, avoids runtime de-normalization
+        'points': points_norm,                              # [N, 3], normalized: (points_world - mu) / sigma
+        'points_norm': points_norm,                         # [N, 3], explicit normalized-coordinate alias
+        'points_world': points_world,                       # [N, 3], world coordinates, avoids runtime de-normalization
+        'pooled_points': points_world,                      # [N, 3], legacy pooled-format alias in world coordinates
         'ray_dirs': result['ray_dirs'].cpu().float(),       # [N, 3]
         'ray_dirs_mean': result['ray_dirs_mean'].cpu().float(),  # [N, 3]
-        'features': result['features'].cpu().half(),        # [N, C] fp16
+        'features': features,                               # [N, C] pooled fp32, BSE fp16
+        'pooled_features': features,                        # [N, C] legacy pooled-format alias
         'colors': result['colors'].cpu().float(),           # [N, 3]
+        'pooled_colors': result['colors'].cpu().float(),    # [N, 3] legacy pooled-format alias
         'cluster_sizes': result['cluster_sizes'].cpu().long(),  # [N]
-        'mu': mu.cpu().float(),                             # [3]
-        'sigma': sigma                                      # scalar
+        'mu': mu_cpu,                                       # [3]
+        'sigma': float(sigma),                              # scalar
+        'normalization_mu': mu_cpu,                         # [3], explicit name consumed by training
+        'normalization_sigma': sigma_tensor,                # scalar tensor, explicit name consumed by training
+        'coordinate_space': {
+            'points': 'normalized',
+            'points_norm': 'normalized',
+            'points_world': 'world',
+            'pooled_points': 'world',
+            'formula': 'points_norm = (points_world - normalization_mu) / normalization_sigma',
+        },
     }
+
+    if config is not None:
+        if config.pool_mode == "pooled":
+            memory_dict['type'] = (
+                "pooled_gt_geometry_patch_based"
+                if config.use_patch_based
+                else "pooled_gt_geometry_enhanced_feats"
+            )
+            memory_dict['extraction_method'] = "patch_based" if config.use_patch_based else "pixel_based"
+            memory_dict['l2_normalization'] = False
+            memory_dict['depth_sampling_method'] = (
+                config.patch_depth_sampling if config.use_patch_based else "pixel"
+            )
+            memory_dict['depth_valid_min'] = float(config.depth_valid_range[0])
+            memory_dict['depth_valid_max'] = float(config.depth_valid_range[1])
+        memory_dict['pool_mode'] = config.pool_mode
+        memory_dict['prepool_mode'] = config.prepool_mode
+        memory_dict['global_merge'] = bool(config.global_merge)
+        memory_dict['global_merge_voxel_size'] = (
+            float(config.global_merge_voxel_size)
+            if config.global_merge_voxel_size is not None
+            else None
+        )
+        memory_dict['voxel_size'] = float(config.voxel_size)
 
     if scene_center is not None:
         memory_dict['scene_center'] = scene_center.cpu().float()  # [3] pooled-compatible scene anchor
@@ -2784,7 +3254,14 @@ def save_memory(
     print(f"[Save] Scene sigma: {sigma:.4f}")
     if scene_center is not None:
         print(f"[Save] Scene center: {scene_center.cpu().float().tolist()}")
+    if config is not None:
+        print(
+            f"[Save] Pooling: pool_mode={config.pool_mode}, prepool_mode={config.prepool_mode}, "
+            f"global_merge={bool(config.global_merge)}"
+        )
     print(f"[Save] World points: {tuple(memory_dict['points_world'].shape)}")
+    print(f"[Save] Normalized points: {tuple(memory_dict['points_norm'].shape)}")
+    print("[Save] Legacy aliases: pooled_points=points_world, pooled_features=features")
     print(f"[Save] Ray representations: {[k for k in memory_dict.keys() if 'ray' in k or 'plucker' in k]}")
     if view_info is not None:
         print(f"[Save] View count: {len(view_info['camera_centers'])}")
@@ -2939,19 +3416,21 @@ def load_dataset(
     """
     Load dataset based on type and loader.
 
-    For mapanything WAI datasets, returns a sequential-view-mode dataset where
-    each index corresponds to one frame (for FPS memory selection).
+    For mapanything WAI datasets, returns a sequential-view-mode dataset. Keep
+    ``n_views=1`` when each FPS index should map to exactly one model input
+    view; WAI returns an anchor-centered multi-view sample when ``n_views>1``.
 
     Args:
         dataset_path: ROOT directory for WAI datasets (e.g. /data/.../7scenes).
         dataset_type: "7scenes", "indoor6", "custom", or "auto"
         scene_name: Specific scene to load (e.g. "chess_train"). Required when
                     dataset_path points to a ROOT directory containing multiple scenes.
-        n_views: Number of views per sample (1 for sequential frame-level access)
+        n_views: Number of views per sample for WAI. Use 1 for true FPS-frame
+                 inputs.
 
     Returns:
-        Dataset object where __getitem__(idx) returns a single view dict with keys:
-            img, depthmap, camera_pose, camera_intrinsics, dataset, label, instance
+        Dataset object where __getitem__(idx) returns a view dict or a list of
+        view dicts with keys such as img, depthmap, camera_pose, and intrinsics.
     """
     if dataset_type == "auto":
         dataset_type = detect_dataset_type(dataset_path)
@@ -3024,9 +3503,10 @@ def _pose_to_center_np(pose: Any) -> Optional[np.ndarray]:
         p = p.reshape(4, 4)
     if p.shape != (4, 4):
         return None
-    R = p[:3, :3]
     t = p[:3, 3]
-    c = -R.T @ t
+    # WAI/MapAnything poses are camera-to-world transforms; translation is the
+    # camera center in world coordinates.
+    c = t
     if not np.isfinite(c).all():
         return None
     return c.astype(np.float64)
@@ -3082,7 +3562,7 @@ def _pose_stats(pose_4x4: Optional[np.ndarray]) -> Dict[str, Any]:
         return {"present": True, "shape": list(p.shape), "error": "not_4x4"}
     R = p[:3, :3]
     t = p[:3, 3]
-    c = -R.T @ t
+    c = t
     return {
         "present": True,
         "t": [float(x) for x in t.tolist()],
@@ -3133,6 +3613,9 @@ def debug_dump_views(
         "ray_pool_strategy": config.ray_pool_strategy,
         "use_model": config.use_model,
         "model_str": config.model_str,
+        "feature_diagnostics": bool(config.feature_diagnostics),
+        "feature_diag_max_points_per_voxel": int(config.feature_diag_max_points_per_voxel),
+        "feature_diag_max_pair_samples": int(config.feature_diag_max_pair_samples),
     }
 
     views_out: List[Dict[str, Any]] = []
@@ -3211,6 +3694,222 @@ def debug_dump_views(
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"meta": meta, "views": views_out}, f, ensure_ascii=False, indent=2)
     return dump_dir
+
+
+def _write_hist_csv(path: str, hist: torch.Tensor, edges: torch.Tensor) -> None:
+    """Write a histogram as CSV with [bin_left, bin_right, count]."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("bin_left,bin_right,count\n")
+        h = hist.detach().cpu().long().tolist()
+        e = edges.detach().cpu().float().tolist()
+        for i, count in enumerate(h):
+            f.write(f"{e[i]:.8f},{e[i + 1]:.8f},{int(count)}\n")
+
+
+def _write_optional_hist_png(path: str, values: torch.Tensor, title: str, xlabel: str) -> None:
+    """Best-effort PNG histogram writer; silently skips if matplotlib is unavailable."""
+    try:
+        mpl_cache = "/tmp/ace_dinov2_lmc_matplotlib"
+        os.makedirs(mpl_cache, exist_ok=True)
+        os.environ.setdefault("MPLCONFIGDIR", mpl_cache)
+        os.environ.setdefault("XDG_CACHE_HOME", mpl_cache)
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        vals = values.detach().cpu().float().numpy()
+        if vals.size == 0:
+            return
+        plt.figure(figsize=(6, 4), dpi=160)
+        plt.hist(vals, bins=80, range=(-1.0, 1.0), color="#3b6ea8", alpha=0.9)
+        plt.title(title)
+        plt.xlabel(xlabel)
+        plt.ylabel("count")
+        plt.tight_layout()
+        plt.savefig(path)
+        plt.close()
+    except Exception:
+        return
+
+
+def save_feature_similarity_diagnostics(
+    output_run_dir: str,
+    config: "ExtractionConfig",
+    pooler: BSEPooler,
+    points: torch.Tensor,
+    features: torch.Tensor,
+    view_ids: torch.Tensor,
+) -> Optional[str]:
+    """Save BSE-generation feature similarity diagnostics.
+
+    This uses raw unprojected points/features before the final global pooling.
+    Same-space pairs are approximated by membership in the same world-space
+    voxel, and only cross-view pairs are counted for the main consistency test.
+    """
+    if not getattr(config, "feature_diagnostics", False):
+        return None
+
+    if points.numel() == 0 or features.numel() == 0 or view_ids.numel() == 0:
+        return None
+
+    diag_dir = os.path.join(output_run_dir, "feature_diagnostics")
+    os.makedirs(diag_dir, exist_ok=True)
+
+    with torch.no_grad():
+        points = points.detach().float().cpu()
+        features = features.detach().float().cpu()
+        view_ids = view_ids.detach().long().cpu()
+
+        cluster_ids = pooler._voxel_hash(points)
+        voxel_means = pooler._scatter_mean(features, cluster_ids)
+        sim_to_mean = pooler._cosine_similarity(features, voxel_means[cluster_ids]).clamp(-1.0, 1.0)
+
+        bins = max(10, int(getattr(config, "feature_diag_bins", 100)))
+        sim_edges = torch.linspace(-1.0, 1.0, bins + 1)
+        sim_hist = torch.histc(sim_to_mean, bins=bins, min=-1.0, max=1.0)
+        _write_hist_csv(os.path.join(diag_dir, "bse_feature_to_voxel_mean_similarity_hist.csv"), sim_hist, sim_edges)
+        _write_optional_hist_png(
+            os.path.join(diag_dir, "bse_feature_to_voxel_mean_similarity_hist.png"),
+            sim_to_mean,
+            "BSE feature-to-voxel-mean cosine similarity",
+            "cosine similarity",
+        )
+
+        max_points_per_voxel = max(2, int(getattr(config, "feature_diag_max_points_per_voxel", 32)))
+        max_pair_samples = max(1, int(getattr(config, "feature_diag_max_pair_samples", 200000)))
+        feat_norm = F.normalize(features, dim=1, eps=1e-6)
+
+        pair_sims: List[torch.Tensor] = []
+        pair_dists: List[torch.Tensor] = []
+        cross_view_voxels = 0
+        total_voxels = int(cluster_ids.max().item()) + 1
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(0)
+
+        for cid in range(total_voxels):
+            idx = (cluster_ids == cid).nonzero(as_tuple=True)[0]
+            n = int(idx.numel())
+            if n < 2:
+                continue
+            if torch.unique(view_ids[idx]).numel() < 2:
+                continue
+            cross_view_voxels += 1
+            if n > max_points_per_voxel:
+                perm = torch.randperm(n, generator=generator)[:max_points_per_voxel]
+                idx = idx[perm]
+                n = int(idx.numel())
+
+            row, col = torch.triu_indices(n, n, offset=1)
+            keep = view_ids[idx[row]] != view_ids[idx[col]]
+            if not bool(keep.any()):
+                continue
+            row = row[keep]
+            col = col[keep]
+            sims = (feat_norm[idx[row]] * feat_norm[idx[col]]).sum(dim=1).clamp(-1.0, 1.0)
+            dists = torch.linalg.norm(points[idx[row]] - points[idx[col]], dim=1)
+            pair_sims.append(sims.cpu())
+            pair_dists.append(dists.cpu())
+
+            if sum(int(x.numel()) for x in pair_sims) >= max_pair_samples:
+                break
+
+        if pair_sims:
+            same_space_sims = torch.cat(pair_sims)[:max_pair_samples]
+            same_space_dists = torch.cat(pair_dists)[:max_pair_samples]
+        else:
+            same_space_sims = torch.empty(0)
+            same_space_dists = torch.empty(0)
+
+        same_hist = torch.histc(same_space_sims, bins=bins, min=-1.0, max=1.0) if same_space_sims.numel() else torch.zeros(bins)
+        _write_hist_csv(os.path.join(diag_dir, "same_voxel_cross_view_feature_similarity_hist.csv"), same_hist, sim_edges)
+        _write_optional_hist_png(
+            os.path.join(diag_dir, "same_voxel_cross_view_feature_similarity_hist.png"),
+            same_space_sims,
+            "Same-voxel cross-view feature cosine similarity",
+            "cosine similarity",
+        )
+
+        dist_max = float(max(float(getattr(config, "voxel_size", 0.05)) * 2.0, same_space_dists.max().item() if same_space_dists.numel() else 0.1))
+        dist_edges = torch.linspace(0.0, dist_max, bins + 1)
+        dist_hist = torch.histc(same_space_dists, bins=bins, min=0.0, max=dist_max) if same_space_dists.numel() else torch.zeros(bins)
+        _write_hist_csv(os.path.join(diag_dir, "same_voxel_cross_view_spatial_distance_hist.csv"), dist_hist, dist_edges)
+
+        neg_count = int(min(max_pair_samples, max(1000, same_space_sims.numel())))
+        if features.shape[0] >= 2 and neg_count > 0:
+            a = torch.randint(0, features.shape[0], (neg_count,), generator=generator)
+            b = torch.randint(0, features.shape[0], (neg_count,), generator=generator)
+            neg_keep = cluster_ids[a] != cluster_ids[b]
+            a = a[neg_keep]
+            b = b[neg_keep]
+            neg_sims = (feat_norm[a] * feat_norm[b]).sum(dim=1).clamp(-1.0, 1.0) if a.numel() else torch.empty(0)
+        else:
+            neg_sims = torch.empty(0)
+        neg_hist = torch.histc(neg_sims, bins=bins, min=-1.0, max=1.0) if neg_sims.numel() else torch.zeros(bins)
+        _write_hist_csv(os.path.join(diag_dir, "random_different_voxel_feature_similarity_hist.csv"), neg_hist, sim_edges)
+        _write_optional_hist_png(
+            os.path.join(diag_dir, "random_different_voxel_feature_similarity_hist.png"),
+            neg_sims,
+            "Random different-voxel feature cosine similarity",
+            "cosine similarity",
+        )
+
+        def _summary(x: torch.Tensor) -> Dict[str, Any]:
+            if x.numel() == 0:
+                return {"count": 0}
+            xf = x.float()
+            qs = torch.quantile(xf, torch.tensor([0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]))
+            return {
+                "count": int(xf.numel()),
+                "mean": float(xf.mean().item()),
+                "std": float(xf.std(unbiased=False).item()),
+                "min": float(xf.min().item()),
+                "max": float(xf.max().item()),
+                "q01": float(qs[0].item()),
+                "q05": float(qs[1].item()),
+                "q10": float(qs[2].item()),
+                "q25": float(qs[3].item()),
+                "q50": float(qs[4].item()),
+                "q75": float(qs[5].item()),
+                "q90": float(qs[6].item()),
+                "q95": float(qs[7].item()),
+                "q99": float(qs[8].item()),
+            }
+
+        summary = {
+            "schema": 1,
+            "definition": {
+                "bse_feature_to_voxel_mean_similarity": "cos(feature_i, mean_feature_of_same_world_voxel)",
+                "same_voxel_cross_view_feature_similarity": "cos(feature_i, feature_j) for raw points in the same world voxel but from different views",
+                "random_different_voxel_feature_similarity": "random feature-pair baseline where points are in different voxels",
+            },
+            "config": {
+                "dataset_loader": config.dataset_loader,
+                "dataset_type": config.dataset_type,
+                "scene_name": config.scene_name,
+                "pool_mode": config.pool_mode,
+                "prepool_mode": config.prepool_mode,
+                "voxel_size": float(config.voxel_size),
+                "use_model": config.use_model,
+                "use_otsu": bool(config.use_otsu),
+                "unimodal_threshold": float(config.unimodal_threshold),
+                "hybrid_split_min_std": float(config.hybrid_split_min_std),
+            },
+            "raw_points": int(points.shape[0]),
+            "feature_dim": int(features.shape[1]),
+            "total_voxels": total_voxels,
+            "cross_view_voxels": int(cross_view_voxels),
+            "bse_otsu_tau_global": float(pooler._otsu_threshold(sim_to_mean, check_unimodal=True)),
+            "bse_feature_to_voxel_mean_similarity": _summary(sim_to_mean),
+            "same_voxel_cross_view_feature_similarity": _summary(same_space_sims),
+            "same_voxel_cross_view_spatial_distance_m": _summary(same_space_dists),
+            "random_different_voxel_feature_similarity": _summary(neg_sims),
+        }
+
+        with open(os.path.join(diag_dir, "feature_similarity_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    print(f"[FeatureDiag] Saved feature similarity diagnostics to: {diag_dir}", flush=True)
+    return diag_dir
 
 
 def _extract_centers_from_pose_dir(dataset_path: str, scene_name: Optional[str] = None) -> Optional[np.ndarray]:
@@ -3385,13 +4084,1476 @@ def fps_select_views(centers: np.ndarray, n_select: int, seed: int = 42,
     return selected
 
 
+def _extract_centers_from_flat_wai_dataset(dataset) -> Optional[np.ndarray]:
+    """Fast path aligned with WAI flat_view_list order, without image IO."""
+    flat_view_list = getattr(dataset, "flat_view_list", None)
+    scene_meta_cache = getattr(dataset, "scene_meta_cache", None)
+    if not isinstance(flat_view_list, list) or scene_meta_cache is None:
+        return None
+
+    centers: List[np.ndarray] = []
+    for item in flat_view_list:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            return None
+        scene_name, frame_name = str(item[0]), str(item[1])
+        meta = scene_meta_cache.get(scene_name) if hasattr(scene_meta_cache, "get") else None
+        if not isinstance(meta, dict):
+            return None
+
+        frame_data = None
+        frame_names = meta.get("frame_names")
+        if isinstance(frame_names, dict) and frame_name in frame_names:
+            idx = int(frame_names[frame_name])
+            frames = meta.get("frames", [])
+            if 0 <= idx < len(frames):
+                frame_data = frames[idx]
+        if frame_data is None:
+            for fr in meta.get("frames", []):
+                if isinstance(fr, dict) and str(fr.get("frame_name")) == frame_name:
+                    frame_data = fr
+                    break
+        if not isinstance(frame_data, dict):
+            return None
+
+        pose = frame_data.get("transform_matrix") or frame_data.get("extrinsics")
+        c = _pose_to_center_np(pose)
+        if c is None:
+            return None
+        centers.append(c)
+
+    if not centers:
+        return None
+    return np.stack(centers, axis=0)
+
+
+def _load_wai_pairwise_covisibility(
+    dataset_path: Optional[str],
+    scene_name: Optional[str],
+    n_expected: Optional[int] = None,
+) -> Optional[np.ndarray]:
+    """Load WAI scene_root/covisibility/v0/*.npy as mmap when available."""
+    if not dataset_path or not scene_name:
+        return None
+
+    covis_dir = os.path.join(str(dataset_path), str(scene_name), "covisibility", "v0")
+    if not os.path.isdir(covis_dir):
+        print(f"[CovisFPS] No covisibility directory found: {covis_dir}", flush=True)
+        return None
+
+    npy_names = sorted([n for n in os.listdir(covis_dir) if n.endswith(".npy")])
+    if not npy_names:
+        print(f"[CovisFPS] No .npy covisibility file found under: {covis_dir}", flush=True)
+        return None
+
+    covis_path = os.path.join(covis_dir, npy_names[0])
+    try:
+        covis = np.load(covis_path, mmap_mode="r")
+    except Exception as e:
+        print(f"[CovisFPS] Failed to load covisibility {covis_path} ({type(e).__name__}: {e})", flush=True)
+        return None
+
+    if covis.ndim != 2 or covis.shape[0] != covis.shape[1]:
+        print(f"[CovisFPS] Invalid covisibility shape {getattr(covis, 'shape', None)} at {covis_path}", flush=True)
+        return None
+    if n_expected is not None and covis.shape[0] < int(n_expected):
+        print(
+            f"[CovisFPS] Covisibility shape {covis.shape} is smaller than expected n={n_expected}; skip.",
+            flush=True,
+        )
+        return None
+    if n_expected is not None and covis.shape[0] > int(n_expected):
+        covis = covis[: int(n_expected), : int(n_expected)]
+
+    print(f"[CovisFPS] Loaded covisibility: {covis_path}, shape={tuple(covis.shape)}", flush=True)
+    return covis
+
+
+def _print_selection_coverage_stats(centers: np.ndarray, selected: List[int], tag: str) -> None:
+    try:
+        centers_np = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+        sel = centers_np[np.asarray(selected, dtype=np.int64)]
+        dists = np.linalg.norm(centers_np[:, None, :] - sel[None, :, :], axis=2).min(axis=1)
+        ref_dists = np.linalg.norm(sel - sel[0:1, :], axis=1)
+        print(
+            f"[{tag}] Coverage nearest-center distance: "
+            f"mean={dists.mean():.4f}m, median={np.median(dists):.4f}m, "
+            f"max={dists.max():.4f}m",
+            flush=True,
+        )
+        print(
+            f"[{tag}] Selected distance-to-reference: "
+            f"mean={ref_dists.mean():.4f}m, median={np.median(ref_dists):.4f}m, "
+            f"max={ref_dists.max():.4f}m",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[{tag}] Coverage stats skipped ({type(e).__name__}: {e})", flush=True)
+
+
+def _selection_coverage_summary(
+    centers: np.ndarray,
+    selected: List[int],
+    ref_idx: Optional[int] = None,
+    covisibility: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    centers_np = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+    n_total = int(centers_np.shape[0])
+    valid_selected: List[int] = []
+    seen = set()
+    for idx in selected:
+        idx = int(idx)
+        if 0 <= idx < n_total and idx not in seen:
+            valid_selected.append(idx)
+            seen.add(idx)
+    if not valid_selected:
+        raise ValueError("selection coverage summary requires at least one valid selected index")
+
+    selected_arr = np.asarray(valid_selected, dtype=np.int64)
+    ref = int(ref_idx) if ref_idx is not None and 0 <= int(ref_idx) < n_total else int(selected_arr[0])
+    dmat = np.linalg.norm(centers_np[:, None, :] - centers_np[selected_arr][None, :, :], axis=2)
+    nearest = dmat.min(axis=1)
+    nearest_pos = dmat.argmin(axis=1)
+    nearest_selected = selected_arr[nearest_pos]
+    ref_dists = np.linalg.norm(centers_np[selected_arr] - centers_np[ref:ref + 1], axis=1)
+
+    def _q(values: np.ndarray, q: float) -> float:
+        return _percentile_or_default(values, q, 0.0)
+
+    worst_order = np.argsort(-nearest)[: min(20, n_total)]
+    coverage = {
+        "mean": float(np.nanmean(nearest)),
+        "median": _q(nearest, 50),
+        "p80": _q(nearest, 80),
+        "p90": _q(nearest, 90),
+        "p95": _q(nearest, 95),
+        "p99": _q(nearest, 99),
+        "max": float(np.nanmax(nearest)),
+        "worst_uncovered": [
+            {
+                "frame_idx": int(i),
+                "nearest_selected_idx": int(nearest_selected[int(i)]),
+                "distance_m": float(nearest[int(i)]),
+            }
+            for i in worst_order
+        ],
+    }
+    ref_summary = {
+        "mean": float(np.nanmean(ref_dists)),
+        "median": _q(ref_dists, 50),
+        "p90": _q(ref_dists, 90),
+        "max": float(np.nanmax(ref_dists)),
+    }
+
+    X = centers_np - centers_np.mean(axis=0, keepdims=True)
+    try:
+        _, _, vh = np.linalg.svd(X, full_matrices=False)
+        uv = X @ vh[:2].T
+    except Exception:
+        uv = centers_np[:, :2]
+    mins = uv.min(axis=0)
+    maxs = uv.max(axis=0)
+    span = np.maximum(maxs - mins, 1e-9)
+    grid = np.floor((uv - mins) / span * 8.0).astype(np.int64)
+    grid = np.clip(grid, 0, 7)
+    all_cells = {tuple(x) for x in grid}
+    selected_cells = {tuple(x) for x in grid[selected_arr]}
+    grid_summary = {
+        "grid_size": 8,
+        "selected_cells": int(len(selected_cells)),
+        "occupied_cells": int(len(all_cells)),
+        "occupancy_ratio": float(len(selected_cells) / max(len(all_cells), 1)),
+    }
+
+    out: Dict[str, Any] = {
+        "num_scene_views": n_total,
+        "num_selected_views": int(len(selected_arr)),
+        "selected_indices": [int(i) for i in selected_arr.tolist()],
+        "reference_index": int(ref),
+        "coverage": coverage,
+        "ref_distance": ref_summary,
+        "pca_grid_occupancy": grid_summary,
+    }
+
+    if covisibility is not None:
+        covis = np.asarray(covisibility)
+        if covis.ndim == 2 and covis.shape[0] >= n_total and covis.shape[1] >= n_total:
+            cov = np.maximum(covis[:n_total, :n_total], covis[:n_total, :n_total].T).astype(np.float64, copy=True)
+            np.fill_diagonal(cov, 0.0)
+            positive = cov[np.isfinite(cov) & (cov > 0)]
+            if positive.size:
+                tau = _percentile_or_default(positive, 95, float(np.nanmin(positive)))
+                adj = cov[np.ix_(selected_arr, selected_arr)] >= tau
+                seen_nodes = set()
+                components: List[int] = []
+                for start in range(len(selected_arr)):
+                    if start in seen_nodes:
+                        continue
+                    stack = [start]
+                    seen_nodes.add(start)
+                    comp_size = 0
+                    while stack:
+                        node = stack.pop()
+                        comp_size += 1
+                        for nxt in np.flatnonzero(adj[node]):
+                            nxt = int(nxt)
+                            if nxt not in seen_nodes:
+                                seen_nodes.add(nxt)
+                                stack.append(nxt)
+                    components.append(comp_size)
+                degrees = adj.sum(axis=1).astype(np.int64)
+                out["strong_covis_graph"] = {
+                    "tau_q95": float(tau),
+                    "component_sizes": sorted([int(c) for c in components], reverse=True),
+                    "num_components": int(len(components)),
+                    "degree_min": int(degrees.min()) if degrees.size else 0,
+                    "degree_median": float(np.median(degrees)) if degrees.size else 0.0,
+                    "degree_max": int(degrees.max()) if degrees.size else 0,
+                    "isolated_count": int((degrees == 0).sum()) if degrees.size else 0,
+                }
+
+    return out
+
+
+def _export_selection_coverage_diagnostics(
+    dataset: Any,
+    dataset_path: Optional[str],
+    scene_name: Optional[str],
+    selected: List[int],
+    output_run_dir: str,
+    max_views: int,
+    adaptive_min_views: int,
+    tag: str = "SelectionCoverage",
+) -> None:
+    """Save geometry-only selection coverage diagnostics without changing selection."""
+    try:
+        centers = _extract_centers_from_flat_wai_dataset(dataset)
+        if centers is None and dataset_path is not None and scene_name:
+            centers = _extract_centers_from_wai_scene_meta(dataset_path, scene_name)
+        if centers is None and dataset_path is not None:
+            centers = _extract_centers_from_pose_dir(dataset_path, scene_name=scene_name)
+        if centers is None:
+            centers = _extract_centers_from_dataset_items(dataset)
+        if centers is None or len(centers) == 0:
+            print(f"[{tag}] Skipped: no camera centers available.", flush=True)
+            return
+
+        ref_idx = int(selected[0]) if selected else 0
+        covis = _load_wai_pairwise_covisibility(dataset_path, scene_name, n_expected=len(centers))
+        summary = _selection_coverage_summary(centers, selected, ref_idx=ref_idx, covisibility=covis)
+
+        fps_same = fps_select_views(centers, len(selected), force_include=[ref_idx])
+        fps_max = fps_select_views(centers, int(max_views), force_include=[ref_idx])
+        summary["baselines"] = {
+            "fps_same_count": _selection_coverage_summary(centers, fps_same, ref_idx=ref_idx),
+            "fps_max_views": _selection_coverage_summary(centers, fps_max, ref_idx=ref_idx),
+        }
+
+        dist_to_ref = np.linalg.norm(np.asarray(centers, dtype=np.float64) - centers[ref_idx:ref_idx + 1], axis=1)
+        positive_ref = dist_to_ref[np.isfinite(dist_to_ref) & (dist_to_ref > 0)]
+        ref_q80 = _percentile_or_default(positive_ref, 80, _percentile_or_default(positive_ref, 50, 1.0))
+        target_mean, target_max, _ = _reference_safe_fps_coverage(
+            centers,
+            ref_idx,
+            adaptive_min_views,
+            ref_q80,
+        )
+        targets = {
+            "source": f"ref_safe_fps_at_{int(adaptive_min_views)}",
+            "ref_dist_q80_m": float(ref_q80),
+            "coverage_mean_limit_m": float(target_mean * 1.10),
+            "coverage_max_limit_m": float(target_max * 1.25),
+            "coverage_p95_advisory_limit_m": float(target_max * 1.25 * 0.75),
+        }
+        cov = summary["coverage"]
+        checks = {
+            "coverage_mean_ok": bool(cov["mean"] <= targets["coverage_mean_limit_m"]),
+            "coverage_max_ok": bool(cov["max"] <= targets["coverage_max_limit_m"]),
+            "coverage_p95_ok": bool(cov["p95"] <= targets["coverage_p95_advisory_limit_m"]),
+        }
+        checks["status"] = "OK" if all(checks.values()) else ("WARN" if checks["coverage_mean_ok"] and checks["coverage_max_ok"] else "FAIL")
+        summary["adaptive_coverage_targets"] = targets
+        summary["coverage_checks"] = checks
+
+        os.makedirs(output_run_dir, exist_ok=True)
+        report_path = os.path.join(output_run_dir, "selection_coverage_report.json")
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+        _save_selection_coverage_topdown(centers, selected, summary, output_run_dir)
+
+        fps_same_cov = summary["baselines"]["fps_same_count"]["coverage"]
+        print(
+            f"[{tag}] Report saved: {report_path}; status={checks['status']}, "
+            f"selected={summary['num_selected_views']}/{int(max_views)}, "
+            f"coverage mean/p95/max={cov['mean']:.4f}/{cov['p95']:.4f}/{cov['max']:.4f}m, "
+            f"limits mean/p95/max={targets['coverage_mean_limit_m']:.4f}/"
+            f"{targets['coverage_p95_advisory_limit_m']:.4f}/{targets['coverage_max_limit_m']:.4f}m, "
+            f"fps_same mean/max={fps_same_cov['mean']:.4f}/{fps_same_cov['max']:.4f}m",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[{tag}] Diagnostics skipped ({type(e).__name__}: {e})", flush=True)
+
+
+def _save_selection_coverage_topdown(
+    centers: np.ndarray,
+    selected: List[int],
+    summary: Dict[str, Any],
+    output_run_dir: str,
+) -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[SelectionCoverage] Top-down plot skipped ({type(e).__name__}: {e})", flush=True)
+        return
+
+    centers_np = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+    selected_arr = np.asarray(summary.get("selected_indices", selected), dtype=np.int64)
+    X = centers_np - centers_np.mean(axis=0, keepdims=True)
+    try:
+        _, _, vh = np.linalg.svd(X, full_matrices=False)
+        uv = X @ vh[:2].T
+    except Exception:
+        uv = centers_np[:, :2]
+
+    sel = centers_np[selected_arr]
+    nearest = np.linalg.norm(centers_np[:, None, :] - sel[None, :, :], axis=2).min(axis=1)
+    worst = [int(x["frame_idx"]) for x in summary.get("coverage", {}).get("worst_uncovered", [])[:10]]
+
+    fig, ax = plt.subplots(figsize=(8, 7), dpi=160)
+    sc = ax.scatter(uv[:, 0], uv[:, 1], c=nearest, s=4, cmap="viridis", alpha=0.85, linewidths=0)
+    ax.scatter(uv[selected_arr, 0], uv[selected_arr, 1], s=42, c="#d62728", marker="x", linewidths=1.3, label="selected")
+    if worst:
+        worst_arr = np.asarray(worst, dtype=np.int64)
+        ax.scatter(uv[worst_arr, 0], uv[worst_arr, 1], s=36, facecolors="none", edgecolors="#1f77b4", linewidths=1.0, label="worst uncovered")
+        for idx in worst[:5]:
+            ax.text(uv[idx, 0], uv[idx, 1], str(idx), fontsize=6, color="#1f77b4")
+    ax.set_title("Selection Coverage Top-Down PCA")
+    ax.set_xlabel("PCA-1")
+    ax.set_ylabel("PCA-2")
+    ax.set_aspect("equal", adjustable="box")
+    ax.legend(loc="best", fontsize=7)
+    cb = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+    cb.set_label("distance to nearest selected view (m)")
+    fig.tight_layout()
+    out_path = os.path.join(output_run_dir, "selection_coverage_topdown.png")
+    fig.savefig(out_path)
+    plt.close(fig)
+    print(f"[SelectionCoverage] Top-down plot saved: {out_path}", flush=True)
+
+
+def _coverage_gain_scores(
+    centers: np.ndarray,
+    current_nearest: np.ndarray,
+    candidates: np.ndarray,
+) -> np.ndarray:
+    """Mean nearest-center coverage improvement if each candidate is added."""
+    if len(candidates) > 128:
+        gains = np.zeros(len(candidates), dtype=np.float64)
+        chunk_size = 256
+        for start in range(0, len(candidates), chunk_size):
+            chunk = candidates[start:start + chunk_size].astype(np.int64)
+            d = np.linalg.norm(centers[:, None, :] - centers[chunk][None, :, :], axis=2)
+            improved = np.maximum(current_nearest[:, None] - np.minimum(current_nearest[:, None], d), 0.0)
+            gains[start:start + len(chunk)] = improved.mean(axis=0)
+        return gains
+
+    gains = np.zeros(len(candidates), dtype=np.float64)
+    for j, idx in enumerate(candidates):
+        d = np.linalg.norm(centers - centers[int(idx)], axis=1)
+        gains[j] = float(np.maximum(current_nearest - np.minimum(current_nearest, d), 0.0).mean())
+    return gains
+
+
+def _percentile_or_default(values: np.ndarray, q: float, default: float) -> float:
+    vals = np.asarray(values, dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return float(default)
+    out = float(np.nanpercentile(vals, float(q)))
+    return out if np.isfinite(out) else float(default)
+
+
+def _reference_safe_fps_coverage(
+    centers: np.ndarray,
+    root: int,
+    min_views: int,
+    ref_dist_limit: float,
+) -> Tuple[float, float, float]:
+    """Estimate a scene-local coverage target from pose statistics only."""
+    n_total = int(centers.shape[0])
+    min_views = max(1, min(int(min_views), n_total))
+    dist_to_ref = np.linalg.norm(centers - centers[int(root)], axis=1).astype(np.float64)
+    allowed = np.isfinite(dist_to_ref) & (dist_to_ref <= float(ref_dist_limit))
+    allowed[int(root)] = False
+
+    selected_mask = np.zeros(n_total, dtype=bool)
+    selected_mask[int(root)] = True
+    current_nearest = np.linalg.norm(centers - centers[int(root)], axis=1).astype(np.float64)
+    gains: List[float] = []
+
+    while int(selected_mask.sum()) < min_views:
+        candidate_mask = allowed & (~selected_mask)
+        if not candidate_mask.any():
+            candidate_mask = ~selected_mask
+        candidates = np.flatnonzero(candidate_mask)
+        if candidates.size == 0:
+            break
+        next_idx = int(candidates[int(np.argmax(current_nearest[candidates]))])
+        new_nearest = np.minimum(current_nearest, np.linalg.norm(centers - centers[next_idx], axis=1))
+        gains.append(float(np.maximum(current_nearest - new_nearest, 0.0).mean()))
+        selected_mask[next_idx] = True
+        current_nearest = new_nearest
+
+    mean_cov = float(np.nanmean(current_nearest)) if current_nearest.size else 0.0
+    max_cov = float(np.nanmax(current_nearest)) if current_nearest.size else 0.0
+    recent = np.asarray(gains[-3:], dtype=np.float64)
+    recent = recent[np.isfinite(recent) & (recent > 0)]
+    gain_floor = float(np.nanmedian(recent) * 0.5) if recent.size else mean_cov * 0.015
+    if not np.isfinite(gain_floor) or gain_floor <= 0:
+        gain_floor = max(mean_cov * 0.015, 1e-6)
+    return mean_cov, max_cov, gain_floor
+
+
+def _estimate_adaptive_asb_scene_params(
+    centers: np.ndarray,
+    covis_strength: np.ndarray,
+    root: int,
+    n_select: int,
+    adaptive_min_views: int,
+    support_min_neighbors: int,
+    log_tag: str,
+) -> Dict[str, float]:
+    """
+    Derive adaptive ASB thresholds from the current scene's pose and covisibility
+    distributions instead of using scene-specific meter-scale constants.
+    """
+    dist_to_ref = np.linalg.norm(centers - centers[int(root)], axis=1).astype(np.float64)
+    positive_ref = dist_to_ref[np.isfinite(dist_to_ref) & (dist_to_ref > 0)]
+    if positive_ref.size == 0:
+        return {}
+
+    ref_q50 = _percentile_or_default(positive_ref, 50, 1.0)
+    ref_q80 = _percentile_or_default(positive_ref, 80, ref_q50)
+    ref_q90 = _percentile_or_default(positive_ref, 90, ref_q80)
+    ref_mean_local = float(np.nanmean(positive_ref[positive_ref <= ref_q80]))
+    if not np.isfinite(ref_mean_local) or ref_mean_local <= 0:
+        ref_mean_local = float(np.nanmean(positive_ref))
+
+    cov_mean_at_min, cov_max_at_min, gain_floor = _reference_safe_fps_coverage(
+        centers,
+        root,
+        adaptive_min_views,
+        ref_q80,
+    )
+
+    positive_covis = covis_strength[np.isfinite(covis_strength) & (covis_strength > 0)]
+    covis_tau = -1.0
+    support_tau = 0.0
+    if positive_covis.size:
+        covis_tau = _percentile_or_default(positive_covis, 5, float(np.nanmin(positive_covis)))
+        min_supportable = max(int(n_select), int(adaptive_min_views) * 2)
+        for q in (95, 90, 75, 50, 25, 5):
+            cand_tau = _percentile_or_default(positive_covis, q, float(np.nanmin(positive_covis)))
+            support_counts = (covis_strength >= cand_tau).sum(axis=1).astype(np.int64)
+            if int((support_counts >= int(support_min_neighbors)).sum()) >= min_supportable:
+                support_tau = float(cand_tau)
+                break
+        if support_tau <= 0:
+            support_tau = _percentile_or_default(positive_covis, 5, float(np.nanmin(positive_covis)))
+
+    params = {
+        "safe_dist_to_ref": float(ref_q50),
+        "ref_dist_max_limit": float(ref_q80),
+        "ref_dist_mean_limit": float(ref_mean_local),
+        "target_coverage_mean": float(cov_mean_at_min * 1.10),
+        "target_coverage_max": float(cov_max_at_min * 1.25),
+        "min_coverage_gain": float(max(gain_floor, cov_mean_at_min * 0.01, 1e-6)),
+        "covis_tau": float(covis_tau),
+        "support_tau": float(support_tau),
+    }
+
+    print(
+        f"[{log_tag}:SceneStats] pose ref_dist: q50={ref_q50:.4f}m, "
+        f"q80={ref_q80:.4f}m, q90={ref_q90:.4f}m, local_mean<=q80={ref_mean_local:.4f}m",
+        flush=True,
+    )
+    print(
+        f"[{log_tag}:SceneStats] coverage target from ref-safe FPS@{adaptive_min_views}: "
+        f"mean={params['target_coverage_mean']:.4f}m, max={params['target_coverage_max']:.4f}m, "
+        f"min_gain={params['min_coverage_gain']:.4f}m",
+        flush=True,
+    )
+    if positive_covis.size:
+        cov_q05 = _percentile_or_default(positive_covis, 5, params["covis_tau"])
+        cov_q95 = _percentile_or_default(positive_covis, 95, params["support_tau"])
+        print(
+            f"[{log_tag}:SceneStats] covis positive: q05={cov_q05:.6g}, "
+            f"q95={cov_q95:.6g}, auto_tau={params['covis_tau']:.6g}, "
+            f"auto_support_tau={params['support_tau']:.6g}",
+            flush=True,
+        )
+    else:
+        print(f"[{log_tag}:SceneStats] covis positive values unavailable; keep covis thresholds disabled.", flush=True)
+
+    return params
+
+
+def _prune_candidate_pool_to_budget(
+    centers: np.ndarray,
+    covis_strength: np.ndarray,
+    candidate_order: List[int],
+    target_select: int,
+    root: int,
+    support_tau: float,
+    alpha: float,
+    coverage_beta: float,
+    eps: float,
+    log_tag: str,
+    adaptive_count: bool = False,
+    min_select: Optional[int] = None,
+    coverage_stop_mean: Optional[float] = None,
+    coverage_stop_max: Optional[float] = None,
+    coverage_repair_order: Optional[List[int]] = None,
+) -> List[int]:
+    """Prune an oversampled ASB candidate pool to the final inference budget.
+
+    The pruning is greedy over the candidate pool, not over the whole dataset:
+    coverage gain keeps spatial support, covisibility-to-selected discourages
+    isolated views, and a local repair pass swaps low-connectivity views with
+    nearby alternatives from the oversampled pool when that preserves coverage.
+    """
+    if len(candidate_order) <= target_select:
+        return candidate_order[:target_select]
+
+    target_select = max(1, min(int(target_select), len(candidate_order)))
+    adaptive_count = bool(adaptive_count)
+    if min_select is None:
+        min_select = target_select
+    min_select = max(1, min(int(min_select), target_select))
+    if coverage_stop_mean is not None:
+        coverage_stop_mean = float(coverage_stop_mean)
+        if not np.isfinite(coverage_stop_mean) or coverage_stop_mean <= 0:
+            coverage_stop_mean = None
+    if coverage_stop_max is not None:
+        coverage_stop_max = float(coverage_stop_max)
+        if not np.isfinite(coverage_stop_max) or coverage_stop_max <= 0:
+            coverage_stop_max = None
+    root = int(root)
+    candidates = []
+    seen = set()
+    for idx in candidate_order:
+        idx = int(idx)
+        if idx not in seen:
+            candidates.append(idx)
+            seen.add(idx)
+    if root not in seen:
+        candidates.insert(0, root)
+    repair_candidates = list(candidates)
+    if coverage_repair_order is not None:
+        repair_seen = set(repair_candidates)
+        for idx in coverage_repair_order:
+            idx = int(idx)
+            if idx not in repair_seen:
+                repair_candidates.append(idx)
+                repair_seen.add(idx)
+
+    selected: List[int] = [root]
+    selected_set = {root}
+    current_nearest = np.linalg.norm(centers - centers[root], axis=1).astype(np.float64)
+    covis_scale = float(np.nanmax(covis_strength[np.ix_(candidates, candidates)])) if candidates else 0.0
+    if not np.isfinite(covis_scale) or covis_scale <= 0:
+        covis_scale = 1.0
+
+    strong_threshold = float(support_tau) if np.isfinite(support_tau) and support_tau > 0 else 0.0
+
+    def _recompute_nearest(sel: List[int]) -> np.ndarray:
+        if not sel:
+            return np.full(centers.shape[0], np.inf, dtype=np.float64)
+        sel_arr = np.asarray(sel, dtype=np.int64)
+        return np.linalg.norm(centers[:, None, :] - centers[sel_arr][None, :, :], axis=2).min(axis=1)
+
+    def _disconnected_count(sel: List[int]) -> int:
+        if len(sel) <= 1 or strong_threshold <= 0:
+            return 0
+        count = 0
+        sel_arr = np.asarray(sel, dtype=np.int64)
+        for idx in sel:
+            if int(idx) == root:
+                continue
+            others = sel_arr[sel_arr != int(idx)]
+            if others.size == 0:
+                count += 1
+                continue
+            conn = float(np.nanmax(covis_strength[int(idx), others]))
+            if not np.isfinite(conn) or conn < strong_threshold:
+                count += 1
+        return count
+
+    while len(selected) < target_select:
+        remaining = np.asarray([idx for idx in candidates if idx not in selected_set], dtype=np.int64)
+        if remaining.size == 0:
+            break
+        gains = _coverage_gain_scores(centers, current_nearest, remaining)
+        max_gain = float(np.nanmax(gains)) if gains.size else 0.0
+        if not np.isfinite(max_gain) or max_gain <= 0:
+            max_gain = 1.0
+        gain_norm = gains / max_gain
+
+        selected_arr = np.asarray(selected, dtype=np.int64)
+        conn = np.nanmax(covis_strength[np.ix_(remaining, selected_arr)], axis=1).astype(np.float64)
+        conn[~np.isfinite(conn)] = 0.0
+        conn_norm = np.clip(conn / covis_scale, 0.0, None)
+
+        score = np.power(eps + gain_norm, max(float(coverage_beta), 0.0)) * np.power(
+            eps + conn_norm,
+            max(float(alpha), 0.0),
+        )
+        next_idx = int(remaining[int(np.argmax(score))])
+        selected.append(next_idx)
+        selected_set.add(next_idx)
+        current_nearest = np.minimum(current_nearest, np.linalg.norm(centers - centers[next_idx], axis=1))
+        if adaptive_count and len(selected) >= min_select:
+            cov_mean = float(np.nanmean(current_nearest)) if current_nearest.size else 0.0
+            cov_max = float(np.nanmax(current_nearest)) if current_nearest.size else 0.0
+            disconnected = _disconnected_count(selected)
+            disconnected_limit = max(1, int(np.ceil(0.15 * float(max(len(selected) - 1, 1)))))
+            coverage_ok = (
+                (coverage_stop_mean is None or cov_mean <= coverage_stop_mean)
+                and (coverage_stop_max is None or cov_max <= coverage_stop_max)
+            )
+            if disconnected <= disconnected_limit and coverage_ok:
+                print(
+                    f"[{log_tag}] Adaptive count stop: views={len(selected)}, "
+                    f"coverage_mean={cov_mean:.4f}m, coverage_max={cov_max:.4f}m, "
+                    f"disconnected={disconnected}/{disconnected_limit}, "
+                    f"coverage_stop_mean={coverage_stop_mean if coverage_stop_mean is not None else -1:.4f}m, "
+                    f"coverage_stop_max={coverage_stop_max if coverage_stop_max is not None else -1:.4f}m",
+                    flush=True,
+                )
+                break
+
+    if len(selected) < target_select and not adaptive_count:
+        for idx in candidates:
+            if idx not in selected_set:
+                selected.append(int(idx))
+                selected_set.add(int(idx))
+            if len(selected) >= target_select:
+                break
+
+    positive_covis = covis_strength[np.isfinite(covis_strength) & (covis_strength > 0)]
+    conn_threshold = float(support_tau) if np.isfinite(support_tau) and support_tau > 0 else 0.0
+    if conn_threshold <= 0 and positive_covis.size:
+        conn_threshold = _percentile_or_default(positive_covis, 5, 0.0)
+
+    candidate_arr = np.asarray(candidates, dtype=np.int64)
+    pool_centers = centers[candidate_arr]
+    if len(candidate_arr) > 1:
+        pair_d = np.linalg.norm(pool_centers[:, None, :] - pool_centers[None, :, :], axis=2)
+        pair_d[pair_d <= 0] = np.nan
+        nn_d = np.nanmin(pair_d, axis=1)
+        nn_d = nn_d[np.isfinite(nn_d) & (nn_d > 0)]
+        local_radius = float(np.nanpercentile(nn_d, 75) * 3.0) if nn_d.size else 0.0
+    else:
+        local_radius = 0.0
+    if not np.isfinite(local_radius) or local_radius <= 0:
+        local_radius = 0.25
+
+    current_nearest = _recompute_nearest(selected)
+    old_cov_mean = float(np.nanmean(current_nearest)) if current_nearest.size else 0.0
+    repairs = 0
+    for pos, idx in list(enumerate(selected)):
+        if idx == root or len(selected) <= 1:
+            continue
+        others = [j for j in selected if j != idx]
+        if not others:
+            continue
+        curr_conn = float(np.nanmax(covis_strength[int(idx), np.asarray(others, dtype=np.int64)]))
+        if np.isfinite(curr_conn) and curr_conn >= conn_threshold:
+            continue
+
+        unselected = [j for j in candidates if j not in selected_set]
+        if not unselected:
+            continue
+        dist_local = np.linalg.norm(centers[np.asarray(unselected, dtype=np.int64)] - centers[int(idx)], axis=1)
+        local = [j for j, d in zip(unselected, dist_local) if float(d) <= local_radius]
+        if not local:
+            continue
+
+        others_arr = np.asarray(others, dtype=np.int64)
+        best_j = None
+        best_score = curr_conn if np.isfinite(curr_conn) else 0.0
+        best_cov = old_cov_mean
+        for cand in local:
+            cand_conn = float(np.nanmax(covis_strength[int(cand), others_arr]))
+            if not np.isfinite(cand_conn) or cand_conn <= best_score:
+                continue
+            trial = others + [int(cand)]
+            trial_centers = centers[np.asarray(trial, dtype=np.int64)]
+            trial_cov = np.linalg.norm(centers[:, None, :] - trial_centers[None, :, :], axis=2).min(axis=1)
+            trial_cov_mean = float(np.nanmean(trial_cov))
+            if trial_cov_mean <= old_cov_mean * 1.05:
+                best_j = int(cand)
+                best_score = cand_conn
+                best_cov = trial_cov_mean
+        if best_j is not None:
+            selected_set.remove(int(idx))
+            selected[pos] = int(best_j)
+            selected_set.add(int(best_j))
+            current_nearest = _recompute_nearest(selected)
+            old_cov_mean = best_cov
+            repairs += 1
+
+    coverage_repairs = 0
+    if adaptive_count and coverage_stop_max is not None:
+        tail_stop = float(coverage_stop_max) * 0.65
+        if coverage_stop_mean is not None:
+            tail_stop = max(tail_stop, float(coverage_stop_mean) * 1.8)
+        while len(selected) < target_select:
+            current_nearest = _recompute_nearest(selected)
+            cov_max = float(np.nanmax(current_nearest)) if current_nearest.size else 0.0
+            cov_p95 = _percentile_or_default(current_nearest, 95, cov_max)
+            cov_p99 = _percentile_or_default(current_nearest, 99, cov_max)
+            if not np.isfinite(cov_max):
+                break
+            if cov_max <= float(coverage_stop_max) and cov_p99 <= tail_stop:
+                break
+
+            unselected = [j for j in repair_candidates if j not in selected_set]
+            if not unselected:
+                break
+            remaining = np.asarray(unselected, dtype=np.int64)
+            selected_arr = np.asarray(selected, dtype=np.int64)
+            conn = np.nanmax(covis_strength[np.ix_(remaining, selected_arr)], axis=1).astype(np.float64)
+            conn[~np.isfinite(conn)] = 0.0
+
+            worst_count = min(32, max(1, int(np.ceil(0.01 * float(centers.shape[0])))))
+            worst_idx = np.argsort(-current_nearest)[:worst_count].astype(np.int64)
+            d_worst = np.linalg.norm(centers[remaining, None, :] - centers[worst_idx][None, :, :], axis=2)
+            new_worst_nearest = np.minimum(current_nearest[worst_idx][None, :], d_worst)
+            worst_gain = (current_nearest[worst_idx][None, :] - new_worst_nearest).mean(axis=1)
+            all_gain = _coverage_gain_scores(centers, current_nearest, remaining)
+            tail_threshold = min(cov_p95, tail_stop)
+            tail_idx = np.flatnonzero(current_nearest >= tail_threshold).astype(np.int64)
+            if tail_idx.size == 0:
+                tail_idx = worst_idx
+
+            worst_frame = int(np.nanargmax(current_nearest))
+            cluster_radius = max(float(coverage_stop_mean or 0.0), float(coverage_stop_max) * 0.35)
+            if not np.isfinite(cluster_radius) or cluster_radius <= 0:
+                cluster_radius = max(float(cov_p95), 0.5)
+            dist_to_worst = np.linalg.norm(centers - centers[worst_frame], axis=1)
+            cluster_idx = np.flatnonzero((dist_to_worst <= cluster_radius) & (current_nearest >= tail_threshold)).astype(np.int64)
+            if cluster_idx.size < 8:
+                tail_order = np.argsort(dist_to_worst[tail_idx])[: min(64, len(tail_idx))]
+                cluster_idx = tail_idx[tail_order].astype(np.int64)
+            d_cluster = np.linalg.norm(centers[remaining, None, :] - centers[cluster_idx][None, :, :], axis=2)
+            new_cluster_nearest = np.minimum(current_nearest[cluster_idx][None, :], d_cluster)
+            cluster_current_max = float(np.nanmax(current_nearest[cluster_idx])) if cluster_idx.size else cov_max
+            cluster_new_max = np.nanmax(new_cluster_nearest, axis=1)
+            cluster_max_reduction = cluster_current_max - cluster_new_max
+            cluster_gain = (current_nearest[cluster_idx][None, :] - new_cluster_nearest).mean(axis=1)
+
+            new_max = np.empty(len(remaining), dtype=np.float64)
+            chunk_size = 256
+            for start in range(0, len(remaining), chunk_size):
+                chunk = remaining[start:start + chunk_size]
+                d_all = np.linalg.norm(centers[:, None, :] - centers[chunk][None, :, :], axis=2)
+                new_nearest = np.minimum(current_nearest[:, None], d_all)
+                new_max[start:start + len(chunk)] = np.nanmax(new_nearest, axis=0)
+            max_reduction = cov_max - new_max
+            d_tail = np.linalg.norm(centers[remaining, None, :] - centers[tail_idx][None, :, :], axis=2)
+            new_tail_nearest = np.minimum(current_nearest[tail_idx][None, :], d_tail)
+            tail_gain = (current_nearest[tail_idx][None, :] - new_tail_nearest).mean(axis=1)
+            improves_tail = np.isfinite(tail_gain) & (tail_gain > 1e-6)
+            improves_max = np.isfinite(max_reduction) & (max_reduction > 1e-6)
+            improves_cluster = (
+                (np.isfinite(cluster_max_reduction) & (cluster_max_reduction > 1e-6))
+                | (np.isfinite(cluster_gain) & (cluster_gain > 1e-6))
+            )
+            improves_any = improves_max | improves_tail | improves_cluster
+            if not improves_any.any():
+                print(
+                    f"[{log_tag}] Coverage-hole repair stopped: no ref-safe candidate reduces "
+                    f"coverage tail (max={cov_max:.4f}m, p99={cov_p99:.4f}m, "
+                    f"tail_stop={tail_stop:.4f}m).",
+                    flush=True,
+                )
+                break
+
+            wg_max = float(np.nanmax(worst_gain)) if worst_gain.size else 0.0
+            ag_max = float(np.nanmax(all_gain)) if all_gain.size else 0.0
+            mr_max = float(np.nanmax(max_reduction[improves_max])) if improves_max.any() else 0.0
+            tg_max = float(np.nanmax(tail_gain[improves_tail])) if improves_tail.any() else 0.0
+            cmr_max = float(np.nanmax(cluster_max_reduction[np.isfinite(cluster_max_reduction)])) if cluster_max_reduction.size else 0.0
+            cg_max = float(np.nanmax(cluster_gain[np.isfinite(cluster_gain)])) if cluster_gain.size else 0.0
+            if not np.isfinite(wg_max) or wg_max <= 0:
+                wg_max = 1.0
+            if not np.isfinite(ag_max) or ag_max <= 0:
+                ag_max = 1.0
+            if not np.isfinite(mr_max) or mr_max <= 0:
+                mr_max = 1.0
+            if not np.isfinite(tg_max) or tg_max <= 0:
+                tg_max = 1.0
+            if not np.isfinite(cmr_max) or cmr_max <= 0:
+                cmr_max = 1.0
+            if not np.isfinite(cg_max) or cg_max <= 0:
+                cg_max = 1.0
+            conn_norm = np.clip(conn / covis_scale, 0.0, None)
+            conn_bonus = np.clip(conn_norm, 0.0, 2.0)
+            score = (
+                3.0 * np.maximum(cluster_max_reduction, 0.0) / cmr_max
+                + 2.0 * np.maximum(cluster_gain, 0.0) / cg_max
+                + 2.0 * np.maximum(max_reduction, 0.0) / mr_max
+                + 1.5 * np.maximum(tail_gain, 0.0) / tg_max
+                + worst_gain / wg_max
+                + 0.25 * (all_gain / ag_max)
+                + 0.10 * conn_bonus
+            )
+            score[~improves_any] = -np.inf
+            connected_mask = conn >= conn_threshold if conn_threshold > 0 else np.ones_like(conn, dtype=bool)
+            if connected_mask.any() and np.isfinite(score[connected_mask]).any():
+                score[~connected_mask] *= 0.25
+            if score.size == 0 or not np.isfinite(score).any() or float(np.nanmax(score)) <= 0:
+                break
+
+            next_idx = int(remaining[int(np.nanargmax(score))])
+            before_max = cov_max
+            selected.append(next_idx)
+            selected_set.add(next_idx)
+            current_nearest = _recompute_nearest(selected)
+            after_max = float(np.nanmax(current_nearest)) if current_nearest.size else 0.0
+            coverage_repairs += 1
+            print(
+                f"[{log_tag}] Coverage-hole repair add idx={next_idx}: "
+                f"views={len(selected)}/{target_select}, coverage_max={before_max:.4f}->{after_max:.4f}m, "
+                f"worst_frame={worst_frame}, cluster={int(cluster_idx.size)}, "
+                f"cluster_max={cluster_current_max:.4f}m, p99={cov_p99:.4f}m, tail_stop={tail_stop:.4f}m, "
+                f"limit={float(coverage_stop_max):.4f}m",
+                flush=True,
+            )
+            after_p99 = _percentile_or_default(current_nearest, 99, after_max)
+            if after_max >= before_max - 1e-6 and after_p99 >= cov_p99 - 1e-6:
+                break
+
+    selected = selected[:target_select]
+    print(
+        f"[{log_tag}] Candidate-pool prune: pool={len(candidate_order)} -> selected={len(selected)}, "
+        f"connectivity_repairs={repairs}, coverage_hole_repairs={coverage_repairs}, "
+        f"local_radius={local_radius:.4f}m, "
+        f"adaptive_count={adaptive_count}, max_views={target_select}",
+        flush=True,
+    )
+    return selected
+
+
+def anchor_support_select_views(
+    centers: np.ndarray,
+    n_select: int,
+    covisibility: np.ndarray,
+    initial_index: Optional[int] = None,
+    alpha: float = 2.0,
+    eps: float = 1e-6,
+    tau: float = -1.0,
+    ref_lambda: float = 0.5,
+    anchor_count: int = 0,
+    support_per_anchor: int = 3,
+    support_tau: float = 1e-4,
+    support_min_neighbors: int = 3,
+    safe_dist_to_ref: float = 3.0,
+    far_view_budget: int = 8,
+    far_anchor_budget: int = 2,
+    coverage_beta: float = 1.0,
+    adaptive: bool = False,
+    adaptive_min_views: int = 28,
+    ref_dist_max_limit: float = 4.2,
+    ref_dist_mean_limit: float = 2.7,
+    min_coverage_gain: float = 0.01,
+    gain_patience: int = 2,
+    target_coverage_mean: float = 0.55,
+    target_coverage_max: float = 2.0,
+    adaptive_scene_stats: bool = True,
+    adaptive_allow_early_stop: bool = True,
+    candidate_pool_ratio: float = 1.0,
+    adaptive_view_count: bool = False,
+    log_tag: str = "CovisFPS:AnchorSupport",
+) -> List[int]:
+    """
+    Reference-aware Anchor+Support selection for one MapAnything forward.
+
+    Anchors improve scene coverage, supports provide local high-covisibility
+    evidence around anchors, and the far-view budgets prevent the selected batch
+    from drifting into the large-baseline regime that breaks a single reference.
+    """
+    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+    n_total = int(centers.shape[0])
+    target_select = min(int(n_select), n_total)
+    candidate_pool_ratio = float(candidate_pool_ratio)
+    use_full_candidate_pool = candidate_pool_ratio <= 0
+    effective_candidate_pool_ratio = 1.0 if use_full_candidate_pool else max(candidate_pool_ratio, 1.0)
+    n_select = (
+        n_total
+        if use_full_candidate_pool
+        else min(max(target_select, int(np.ceil(float(target_select) * effective_candidate_pool_ratio))), n_total)
+    )
+    if target_select >= n_total:
+        return list(range(n_total))
+
+    covis = np.asarray(covisibility)
+    if covis.shape[0] < n_total or covis.shape[1] < n_total:
+        raise ValueError(f"covisibility shape {covis.shape} is smaller than centers length {n_total}")
+    covis = covis[:n_total, :n_total]
+    covis_strength = np.maximum(covis, covis.T).astype(np.float64, copy=True)
+    np.fill_diagonal(covis_strength, 0.0)
+
+    if initial_index is not None and 0 <= int(initial_index) < n_total:
+        root = int(initial_index)
+    else:
+        root = 0
+
+    dist_to_ref = np.linalg.norm(centers - centers[root], axis=1).astype(np.float64)
+    positive_ref_dists = dist_to_ref[np.isfinite(dist_to_ref) & (dist_to_ref > 0)]
+    ref_scale = float(np.nanmedian(positive_ref_dists)) if positive_ref_dists.size else 1.0
+    if not np.isfinite(ref_scale) or ref_scale <= 0:
+        ref_scale = 1.0
+
+    eps = max(float(eps), 1e-12)
+    alpha = max(float(alpha), 0.0)
+    tau = float(tau)
+    ref_lambda = max(float(ref_lambda), 0.0)
+    support_per_anchor = max(0, int(support_per_anchor))
+    support_tau = max(float(support_tau), 0.0)
+    support_min_neighbors = max(0, int(support_min_neighbors))
+    far_view_budget = max(0, int(far_view_budget))
+    far_anchor_budget = max(0, int(far_anchor_budget))
+    coverage_beta = max(float(coverage_beta), 0.0)
+    adaptive = bool(adaptive)
+    adaptive_scene_stats = bool(adaptive_scene_stats)
+    adaptive_allow_early_stop = bool(adaptive_allow_early_stop)
+    adaptive_view_count = bool(adaptive_view_count)
+    if n_select > target_select:
+        adaptive_allow_early_stop = False
+    adaptive_min_views = max(1, min(int(adaptive_min_views), target_select))
+    min_coverage_gain = max(float(min_coverage_gain), 0.0)
+    gain_patience = max(1, int(gain_patience))
+    ref_dist_max_limit = float(ref_dist_max_limit)
+    ref_dist_mean_limit = float(ref_dist_mean_limit)
+    target_coverage_mean = float(target_coverage_mean)
+    target_coverage_max = float(target_coverage_max)
+
+    if adaptive and adaptive_scene_stats:
+        auto_params = _estimate_adaptive_asb_scene_params(
+            centers,
+            covis_strength,
+            root,
+            target_select,
+            adaptive_min_views,
+            support_min_neighbors,
+            log_tag,
+        )
+        safe_dist_to_ref = auto_params.get("safe_dist_to_ref", float(safe_dist_to_ref))
+        ref_dist_max_limit = auto_params.get("ref_dist_max_limit", ref_dist_max_limit)
+        ref_dist_mean_limit = auto_params.get("ref_dist_mean_limit", ref_dist_mean_limit)
+        target_coverage_mean = auto_params.get("target_coverage_mean", target_coverage_mean)
+        target_coverage_max = auto_params.get("target_coverage_max", target_coverage_max)
+        min_coverage_gain = auto_params.get("min_coverage_gain", min_coverage_gain)
+        if tau < 0 and auto_params.get("covis_tau", -1.0) > 0:
+            tau = float(auto_params["covis_tau"])
+        if auto_params.get("support_tau", 0.0) > 0:
+            support_tau = float(auto_params["support_tau"])
+
+    use_ref_dist_max_limit = adaptive and np.isfinite(ref_dist_max_limit) and ref_dist_max_limit > 0
+    use_ref_dist_mean_limit = adaptive and np.isfinite(ref_dist_mean_limit) and ref_dist_mean_limit > 0
+    use_target_coverage_mean = adaptive and np.isfinite(target_coverage_mean) and target_coverage_mean > 0
+    use_target_coverage_max = adaptive and np.isfinite(target_coverage_max) and target_coverage_max > 0
+    adaptive_count_enabled = adaptive and adaptive_view_count
+    adaptive_count_min_select = target_select
+    adaptive_count_coverage_stop_mean = None
+    adaptive_count_coverage_stop_max = None
+    if adaptive_count_enabled:
+        adaptive_count_min_select = max(adaptive_min_views, int(np.ceil(0.85 * float(target_select))))
+        adaptive_count_min_select = max(1, min(adaptive_count_min_select, target_select))
+        if use_target_coverage_mean:
+            adaptive_count_coverage_stop_mean = max(target_coverage_mean, 1e-6)
+        if use_target_coverage_max:
+            adaptive_count_coverage_stop_max = max(target_coverage_max, 1e-6)
+
+    safe_dist_to_ref = float(safe_dist_to_ref)
+    use_safe_dist = np.isfinite(safe_dist_to_ref) and safe_dist_to_ref > 0
+    far_mask = (dist_to_ref > safe_dist_to_ref) if use_safe_dist else np.zeros(n_total, dtype=bool)
+
+    support_counts = (covis_strength >= support_tau).sum(axis=1).astype(np.int64)
+    supportable = support_counts >= support_min_neighbors
+    supportable[root] = False
+    n_supportable = int(supportable.sum())
+
+    max_anchor_by_budget = max(1, (n_select - 1) // max(1, support_per_anchor + 1))
+    if int(anchor_count) <= 0:
+        anchor_count = min(8, max(4, n_select // 5), max_anchor_by_budget)
+    anchor_count = max(1, min(int(anchor_count), max_anchor_by_budget, n_select - 1))
+
+    print(
+        f"[{log_tag}] Selecting {n_select} views: root={root}, anchors={anchor_count}, "
+        f"support_per_anchor={support_per_anchor}, support_tau={support_tau:.6g}, "
+        f"support_min_neighbors={support_min_neighbors}, safe_dist_to_ref={safe_dist_to_ref:.4f}m, "
+        f"far_view_budget={far_view_budget}, far_anchor_budget={far_anchor_budget}, "
+        f"ref_lambda={ref_lambda:.4f}, coverage_beta={coverage_beta:.3f}, "
+        f"supportable_candidates={n_supportable}/{n_total}",
+        flush=True,
+    )
+    if n_select > target_select:
+        print(
+            f"[{log_tag}] Candidate pool enabled: target_views={target_select}, "
+            f"candidate_pool_views={n_select}, ratio="
+            f"{'all' if use_full_candidate_pool else f'{effective_candidate_pool_ratio:.3f}'}",
+            flush=True,
+        )
+    if adaptive:
+        print(
+            f"[{log_tag}] Adaptive enabled: scene_stats={adaptive_scene_stats}, "
+            f"allow_early_stop={adaptive_allow_early_stop}, min_views={adaptive_min_views}, "
+            f"ref_dist_max_limit={ref_dist_max_limit:.4f}m, "
+            f"ref_dist_mean_limit={ref_dist_mean_limit:.4f}m, "
+            f"target_coverage_mean={target_coverage_mean:.4f}m, "
+            f"target_coverage_max={target_coverage_max:.4f}m, "
+            f"min_coverage_gain={min_coverage_gain:.4f}m, gain_patience={gain_patience}, "
+            f"adaptive_view_count={adaptive_count_enabled}, "
+            f"adaptive_count_min_views={adaptive_count_min_select if adaptive_count_enabled else target_select}",
+            flush=True,
+        )
+
+    if use_full_candidate_pool:
+        candidate_mask = np.ones(n_total, dtype=bool)
+        candidate_mask[root] = False
+        if adaptive and use_ref_dist_max_limit:
+            candidate_mask &= dist_to_ref <= ref_dist_max_limit
+        coverage_repair_order = [root] + [int(i) for i in np.flatnonzero(candidate_mask).astype(np.int64)]
+        supportable_mask = support_counts >= support_min_neighbors
+        if int((candidate_mask & supportable_mask).sum()) >= max(target_select * 2, target_select - 1):
+            candidate_mask &= supportable_mask
+        candidates = np.flatnonzero(candidate_mask).astype(np.int64)
+        if candidates.size < max(target_select - 1, 1):
+            candidates = np.flatnonzero(np.arange(n_total) != root).astype(np.int64)
+        candidate_order = [root] + [int(i) for i in candidates]
+        ordered = _prune_candidate_pool_to_budget(
+            centers,
+            covis_strength,
+            candidate_order,
+            target_select,
+            root,
+            support_tau,
+            alpha,
+            coverage_beta,
+            eps,
+            log_tag,
+            adaptive_count=adaptive_count_enabled,
+            min_select=adaptive_count_min_select,
+            coverage_stop_mean=adaptive_count_coverage_stop_mean,
+            coverage_stop_max=adaptive_count_coverage_stop_max,
+            coverage_repair_order=coverage_repair_order,
+        )
+        final_cov = np.linalg.norm(
+            centers[:, None, :] - centers[np.asarray(ordered, dtype=np.int64)][None, :, :],
+            axis=2,
+        ).min(axis=1)
+        ordered_ref = dist_to_ref[np.asarray(ordered, dtype=np.int64)]
+        print(
+            f"[{log_tag}] Full candidate pool final stats: coverage_mean={float(np.nanmean(final_cov)):.4f}m, "
+            f"coverage_max={float(np.nanmax(final_cov)):.4f}m, "
+            f"ref_dist_mean={float(np.nanmean(ordered_ref)):.4f}m, "
+            f"ref_dist_max={float(np.nanmax(ordered_ref)):.4f}m, candidates={len(candidate_order)}",
+            flush=True,
+        )
+        return ordered
+
+    selected_mask = np.zeros(n_total, dtype=bool)
+    selected_mask[root] = True
+    selected_all: List[int] = [root]
+    anchors: List[int] = []
+    supports_by_anchor: Dict[int, List[int]] = {}
+    fillers: List[int] = []
+    current_nearest = np.linalg.norm(centers - centers[root], axis=1)
+
+    max_support_count = float(np.nanmax(support_counts)) if support_counts.size else 1.0
+    if not np.isfinite(max_support_count) or max_support_count <= 0:
+        max_support_count = 1.0
+    support_gamma = 0.5 * min(alpha, 2.0)
+
+    def _far_view_count() -> int:
+        return int(far_mask[np.asarray(selected_all, dtype=np.int64)].sum()) if selected_all else 0
+
+    def _coverage_mean() -> float:
+        return float(np.nanmean(current_nearest)) if current_nearest.size else 0.0
+
+    def _coverage_max() -> float:
+        return float(np.nanmax(current_nearest)) if current_nearest.size else 0.0
+
+    def _selected_disconnected_count() -> int:
+        if len(selected_all) <= 1 or support_tau <= 0:
+            return 0
+        count = 0
+        sel_arr = np.asarray(selected_all, dtype=np.int64)
+        for idx in selected_all:
+            idx = int(idx)
+            if idx == root:
+                continue
+            others = sel_arr[sel_arr != idx]
+            if others.size == 0:
+                count += 1
+                continue
+            conn = float(np.nanmax(covis_strength[idx, others]))
+            if not np.isfinite(conn) or conn < support_tau:
+                count += 1
+        return count
+
+    def _coverage_target_met() -> bool:
+        if not adaptive_allow_early_stop:
+            return False
+        checks: List[bool] = []
+        if use_target_coverage_mean:
+            checks.append(_coverage_mean() <= target_coverage_mean)
+        if use_target_coverage_max:
+            checks.append(_coverage_max() <= target_coverage_max)
+        return bool(checks) and all(checks)
+
+    def _selected_ref_dist_mean_after(idx: int) -> float:
+        selected_arr = np.asarray(selected_all, dtype=np.int64)
+        current_sum = float(dist_to_ref[selected_arr].sum()) if selected_arr.size else 0.0
+        return (current_sum + float(dist_to_ref[int(idx)])) / float(len(selected_all) + 1)
+
+    def _candidate_exceeds_ref_limits(idx: int) -> bool:
+        if not adaptive:
+            return False
+        idx = int(idx)
+        if use_ref_dist_max_limit and float(dist_to_ref[idx]) > ref_dist_max_limit:
+            return True
+        if use_ref_dist_mean_limit and _selected_ref_dist_mean_after(idx) > ref_dist_mean_limit:
+            return True
+        return False
+
+    def _adaptive_count_target_met() -> bool:
+        if not adaptive_count_enabled or len(selected_all) < adaptive_count_min_select:
+            return False
+        coverage_ok = (
+            (adaptive_count_coverage_stop_mean is None or _coverage_mean() <= adaptive_count_coverage_stop_mean)
+            and (adaptive_count_coverage_stop_max is None or _coverage_max() <= adaptive_count_coverage_stop_max)
+        )
+        disconnected = _selected_disconnected_count()
+        disconnected_limit = max(1, int(np.ceil(0.15 * float(max(len(selected_all) - 1, 1)))))
+        return coverage_ok and disconnected <= disconnected_limit
+
+    def _filter_ref_limit_candidates(candidates: np.ndarray) -> np.ndarray:
+        if not adaptive or candidates.size == 0:
+            return candidates
+        keep = np.asarray([not _candidate_exceeds_ref_limits(int(idx)) for idx in candidates], dtype=bool)
+        return candidates[keep]
+
+    def _add_view(idx: int) -> None:
+        nonlocal current_nearest
+        idx = int(idx)
+        if selected_mask[idx]:
+            return
+        selected_mask[idx] = True
+        selected_all.append(idx)
+        d = np.linalg.norm(centers - centers[idx], axis=1)
+        current_nearest = np.minimum(current_nearest, d)
+
+    # 1) Coverage anchors, but only among nodes that have enough local support.
+    far_anchor_used = 0
+    for _ in range(anchor_count):
+        candidate_mask = supportable & (~selected_mask)
+        if not candidate_mask.any():
+            print(f"[{log_tag}] No supportable anchor candidates remain; using unconstrained candidates.", flush=True)
+            candidate_mask = ~selected_mask
+
+        if use_safe_dist and far_anchor_used >= far_anchor_budget:
+            near_mask = candidate_mask & (~far_mask)
+            if near_mask.any():
+                candidate_mask = near_mask
+
+        candidates = np.flatnonzero(candidate_mask)
+        if adaptive:
+            safe_candidates = _filter_ref_limit_candidates(candidates)
+            if safe_candidates.size == 0:
+                print(
+                    f"[{log_tag}] Stop anchor selection: no candidates satisfy adaptive ref-distance limits "
+                    f"(selected={len(selected_all)}, coverage_mean={_coverage_mean():.4f}m, "
+                    f"coverage_max={_coverage_max():.4f}m).",
+                    flush=True,
+                )
+                break
+            candidates = safe_candidates
+        if candidates.size == 0:
+            break
+
+        gains = _coverage_gain_scores(centers, current_nearest, candidates)
+        max_gain = float(np.nanmax(gains)) if gains.size else 0.0
+        if not np.isfinite(max_gain) or max_gain <= 0:
+            max_gain = 1.0
+        gain_norm = gains / max_gain
+        support_norm = np.log1p(support_counts[candidates].astype(np.float64)) / np.log1p(max_support_count)
+        support_norm = np.clip(support_norm, 0.0, None)
+        ref_penalty = np.exp(-ref_lambda * (dist_to_ref[candidates] / ref_scale))
+        ref_penalty[~np.isfinite(ref_penalty)] = 0.0
+        score = np.power(eps + gain_norm, coverage_beta) * np.power(eps + support_norm, support_gamma) * ref_penalty
+        next_anchor = int(candidates[int(np.argmax(score))])
+
+        if use_safe_dist and far_mask[next_anchor]:
+            far_anchor_used += 1
+        anchors.append(next_anchor)
+        supports_by_anchor[next_anchor] = []
+        _add_view(next_anchor)
+
+    print(
+        f"[{log_tag}] Anchors selected ({len(anchors)}): {anchors}; "
+        f"far_anchors={int(far_mask[np.asarray(anchors, dtype=np.int64)].sum()) if anchors else 0}",
+        flush=True,
+    )
+
+    # 2) Local supports for each anchor. Use high covisibility first, with a
+    # small diversity bonus so support views do not collapse to the same camera.
+    for anchor in anchors:
+        for _ in range(support_per_anchor):
+            if len(selected_all) >= n_select:
+                break
+            candidate_mask = (~selected_mask) & (covis_strength[anchor] >= support_tau)
+            if use_safe_dist and _far_view_count() >= far_view_budget:
+                near_mask = candidate_mask & (~far_mask)
+                if near_mask.any():
+                    candidate_mask = near_mask
+            candidates = np.flatnonzero(candidate_mask)
+            if adaptive:
+                safe_candidates = _filter_ref_limit_candidates(candidates)
+                if safe_candidates.size == 0:
+                    break
+                candidates = safe_candidates
+            if candidates.size == 0:
+                break
+
+            covis_vals = covis_strength[anchor, candidates].astype(np.float64)
+            covis_max = float(np.nanmax(covis_vals)) if covis_vals.size else 0.0
+            if not np.isfinite(covis_max) or covis_max <= 0:
+                covis_max = 1.0
+            covis_norm = np.clip(covis_vals / covis_max, 0.0, None)
+
+            chosen_supports = supports_by_anchor.get(anchor, [])
+            if chosen_supports:
+                support_centers = centers[np.asarray(chosen_supports, dtype=np.int64)]
+                div = np.linalg.norm(centers[candidates, None, :] - support_centers[None, :, :], axis=2).min(axis=1)
+                div_max = float(np.nanmax(div)) if div.size else 0.0
+                div_norm = div / div_max if np.isfinite(div_max) and div_max > 0 else np.zeros_like(div)
+            else:
+                div_norm = np.zeros(len(candidates), dtype=np.float64)
+
+            score = covis_norm * (1.0 + 0.25 * div_norm)
+            next_support = int(candidates[int(np.argmax(score))])
+            supports_by_anchor[anchor].append(next_support)
+            _add_view(next_support)
+
+    support_sizes = [len(supports_by_anchor.get(a, [])) for a in anchors]
+    print(
+        f"[{log_tag}] Support sizes per anchor: {support_sizes}; "
+        f"selected_after_support={len(selected_all)}, far_views={_far_view_count()}",
+        flush=True,
+    )
+
+    # 3) Fill remaining slots with coverage gain, covisibility to the selected
+    # set, and the same reference-distance penalty / far-view budget.
+    covis_scale = float(np.nanmax(covis_strength)) if covis_strength.size else 0.0
+    if not np.isfinite(covis_scale) or covis_scale <= 0:
+        covis_scale = 1.0
+    low_gain_steps = 0
+    while len(selected_all) < n_select:
+        if _adaptive_count_target_met():
+            print(
+                f"[{log_tag}] Adaptive count stop before filler: selected={len(selected_all)}, "
+                f"coverage_mean={_coverage_mean():.4f}m, coverage_max={_coverage_max():.4f}m, "
+                f"disconnected={_selected_disconnected_count()}, max_views={target_select}.",
+                flush=True,
+            )
+            break
+        selected_arr = np.asarray(selected_all, dtype=np.int64)
+        max_covis = np.nanmax(covis_strength[:, selected_arr], axis=1).astype(np.float64)
+        max_covis[~np.isfinite(max_covis)] = 0.0
+
+        candidate_mask = ~selected_mask
+        if use_safe_dist and _far_view_count() >= far_view_budget:
+            near_mask = candidate_mask & (~far_mask)
+            if near_mask.any():
+                candidate_mask = near_mask
+        if tau >= 0:
+            valid = candidate_mask & (max_covis >= tau)
+            if valid.any():
+                candidate_mask = valid
+
+        candidates = np.flatnonzero(candidate_mask)
+        if candidates.size == 0:
+            break
+
+        gains = _coverage_gain_scores(centers, current_nearest, candidates)
+        max_gain = float(np.nanmax(gains)) if gains.size else 0.0
+        if not np.isfinite(max_gain) or max_gain <= 0:
+            max_gain = 1.0
+        gain_norm = gains / max_gain
+        covis_norm = np.clip(max_covis[candidates] / covis_scale, 0.0, None)
+        ref_penalty = np.exp(-ref_lambda * (dist_to_ref[candidates] / ref_scale))
+        ref_penalty[~np.isfinite(ref_penalty)] = 0.0
+        score = np.power(eps + gain_norm, coverage_beta) * np.power(eps + covis_norm, alpha) * ref_penalty
+        if adaptive:
+            raw_best_pos = int(np.argmax(score))
+            raw_best_idx = int(candidates[raw_best_pos])
+            raw_best_risky = _candidate_exceeds_ref_limits(raw_best_idx)
+            if len(selected_all) >= adaptive_min_views and _coverage_target_met() and raw_best_risky:
+                print(
+                    f"[{log_tag}] Adaptive stop before risky filler idx={raw_best_idx}: "
+                    f"selected={len(selected_all)}, coverage_mean={_coverage_mean():.4f}m, "
+                    f"coverage_max={_coverage_max():.4f}m, ref_dist={dist_to_ref[raw_best_idx]:.4f}m.",
+                    flush=True,
+                )
+                break
+
+            keep = np.asarray([not _candidate_exceeds_ref_limits(int(idx)) for idx in candidates], dtype=bool)
+            if not keep.any():
+                print(
+                    f"[{log_tag}] Adaptive stop: no filler candidates satisfy ref-distance limits "
+                    f"(selected={len(selected_all)}, coverage_mean={_coverage_mean():.4f}m, "
+                    f"coverage_max={_coverage_max():.4f}m).",
+                    flush=True,
+                )
+                break
+            if not keep.all():
+                candidates = candidates[keep]
+                gains = gains[keep]
+                score = score[keep]
+
+        best_pos = int(np.argmax(score))
+        next_idx = int(candidates[best_pos])
+        selected_gain = float(gains[best_pos]) if gains.size else 0.0
+        fillers.append(next_idx)
+        _add_view(next_idx)
+        if adaptive and len(selected_all) >= adaptive_min_views:
+            if selected_gain < min_coverage_gain:
+                low_gain_steps += 1
+            else:
+                low_gain_steps = 0
+            if low_gain_steps >= gain_patience and _coverage_target_met():
+                print(
+                    f"[{log_tag}] Adaptive stop after low-gain fillers: selected={len(selected_all)}, "
+                    f"last_gain={selected_gain:.4f}m, low_gain_steps={low_gain_steps}, "
+                    f"coverage_mean={_coverage_mean():.4f}m, coverage_max={_coverage_max():.4f}m.",
+                    flush=True,
+                )
+                break
+
+    # Stable MapAnything input order: root first, then local anchor/support
+    # blocks, then any coverage fillers. Never sort by frame index.
+    ordered: List[int] = [root]
+    seen = {root}
+    for anchor in sorted(anchors, key=lambda i: float(dist_to_ref[int(i)])):
+        if anchor not in seen:
+            ordered.append(anchor)
+            seen.add(anchor)
+        for support in sorted(supports_by_anchor.get(anchor, []), key=lambda i: -float(covis_strength[anchor, int(i)])):
+            if support not in seen:
+                ordered.append(int(support))
+                seen.add(int(support))
+    for filler in fillers:
+        if filler not in seen:
+            ordered.append(int(filler))
+            seen.add(int(filler))
+    for idx in selected_all:
+        if idx not in seen:
+            ordered.append(int(idx))
+            seen.add(int(idx))
+
+    if len(ordered) > target_select:
+        ordered = _prune_candidate_pool_to_budget(
+            centers,
+            covis_strength,
+            ordered,
+            target_select,
+            root,
+            support_tau,
+            alpha,
+            coverage_beta,
+            eps,
+            log_tag,
+            adaptive_count=adaptive_count_enabled,
+            min_select=adaptive_count_min_select,
+            coverage_stop_mean=adaptive_count_coverage_stop_mean,
+            coverage_stop_max=adaptive_count_coverage_stop_max,
+        )
+    else:
+        ordered = ordered[:target_select]
+    print(
+        f"[{log_tag}] Final ordered views={len(ordered)}, anchors={len(anchors)}, "
+        f"supports={sum(support_sizes)}, fillers={len(fillers)}, "
+        f"far_views={int(far_mask[np.asarray(ordered, dtype=np.int64)].sum()) if ordered else 0}",
+        flush=True,
+    )
+    if adaptive:
+        ordered_ref = dist_to_ref[np.asarray(ordered, dtype=np.int64)] if ordered else np.asarray([], dtype=np.float64)
+        ref_mean = float(np.nanmean(ordered_ref)) if ordered_ref.size else 0.0
+        ref_max = float(np.nanmax(ordered_ref)) if ordered_ref.size else 0.0
+        if ordered:
+            final_cov = np.linalg.norm(
+                centers[:, None, :] - centers[np.asarray(ordered, dtype=np.int64)][None, :, :],
+                axis=2,
+            ).min(axis=1)
+            final_cov_mean = float(np.nanmean(final_cov))
+            final_cov_max = float(np.nanmax(final_cov))
+        else:
+            final_cov_mean = 0.0
+            final_cov_max = 0.0
+        print(
+            f"[{log_tag}] Adaptive final stats: coverage_mean={final_cov_mean:.4f}m, "
+            f"coverage_max={final_cov_max:.4f}m, ref_dist_mean={ref_mean:.4f}m, "
+            f"ref_dist_max={ref_max:.4f}m, min_views={adaptive_min_views}, max_views={target_select}",
+            flush=True,
+        )
+        if len(ordered) < adaptive_min_views:
+            print(
+                f"[{log_tag}] WARNING: adaptive ref-distance limits stopped selection below min_views "
+                f"({len(ordered)} < {adaptive_min_views}).",
+                flush=True,
+            )
+    return ordered
+
+
 def select_memory_views(
     dataset,
     n_memory: int,
     dataset_path: Optional[str] = None,
     scene_name: Optional[str] = None,
     force_include_origin: bool = True,
-) -> Tuple[List[int], Optional[np.ndarray]]:
+    selection_mode: str = "fps_flat",
+    covis_alpha: float = 1.0,
+    covis_eps: float = 1e-6,
+    covis_tau: float = -1.0,
+    covis_ref_lambda: float = 0.0,
+    covis_anchor_count: int = 0,
+    covis_support_per_anchor: int = 3,
+    covis_support_tau: float = 1e-4,
+    covis_support_min_neighbors: int = 3,
+    covis_safe_dist_to_ref: float = 3.0,
+    covis_far_view_budget: int = 8,
+    covis_far_anchor_budget: int = 2,
+    covis_coverage_beta: float = 1.0,
+    covis_candidate_pool_ratio: float = 1.0,
+    covis_adaptive_asb: bool = False,
+    covis_adaptive_scene_stats: bool = True,
+    covis_adaptive_view_count: bool = False,
+    covis_adaptive_allow_early_stop: bool = True,
+    covis_adaptive_min_views: int = 28,
+    covis_ref_dist_max_limit: float = 4.2,
+    covis_ref_dist_mean_limit: float = 2.7,
+    covis_min_coverage_gain: float = 0.01,
+    covis_gain_patience: int = 2,
+    covis_target_coverage_mean: float = 0.55,
+    covis_target_coverage_max: float = 2.0,
+) -> Tuple[List[int], Optional[np.ndarray], List[List[int]]]:
     """
     选择 memory 视角（优先 FPS）。
 
@@ -3406,17 +5568,18 @@ def select_memory_views(
             reference frame aligns with the scene world origin, eliminating
             implicit coordinate offsets between features and point cloud.
     """
-    try:
-        from mapanything.tasks.ace.memory_selection import select_optimal_memory_indices  # pyright: ignore[reportMissingImports]
-        memory_indices, scene_center = select_optimal_memory_indices(dataset, n_memory)
-        return memory_indices, scene_center
-    except ImportError:
-        pass
+    if selection_mode != "anchor_support":
+        try:
+            from mapanything.tasks.ace.memory_selection import select_optimal_memory_indices  # pyright: ignore[reportMissingImports]
+            memory_indices, scene_center = select_optimal_memory_indices(dataset, n_memory)
+            return memory_indices, scene_center, [memory_indices]
+        except ImportError:
+            pass
 
-    centers = None
+    centers = _extract_centers_from_flat_wai_dataset(dataset)
     if dataset_path is not None:
         # WAI fastest path: scene_meta.json already contains per-frame c2w.
-        if scene_name:
+        if centers is None and scene_name:
             centers = _extract_centers_from_wai_scene_meta(dataset_path, scene_name)
         # ACE / generic path: poses/ directory
         if centers is None:
@@ -3424,11 +5587,57 @@ def select_memory_views(
     if centers is None:
         centers = _extract_centers_from_dataset_items(dataset)
 
+    scene_center = centers.mean(axis=0).astype(np.float32) if centers is not None and len(centers) > 0 else None
+
+    if selection_mode == "anchor_support":
+        ref_idx = int(np.argmin(np.linalg.norm(centers - scene_center.reshape(1, 3), axis=1)))
+        covis = _load_wai_pairwise_covisibility(dataset_path, scene_name, n_expected=len(centers))
+        if covis is not None:
+            print(
+                f"[AnchorSupport] Selecting {n_memory} views with ref_idx={ref_idx}, "
+                f"alpha={covis_alpha}, eps={covis_eps}, tau={covis_tau}, ref_lambda={covis_ref_lambda}",
+                flush=True,
+            )
+            indices = anchor_support_select_views(
+                centers,
+                n_memory,
+                covis,
+                initial_index=ref_idx,
+                alpha=covis_alpha,
+                eps=covis_eps,
+                tau=covis_tau,
+                ref_lambda=covis_ref_lambda,
+                anchor_count=covis_anchor_count,
+                support_per_anchor=covis_support_per_anchor,
+                support_tau=covis_support_tau,
+                support_min_neighbors=covis_support_min_neighbors,
+                safe_dist_to_ref=covis_safe_dist_to_ref,
+                far_view_budget=covis_far_view_budget,
+                far_anchor_budget=covis_far_anchor_budget,
+                coverage_beta=covis_coverage_beta,
+                candidate_pool_ratio=covis_candidate_pool_ratio,
+                adaptive=covis_adaptive_asb,
+                adaptive_scene_stats=covis_adaptive_scene_stats,
+                adaptive_view_count=covis_adaptive_view_count,
+                adaptive_allow_early_stop=covis_adaptive_allow_early_stop,
+                adaptive_min_views=covis_adaptive_min_views,
+                ref_dist_max_limit=covis_ref_dist_max_limit,
+                ref_dist_mean_limit=covis_ref_dist_mean_limit,
+                min_coverage_gain=covis_min_coverage_gain,
+                gain_patience=covis_gain_patience,
+                target_coverage_mean=covis_target_coverage_mean,
+                target_coverage_max=covis_target_coverage_max,
+            )
+            groups = [indices]
+            _print_selection_coverage_stats(centers, indices, "AnchorSupport")
+            return indices, scene_center, groups
+        print("[AnchorSupport] Falling back to metadata FPS because covisibility is unavailable.", flush=True)
+        indices = fps_select_views(centers, n_memory, force_include=[ref_idx])
+        return indices, scene_center, [indices]
+
     force_include = [0] if force_include_origin else None
     indices = fps_select_views(centers, n_memory, force_include=force_include)
-    indices.sort()  # 顺序化索引，利于后续按序 IO
-    scene_center = centers.mean(axis=0).astype(np.float32) if centers is not None and len(centers) > 0 else None
-    return indices, scene_center
+    return indices, scene_center, [indices]
 
 
 def convert_ace_tuple_to_dict(
@@ -3618,8 +5827,13 @@ def parse_args() -> ExtractionConfig:
         '--pool_mode',
         type=str,
         default='bse',
-        choices=['bse', 'simple', 'hybrid'],
-        help='pooling 模式：bse=voxel hash + Otsu split；simple=简单 voxel mean；hybrid=全局 simple mean + 选择性 split。',
+        choices=['bse', 'pooled', 'simple', 'hybrid'],
+        help=(
+            'pooling 模式：'
+            'bse=voxel hash + Otsu split；'
+            'pooled=旧 pooled baseline，强制 raw 点全局一次 voxel mean，忽略 BSE/Otsu/prepool/global_merge 开关；'
+            'simple=底层简单 voxel mean；hybrid=全局 simple mean + 选择性 split。'
+        ),
     )
     parser.add_argument(
         '--prepool_mode',
@@ -3746,7 +5960,152 @@ def parse_args() -> ExtractionConfig:
         choices=['wai', 'ace'],
         help='数据加载：wai=MapAnything WAI；ace=ACE CamLocDatasetDINOv2。',
     )
-
+    parser.add_argument(
+        '--wai_view_mode',
+        type=str,
+        default='fps_flat',
+        choices=['fps_flat', 'original_multiview', 'anchor_support'],
+        help=(
+            'WAI 视图加载协议：fps_flat=每个 FPS index 只加载 1 张图，实际推理输入严格等于 FPS list；'
+            'original_multiview=复现 map-anything fps_memory.sh，dataset[idx] 一次返回 n_memory 个 covisibility views；'
+            'anchor_support=当前 Reference-aware Anchor+Support 选帧。'
+        ),
+    )
+    parser.add_argument(
+        '--anchor_support_alpha',
+        type=float,
+        default=1.0,
+        help='anchor_support 中 covisibility 项的指数权重；越大越偏向共视性。',
+    )
+    parser.add_argument(
+        '--anchor_support_eps',
+        type=float,
+        default=1e-6,
+        help='anchor_support score epsilon，避免零值导致分数为 0。',
+    )
+    parser.add_argument(
+        '--anchor_support_tau',
+        type=float,
+        default=-1.0,
+        help='anchor_support fill 阶段硬共视阈值；<0 表示关闭硬阈值，仅使用 soft score。',
+    )
+    parser.add_argument(
+        '--covis_ref_lambda',
+        type=float,
+        default=0.0,
+        help='anchor_support 下的 reference 距离软惩罚强度；0 表示不惩罚远离 reference 的候选。',
+    )
+    parser.add_argument(
+        '--covis_anchor_count',
+        type=int,
+        default=0,
+        help='anchor_support 模式下的 anchor 数；<=0 时按 n_memory 自动取保守值。',
+    )
+    parser.add_argument(
+        '--covis_support_per_anchor',
+        type=int,
+        default=3,
+        help='anchor_support 模式下每个 anchor 选择的高共视 support 数。',
+    )
+    parser.add_argument(
+        '--covis_support_tau',
+        type=float,
+        default=1e-4,
+        help='anchor_support 模式下 strong support neighbor 的共视阈值。',
+    )
+    parser.add_argument(
+        '--covis_support_min_neighbors',
+        type=int,
+        default=3,
+        help='anchor_support 模式下 anchor 至少需要多少个 strong support neighbors。',
+    )
+    parser.add_argument(
+        '--covis_safe_dist_to_ref',
+        type=float,
+        default=3.0,
+        help='anchor_support 模式下视为 reference-safe 的距离阈值；远视角由 budget 控制。',
+    )
+    parser.add_argument(
+        '--covis_far_view_budget',
+        type=int,
+        default=8,
+        help='anchor_support 模式下允许 dist_to_ref 超过 safe_dist 的总视角数。',
+    )
+    parser.add_argument(
+        '--covis_far_anchor_budget',
+        type=int,
+        default=2,
+        help='anchor_support 模式下允许 dist_to_ref 超过 safe_dist 的 anchor 数。',
+    )
+    parser.add_argument(
+        '--covis_coverage_beta',
+        type=float,
+        default=1.0,
+        help='anchor_support/fill 阶段 coverage_gain 项指数；越大越偏向覆盖收益。',
+    )
+    parser.add_argument(
+        '--covis_candidate_pool_ratio',
+        type=float,
+        default=1.0,
+        help='anchor_support 内部候选池倍率；>1 时先多选候选再裁回 n_memory；<=0 表示使用全场景候选池。',
+    )
+    parser.add_argument(
+        '--covis_adaptive_asb',
+        action='store_true',
+        help='启用 adaptive ASB：按 scene meta 统计自适应调整 coverage/ref-distance 约束。',
+    )
+    parser.add_argument(
+        '--covis_adaptive_view_count',
+        action='store_true',
+        help='anchor_support adaptive 模式下把 n_memory 仅作为 max views；连通性和覆盖足够时允许少选几张。',
+    )
+    parser.add_argument(
+        '--covis_disable_adaptive_scene_stats',
+        action='store_true',
+        help='关闭 adaptive ASB 的场景统计自适应；关闭后使用手动传入的米制阈值。',
+    )
+    parser.add_argument(
+        '--covis_adaptive_min_views',
+        type=int,
+        default=28,
+        help='adaptive ASB 下至少保留的视角数；超过后才允许 early stop。',
+    )
+    parser.add_argument(
+        '--covis_ref_dist_max_limit',
+        type=float,
+        default=4.2,
+        help='adaptive ASB 候选硬约束：加入后 selected ref_dist_max 不超过该值；<=0 关闭。',
+    )
+    parser.add_argument(
+        '--covis_ref_dist_mean_limit',
+        type=float,
+        default=2.7,
+        help='adaptive ASB 候选硬约束：加入后 selected ref_dist_mean 不超过该值；<=0 关闭。',
+    )
+    parser.add_argument(
+        '--covis_min_coverage_gain',
+        type=float,
+        default=0.01,
+        help='adaptive ASB 低收益判定阈值：coverage_mean 改善小于该值计入 patience。',
+    )
+    parser.add_argument(
+        '--covis_gain_patience',
+        type=int,
+        default=2,
+        help='adaptive ASB 低 coverage gain 连续次数阈值；达到且 coverage target 满足后停止。',
+    )
+    parser.add_argument(
+        '--covis_target_coverage_mean',
+        type=float,
+        default=0.55,
+        help='adaptive ASB coverage target：nearest-center mean 小于等于该值才允许风险/低收益停止；<=0 关闭。',
+    )
+    parser.add_argument(
+        '--covis_target_coverage_max',
+        type=float,
+        default=2.0,
+        help='adaptive ASB coverage target：nearest-center max 小于等于该值才允许风险/低收益停止；<=0 关闭。',
+    )
     parser.add_argument(
         '--ray_pool_strategy',
         type=str,
@@ -3773,6 +6132,30 @@ def parse_args() -> ExtractionConfig:
         default=False,
         help='为 true 时：任一非参考视角平移误差超阈值则进程以退出码 1 结束。',
     )
+    parser.add_argument(
+        '--pose_prune_after_infer',
+        action='store_true',
+        default=False,
+        help='第一次 MapAnything infer 后按 PoseEval 删除最差非 reference views，并用保留 views 重新 infer。',
+    )
+    parser.add_argument(
+        '--pose_prune_min_views',
+        type=int,
+        default=20,
+        help='PoseEval 剪枝后至少保留多少个 views（包含 reference）。',
+    )
+    parser.add_argument(
+        '--pose_prune_min_keep_ratio',
+        type=float,
+        default=0.70,
+        help='PoseEval 剪枝后至少保留的比例；与 pose_prune_min_views 取更严格者。',
+    )
+    parser.add_argument(
+        '--pose_prune_mad_k',
+        type=float,
+        default=2.5,
+        help='PoseEval 剪枝日志中的 robust threshold 系数；实际 drop 优先裁掉 translation_ok_m 以上的最高误差。',
+    )
 
     parser.add_argument(
         '--debug_dump',
@@ -3792,10 +6175,35 @@ def parse_args() -> ExtractionConfig:
         default=False,
         help='debug_dump 额外保存少量数值快照（.npz），方便离线精确对比；会显著增大输出体积。',
     )
+    parser.add_argument(
+        '--feature_diagnostics',
+        action='store_true',
+        default=False,
+        help='保存 BSE 生成阶段的 feature 相似度诊断：voxel-mean 相似度、同 voxel 跨视图相似度和随机负样本直方图。'
+        '当前只对 prepool_mode=global_only 的 raw points/features 有完整意义。',
+    )
+    parser.add_argument(
+        '--feature_diag_max_points_per_voxel',
+        type=int,
+        default=32,
+        help='feature_diagnostics：每个空间 voxel 最多采样多少个 raw points 做 pairwise 统计。',
+    )
+    parser.add_argument(
+        '--feature_diag_max_pair_samples',
+        type=int,
+        default=200000,
+        help='feature_diagnostics：最多累计多少条 same-voxel cross-view pair 样本。',
+    )
+    parser.add_argument(
+        '--feature_diag_bins',
+        type=int,
+        default=100,
+        help='feature_diagnostics：相似度/距离直方图的 bin 数。',
+    )
 
     args = parser.parse_args()
 
-    return ExtractionConfig(
+    config = ExtractionConfig(
         dataset_path=args.dataset_path,
         output_path=args.output_path,
         n_memory=args.n_memory,
@@ -3825,16 +6233,65 @@ def parse_args() -> ExtractionConfig:
         dataset_type=args.dataset_type,
         scene_name=args.scene_name,
         dataset_loader=args.dataset_loader,
+        wai_view_mode=args.wai_view_mode,
+        anchor_support_alpha=float(args.anchor_support_alpha),
+        anchor_support_eps=float(args.anchor_support_eps),
+        anchor_support_tau=float(args.anchor_support_tau),
+        covis_ref_lambda=float(args.covis_ref_lambda),
+        covis_anchor_count=int(args.covis_anchor_count),
+        covis_support_per_anchor=int(args.covis_support_per_anchor),
+        covis_support_tau=float(args.covis_support_tau),
+        covis_support_min_neighbors=int(args.covis_support_min_neighbors),
+        covis_safe_dist_to_ref=float(args.covis_safe_dist_to_ref),
+        covis_far_view_budget=int(args.covis_far_view_budget),
+        covis_far_anchor_budget=int(args.covis_far_anchor_budget),
+        covis_coverage_beta=float(args.covis_coverage_beta),
+        covis_candidate_pool_ratio=float(args.covis_candidate_pool_ratio),
+        covis_adaptive_asb=bool(args.covis_adaptive_asb),
+        covis_adaptive_scene_stats=not bool(args.covis_disable_adaptive_scene_stats),
+        covis_adaptive_view_count=bool(args.covis_adaptive_view_count),
+        covis_adaptive_min_views=int(args.covis_adaptive_min_views),
+        covis_ref_dist_max_limit=float(args.covis_ref_dist_max_limit),
+        covis_ref_dist_mean_limit=float(args.covis_ref_dist_mean_limit),
+        covis_min_coverage_gain=float(args.covis_min_coverage_gain),
+        covis_gain_patience=int(args.covis_gain_patience),
+        covis_target_coverage_mean=float(args.covis_target_coverage_mean),
+        covis_target_coverage_max=float(args.covis_target_coverage_max),
         ray_pool_strategy=args.ray_pool_strategy,
         save_all_ray_strategies=args.save_all_ray_strategies,
         use_model=args.use_model,
         dinov2_intermediate_layers=args.dinov2_intermediate_layers,
         pose_eval_translation_ok_m=args.pose_eval_translation_ok_m,
         pose_eval_strict=args.pose_eval_strict,
+        pose_prune_after_infer=args.pose_prune_after_infer,
+        pose_prune_min_views=int(args.pose_prune_min_views),
+        pose_prune_min_keep_ratio=float(args.pose_prune_min_keep_ratio),
+        pose_prune_mad_k=float(args.pose_prune_mad_k),
         debug_dump=args.debug_dump,
         debug_dump_max_views=int(args.debug_dump_max_views),
         debug_dump_save_npz=args.debug_dump_save_npz,
+        feature_diagnostics=args.feature_diagnostics,
+        feature_diag_max_points_per_voxel=int(args.feature_diag_max_points_per_voxel),
+        feature_diag_max_pair_samples=int(args.feature_diag_max_pair_samples),
+        feature_diag_bins=int(args.feature_diag_bins),
     )
+
+    if config.pool_mode == "pooled":
+        # Pooled is an isolated baseline mode: concatenate raw points from all
+        # views, then run exactly one global voxel mean. BSE/Otsu/per-view
+        # prepooling/global post-merge switches must not alter this branch.
+        config.prepool_mode = "global_only"
+        config.use_otsu = False
+        config.global_merge = False
+        config.global_merge_voxel_size = None
+        if os.path.basename(config.output_path) == "memory_bse.pt":
+            config.output_path = os.path.join(os.path.dirname(config.output_path), "memory_pooled.pt")
+            print(
+                f"[Config] pool_mode=pooled: output basename adjusted to {config.output_path}",
+                flush=True,
+            )
+
+    return config
 
 
 def main():
@@ -3878,6 +6335,18 @@ def main():
         f"[Config] Depth valid range: [{config.depth_valid_range[0]:.3f}, {config.depth_valid_range[1]:.3f}] m",
         flush=True,
     )
+    if config.feature_diagnostics:
+        print(
+            f"[FeatureDiag] enabled: max_points_per_voxel={config.feature_diag_max_points_per_voxel}, "
+            f"max_pair_samples={config.feature_diag_max_pair_samples}, bins={config.feature_diag_bins}",
+            flush=True,
+        )
+        if config.prepool_mode != "global_only":
+            print(
+                "[FeatureDiag] WARNING: full cross-view raw-feature diagnostics require prepool_mode=global_only; "
+                "current run may not contain raw cross-view chunks.",
+                flush=True,
+            )
 
     if config.pool_mode == "hybrid":
         if config.prepool_mode != "global_only":
@@ -3917,31 +6386,94 @@ def main():
 
     # Load dataset
     print("[BSE Memory] Loading dataset...", flush=True)
+    if config.dataset_loader == "wai" and config.wai_view_mode == "original_multiview":
+        # Reproduce map-anything fps_memory.sh: with sequential WAI datasets,
+        # dataset[idx] returns an anchor-centered covisibility sample of
+        # num_views views. The first FPS anchor can therefore fill all memory
+        # slots by itself.
+        dataset_num_views = config.n_memory
+    else:
+        # Strict FPS protocol: one dataset view per FPS index, so the actual
+        # model inputs match select_optimal_memory_indices() exactly.
+        dataset_num_views = 1
+    print(
+        f"[Data] WAI view mode: {config.wai_view_mode} (dataset_num_views={dataset_num_views})",
+        flush=True,
+    )
     train_dataset = load_dataset(
         config.dataset_path,
         dataset_type=dataset_type,
         scene_name=scene_name,
-        n_views=1,
+        n_views=dataset_num_views,
         dataset_loader=config.dataset_loader,
     )
     print(f"[BSE Memory] Train dataset: {len(train_dataset)} frames")
 
+    requested_memory_views = int(config.n_memory)
+    probe_memory_views = requested_memory_views
+    if config.pose_prune_after_infer:
+        keep_ratio = max(float(config.pose_prune_min_keep_ratio), 1e-3)
+        probe_memory_views = int(np.ceil(float(requested_memory_views) / keep_ratio))
+        probe_memory_views = max(requested_memory_views, probe_memory_views)
+        probe_memory_views = min(probe_memory_views, len(train_dataset))
+        print(
+            f"[PosePrune] Probe selection enabled: target_views={requested_memory_views}, "
+            f"probe_views={probe_memory_views}, keep_ratio={config.pose_prune_min_keep_ratio:.3f}",
+            flush=True,
+        )
+
     # Select memory views
     print("[BSE Memory] Selecting memory views...", flush=True)
-    memory_indices, scene_center_from_cameras = select_memory_views(
+    memory_indices, scene_center_from_cameras, memory_index_groups = select_memory_views(
         train_dataset,
-        config.n_memory,
+        probe_memory_views,
         dataset_path=config.dataset_path,
         scene_name=scene_name,
+        selection_mode=config.wai_view_mode,
+        covis_alpha=config.anchor_support_alpha,
+        covis_eps=config.anchor_support_eps,
+        covis_tau=config.anchor_support_tau,
+        covis_ref_lambda=config.covis_ref_lambda,
+        covis_anchor_count=config.covis_anchor_count,
+        covis_support_per_anchor=config.covis_support_per_anchor,
+        covis_support_tau=config.covis_support_tau,
+        covis_support_min_neighbors=config.covis_support_min_neighbors,
+        covis_safe_dist_to_ref=config.covis_safe_dist_to_ref,
+        covis_far_view_budget=config.covis_far_view_budget,
+        covis_far_anchor_budget=config.covis_far_anchor_budget,
+        covis_coverage_beta=config.covis_coverage_beta,
+        covis_candidate_pool_ratio=config.covis_candidate_pool_ratio,
+        covis_adaptive_asb=config.covis_adaptive_asb,
+        covis_adaptive_scene_stats=config.covis_adaptive_scene_stats,
+        covis_adaptive_view_count=config.covis_adaptive_view_count,
+        covis_adaptive_allow_early_stop=not config.pose_prune_after_infer,
+        covis_adaptive_min_views=config.covis_adaptive_min_views,
+        covis_ref_dist_max_limit=config.covis_ref_dist_max_limit,
+        covis_ref_dist_mean_limit=config.covis_ref_dist_mean_limit,
+        covis_min_coverage_gain=config.covis_min_coverage_gain,
+        covis_gain_patience=config.covis_gain_patience,
+        covis_target_coverage_mean=config.covis_target_coverage_mean,
+        covis_target_coverage_max=config.covis_target_coverage_max,
     )
     print(f"[BSE Memory] Selected {len(memory_indices)} views", flush=True)
     print(f"[Data] Selected memory indices ({len(memory_indices)}): {memory_indices}", flush=True)
+    output_run_dir = os.path.dirname(os.path.abspath(config.output_path))
+    _export_selection_coverage_diagnostics(
+        train_dataset,
+        config.dataset_path,
+        scene_name,
+        memory_indices,
+        output_run_dir,
+        max_views=requested_memory_views,
+        adaptive_min_views=config.covis_adaptive_min_views,
+    )
 
     # Prepare input views (fast path: load directly from disk, skip WAI heavy processing)
     print("[BSE Memory] Preparing input views...", flush=True)
     raw_batches = []  # Store original data for depth/intrinsics access
     memory_views = []  # Store processed data for model input
     memory_gt_poses: List[torch.Tensor] = []  # For post-infer pose vs GT check (MapAnything)
+    loaded_view_records: List[Dict[str, Any]] = []
     did_print_compare = False
 
     def _stat_any(x: Any) -> str:
@@ -4003,9 +6535,118 @@ def main():
         if "camera_poses" in processed:
             print(f"[Compare] processed camera_poses: {_stat_any(processed['camera_poses'])}", flush=True)
         print("==================================================================\n", flush=True)
+
+    flat_view_lookup: Dict[Tuple[str, str], int] = {}
+    flat_view_list = getattr(train_dataset, "flat_view_list", None)
+    if isinstance(flat_view_list, list):
+        for flat_i, item in enumerate(flat_view_list):
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                flat_view_lookup[(str(item[0]), str(item[1]))] = flat_i
+    memory_index_to_group: Dict[int, int] = {}
+    for group_i, group in enumerate(memory_index_groups):
+        for idx in group:
+            memory_index_to_group[int(idx)] = int(group_i)
+
+    def _first_scalar_str(x: Any) -> Optional[str]:
+        if isinstance(x, (list, tuple)):
+            x = x[0] if x else None
+        if x is None:
+            return None
+        return str(x)
+
+    def _view_source_name(view: Any) -> str:
+        if not isinstance(view, dict):
+            return "<non-dict-view>"
+        for key in ("instance", "image_path", "rgb_path", "filename", "path"):
+            val = _first_scalar_str(view.get(key))
+            if val:
+                return val
+        return "<unknown>"
+
+    def _lookup_actual_flat_idx(view: Any) -> Optional[int]:
+        if not isinstance(view, dict) or not flat_view_lookup:
+            return None
+        label = _first_scalar_str(view.get("label", view.get("scene_name", scene_name))) or str(scene_name)
+        source = _view_source_name(view)
+        frame = os.path.basename(source)
+        candidates = [frame]
+        stem, ext = os.path.splitext(frame)
+        if ext:
+            candidates.append(stem)
+        for cand in candidates:
+            idx = flat_view_lookup.get((label, cand))
+            if idx is not None:
+                return idx
+        return None
+
+    def _write_loaded_view_records(records: List[Dict[str, Any]]) -> None:
+        print("[Data] Actual model input views:", flush=True)
+        for rec in records:
+            print(
+                "  [view_%02d] outer=%s inner=%s fps_idx_at_pos=%s actual_flat_idx=%s match_fps=%s source=%s"
+                % (
+                    int(rec["view_idx"]),
+                    rec.get("outer_index"),
+                    rec.get("inner_index"),
+                    rec.get("fps_idx_at_view_position"),
+                    rec.get("actual_flat_idx"),
+                    rec.get("matches_fps_at_view_position"),
+                    rec.get("source"),
+                ),
+                flush=True,
+            )
+        try:
+            out_path = os.path.join(output_run_dir, "loaded_model_input_views.json")
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "selected_memory_indices": memory_indices,
+                        "wai_view_mode": config.wai_view_mode,
+                        "dataset_num_views": dataset_num_views,
+                        "anchor_support": {
+                            "alpha": float(config.anchor_support_alpha),
+                            "eps": float(config.anchor_support_eps),
+                            "tau": float(config.anchor_support_tau),
+                            "ref_lambda": float(config.covis_ref_lambda),
+                            "anchor_count": int(config.covis_anchor_count),
+                            "support_per_anchor": int(config.covis_support_per_anchor),
+                            "support_tau": float(config.covis_support_tau),
+                            "support_min_neighbors": int(config.covis_support_min_neighbors),
+                            "safe_dist_to_ref": float(config.covis_safe_dist_to_ref),
+                            "far_view_budget": int(config.covis_far_view_budget),
+                            "far_anchor_budget": int(config.covis_far_anchor_budget),
+                            "coverage_beta": float(config.covis_coverage_beta),
+                            "candidate_pool_ratio": float(config.covis_candidate_pool_ratio),
+                            "adaptive_asb": bool(config.covis_adaptive_asb),
+                            "adaptive_scene_stats": bool(config.covis_adaptive_scene_stats),
+                            "adaptive_view_count": bool(config.covis_adaptive_view_count),
+                            "adaptive_allow_early_stop": not bool(config.pose_prune_after_infer),
+                            "adaptive_min_views": int(config.covis_adaptive_min_views),
+                            "ref_dist_max_limit": float(config.covis_ref_dist_max_limit),
+                            "ref_dist_mean_limit": float(config.covis_ref_dist_mean_limit),
+                            "min_coverage_gain": float(config.covis_min_coverage_gain),
+                            "gain_patience": int(config.covis_gain_patience),
+                            "target_coverage_mean": float(config.covis_target_coverage_mean),
+                            "target_coverage_max": float(config.covis_target_coverage_max),
+                            "pose_prune_after_infer": bool(config.pose_prune_after_infer),
+                            "pose_prune_min_views": int(config.pose_prune_min_views),
+                            "pose_prune_min_keep_ratio": float(config.pose_prune_min_keep_ratio),
+                            "pose_prune_mad_k": float(config.pose_prune_mad_k),
+                        },
+                        "memory_index_groups": memory_index_groups,
+                        "records": records,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            print(f"[Data] Loaded model input view records saved to: {out_path}", flush=True)
+        except Exception as e:
+            print(f"[Data] Failed to save loaded model input view records ({type(e).__name__}: {e})", flush=True)
+
     t0 = time.time()
     for i, idx in enumerate(memory_indices):
-        if len(raw_batches) >= config.n_memory:
+        if len(raw_batches) >= probe_memory_views:
             break
         raw_data = train_dataset[idx]
 
@@ -4019,9 +6660,38 @@ def main():
         else:
             views = [raw_data]
 
-        for view in views:
-            if len(raw_batches) >= config.n_memory:
+        for inner_j, view in enumerate(views):
+            if len(raw_batches) >= probe_memory_views:
                 break
+            view_idx = len(raw_batches)
+            actual_flat_idx = _lookup_actual_flat_idx(view)
+            fps_idx_at_view_position = memory_indices[view_idx] if view_idx < len(memory_indices) else None
+            loaded_view_records.append(
+                {
+                    "view_idx": view_idx,
+                    "outer_index": i,
+                    "inner_index": inner_j,
+                    "selected_outer_fps_idx": int(idx) if isinstance(idx, (int, np.integer)) else idx,
+                    "group_id": memory_index_to_group.get(int(idx)) if isinstance(idx, (int, np.integer)) else None,
+                    "fps_idx_at_view_position": (
+                        int(fps_idx_at_view_position)
+                        if isinstance(fps_idx_at_view_position, (int, np.integer))
+                        else fps_idx_at_view_position
+                    ),
+                    "actual_flat_idx": (
+                        int(actual_flat_idx)
+                        if isinstance(actual_flat_idx, (int, np.integer))
+                        else actual_flat_idx
+                    ),
+                    "matches_fps_at_view_position": (
+                        actual_flat_idx == fps_idx_at_view_position
+                        if actual_flat_idx is not None and fps_idx_at_view_position is not None
+                        else None
+                    ),
+                    "source": _view_source_name(view),
+                    "label": _first_scalar_str(view.get("label")) if isinstance(view, dict) else None,
+                }
+            )
             raw_batches.append(view)  # Save original data
             processed = prepare_batch_input(view, device)
             memory_views.append(processed)
@@ -4032,13 +6702,15 @@ def main():
         if i == 0 or (i + 1) % 10 == 0:
             elapsed = time.time() - t0
             print(f"  [{i+1}/{len(memory_indices)} views loaded] {elapsed:.1f}s elapsed", flush=True)
-    # Cap to exactly n_memory
-    raw_batches = raw_batches[:config.n_memory]
-    memory_views = memory_views[:config.n_memory]
-    memory_gt_poses = memory_gt_poses[:config.n_memory]
+    # Cap to the probe budget. Without PosePrune this equals n_memory; with
+    # PosePrune the final target is restored after the probe infer.
+    raw_batches = raw_batches[:probe_memory_views]
+    memory_views = memory_views[:probe_memory_views]
+    memory_gt_poses = memory_gt_poses[:probe_memory_views]
+    loaded_view_records = loaded_view_records[:probe_memory_views]
+    _write_loaded_view_records(loaded_view_records)
     print(f"  [All {len(memory_views)} views loaded in {time.time()-t0:.1f}s]", flush=True)
 
-    output_run_dir = os.path.dirname(os.path.abspath(config.output_path))
     try:
         print(f"[Vis] Exporting depth/RGB validation under run dir: {output_run_dir}", flush=True)
         export_memory_views_visualization(
@@ -4047,6 +6719,7 @@ def main():
             output_run_dir,
             depth_min=config.depth_valid_range[0],
             depth_max=config.depth_valid_range[1],
+            view_records=loaded_view_records,
         )
     except Exception as e:
         print(f"[Vis] Visualization skipped ({type(e).__name__}: {e})", flush=True)
@@ -4120,7 +6793,8 @@ def main():
     print("[BSE Memory] Extracting features...", flush=True)
 
     if use_mapanything:
-        # MapAnything: call infer and get features from memory
+        # MapAnything must run as one batch so all features share the same
+        # internal reference frame.
         with torch.no_grad():
             predictions = extractor.model.infer(
                 memory_views,
@@ -4131,11 +6805,81 @@ def main():
                 ignore_calibration_inputs=False
             )
 
-        pose_ok = print_pose_prediction_vs_gt(
+        pose_ok, trans_errors, _rot_errors = print_pose_prediction_vs_gt(
             memory_gt_poses,
             predictions,
             translation_ok_m=config.pose_eval_translation_ok_m,
+            return_errors=True,
         )
+        if config.pose_prune_after_infer and trans_errors:
+            keep_indices, prune_stats = _pose_prune_keep_indices(
+                trans_errors,
+                translation_ok_m=config.pose_eval_translation_ok_m,
+                min_views=max(config.pose_prune_min_views, requested_memory_views),
+                min_keep_ratio=0.0,
+                mad_k=config.pose_prune_mad_k,
+                max_views=requested_memory_views,
+            )
+            if len(keep_indices) < len(memory_views):
+                print(
+                    f"[PosePrune] Dropping {len(memory_views) - len(keep_indices)} / {len(memory_views)} views "
+                    f"after probe infer; target_keep={prune_stats.get('target_keep')}, "
+                    f"median={prune_stats.get('median', 0.0):.4f}m, "
+                    f"MAD={prune_stats.get('mad', 0.0):.4f}m, "
+                    f"robust_threshold={prune_stats.get('robust_threshold', 0.0):.4f}m.",
+                    flush=True,
+                )
+                print(f"[PosePrune] Dropped view errors: {prune_stats.get('dropped_errors', {})}", flush=True)
+
+                raw_batches = [raw_batches[i] for i in keep_indices]
+                memory_views = [memory_views[i] for i in keep_indices]
+                memory_gt_poses = [memory_gt_poses[i] for i in keep_indices]
+                loaded_view_records = [
+                    {**loaded_view_records[i], "pruned_from_view_idx": int(loaded_view_records[i].get("view_idx", i)), "view_idx": new_i}
+                    for new_i, i in enumerate(keep_indices)
+                ]
+                memory_indices = [
+                    int(rec.get("actual_flat_idx", rec.get("selected_outer_fps_idx", idx)))
+                    for rec, idx in zip(loaded_view_records, keep_indices)
+                ]
+                try:
+                    out_path = os.path.join(output_run_dir, "pose_pruned_model_input_views.json")
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        json.dump(
+                            {
+                                "pose_prune": prune_stats,
+                                "selected_memory_indices_after_prune": memory_indices,
+                                "records": loaded_view_records,
+                            },
+                            f,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                    print(f"[PosePrune] Pruned input view records saved to: {out_path}", flush=True)
+                except Exception as e:
+                    print(f"[PosePrune] Failed to save prune records ({type(e).__name__}: {e})", flush=True)
+
+                if hasattr(extractor.model, "get_info_sharing_intermediate_features"):
+                    extractor.model.get_info_sharing_intermediate_features(clear=True)
+                torch.cuda.empty_cache()
+                print(f"[PosePrune] Re-running MapAnything infer with {len(memory_views)} kept views...", flush=True)
+                with torch.no_grad():
+                    predictions = extractor.model.infer(
+                        memory_views,
+                        memory_efficient_inference=True,
+                        use_amp=False,
+                        ignore_depth_inputs=False,
+                        ignore_pose_inputs=False,
+                        ignore_calibration_inputs=False,
+                    )
+                pose_ok, trans_errors, _rot_errors = print_pose_prediction_vs_gt(
+                    memory_gt_poses,
+                    predictions,
+                    translation_ok_m=config.pose_eval_translation_ok_m,
+                    return_errors=True,
+                )
+            else:
+                print("[PosePrune] No views dropped by PoseEval gate.", flush=True)
         if config.pose_eval_strict and not pose_ok:
             print(
                 "[PoseEval] Strict mode: exiting with code 1 (see table above).",
@@ -4143,13 +6887,13 @@ def main():
             )
             sys.exit(1)
 
-        # Add 'depths' key for compatibility with two_pass_processing
+        # Add 'depths' key only after MapAnything infer(), because infer()
+        # validates input keys strictly and rejects this compatibility alias.
         for view in memory_views:
             if 'depth_z' in view and 'depths' not in view:
                 depth_z = view['depth_z']  # [B,H,W,1]
                 view['depths'] = depth_z.permute(0, 3, 1, 2)  # [B,1,H,W]
 
-        # Get features from model's internal storage
         stored_features = extractor.model.get_info_sharing_intermediate_features()
         features_dict = extractor._process_saved_features(stored_features, len(memory_views))
     else:
@@ -4179,6 +6923,7 @@ def main():
         view_info,
         layers_idx,
         scene_center=pooled_scene_center,
+        config=config,
     )
 
     # Save PLY for visualization

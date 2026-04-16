@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Literal, Tuple
 
 # Ray pooling strategies
 RayPoolStrategy = Literal['mean', 'dominant', 'first', 'all']
-PoolMode = Literal['bse', 'simple', 'hybrid']
+PoolMode = Literal['bse', 'pooled', 'simple', 'hybrid']
 
 
 def compute_plucker_rays(
@@ -70,7 +70,8 @@ class BSEPooler:
             unimodal_threshold: Skip split if std(sim) < threshold
             pool_mode: Pooling mode
                 - 'bse': voxel hash + Otsu split (current default)
-                - 'simple': simple voxel mean without Otsu/boundary split
+                - 'pooled': pooled baseline; simple voxel mean without Otsu/boundary split
+                - 'simple': low-level simple voxel mean without Otsu/boundary split
                 - 'hybrid': simple voxel mean, with selective per-voxel split
             ray_pool_strategy: Strategy for pooling ray directions
                 - 'mean': Average + L2 normalize (may lose multi-view info)
@@ -123,9 +124,9 @@ class BSEPooler:
                 - plucker_rays: [N_pooled, 6] Plücker coordinates (if camera_centers provided)
                 - cluster_sizes: [N_pooled] number of points per cluster
         """
-        cluster_ids = self._voxel_hash(points)
+        cluster_ids = self._voxel_cluster_ids(points) if self.pool_mode == 'pooled' else self._voxel_hash(points)
 
-        if self.pool_mode == 'simple':
+        if self.pool_mode in ('pooled', 'simple'):
             return self._scatter_mean_all(
                 points, features, colors, ray_dirs, cluster_ids,
                 camera_centers=camera_centers,
@@ -170,6 +171,12 @@ class BSEPooler:
         # Encode 3D -> 1D via prime hashing
         hash_vals = quantized[:, 0] * 73856093 + quantized[:, 1] * 19349663 + quantized[:, 2] * 83492791
         _, cluster_ids = torch.unique(hash_vals, return_inverse=True)
+        return cluster_ids
+
+    def _voxel_cluster_ids(self, points: Tensor) -> Tensor:
+        """Original pooled baseline voxel assignment using unique 3D coords."""
+        quantized = torch.floor(points / self.voxel_size).to(torch.int32)
+        _, cluster_ids = torch.unique(quantized, dim=0, return_inverse=True)
         return cluster_ids
 
     def _scatter_mean(self, features: Tensor, cluster_ids: Tensor) -> Tensor:
@@ -375,10 +382,12 @@ class BSEPooler:
         else:
             pooled_ray_dirs = pooled_ray_dirs_mean
 
+        feature_dtype = features.dtype if self.pool_mode == 'pooled' else torch.float16
+
         # Build result dict
         result = {
             'points': pooled_points,
-            'features': pooled_features.half(),  # Back to fp16
+            'features': pooled_features.to(feature_dtype),
             'colors': pooled_colors,
             'ray_dirs': pooled_ray_dirs,
             'ray_dirs_mean': pooled_ray_dirs_mean,

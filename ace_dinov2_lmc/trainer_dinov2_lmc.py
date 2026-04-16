@@ -141,6 +141,26 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "scene_center": _unsqueeze0(scene_center),
             "all_scale_tokens": _unsqueeze0(bank_data.get("all_scale_tokens")) if bank_data.get("all_scale_tokens") is not None else None,
         }
+        for opt_key in (
+            "points_world",
+            "points_norm",
+            "ray_dirs",
+            "ray_dirs_mean",
+            "ray_dirs_dominant",
+            "ray_dirs_first",
+            "plucker_rays",
+            "cluster_sizes",
+            "view_camera_centers",
+            "view_camera_rotations",
+            "view_camera_intrinsics",
+            "view_plucker_main_rays",
+        ):
+            opt_val = bank_data.get(opt_key)
+            if opt_val is not None:
+                if opt_key in ("view_camera_rotations", "view_camera_intrinsics") and isinstance(opt_val, torch.Tensor) and opt_val.dim() == 3:
+                    self.memory_dict[opt_key] = opt_val.unsqueeze(0)
+                else:
+                    self.memory_dict[opt_key] = _unsqueeze0(opt_val)
 
         N_mem = self.memory_dict["pooled_points"].shape[1]
         pooled_features_dim = self.memory_dict["pooled_features"].shape[-1]

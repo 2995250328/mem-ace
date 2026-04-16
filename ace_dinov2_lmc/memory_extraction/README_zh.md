@@ -29,6 +29,19 @@ SCENE_TRAIN=fire_train N_VIEWS=40 bash ace_dinov2_lmc/memory_extraction/extract_
 # Indoor6 场景
 DATASET_TYPE=indoor6 SCENE_TRAIN=scene2a_train N_VIEWS=40 bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
+# 严格 FPS 协议（默认）：实际送入 MapAnything 的 40 张图与 FPS list 一一对应
+WAI_VIEW_MODE=fps_flat DATASET_TYPE=indoor6 SCENE_TRAIN=scene2a_train N_VIEWS=40 \
+  bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+
+# 复现 map-anything 原版 fps_memory.sh：第一个 FPS anchor 扩展成 40 个 covisibility views
+WAI_VIEW_MODE=original_multiview DATASET_TYPE=indoor6 SCENE_TRAIN=scene2a_train N_VIEWS=40 \
+  bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+
+# 共视性加权 FPS：尽量保持 FPS 覆盖，同时避免低共视大 baseline 视图破坏 MapAnything 推理
+WAI_VIEW_MODE=covis_fps COVIS_FPS_ALPHA=1.0 COVIS_FPS_TAU=-1.0 \
+  DATASET_TYPE=indoor6 SCENE_TRAIN=scene2a_train N_VIEWS=40 \
+  bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+
 # === ACE 数据集加载器（CamLocDatasetDINOv2） ===
 # 适用于任何含 rgb/、poses/、calibration/ 目录的场景（7-Scenes / Indoor6 / 自定义）
 #
@@ -123,6 +136,9 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 
 ## 与 map-anything `fps_memory.sh` 的对齐
 
+- **WAI 视图加载协议**：`WAI_VIEW_MODE=fps_flat`（默认）表示每个 FPS index 只加载 1 张图，因此实际送入 MapAnything 的 `input_views` 与 `select_optimal_memory_indices()` 返回的 FPS list 一一对应；`WAI_VIEW_MODE=original_multiview` 表示复现原版 `fps_memory.sh` 行为，即 WAI `dataset[idx]` 在 `num_views=N_VIEWS` 下会把第一个 FPS anchor 扩展成 `N_VIEWS` 个 covisibility views，后续 FPS indices 可能不会被实际消费；`WAI_VIEW_MODE=covis_fps` 表示读取 WAI `scene_root/covisibility/v0/*.npy` 的真实共视矩阵，按 `score = normalized_min_dist_to_selected * (eps + normalized_max_covis_to_selected)^alpha` 做共视性加权 FPS。三者是不同实验协议，PoseEval / pooled memory 点数不可直接当作同一选帧策略比较。
+- **推荐用法**：需要严格验证 FPS 选出的 40 张图时使用默认 `fps_flat`；需要复现 map-anything 原版 pooled memory / PoseEval 时使用 `WAI_VIEW_MODE=original_multiview`；需要折中覆盖性和 MapAnything 多视图稳定性时使用 `WAI_VIEW_MODE=covis_fps`，先用 `COVIS_FPS_ALPHA=1.0 COVIS_FPS_TAU=-1.0` 做 soft-score 消融。
+- **实际输入检查**：每次 run 会在日志中打印 `[Data] Actual model input views:`，并在输出目录写出 `loaded_model_input_views.json`，字段包括 `selected_memory_indices`、`wai_view_mode`、`dataset_num_views`、每个 view 的 `actual_flat_idx`、`fps_idx_at_view_position`、`matches_fps_at_view_position` 和 `source`。`model_input_vis/view_XX_model_input.png` 左上角也会标注 `src`、`actual_idx`、`fps_idx`、`outer/inner`，可直接和 FPS list 对照。
 - **网格深度采样**：与 `mapanything/tasks/run_memory_extraction.py` 中 `generate_patch_point_cloud` 一致，支持 `nearest` / `median` / `nearest_valid`。Indoor6 等 **稀疏深度** 必须用 **`nearest_valid`**（在网格中心邻域内取有效深度的中位数），否则容易出现「整图有深度、网格上几乎无有效点」。
 - **Shell 默认**：`DATASET_TYPE=indoor6` 时脚本默认 `PATCH_DEPTH_SAMPLING=nearest_valid`；`7scenes` 默认 `nearest`。
 - **深度校验图**：选帧并加载视图后，会在本次 run 目录下写出 `depth_validation/` 与 `model_input_vis/`（行为对齐 map-anything；若本机可导入 `mapanything.tasks.run_memory_extraction`，则优先复用其 `_save_raw_rgb` / `_save_depth_on_rgb_vis` 等；稀疏深度用 scatter，极稠密时自动改用向量化 turbo 上色，避免卡顿）。
@@ -141,12 +157,13 @@ memory_extract/
 │   │       ├── memory_bse.pt                    # 主输出
 │   │       ├── extraction_config.json           # 配置快照（含 patch_depth_sampling 等）
 │   │       ├── extraction_log.txt               # 运行日志
+│   │       ├── loaded_model_input_views.json    # 实际进入 MapAnything 推理的 view 文件名 / FPS 对照
 │   │       ├── depth_validation/                # 深度与 RGB 对齐检查（与 fps_memory 一致）
 │   │       │   ├── view_00_rgb_raw.png
 │   │       │   ├── view_XX_depth_vis.png
 │   │       │   ├── view_XX_depth_on_rgb.png
 │   │       │   └── view_00_raw_depth_pointcloud.ply  # 若 Open3D 可用且 view0 有有效点
-│   │       └── model_input_vis/                  # 送入网络的归一化图像可视化
+│   │       └── model_input_vis/                  # 送入网络的归一化图像可视化（左上角标注实际文件名/FPS index）
 │   │           └── view_XX_model_input.png
 │   └── 20v_v0.10_bilinear_l2/            # 消融：不同 voxel size
 │       └── 20260328_150000/
@@ -182,6 +199,11 @@ memory_extract/
 | `SCENE_TEST` | 自动推导 | 测试场景名（从 `SCENE_TRAIN` 自动推导） |
 | `DATASET_ROOT` | 自动 | 数据集根目录（根据 `DATASET_TYPE` 自动设置） |
 | `DATASET_LOADER` | `wai` | 数据集加载器：`wai`=WAI 格式；`ace`=ACE CamLocDatasetDINOv2 |
+| `WAI_VIEW_MODE` | `fps_flat` | WAI 选帧协议：`fps_flat`=实际输入严格等于 FPS list；`original_multiview`=复现原版 `fps_memory.sh` 的 covisibility 多视图 sample；`covis_fps`=共视性加权 FPS |
+| `COVIS_FPS_ALPHA` | `1.0` | `covis_fps` 的共视性权重；`0` 退化成纯 FPS，越大越偏向共视性 |
+| `COVIS_FPS_EPS` | `1e-6` | `covis_fps` soft score 的 epsilon |
+| `COVIS_FPS_TAU` | `-1.0` | `covis_fps` 硬共视阈值；`<0` 表示关闭硬阈值，仅使用 soft score |
+| `COVIS_MAX_DIST_TO_REF` | `-1.0` | `covis_fps` 局部性约束：候选帧到 reference 帧 camera center 的最大距离（米）；`<0` 关闭 |
 | `N_VIEWS` | `20` | 记忆视角数量 |
 | `GPU_ID` | `3` | GPU 编号（`CUDA_VISIBLE_DEVICES`） |
 | `DATASET_LOADER` | `wai` | 数据集加载器：`wai`（MapAnything WAI）或 `ace`（ACE CamLocDatasetDINOv2） |
@@ -250,6 +272,11 @@ memory_extract/
 | `--sor_k` | `20` | SOR 近邻个数 k |
 | `--sor_std_ratio` | `2.0` | SOR 标准差倍数阈值（越小越严格） |
 | `--dataset_loader` | `wai` | 数据集加载器：`wai`（MapAnything WAI 格式，需 `--scene_name`）或 `ace`（ACE CamLocDataset 格式，`dataset_path` 直接指向含 `rgb/` 的目录） |
+| `--wai_view_mode` | `fps_flat` | WAI 视图加载协议：`fps_flat` 严格使用 FPS list；`original_multiview` 复现原版 `fps_memory.sh` 多视图 sample；`covis_fps` 共视性加权 FPS |
+| `--covis_fps_alpha` | `1.0` | `covis_fps` 的共视性权重 |
+| `--covis_fps_eps` | `1e-6` | `covis_fps` soft score epsilon |
+| `--covis_fps_tau` | `-1.0` | `covis_fps` 硬共视阈值，`<0` 关闭 |
+| `--covis_max_dist_to_ref` | `-1.0` | `covis_fps` 局部性约束：候选帧到 reference 帧 camera center 的最大距离（米）；`<0` 关闭 |
 | `--dinov2_checkpoint` | /mnt/storage/xwh/checkpoints/... | DINOv2 权重（fallback 时使用） |
 | `--use_model` | `mapanything` | 特征提取器：`mapanything`（默认）或 `dinov2` |
 

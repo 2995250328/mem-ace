@@ -132,6 +132,39 @@ fi
 # N_VIEWS — 传给 --n_memory：参与 memory 提取的帧数
 N_VIEWS="${N_VIEWS:-20}"
 
+# WAI_VIEW_MODE — WAI 视图加载协议：
+#   fps_flat=每个 FPS index 只加载 1 张图，实际推理输入严格等于 FPS list
+#   original_multiview=复现 map-anything fps_memory.sh，首个 FPS anchor 返回 n_views 个 covisibility views
+#   anchor_support=reference-aware anchor/support 选帧，anchor 保覆盖、support 保局部共视
+WAI_VIEW_MODE="${WAI_VIEW_MODE:-fps_flat}"
+ASB_ALPHA="${ASB_ALPHA:-${COVIS_ALPHA:-1.0}}"
+ASB_EPS="${ASB_EPS:-${COVIS_EPS:-1e-6}}"
+ASB_TAU="${ASB_TAU:-${COVIS_TAU:--1.0}}"
+ASB_REF_LAMBDA="${ASB_REF_LAMBDA:-${COVIS_REF_LAMBDA:-0.0}}"
+ASB_ANCHOR_COUNT="${ASB_ANCHOR_COUNT:-${COVIS_ANCHOR_COUNT:-0}}"
+ASB_SUPPORT_PER_ANCHOR="${ASB_SUPPORT_PER_ANCHOR:-${COVIS_SUPPORT_PER_ANCHOR:-3}}"
+ASB_SUPPORT_TAU="${ASB_SUPPORT_TAU:-${COVIS_SUPPORT_TAU:-1e-4}}"
+ASB_SUPPORT_MIN_NEIGHBORS="${ASB_SUPPORT_MIN_NEIGHBORS:-${COVIS_SUPPORT_MIN_NEIGHBORS:-3}}"
+ASB_SAFE_DIST_TO_REF="${ASB_SAFE_DIST_TO_REF:-${COVIS_SAFE_DIST_TO_REF:-3.0}}"
+ASB_FAR_VIEW_BUDGET="${ASB_FAR_VIEW_BUDGET:-${COVIS_FAR_VIEW_BUDGET:-8}}"
+ASB_FAR_ANCHOR_BUDGET="${ASB_FAR_ANCHOR_BUDGET:-${COVIS_FAR_ANCHOR_BUDGET:-2}}"
+ASB_COVERAGE_BETA="${ASB_COVERAGE_BETA:-${COVIS_COVERAGE_BETA:-1.0}}"
+ASB_CANDIDATE_POOL_RATIO="${ASB_CANDIDATE_POOL_RATIO:-${COVIS_CANDIDATE_POOL_RATIO:-1.0}}"
+ASB_ADAPTIVE="${ASB_ADAPTIVE:-${COVIS_ADAPTIVE_ASB:-false}}"
+ASB_SCENE_STATS="${ASB_SCENE_STATS:-${COVIS_ADAPTIVE_SCENE_STATS:-true}}"
+ASB_ADAPTIVE_VIEW_COUNT="${ASB_ADAPTIVE_VIEW_COUNT:-${COVIS_ADAPTIVE_VIEW_COUNT:-false}}"
+ASB_MIN_VIEWS="${ASB_MIN_VIEWS:-${COVIS_ADAPTIVE_MIN_VIEWS:-28}}"
+ASB_REF_DIST_MAX_LIMIT="${ASB_REF_DIST_MAX_LIMIT:-${COVIS_REF_DIST_MAX_LIMIT:-4.2}}"
+ASB_REF_DIST_MEAN_LIMIT="${ASB_REF_DIST_MEAN_LIMIT:-${COVIS_REF_DIST_MEAN_LIMIT:-2.7}}"
+ASB_MIN_COVERAGE_GAIN="${ASB_MIN_COVERAGE_GAIN:-${COVIS_MIN_COVERAGE_GAIN:-0.01}}"
+ASB_GAIN_PATIENCE="${ASB_GAIN_PATIENCE:-${COVIS_GAIN_PATIENCE:-2}}"
+ASB_TARGET_COVERAGE_MEAN="${ASB_TARGET_COVERAGE_MEAN:-${COVIS_TARGET_COVERAGE_MEAN:-0.55}}"
+ASB_TARGET_COVERAGE_MAX="${ASB_TARGET_COVERAGE_MAX:-${COVIS_TARGET_COVERAGE_MAX:-2.0}}"
+ASB_POSE_PRUNE="${ASB_POSE_PRUNE:-${COVIS_POSE_PRUNE:-false}}"
+ASB_POSE_PRUNE_MIN_VIEWS="${ASB_POSE_PRUNE_MIN_VIEWS:-${COVIS_POSE_PRUNE_MIN_VIEWS:-20}}"
+ASB_POSE_PRUNE_KEEP_RATIO="${ASB_POSE_PRUNE_KEEP_RATIO:-${COVIS_POSE_PRUNE_KEEP_RATIO:-0.70}}"
+ASB_POSE_PRUNE_MAD_K="${ASB_POSE_PRUNE_MAD_K:-${COVIS_POSE_PRUNE_MAD_K:-2.5}}"
+
 # GPU_ID — 仅设置 CUDA_VISIBLE_DEVICES；Python 仍使用 --device cuda:0（即「可见 GPU 列表中的第 0 块」）
 GPU_ID="${GPU_ID:-1}"
 
@@ -140,7 +173,10 @@ GPU_ID="${GPU_ID:-1}"
 # =============================================================================
 
 # VOXEL_SIZE — --voxel_size：BSE 体素边长（米）
-# POOL_MODE — --pool_mode：bse=voxel hash + Otsu split；simple=简单 voxel mean
+# POOL_MODE — --pool_mode：
+#   bse=voxel hash + Otsu split
+#   pooled=旧 pooled baseline，raw 点全局一次 voxel mean；自动忽略 BSE/Otsu/prepool/global_merge 开关
+#   simple=底层简单 voxel mean（保留给消融）
 # PREPOOL_MODE — --prepool_mode：per_view=每个 view 先池化；global_only=直接缓存 raw points，Pass 2 再全局池化
 # USE_OTSU — --use_otsu：true=使用 Otsu adaptive split；false=固定 tau=0.90
 # UNIMODAL_THRESHOLD — --unimodal_threshold：std(sim) 低于该值时跳过 split
@@ -157,6 +193,13 @@ HYBRID_MIN_CLUSTER_SIZE="${HYBRID_MIN_CLUSTER_SIZE:-4}"
 HYBRID_MIN_SPLIT_POINTS="${HYBRID_MIN_SPLIT_POINTS:-2}"
 # ENABLE_SOR — 为 true 时追加 --enable_sor，并打开 SOR_K/STD（Python 内 sor_k、sor_std_ratio 用默认值）
 ENABLE_SOR="${ENABLE_SOR:-true}"
+
+if [ "$POOL_MODE" = "pooled" ]; then
+    PREPOOL_MODE="global_only"
+    USE_OTSU="false"
+    GLOBAL_MERGE="false"
+    GLOBAL_MERGE_VOXEL_SIZE=""
+fi
 
 # DEPTH_MIN / DEPTH_MAX — 组成 --depth_valid_range：反投影保留的深度区间（米）
 # 7Scenes 常用 max=6.0；Indoor6 COLMAP 稀疏深度常用 max=100 避免裁掉远点
@@ -214,26 +257,30 @@ if [ "$USE_PATCH_BASED" = "true" ]; then
 else
     CONFIG_TAG="${CONFIG_TAG}_bilinear"
 fi
-if [ "$POOL_MODE" = "simple" ]; then
+if [ "$POOL_MODE" = "pooled" ]; then
+    CONFIG_TAG="${CONFIG_TAG}_pooled"
+elif [ "$POOL_MODE" = "simple" ]; then
     CONFIG_TAG="${CONFIG_TAG}_simple"
 elif [ "$POOL_MODE" = "hybrid" ]; then
     CONFIG_TAG="${CONFIG_TAG}_hybrid_hstd${HYBRID_SPLIT_MIN_STD}_hmin${HYBRID_MIN_CLUSTER_SIZE}_hsplit${HYBRID_MIN_SPLIT_POINTS}"
 else
     CONFIG_TAG="${CONFIG_TAG}_bse"
 fi
-if [ "$USE_OTSU" = "false" ]; then
+if [ "$POOL_MODE" != "pooled" ] && [ "$USE_OTSU" = "false" ]; then
     CONFIG_TAG="${CONFIG_TAG}_nootsu"
 fi
 if [ "$POOL_MODE" = "bse" ]; then
     CONFIG_TAG="${CONFIG_TAG}_ut${UNIMODAL_THRESHOLD}"
 fi
-if [ "$PREPOOL_MODE" = "global_only" ]; then
+if [ "$POOL_MODE" != "pooled" ] && [ "$PREPOOL_MODE" = "global_only" ]; then
     CONFIG_TAG="${CONFIG_TAG}_globalonly"
 fi
 if [ "$ENABLE_SOR" = "true" ]; then
     CONFIG_TAG="${CONFIG_TAG}_sor"
 fi
-if [ "$GLOBAL_MERGE" = "true" ]; then
+if [ "$POOL_MODE" = "pooled" ]; then
+    :
+elif [ "$GLOBAL_MERGE" = "true" ]; then
     CONFIG_TAG="${CONFIG_TAG}_gm"
     if [ -n "$GLOBAL_MERGE_VOXEL_SIZE" ]; then
         CONFIG_TAG="${CONFIG_TAG}v${GLOBAL_MERGE_VOXEL_SIZE}"
@@ -258,7 +305,13 @@ fi
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 OUTPUT_DIR="${OUTPUT_ROOT}/${SCENE_NAME}/${N_VIEWS}v_${CONFIG_TAG}/${TIMESTAMP}"
-OUTPUT_FILE="${OUTPUT_DIR}/memory_bse.pt"
+case "$POOL_MODE" in
+    pooled) OUTPUT_BASENAME="memory_pooled.pt" ;;
+    simple) OUTPUT_BASENAME="memory_simple.pt" ;;
+    hybrid) OUTPUT_BASENAME="memory_hybrid.pt" ;;
+    *)      OUTPUT_BASENAME="memory_bse.pt" ;;
+esac
+OUTPUT_FILE="${OUTPUT_DIR}/${OUTPUT_BASENAME}"
 TEMP_DIR="/dev/shm/ace_bse_${SCENE_NAME}_${N_VIEWS}v_${CONFIG_TAG}_${TIMESTAMP}_gpu${GPU_ID}_pid$$"
 
 # =============================================================================
@@ -296,6 +349,12 @@ echo "    root:       $DATASET_ROOT"
 echo "    path:       $DATASET_PATH"
 echo "    scene:      $SCENE_TRAIN → $SCENE_TEST"
 echo "    n_views:    $N_VIEWS"
+echo "    wai_view_mode: $WAI_VIEW_MODE"
+if [ "$WAI_VIEW_MODE" = "anchor_support" ]; then
+echo "    anchor_support: alpha=$ASB_ALPHA eps=$ASB_EPS tau=$ASB_TAU ref_lambda=$ASB_REF_LAMBDA anchor_count=$ASB_ANCHOR_COUNT support_per_anchor=$ASB_SUPPORT_PER_ANCHOR support_tau=$ASB_SUPPORT_TAU support_min_neighbors=$ASB_SUPPORT_MIN_NEIGHBORS safe_dist=$ASB_SAFE_DIST_TO_REF far_views=$ASB_FAR_VIEW_BUDGET far_anchors=$ASB_FAR_ANCHOR_BUDGET coverage_beta=$ASB_COVERAGE_BETA candidate_pool_ratio=$ASB_CANDIDATE_POOL_RATIO"
+echo "    adaptive_asb: enabled=$ASB_ADAPTIVE scene_stats=$ASB_SCENE_STATS adaptive_view_count=$ASB_ADAPTIVE_VIEW_COUNT min_views=$ASB_MIN_VIEWS ref_max=$ASB_REF_DIST_MAX_LIMIT ref_mean=$ASB_REF_DIST_MEAN_LIMIT target_cov_mean=$ASB_TARGET_COVERAGE_MEAN target_cov_max=$ASB_TARGET_COVERAGE_MAX min_gain=$ASB_MIN_COVERAGE_GAIN patience=$ASB_GAIN_PATIENCE"
+echo "    pose_prune: enabled=$ASB_POSE_PRUNE min_views=$ASB_POSE_PRUNE_MIN_VIEWS keep_ratio=$ASB_POSE_PRUNE_KEEP_RATIO mad_k=$ASB_POSE_PRUNE_MAD_K"
+fi
 echo "    temp_dir:   $TEMP_DIR"
 echo ""
 echo "  BSE Config:"
@@ -377,6 +436,52 @@ if [ "$POOL_MODE" = "hybrid" ]; then
 fi
 PYTHON_ARGS="$PYTHON_ARGS --dataset_type $DATASET_TYPE"
 PYTHON_ARGS="$PYTHON_ARGS --dataset_loader $DATASET_LOADER"
+PYTHON_ARGS="$PYTHON_ARGS --wai_view_mode $WAI_VIEW_MODE"
+if [ "$WAI_VIEW_MODE" = "anchor_support" ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --anchor_support_alpha $ASB_ALPHA"
+    PYTHON_ARGS="$PYTHON_ARGS --anchor_support_eps $ASB_EPS"
+    PYTHON_ARGS="$PYTHON_ARGS --anchor_support_tau $ASB_TAU"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_ref_lambda $ASB_REF_LAMBDA"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_anchor_count $ASB_ANCHOR_COUNT"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_support_per_anchor $ASB_SUPPORT_PER_ANCHOR"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_support_tau $ASB_SUPPORT_TAU"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_support_min_neighbors $ASB_SUPPORT_MIN_NEIGHBORS"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_safe_dist_to_ref $ASB_SAFE_DIST_TO_REF"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_far_view_budget $ASB_FAR_VIEW_BUDGET"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_far_anchor_budget $ASB_FAR_ANCHOR_BUDGET"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_coverage_beta $ASB_COVERAGE_BETA"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_candidate_pool_ratio $ASB_CANDIDATE_POOL_RATIO"
+    case "${ASB_ADAPTIVE,,}" in
+        true|1|yes|y|on)
+            PYTHON_ARGS="$PYTHON_ARGS --covis_adaptive_asb"
+            ;;
+    esac
+    case "${ASB_ADAPTIVE_VIEW_COUNT,,}" in
+        true|1|yes|y|on)
+            PYTHON_ARGS="$PYTHON_ARGS --covis_adaptive_view_count"
+            ;;
+    esac
+    case "${ASB_SCENE_STATS,,}" in
+        false|0|no|n|off)
+            PYTHON_ARGS="$PYTHON_ARGS --covis_disable_adaptive_scene_stats"
+            ;;
+    esac
+    PYTHON_ARGS="$PYTHON_ARGS --covis_adaptive_min_views $ASB_MIN_VIEWS"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_ref_dist_max_limit $ASB_REF_DIST_MAX_LIMIT"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_ref_dist_mean_limit $ASB_REF_DIST_MEAN_LIMIT"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_min_coverage_gain $ASB_MIN_COVERAGE_GAIN"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_gain_patience $ASB_GAIN_PATIENCE"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_target_coverage_mean $ASB_TARGET_COVERAGE_MEAN"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_target_coverage_max $ASB_TARGET_COVERAGE_MAX"
+    case "${ASB_POSE_PRUNE,,}" in
+        true|1|yes|y|on)
+            PYTHON_ARGS="$PYTHON_ARGS --pose_prune_after_infer"
+            ;;
+    esac
+    PYTHON_ARGS="$PYTHON_ARGS --pose_prune_min_views $ASB_POSE_PRUNE_MIN_VIEWS"
+    PYTHON_ARGS="$PYTHON_ARGS --pose_prune_min_keep_ratio $ASB_POSE_PRUNE_KEEP_RATIO"
+    PYTHON_ARGS="$PYTHON_ARGS --pose_prune_mad_k $ASB_POSE_PRUNE_MAD_K"
+fi
 PYTHON_ARGS="$PYTHON_ARGS --scene_name $SCENE_TRAIN"
 PYTHON_ARGS="$PYTHON_ARGS --depth_valid_range $DEPTH_MIN $DEPTH_MAX"
 PYTHON_ARGS="$PYTHON_ARGS --patch_depth_sampling $PATCH_DEPTH_SAMPLING"
@@ -431,6 +536,34 @@ cat > "${OUTPUT_DIR}/extraction_config.json" <<EOF
     "scene_train": "$SCENE_TRAIN",
     "scene_test": "$SCENE_TEST",
     "n_views": $N_VIEWS,
+    "wai_view_mode": "$WAI_VIEW_MODE",
+    "anchor_support_alpha": $ASB_ALPHA,
+    "anchor_support_eps": $ASB_EPS,
+    "anchor_support_tau": $ASB_TAU,
+    "anchor_support_ref_lambda": $ASB_REF_LAMBDA,
+    "anchor_support_anchor_count": $ASB_ANCHOR_COUNT,
+    "anchor_support_support_per_anchor": $ASB_SUPPORT_PER_ANCHOR,
+    "anchor_support_support_tau": $ASB_SUPPORT_TAU,
+    "anchor_support_support_min_neighbors": $ASB_SUPPORT_MIN_NEIGHBORS,
+    "anchor_support_safe_dist_to_ref": $ASB_SAFE_DIST_TO_REF,
+    "anchor_support_far_view_budget": $ASB_FAR_VIEW_BUDGET,
+    "anchor_support_far_anchor_budget": $ASB_FAR_ANCHOR_BUDGET,
+    "anchor_support_coverage_beta": $ASB_COVERAGE_BETA,
+    "anchor_support_candidate_pool_ratio": $ASB_CANDIDATE_POOL_RATIO,
+    "anchor_support_adaptive": "$ASB_ADAPTIVE",
+    "anchor_support_adaptive_scene_stats": "$ASB_SCENE_STATS",
+    "anchor_support_adaptive_view_count": "$ASB_ADAPTIVE_VIEW_COUNT",
+    "anchor_support_min_views": $ASB_MIN_VIEWS,
+    "anchor_support_ref_dist_max_limit": $ASB_REF_DIST_MAX_LIMIT,
+    "anchor_support_ref_dist_mean_limit": $ASB_REF_DIST_MEAN_LIMIT,
+    "anchor_support_min_coverage_gain": $ASB_MIN_COVERAGE_GAIN,
+    "anchor_support_gain_patience": $ASB_GAIN_PATIENCE,
+    "anchor_support_target_coverage_mean": $ASB_TARGET_COVERAGE_MEAN,
+    "anchor_support_target_coverage_max": $ASB_TARGET_COVERAGE_MAX,
+    "anchor_support_pose_prune": "$ASB_POSE_PRUNE",
+    "anchor_support_pose_prune_min_views": $ASB_POSE_PRUNE_MIN_VIEWS,
+    "anchor_support_pose_prune_keep_ratio": $ASB_POSE_PRUNE_KEEP_RATIO,
+    "anchor_support_pose_prune_mad_k": $ASB_POSE_PRUNE_MAD_K,
     "voxel_size": $VOXEL_SIZE,
     "pool_mode": "$POOL_MODE",
     "prepool_mode": "$PREPOOL_MODE",
@@ -489,7 +622,7 @@ if [ $EXIT_CODE -eq 0 ] && [ -f "$OUTPUT_FILE" ]; then
     echo "    └── ${SCENE_NAME}/"
     echo "        └── ${N_VIEWS}v_${CONFIG_TAG}/"
     echo "            └── ${TIMESTAMP}/"
-    echo "                ├── memory_bse.pt"
+    echo "                ├── ${OUTPUT_BASENAME}"
     echo "                ├── extraction_config.json"
     echo "                └── extraction_log.txt"
 else

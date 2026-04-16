@@ -1,5 +1,7 @@
 """Shared utility helpers for DINOv2 LMC training stack."""
 
+from __future__ import annotations
+
 import argparse
 import logging
 import os
@@ -184,20 +186,26 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
             return val.to(device)
         return val
 
-    # === BSE format detection ===
+    # === Extended pooled extraction format detection ===
     if "points" in payload and "features" in payload and "schema_version" in payload:
-        _logger.info("[LMC] Detected BSE memory format at %s", path)
+        _logger.info(
+            "[LMC] Detected extended pooled memory format at %s (pool_mode=%s)",
+            path,
+            payload.get("pool_mode", "unknown"),
+        )
 
         def _to_tensor(x):
             if isinstance(x, torch.Tensor):
                 return x.to(device)
             return torch.tensor(x, device=device)
 
-        # Field mapping: BSE → pooled format
-        points_normalized = _to_tensor(payload["points"])  # (raw-mu)/sigma
+        # Field mapping: extended extraction schema -> pooled training contract.
+        # `pooled_points` stays world-coordinate compatible; `points`/`points_norm`
+        # carry normalized coordinates for the full-pipeline norm path.
+        points_normalized = _to_tensor(payload.get("points_norm", payload["points"]))  # (raw-mu)/sigma
         points_world = _to_tensor(payload["points_world"]) if payload.get("points_world") is not None else None
-        mu_tensor = _to_tensor(payload["mu"])              # centroid [3]
-        sigma_val = payload.get("sigma")
+        mu_tensor = _to_tensor(payload.get("normalization_mu", payload.get("mu")))  # centroid [3]
+        sigma_val = payload.get("normalization_sigma", payload.get("sigma"))
         sigma_tensor = _to_tensor(sigma_val) if sigma_val is not None else None
 
         if bse_denorm_to_world and points_world is not None:
@@ -350,12 +358,15 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
             "load_timestamp": time.time(),
             "num_points": int(N_pts),
             "feature_dim": int(feature_dim),
-            "format": "bse",
+            "format": "extended_pooled",
             "schema_version": payload.get("schema_version", "unknown"),
+            "pool_mode": payload.get("pool_mode", "unknown"),
+            "prepool_mode": payload.get("prepool_mode", "unknown"),
+            "global_merge": payload.get("global_merge", "unknown"),
         }
 
         t_elapsed = time.time() - t_start
-        _logger.info("[LMC] BSE memory loaded in %.2fs", t_elapsed)
+        _logger.info("[LMC] Extended pooled memory loaded in %.2fs", t_elapsed)
 
         return {
             "type": "pooled",
@@ -377,6 +388,17 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
             "normalization_mu": norm_mu_out,          # [3] centroid or None
             "normalization_sigma": norm_sigma_out,    # scalar std or None
             "points_world": points_world,
+            "points_norm": points_normalized,
+            "ray_dirs": safe_to_device("ray_dirs"),
+            "ray_dirs_mean": safe_to_device("ray_dirs_mean"),
+            "ray_dirs_dominant": safe_to_device("ray_dirs_dominant"),
+            "ray_dirs_first": safe_to_device("ray_dirs_first"),
+            "plucker_rays": safe_to_device("plucker_rays"),
+            "cluster_sizes": safe_to_device("cluster_sizes"),
+            "view_camera_centers": safe_to_device("view_camera_centers"),
+            "view_camera_rotations": safe_to_device("view_camera_rotations"),
+            "view_camera_intrinsics": safe_to_device("view_camera_intrinsics"),
+            "view_plucker_main_rays": safe_to_device("view_plucker_main_rays"),
         }
 
     # === Pooled format detection ===
@@ -389,6 +411,14 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
 
         pooled_points = _to_tensor(payload["pooled_points"])
         pooled_features = _to_tensor(payload["pooled_features"])
+        points_norm = safe_to_device("points_norm")
+        points_world = safe_to_device("points_world")
+        norm_mu = safe_to_device("normalization_mu")
+        norm_sigma = safe_to_device("normalization_sigma")
+        if norm_mu is not None and not isinstance(norm_mu, torch.Tensor):
+            norm_mu = torch.tensor(norm_mu, device=device)
+        if norm_sigma is not None and not isinstance(norm_sigma, torch.Tensor):
+            norm_sigma = torch.tensor(norm_sigma, device=device)
 
         # --- Shape validation ---
         if pooled_points.ndim != 2 or pooled_points.shape[1] < 3:
@@ -510,6 +540,20 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
             "scene": payload.get("scene", "unknown"),
             "layers_idx": payload.get("layers_idx", []),
             "_meta": _meta,
+            "normalization_mu": norm_mu,
+            "normalization_sigma": norm_sigma,
+            "points_norm": points_norm,
+            "points_world": points_world,
+            "ray_dirs": safe_to_device("ray_dirs"),
+            "ray_dirs_mean": safe_to_device("ray_dirs_mean"),
+            "ray_dirs_dominant": safe_to_device("ray_dirs_dominant"),
+            "ray_dirs_first": safe_to_device("ray_dirs_first"),
+            "plucker_rays": safe_to_device("plucker_rays"),
+            "cluster_sizes": safe_to_device("cluster_sizes"),
+            "view_camera_centers": safe_to_device("view_camera_centers"),
+            "view_camera_rotations": safe_to_device("view_camera_rotations"),
+            "view_camera_intrinsics": safe_to_device("view_camera_intrinsics"),
+            "view_plucker_main_rays": safe_to_device("view_plucker_main_rays"),
         }
     if "intermediate" in payload or "final" in payload:
         raise ValueError(

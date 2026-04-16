@@ -29,6 +29,19 @@ SCENE_TRAIN=fire_train N_VIEWS=40 bash ace_dinov2_lmc/memory_extraction/extract_
 # Indoor6 scene
 DATASET_TYPE=indoor6 SCENE_TRAIN=scene2a_train N_VIEWS=40 bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
+# Strict FPS protocol (default): actual MapAnything inputs match the FPS list one-to-one
+WAI_VIEW_MODE=fps_flat DATASET_TYPE=indoor6 SCENE_TRAIN=scene2a_train N_VIEWS=40 \
+  bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+
+# Reproduce original map-anything fps_memory.sh: first FPS anchor expands to 40 covisibility views
+WAI_VIEW_MODE=original_multiview DATASET_TYPE=indoor6 SCENE_TRAIN=scene2a_train N_VIEWS=40 \
+  bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+
+# Covisibility-weighted FPS: preserve coverage while avoiding low-overlap large-baseline inputs
+WAI_VIEW_MODE=covis_fps COVIS_FPS_ALPHA=1.0 COVIS_FPS_TAU=-1.0 \
+  DATASET_TYPE=indoor6 SCENE_TRAIN=scene2a_train N_VIEWS=40 \
+  bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+
 # === ACE Dataset Loader (CamLocDatasetDINOv2) ===
 # Works with any scene containing rgb/, poses/, calibration/ directories (7-Scenes / Indoor6 / custom)
 #
@@ -143,6 +156,11 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 |-----------|---------|-------------|
 | `--dataset_type` | `auto` | Dataset type: `auto`, `7scenes`, `indoor6`, `custom` |
 | `--dataset_loader` | `wai` | **Dataset loader**: `wai` (MapAnything WAI) or `ace` (ACE CamLocDataset) |
+| `--wai_view_mode` | `fps_flat` | WAI view loading protocol: `fps_flat` makes actual model inputs match the FPS list; `original_multiview` reproduces map-anything `fps_memory.sh` covisibility multi-view samples; `covis_fps` uses covisibility-weighted FPS |
+| `--covis_fps_alpha` | `1.0` | Covisibility exponent for `covis_fps`; `0` degenerates to pure FPS, larger values prefer overlap |
+| `--covis_fps_eps` | `1e-6` | Epsilon used by the `covis_fps` soft score |
+| `--covis_fps_tau` | `-1.0` | Hard max-covisibility threshold for `covis_fps`; `<0` disables hard thresholding |
+| `--covis_max_dist_to_ref` | `-1.0` | Locality constraint for `covis_fps`: max camera-center distance from the reference view in meters; `<0` disables |
 | `--scene_name` | None | Scene name for WAI datasets (e.g. `chess_train`, `scene2a_train`) |
 
 ### BSE Pooling Configuration
@@ -262,12 +280,13 @@ memory_extract/
 │   │       ├── memory_bse.pt              # Main output
 │   │       ├── extraction_config.json     # Config snapshot
 │   │       ├── extraction_log.txt         # Run log
+│   │       ├── loaded_model_input_views.json  # Actual model input filenames / FPS index check
 │   │       ├── depth_validation/          # Depth and RGB alignment check (aligned with fps_memory)
 │   │       │   ├── view_00_rgb_raw.png
 │   │       │   ├── view_XX_depth_vis.png
 │   │       │   ├── view_XX_depth_on_rgb.png
 │   │       │   └── view_00_raw_depth_pointcloud.ply  # If Open3D available and view0 has valid points
-│   │       └── model_input_vis/           # Normalized images fed to the network
+│   │       └── model_input_vis/           # Normalized model inputs, annotated with filename/FPS index
 │   │           └── view_XX_model_input.png
 │   └── 20v_v0.10_bilinear_l2/            # Ablation: different voxel size
 │       └── 20260328_150000/
@@ -305,6 +324,11 @@ All parameters are set via environment variables:
 | `N_VIEWS` | `20` | Number of memory views |
 | `GPU_ID` | `0` | GPU device index |
 | `DATASET_LOADER` | `wai` | Dataset loader: `wai` or `ace` |
+| `WAI_VIEW_MODE` | `fps_flat` | WAI view protocol: `fps_flat` uses one actual input per FPS index; `original_multiview` reproduces map-anything `fps_memory.sh` covisibility multi-view behavior; `covis_fps` uses covisibility-weighted FPS |
+| `COVIS_FPS_ALPHA` | `1.0` | Covisibility exponent for `covis_fps` |
+| `COVIS_FPS_EPS` | `1e-6` | Epsilon used by the `covis_fps` soft score |
+| `COVIS_FPS_TAU` | `-1.0` | Hard max-covisibility threshold for `covis_fps`; `<0` disables hard thresholding |
+| `COVIS_MAX_DIST_TO_REF` | `-1.0` | Locality constraint for `covis_fps`: max camera-center distance from the reference view in meters; `<0` disables |
 
 **Dataset path auto-derivation:**
 
@@ -337,6 +361,8 @@ All parameters are set via environment variables:
 
 ## Alignment with map-anything `fps_memory.sh`
 
+- **WAI view loading protocol**: `WAI_VIEW_MODE=fps_flat` (default) makes each FPS index load exactly one image, so the actual `input_views` sent to MapAnything match `select_optimal_memory_indices()` one-to-one. `WAI_VIEW_MODE=original_multiview` reproduces the original `fps_memory.sh` behavior: WAI `dataset[idx]` uses `num_views=N_VIEWS`, so the first FPS anchor can expand to `N_VIEWS` covisibility views and later FPS indices may not be consumed. `WAI_VIEW_MODE=covis_fps` reads the real WAI `scene_root/covisibility/v0/*.npy` matrix and uses `score = normalized_min_dist_to_selected * (eps + normalized_max_covis_to_selected)^alpha` to trade off coverage and overlap. These are different experiment protocols; do not compare PoseEval / pooled-memory point counts as if they used the same selected frames.
+- **Input audit artifacts**: each run logs `[Data] Actual model input views:`, saves `loaded_model_input_views.json`, and annotates `model_input_vis/view_XX_model_input.png` with `src`, `actual_idx`, `fps_idx`, and `outer/inner` so the loaded filenames can be checked against the FPS list.
 - **Grid depth sampling**: Aligned with `mapanything/tasks/run_memory_extraction.py` `generate_patch_point_cloud`. Supports `nearest` / `median` / `nearest_valid`. Indoor6 and other **sparse depth** must use **`nearest_valid`** (median of valid depths within grid center neighborhood), otherwise you may get "whole image has depth but almost no valid points on the grid".
 - **Shell defaults**: `DATASET_TYPE=indoor6` defaults to `PATCH_DEPTH_SAMPLING=nearest_valid`; `7scenes` defaults to `nearest`.
 - **Depth validation images**: After selecting frames and loading views, outputs `depth_validation/` and `model_input_vis/` in the run directory (behavior aligned with map-anything; reuses `_save_raw_rgb` / `_save_depth_on_rgb_vis` from `mapanything.tasks.run_memory_extraction` if importable; sparse depth uses scatter plot, very dense uses vectorized turbo coloring).
