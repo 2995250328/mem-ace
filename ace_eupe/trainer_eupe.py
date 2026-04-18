@@ -7,9 +7,11 @@ import logging
 
 from ace_eupe.ace_network_eupe import Regressor, backbone_spec
 from ace_eupe.dataset_eupe import CamLocDatasetEUPE
+import trainer_dinov2 as _base_trainer
 from trainer_dinov2 import TrainerACEDINOv2
 
 _logger = logging.getLogger(__name__)
+_base_trainer._logger = _logger
 
 
 def _feature_dim_for_model(model_name: str) -> int:

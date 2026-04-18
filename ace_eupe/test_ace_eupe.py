@@ -25,7 +25,7 @@ import dsacstar  # noqa: E402
 from ace_eupe.ace_network_eupe import BACKBONE_SPECS, Regressor, backbone_spec  # noqa: E402
 from ace_eupe.dataset_eupe import CamLocDatasetEUPE  # noqa: E402
 
-_logger = logging.getLogger(__name__)
+_logger = logging.getLogger("ace_eupe.test_ace_eupe")
 
 
 def _sanitize_tag(text: str) -> str:

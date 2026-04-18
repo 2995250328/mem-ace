@@ -1,7 +1,7 @@
 # ACE + EUPE Backbone
 
 This subdirectory adds isolated EUPE backbone variants without changing the
-existing ACE, ACE-DINOv2, or LMC code paths.
+existing ACE or LMC code paths.
 
 The implementation supports two separate EUPE replacements:
 
@@ -59,6 +59,6 @@ python ace_eupe/test_ace_eupe.py \
 
 ## Notes
 
-The trainer follows the existing DINOv2 variant's head-only training flow: the
-EUPE backbone is used to fill the feature buffer, and the ACE head is trained
-from sampled features.
+The trainer follows the original ACE head-only training flow: the EUPE backbone
+is used to fill the feature buffer, and the ACE head is trained from sampled
+features.

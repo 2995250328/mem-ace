@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """ACE regressor with an EUPE backbone.
 
-This module mirrors the public surface of ``ace_network_dinov2.py`` so the
-existing ACE trainer/evaluator can swap the backbone with minimal changes.
+This module mirrors the ACE regressor surface so the trainer/evaluator can swap
+the backbone with minimal changes.
 The default target is EUPE ViT-B/16; EUPE ConvNeXt-B is also supported as a
 separate replacement with its native final stride.
 """

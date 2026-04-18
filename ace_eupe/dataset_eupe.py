@@ -16,7 +16,7 @@ _logger = logging.getLogger(__name__)
 
 
 class CamLocDatasetEUPE(CamLocDatasetDINOv2):
-    """DINOv2 RGB dataset variant with EUPE's model-specific patch stride.
+    """RGB ACE-format dataset variant with EUPE's model-specific patch stride.
 
     Training and evaluation use ``mode=0``. Sparse/depth initialization modes are
     kept compatible with the parent implementation where possible.

@@ -36,7 +36,7 @@ from ace_eupe.trainer_eupe import TrainerACEEUPE  # noqa: E402
 from ace_eupe.ace_network_eupe import BACKBONE_SPECS, backbone_spec  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
-_logger = logging.getLogger(__name__)
+_logger = logging.getLogger("ace_eupe.train_ace_eupe")
 
 
 def _strtobool(x):
