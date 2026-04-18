@@ -133,10 +133,21 @@ fi
 N_VIEWS="${N_VIEWS:-20}"
 
 # WAI_VIEW_MODE — WAI 视图加载协议：
-#   fps_flat=每个 FPS index 只加载 1 张图，实际推理输入严格等于 FPS list
-#   original_multiview=复现 map-anything fps_memory.sh，首个 FPS anchor 返回 n_views 个 covisibility views
-#   anchor_support=reference-aware anchor/support 选帧，anchor 保覆盖、support 保局部共视
+#   fps_flat / fps_strict=每个 FPS index 只加载 1 张图，实际推理输入严格等于 FPS list
+#   original_multiview / first_fps_covis=复现 map-anything fps_memory.sh，首个 FPS anchor 返回 n_views 个 covisibility views
+#   anchor_support / asb=reference-aware anchor/support 选帧，anchor 保覆盖、support 保局部共视
 WAI_VIEW_MODE="${WAI_VIEW_MODE:-fps_flat}"
+case "${WAI_VIEW_MODE,,}" in
+    fps_strict|strict_fps)
+        WAI_VIEW_MODE="fps_flat"
+        ;;
+    first_fps_covis|first_fps_covis40|mapanything_original)
+        WAI_VIEW_MODE="original_multiview"
+        ;;
+    asb)
+        WAI_VIEW_MODE="anchor_support"
+        ;;
+esac
 ASB_ALPHA="${ASB_ALPHA:-${COVIS_ALPHA:-1.0}}"
 ASB_EPS="${ASB_EPS:-${COVIS_EPS:-1e-6}}"
 ASB_TAU="${ASB_TAU:-${COVIS_TAU:--1.0}}"
@@ -150,9 +161,26 @@ ASB_FAR_VIEW_BUDGET="${ASB_FAR_VIEW_BUDGET:-${COVIS_FAR_VIEW_BUDGET:-8}}"
 ASB_FAR_ANCHOR_BUDGET="${ASB_FAR_ANCHOR_BUDGET:-${COVIS_FAR_ANCHOR_BUDGET:-2}}"
 ASB_COVERAGE_BETA="${ASB_COVERAGE_BETA:-${COVIS_COVERAGE_BETA:-1.0}}"
 ASB_CANDIDATE_POOL_RATIO="${ASB_CANDIDATE_POOL_RATIO:-${COVIS_CANDIDATE_POOL_RATIO:-1.0}}"
+ASB_MA_SAFE="${ASB_MA_SAFE:-${COVIS_MA_SAFE_ASB:-false}}"
+ASB_MA_SAFE_POOL_RATIO="${ASB_MA_SAFE_POOL_RATIO:-${COVIS_MA_SAFE_POOL_RATIO:-3.0}}"
+ASB_NATIVE_GROUP="${ASB_NATIVE_GROUP:-${COVIS_NATIVE_GROUP_ASB:-false}}"
+ASB_NATIVE_ANCHOR_CANDIDATES="${ASB_NATIVE_ANCHOR_CANDIDATES:-${COVIS_NATIVE_ANCHOR_CANDIDATES:-64}}"
 ASB_ADAPTIVE="${ASB_ADAPTIVE:-${COVIS_ADAPTIVE_ASB:-false}}"
 ASB_SCENE_STATS="${ASB_SCENE_STATS:-${COVIS_ADAPTIVE_SCENE_STATS:-true}}"
-ASB_ADAPTIVE_VIEW_COUNT="${ASB_ADAPTIVE_VIEW_COUNT:-${COVIS_ADAPTIVE_VIEW_COUNT:-false}}"
+if [ -z "${ASB_ADAPTIVE_VIEW_COUNT+x}" ]; then
+    if [ -n "${COVIS_ADAPTIVE_VIEW_COUNT+x}" ]; then
+        ASB_ADAPTIVE_VIEW_COUNT="$COVIS_ADAPTIVE_VIEW_COUNT"
+    else
+        case "${ASB_ADAPTIVE,,}" in
+            true|1|yes|y|on)
+                ASB_ADAPTIVE_VIEW_COUNT="true"
+                ;;
+            *)
+                ASB_ADAPTIVE_VIEW_COUNT="false"
+                ;;
+        esac
+    fi
+fi
 ASB_MIN_VIEWS="${ASB_MIN_VIEWS:-${COVIS_ADAPTIVE_MIN_VIEWS:-28}}"
 ASB_REF_DIST_MAX_LIMIT="${ASB_REF_DIST_MAX_LIMIT:-${COVIS_REF_DIST_MAX_LIMIT:-4.2}}"
 ASB_REF_DIST_MEAN_LIMIT="${ASB_REF_DIST_MEAN_LIMIT:-${COVIS_REF_DIST_MEAN_LIMIT:-2.7}}"
@@ -175,7 +203,7 @@ GPU_ID="${GPU_ID:-1}"
 # VOXEL_SIZE — --voxel_size：BSE 体素边长（米）
 # POOL_MODE — --pool_mode：
 #   bse=voxel hash + Otsu split
-#   pooled=旧 pooled baseline，raw 点全局一次 voxel mean；自动忽略 BSE/Otsu/prepool/global_merge 开关
+#   pooled=map-anything 原版 pooled_GT baseline，raw 点全局 SOR 后一次 voxel mean；自动忽略 BSE/Otsu/prepool/global_merge 开关
 #   simple=底层简单 voxel mean（保留给消融）
 # PREPOOL_MODE — --prepool_mode：per_view=每个 view 先池化；global_only=直接缓存 raw points，Pass 2 再全局池化
 # USE_OTSU — --use_otsu：true=使用 Otsu adaptive split；false=固定 tau=0.90
@@ -204,12 +232,12 @@ fi
 # DEPTH_MIN / DEPTH_MAX — 组成 --depth_valid_range：反投影保留的深度区间（米）
 # 7Scenes 常用 max=6.0；Indoor6 COLMAP 稀疏深度常用 max=100 避免裁掉远点
 if [ "$DATASET_TYPE" = "indoor6" ]; then
-    DEPTH_MIN="${DEPTH_MIN:-0.02}"
+    DEPTH_MIN="${DEPTH_MIN:-0.1}"
     DEPTH_MAX="${DEPTH_MAX:-100.0}"
     # PATCH_DEPTH_SAMPLING — --patch_depth_sampling：Indoor6 默认 nearest_valid（邻域最近有效深度）
     PATCH_DEPTH_SAMPLING="${PATCH_DEPTH_SAMPLING:-nearest_valid}"
 else
-    DEPTH_MIN="${DEPTH_MIN:-0.02}"
+    DEPTH_MIN="${DEPTH_MIN:-0.1}"
     DEPTH_MAX="${DEPTH_MAX:-6.0}"
     PATCH_DEPTH_SAMPLING="${PATCH_DEPTH_SAMPLING:-nearest}"
 fi
@@ -271,6 +299,39 @@ if [ "$POOL_MODE" != "pooled" ] && [ "$USE_OTSU" = "false" ]; then
 fi
 if [ "$POOL_MODE" = "bse" ]; then
     CONFIG_TAG="${CONFIG_TAG}_ut${UNIMODAL_THRESHOLD}"
+fi
+if [ "$DATASET_LOADER" = "wai" ]; then
+    case "$WAI_VIEW_MODE" in
+        original_multiview)
+            CONFIG_TAG="${CONFIG_TAG}_original"
+            ;;
+        fps_flat)
+            CONFIG_TAG="${CONFIG_TAG}_fps"
+            ;;
+        anchor_support)
+            CONFIG_TAG="${CONFIG_TAG}_asb"
+            case "${ASB_ADAPTIVE,,}" in
+                true|1|yes|y|on)
+                    CONFIG_TAG="${CONFIG_TAG}_adaptive"
+                    ;;
+            esac
+            if [ "$ASB_CANDIDATE_POOL_RATIO" = "0" ] || [ "$ASB_CANDIDATE_POOL_RATIO" = "0.0" ]; then
+                CONFIG_TAG="${CONFIG_TAG}_fullpool"
+            else
+                CONFIG_TAG="${CONFIG_TAG}_pool${ASB_CANDIDATE_POOL_RATIO}"
+            fi
+            case "${ASB_MA_SAFE,,}" in
+                true|1|yes|y|on)
+                    CONFIG_TAG="${CONFIG_TAG}_masafe${ASB_MA_SAFE_POOL_RATIO}"
+                    ;;
+            esac
+            case "${ASB_NATIVE_GROUP,,}" in
+                true|1|yes|y|on)
+                    CONFIG_TAG="${CONFIG_TAG}_native${ASB_NATIVE_ANCHOR_CANDIDATES}"
+                    ;;
+            esac
+            ;;
+    esac
 fi
 if [ "$POOL_MODE" != "pooled" ] && [ "$PREPOOL_MODE" = "global_only" ]; then
     CONFIG_TAG="${CONFIG_TAG}_globalonly"
@@ -351,7 +412,7 @@ echo "    scene:      $SCENE_TRAIN → $SCENE_TEST"
 echo "    n_views:    $N_VIEWS"
 echo "    wai_view_mode: $WAI_VIEW_MODE"
 if [ "$WAI_VIEW_MODE" = "anchor_support" ]; then
-echo "    anchor_support: alpha=$ASB_ALPHA eps=$ASB_EPS tau=$ASB_TAU ref_lambda=$ASB_REF_LAMBDA anchor_count=$ASB_ANCHOR_COUNT support_per_anchor=$ASB_SUPPORT_PER_ANCHOR support_tau=$ASB_SUPPORT_TAU support_min_neighbors=$ASB_SUPPORT_MIN_NEIGHBORS safe_dist=$ASB_SAFE_DIST_TO_REF far_views=$ASB_FAR_VIEW_BUDGET far_anchors=$ASB_FAR_ANCHOR_BUDGET coverage_beta=$ASB_COVERAGE_BETA candidate_pool_ratio=$ASB_CANDIDATE_POOL_RATIO"
+echo "    anchor_support: alpha=$ASB_ALPHA eps=$ASB_EPS tau=$ASB_TAU ref_lambda=$ASB_REF_LAMBDA anchor_count=$ASB_ANCHOR_COUNT support_per_anchor=$ASB_SUPPORT_PER_ANCHOR support_tau=$ASB_SUPPORT_TAU support_min_neighbors=$ASB_SUPPORT_MIN_NEIGHBORS safe_dist=$ASB_SAFE_DIST_TO_REF far_views=$ASB_FAR_VIEW_BUDGET far_anchors=$ASB_FAR_ANCHOR_BUDGET coverage_beta=$ASB_COVERAGE_BETA candidate_pool_ratio=$ASB_CANDIDATE_POOL_RATIO ma_safe=$ASB_MA_SAFE ma_safe_pool_ratio=$ASB_MA_SAFE_POOL_RATIO native_group=$ASB_NATIVE_GROUP native_anchor_candidates=$ASB_NATIVE_ANCHOR_CANDIDATES"
 echo "    adaptive_asb: enabled=$ASB_ADAPTIVE scene_stats=$ASB_SCENE_STATS adaptive_view_count=$ASB_ADAPTIVE_VIEW_COUNT min_views=$ASB_MIN_VIEWS ref_max=$ASB_REF_DIST_MAX_LIMIT ref_mean=$ASB_REF_DIST_MEAN_LIMIT target_cov_mean=$ASB_TARGET_COVERAGE_MEAN target_cov_max=$ASB_TARGET_COVERAGE_MAX min_gain=$ASB_MIN_COVERAGE_GAIN patience=$ASB_GAIN_PATIENCE"
 echo "    pose_prune: enabled=$ASB_POSE_PRUNE min_views=$ASB_POSE_PRUNE_MIN_VIEWS keep_ratio=$ASB_POSE_PRUNE_KEEP_RATIO mad_k=$ASB_POSE_PRUNE_MAD_K"
 fi
@@ -451,6 +512,18 @@ if [ "$WAI_VIEW_MODE" = "anchor_support" ]; then
     PYTHON_ARGS="$PYTHON_ARGS --covis_far_anchor_budget $ASB_FAR_ANCHOR_BUDGET"
     PYTHON_ARGS="$PYTHON_ARGS --covis_coverage_beta $ASB_COVERAGE_BETA"
     PYTHON_ARGS="$PYTHON_ARGS --covis_candidate_pool_ratio $ASB_CANDIDATE_POOL_RATIO"
+    case "${ASB_MA_SAFE,,}" in
+        true|1|yes|y|on)
+            PYTHON_ARGS="$PYTHON_ARGS --covis_ma_safe_asb"
+            ;;
+    esac
+    PYTHON_ARGS="$PYTHON_ARGS --covis_ma_safe_pool_ratio $ASB_MA_SAFE_POOL_RATIO"
+    case "${ASB_NATIVE_GROUP,,}" in
+        true|1|yes|y|on)
+            PYTHON_ARGS="$PYTHON_ARGS --covis_native_group_asb"
+            ;;
+    esac
+    PYTHON_ARGS="$PYTHON_ARGS --covis_native_anchor_candidates $ASB_NATIVE_ANCHOR_CANDIDATES"
     case "${ASB_ADAPTIVE,,}" in
         true|1|yes|y|on)
             PYTHON_ARGS="$PYTHON_ARGS --covis_adaptive_asb"
@@ -550,6 +623,10 @@ cat > "${OUTPUT_DIR}/extraction_config.json" <<EOF
     "anchor_support_far_anchor_budget": $ASB_FAR_ANCHOR_BUDGET,
     "anchor_support_coverage_beta": $ASB_COVERAGE_BETA,
     "anchor_support_candidate_pool_ratio": $ASB_CANDIDATE_POOL_RATIO,
+    "anchor_support_ma_safe": "$ASB_MA_SAFE",
+    "anchor_support_ma_safe_pool_ratio": $ASB_MA_SAFE_POOL_RATIO,
+    "anchor_support_native_group": "$ASB_NATIVE_GROUP",
+    "anchor_support_native_anchor_candidates": $ASB_NATIVE_ANCHOR_CANDIDATES,
     "anchor_support_adaptive": "$ASB_ADAPTIVE",
     "anchor_support_adaptive_scene_stats": "$ASB_SCENE_STATS",
     "anchor_support_adaptive_view_count": "$ASB_ADAPTIVE_VIEW_COUNT",

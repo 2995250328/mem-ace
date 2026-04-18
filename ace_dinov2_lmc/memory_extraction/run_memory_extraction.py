@@ -738,7 +738,7 @@ def export_memory_views_visualization(
 # Schema Versioning
 # =============================================================================
 
-MEMORY_SCHEMA_VERSION = "1.3"  # Added world-coordinate points alongside normalized coordinates
+MEMORY_SCHEMA_VERSION = "1.4"  # Adds pooled_GT legacy aliases plus selection metadata.
 CHECKPOINT_FILE = "extraction_checkpoint.json"
 
 # ace_depth/checkpoints/dinov2_vitl14_pretrain.pth → 常指向共享存储的软链接
@@ -769,6 +769,29 @@ def resolve_dinov2_checkpoint_path(explicit: Optional[str] = None) -> str:
 
 
 _DEFAULT_DINO_CHECKPOINT = resolve_dinov2_checkpoint_path(None)
+
+
+WAI_VIEW_MODE_ALIASES = {
+    "fps_flat": "fps_flat",
+    "fps_strict": "fps_flat",
+    "strict_fps": "fps_flat",
+    "original_multiview": "original_multiview",
+    "first_fps_covis": "original_multiview",
+    "first_fps_covis40": "original_multiview",
+    "mapanything_original": "original_multiview",
+    "anchor_support": "anchor_support",
+    "asb": "anchor_support",
+}
+
+
+def canonicalize_wai_view_mode(mode: str) -> str:
+    """Normalize user-facing WAI selection aliases to the internal protocol name."""
+    key = str(mode or "fps_flat").strip().lower()
+    try:
+        return WAI_VIEW_MODE_ALIASES[key]
+    except KeyError as exc:
+        valid = ", ".join(sorted(WAI_VIEW_MODE_ALIASES))
+        raise ValueError(f"Unsupported wai_view_mode={mode!r}. Valid values/aliases: {valid}") from exc
 
 
 # =============================================================================
@@ -866,6 +889,10 @@ class ExtractionConfig:
     covis_far_anchor_budget: int = 2
     covis_coverage_beta: float = 1.0
     covis_candidate_pool_ratio: float = 1.0
+    covis_ma_safe_asb: bool = False
+    covis_ma_safe_pool_ratio: float = 3.0
+    covis_native_group_asb: bool = False
+    covis_native_anchor_candidates: int = 64
     covis_adaptive_asb: bool = False
     covis_adaptive_scene_stats: bool = True
     covis_adaptive_view_count: bool = False
@@ -2028,6 +2055,42 @@ def normalize_depth_to_hw(depth: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unsupported depth tensor ndim={d.ndim}, shape={tuple(depth.shape)}")
 
 
+def mapanything_pooled_color_image(
+    view_data: Dict[str, Any],
+    image_H: int,
+    image_W: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """
+    Return the color tensor used by the original fps_memory.py pooled path.
+
+    The original pooled script did not use raw RGB for `pooled_colors`; it took
+    the exact model input image, resized if needed, then min-max normalized it
+    per view before flattening/sampling. Keep that behavior for `pool_mode=pooled`
+    so the payload is comparable to `*_pooled_GT.pt`.
+    """
+    img = view_data.get("img") if isinstance(view_data, dict) else None
+    if not isinstance(img, torch.Tensor):
+        return None
+
+    img = img.detach().to(device).float()
+    if img.ndim == 3:
+        img = img.unsqueeze(0)
+    if img.ndim != 4 or img.shape[1] != 3:
+        return None
+
+    if img.shape[-2:] != (image_H, image_W):
+        img = F.interpolate(img, size=(image_H, image_W), mode="bilinear", align_corners=False)
+
+    img_min = img.min()
+    img_max = img.max()
+    if img_max > img_min:
+        img = (img - img_min) / (img_max - img_min)
+    else:
+        img = torch.zeros_like(img)
+    return img.clamp(0.0, 1.0)
+
+
 def unproject_with_pixel_features(
     view_data: Dict[str, torch.Tensor],
     features_flat: torch.Tensor,
@@ -2463,6 +2526,11 @@ def sor_filter_mapanything_compatible(
     std_ratio: float,
 ) -> torch.Tensor:
     """SOR mask matching map-anything's Open3D path, with torch fallback."""
+    nb_neighbors = max(1, int(nb_neighbors))
+    std_ratio = float(std_ratio)
+    if len(points) < nb_neighbors + 1:
+        return torch.ones(len(points), dtype=torch.bool, device=points.device)
+
     try:
         import open3d as o3d  # type: ignore[import-not-found]
 
@@ -2475,9 +2543,23 @@ def sor_filter_mapanything_compatible(
         return torch.from_numpy(mask_np).to(points.device)
     except Exception as e:
         print(
-            f"[SOR] Open3D SOR unavailable ({type(e).__name__}: {e}); using torch fallback.",
+            f"[SOR] Open3D SOR unavailable ({type(e).__name__}: {e}).",
             flush=True,
         )
+
+        # The torch fallback is O(N^2) in memory because it forms a full cdist
+        # matrix. That is fine for small patch clouds, but pixel-level Indoor6
+        # views can have 100k+ valid points and would request hundreds of GB.
+        max_torch_points = 12000
+        if int(points.shape[0]) > max_torch_points:
+            print(
+                f"[SOR] Skipping torch fallback for {int(points.shape[0])} points "
+                f"(>{max_torch_points}) to avoid O(N^2) memory use.",
+                flush=True,
+            )
+            return torch.ones(len(points), dtype=torch.bool, device=points.device)
+
+        print("[SOR] Using torch fallback for small point cloud.", flush=True)
         return sor_filter(points, k=nb_neighbors, std_ratio=std_ratio)
 
 
@@ -2662,6 +2744,10 @@ def two_pass_processing(
         view_camera_intrinsics = []
         view_plucker_main_rays = []
         all_cls_tokens = []
+        saved_grid_H = None
+        saved_grid_W = None
+        saved_img_H = None
+        saved_img_W = None
 
         for view_idx, (view_data, raw_batch) in enumerate(tqdm(zip(memory_views, raw_batches))):
             # Skip if already completed (resume capability)
@@ -2688,6 +2774,12 @@ def two_pass_processing(
                     if isinstance(val, np.ndarray): val = torch.from_numpy(val)
                     if isinstance(val, torch.Tensor): batch_gpu[key] = val.to(device)
 
+            depth_for_hw = batch_gpu.get('depth', batch_gpu.get('depthmap', batch_gpu.get('depth_z', batch_gpu.get('gt_depth'))))
+            if depth_for_hw is not None:
+                image_H, image_W = normalize_depth_to_hw(depth_for_hw).shape
+            else:
+                image_H, image_W = view_data['img'].shape[-2:]
+
             # Process features: use_patch_based=False keeps the original
             # fps_memory pixel-based path; patch experiments use grid centers.
             if config.use_patch_based:
@@ -2695,14 +2787,25 @@ def two_pass_processing(
                     feat_list, apply_l2_norm=False
                 )
             else:
-                depth_for_hw = batch_gpu.get('depth', batch_gpu.get('depthmap', batch_gpu.get('depth_z', batch_gpu.get('gt_depth'))))
-                if depth_for_hw is not None:
-                    image_H, image_W = normalize_depth_to_hw(depth_for_hw).shape
-                else:
-                    image_H, image_W = view_data['img'].shape[-2:]
                 features_flat, grid_H, grid_W = process_multiscale_features_to_image(
                     feat_list, int(image_H), int(image_W)
                 )
+
+            if saved_grid_H is None:
+                saved_grid_H = int(grid_H)
+                saved_grid_W = int(grid_W)
+                saved_img_H = int(image_H)
+                saved_img_W = int(image_W)
+
+            if config.pool_mode == "pooled":
+                compat_img = mapanything_pooled_color_image(
+                    view_data,
+                    int(image_H),
+                    int(image_W),
+                    device,
+                )
+                if compat_img is not None:
+                    batch_gpu["images"] = compat_img
 
             # Add RGB for color sampling (required for colored PLY, esp. Indoor6).
             # Prefer raw uint8 if present; otherwise fall back to processed model input.
@@ -2810,8 +2913,21 @@ def two_pass_processing(
 
             # Optional: SOR filtering (MEDIUM priority)
             if config.enable_sor and config.pool_mode != "pooled":
-                inlier_mask = sor_filter(
-                    points, k=config.sor_k, std_ratio=config.sor_std_ratio
+                print(
+                    f"[SOR] Running per-view SOR "
+                    f"(n={int(points.shape[0])}, nb_neighbors={int(config.sor_k)}, "
+                    f"std_ratio={float(config.sor_std_ratio):.3f})...",
+                    flush=True,
+                )
+                inlier_mask = sor_filter_mapanything_compatible(
+                    points,
+                    nb_neighbors=config.sor_k,
+                    std_ratio=config.sor_std_ratio,
+                )
+                print(
+                    f"[SOR] Per-view SOR removed {int((~inlier_mask).sum().item())} / "
+                    f"{int(inlier_mask.numel())} points.",
+                    flush=True,
                 )
                 points = points[inlier_mask]
                 ray_dirs = ray_dirs[inlier_mask]
@@ -3106,6 +3222,10 @@ def two_pass_processing(
             'plucker_main_rays': torch.stack(view_plucker_main_rays, dim=0), # [M, 6]
             'all_scale_tokens': torch.stack(all_cls_tokens, dim=0) if all_cls_tokens else None,  # [M, D]
             'scene_center_cam': scene_center_cam,                           # [3] — mean camera center (for head.mean)
+            'grid_H': saved_grid_H,
+            'grid_W': saved_grid_W,
+            'img_H': saved_img_H,
+            'img_W': saved_img_W,
         }
 
         return result, mu_scene, sigma_scene, view_info
@@ -3129,6 +3249,7 @@ def save_memory(
     layers_idx: Optional[List] = None,
     scene_center: Optional[torch.Tensor] = None,
     config: Optional[ExtractionConfig] = None,
+    selection_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Save memory to .pt file with extended schema and versioning.
@@ -3192,6 +3313,27 @@ def save_memory(
         },
     }
 
+    all_poses = None
+    all_intrinsics = None
+    if view_info is not None and view_info.get('camera_centers') is not None and view_info.get('camera_rotations') is not None:
+        centers = view_info['camera_centers'].cpu().float()
+        rotations = view_info['camera_rotations'].cpu().float()
+        if centers.ndim == 2 and rotations.ndim == 3 and rotations.shape[0] == centers.shape[0]:
+            all_poses = torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(centers.shape[0], 1, 1)
+            all_poses[:, :3, :3] = rotations
+            all_poses[:, :3, 3] = centers
+    if view_info is not None and view_info.get('camera_intrinsics') is not None:
+        all_intrinsics = view_info['camera_intrinsics'].cpu().float()
+
+    if all_poses is not None:
+        # Legacy pooled_GT fields, kept alongside the extended camera metadata.
+        memory_dict['all_poses'] = all_poses
+        memory_dict['ref_pose'] = all_poses[0].clone()
+        memory_dict['original_views'] = int(all_poses.shape[0])
+    if all_intrinsics is not None:
+        memory_dict['all_intrinsics'] = all_intrinsics
+    memory_dict['patch_stride'] = 14.0
+
     if config is not None:
         if config.pool_mode == "pooled":
             memory_dict['type'] = (
@@ -3206,6 +3348,14 @@ def save_memory(
             )
             memory_dict['depth_valid_min'] = float(config.depth_valid_range[0])
             memory_dict['depth_valid_max'] = float(config.depth_valid_range[1])
+            memory_dict['depth_sparsify_prob'] = 0.0
+            memory_dict['depth_sparsify_removal_percent'] = 0.0
+            memory_dict['depth_sparsify_seed'] = 3407
+            if view_info is not None:
+                memory_dict['grid_H'] = view_info.get('grid_H') if config.use_patch_based else None
+                memory_dict['grid_W'] = view_info.get('grid_W') if config.use_patch_based else None
+                memory_dict['img_H'] = view_info.get('img_H') if config.use_patch_based else None
+                memory_dict['img_W'] = view_info.get('img_W') if config.use_patch_based else None
         memory_dict['pool_mode'] = config.pool_mode
         memory_dict['prepool_mode'] = config.prepool_mode
         memory_dict['global_merge'] = bool(config.global_merge)
@@ -3215,6 +3365,21 @@ def save_memory(
             else None
         )
         memory_dict['voxel_size'] = float(config.voxel_size)
+        if config.scene_name is not None:
+            memory_dict['scene'] = config.scene_name
+
+    if selection_metadata:
+        memory_dict['selection_metadata'] = selection_metadata
+        for key in (
+            'selection_strategy',
+            'wai_view_mode',
+            'selected_memory_indices',
+            'memory_index_groups',
+            'dataset_num_views',
+            'scene_center_source',
+        ):
+            if key in selection_metadata:
+                memory_dict[key] = selection_metadata[key]
 
     if scene_center is not None:
         memory_dict['scene_center'] = scene_center.cpu().float()  # [3] pooled-compatible scene anchor
@@ -4617,6 +4782,8 @@ def _prune_candidate_pool_to_budget(
     coverage_stop_mean: Optional[float] = None,
     coverage_stop_max: Optional[float] = None,
     coverage_repair_order: Optional[List[int]] = None,
+    force_target_count: bool = False,
+    coverage_first: bool = False,
 ) -> List[int]:
     """Prune an oversampled ASB candidate pool to the final inference budget.
 
@@ -4707,10 +4874,15 @@ def _prune_candidate_pool_to_budget(
         conn[~np.isfinite(conn)] = 0.0
         conn_norm = np.clip(conn / covis_scale, 0.0, None)
 
-        score = np.power(eps + gain_norm, max(float(coverage_beta), 0.0)) * np.power(
-            eps + conn_norm,
-            max(float(alpha), 0.0),
-        )
+        if coverage_first:
+            score = np.power(eps + gain_norm, max(float(coverage_beta), 0.0))
+            if alpha > 0:
+                score = score + 0.10 * min(float(alpha), 2.0) * conn_norm
+        else:
+            score = np.power(eps + gain_norm, max(float(coverage_beta), 0.0)) * np.power(
+                eps + conn_norm,
+                max(float(alpha), 0.0),
+            )
         next_idx = int(remaining[int(np.argmax(score))])
         selected.append(next_idx)
         selected_set.add(next_idx)
@@ -4938,15 +5110,168 @@ def _prune_candidate_pool_to_budget(
             if after_max >= before_max - 1e-6 and after_p99 >= cov_p99 - 1e-6:
                 break
 
+    if force_target_count and len(selected) < target_select:
+        fill_pool = repair_candidates if repair_candidates else candidates
+        while len(selected) < target_select:
+            remaining = np.asarray([idx for idx in fill_pool if idx not in selected_set], dtype=np.int64)
+            if remaining.size == 0:
+                break
+
+            current_nearest = _recompute_nearest(selected)
+            gains = _coverage_gain_scores(centers, current_nearest, remaining)
+            max_gain = float(np.nanmax(gains)) if gains.size else 0.0
+            if not np.isfinite(max_gain) or max_gain <= 0:
+                max_gain = 1.0
+            gain_norm = gains / max_gain
+
+            selected_arr = np.asarray(selected, dtype=np.int64)
+            conn = np.nanmax(covis_strength[np.ix_(remaining, selected_arr)], axis=1).astype(np.float64)
+            conn[~np.isfinite(conn)] = 0.0
+            conn_norm = np.clip(conn / covis_scale, 0.0, None)
+
+            if coverage_first:
+                score = np.power(eps + gain_norm, max(float(coverage_beta), 0.0))
+                if alpha > 0:
+                    score = score + 0.10 * min(float(alpha), 2.0) * conn_norm
+            else:
+                score = np.power(eps + gain_norm, max(float(coverage_beta), 0.0)) * np.power(
+                    eps + conn_norm,
+                    max(float(alpha), 0.0),
+                )
+            if score.size == 0 or not np.isfinite(score).any():
+                break
+            next_idx = int(remaining[int(np.nanargmax(score))])
+            selected.append(next_idx)
+            selected_set.add(next_idx)
+        if len(selected) < target_select:
+            print(
+                f"[{log_tag}] WARNING: forced target_count requested but only selected "
+                f"{len(selected)}/{target_select} views.",
+                flush=True,
+            )
+
     selected = selected[:target_select]
     print(
         f"[{log_tag}] Candidate-pool prune: pool={len(candidate_order)} -> selected={len(selected)}, "
         f"connectivity_repairs={repairs}, coverage_hole_repairs={coverage_repairs}, "
         f"local_radius={local_radius:.4f}m, "
-        f"adaptive_count={adaptive_count}, max_views={target_select}",
+        f"adaptive_count={adaptive_count}, coverage_first={coverage_first}, max_views={target_select}",
         flush=True,
     )
     return selected
+
+
+def _native_covis_group_for_anchor(
+    covis_strength: np.ndarray,
+    root: int,
+    n_select: int,
+) -> List[int]:
+    """Approximate WAI native multi-view group as root + strongest root-covis views."""
+    n_total = int(covis_strength.shape[0])
+    root = int(root)
+    target = max(1, min(int(n_select), n_total))
+    if target >= n_total:
+        return list(range(n_total))
+
+    row = covis_strength[root].astype(np.float64, copy=True)
+    row[root] = -np.inf
+    finite = np.isfinite(row)
+    positive = finite & (row > 0)
+    order = np.argsort(-np.where(positive, row, -np.inf), kind="stable")
+
+    selected: List[int] = [root]
+    seen = {root}
+    for idx in order:
+        idx = int(idx)
+        if idx in seen or not positive[idx]:
+            continue
+        selected.append(idx)
+        seen.add(idx)
+        if len(selected) >= target:
+            return selected
+
+    # Fallback for sparse/empty covis rows: fill with nearest camera centers is
+    # done by caller through FPS candidates, but keep this function total.
+    order = np.argsort(-np.where(finite, row, -np.inf), kind="stable")
+    for idx in order:
+        idx = int(idx)
+        if idx in seen:
+            continue
+        selected.append(idx)
+        seen.add(idx)
+        if len(selected) >= target:
+            break
+    return selected
+
+
+def select_native_covis_group_anchor(
+    centers: np.ndarray,
+    covisibility: np.ndarray,
+    n_select: int,
+    initial_index: int,
+    candidate_anchor_count: int = 64,
+    log_tag: str = "CovisFPS:NativeGroupASB",
+) -> Tuple[int, List[int]]:
+    """
+    Pick one WAI-native covisibility anchor whose native high-covis group has
+    the best scene coverage among FPS-spread anchor candidates.
+
+    This keeps MapAnything's original high-covis single-batch assumption: the
+    final loaded views come from dataset[anchor] with num_views=n_select.
+    """
+    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+    n_total = int(centers.shape[0])
+    target = max(1, min(int(n_select), n_total))
+    covis = np.asarray(covisibility)
+    covis_strength = np.maximum(covis[:n_total, :n_total], covis[:n_total, :n_total].T).astype(np.float64, copy=True)
+    np.fill_diagonal(covis_strength, 0.0)
+
+    ref_idx = int(initial_index)
+    n_anchor_candidates = max(1, min(int(candidate_anchor_count), n_total))
+    anchor_candidates = fps_select_views(centers, n_anchor_candidates, force_include=[ref_idx])
+
+    best_anchor = ref_idx
+    best_group = _native_covis_group_for_anchor(covis_strength, ref_idx, target)
+    best_score = float("inf")
+    best_cov_mean = float("inf")
+    best_cov_max = float("inf")
+    best_root_conn_median = 0.0
+
+    for anchor in anchor_candidates:
+        anchor = int(anchor)
+        group = _native_covis_group_for_anchor(covis_strength, anchor, target)
+        if len(group) < target:
+            continue
+        sel = np.asarray(group, dtype=np.int64)
+        nearest = np.linalg.norm(centers[:, None, :] - centers[sel][None, :, :], axis=2).min(axis=1)
+        cov_mean = float(np.nanmean(nearest))
+        cov_max = float(np.nanmax(nearest))
+        root_conn = covis_strength[anchor, sel[sel != anchor]]
+        root_conn_median = float(np.nanmedian(root_conn)) if root_conn.size else 0.0
+        # Max tail matters for memory coverage, but keep mean in the objective
+        # so we do not choose an anchor with one-off tail improvement only.
+        score = cov_mean + 0.25 * cov_max
+        if score < best_score:
+            best_score = score
+            best_anchor = anchor
+            best_group = group
+            best_cov_mean = cov_mean
+            best_cov_max = cov_max
+            best_root_conn_median = root_conn_median
+
+    ref_group = _native_covis_group_for_anchor(covis_strength, ref_idx, target)
+    ref_sel = np.asarray(ref_group, dtype=np.int64)
+    ref_nearest = np.linalg.norm(centers[:, None, :] - centers[ref_sel][None, :, :], axis=2).min(axis=1)
+    print(
+        f"[{log_tag}] selected_anchor={best_anchor}, ref_anchor={ref_idx}, "
+        f"candidate_anchors={len(anchor_candidates)}, native_group_views={len(best_group)}, "
+        f"coverage_mean/max={best_cov_mean:.4f}/{best_cov_max:.4f}m, "
+        f"ref_anchor_coverage_mean/max={float(np.nanmean(ref_nearest)):.4f}/"
+        f"{float(np.nanmax(ref_nearest)):.4f}m, "
+        f"root_covis_median={best_root_conn_median:.6g}",
+        flush=True,
+    )
+    return best_anchor, best_group
 
 
 def anchor_support_select_views(
@@ -4978,6 +5303,8 @@ def anchor_support_select_views(
     adaptive_allow_early_stop: bool = True,
     candidate_pool_ratio: float = 1.0,
     adaptive_view_count: bool = False,
+    ma_safe: bool = False,
+    ma_safe_pool_ratio: float = 3.0,
     log_tag: str = "CovisFPS:AnchorSupport",
 ) -> List[int]:
     """
@@ -5033,6 +5360,8 @@ def anchor_support_select_views(
     adaptive_scene_stats = bool(adaptive_scene_stats)
     adaptive_allow_early_stop = bool(adaptive_allow_early_stop)
     adaptive_view_count = bool(adaptive_view_count)
+    ma_safe = bool(ma_safe)
+    ma_safe_pool_ratio = max(float(ma_safe_pool_ratio), 1.0)
     if n_select > target_select:
         adaptive_allow_early_stop = False
     adaptive_min_views = max(1, min(int(adaptive_min_views), target_select))
@@ -5069,6 +5398,7 @@ def anchor_support_select_views(
     use_target_coverage_mean = adaptive and np.isfinite(target_coverage_mean) and target_coverage_mean > 0
     use_target_coverage_max = adaptive and np.isfinite(target_coverage_max) and target_coverage_max > 0
     adaptive_count_enabled = adaptive and adaptive_view_count
+    allow_short_selection = adaptive_count_enabled and adaptive_allow_early_stop
     adaptive_count_min_select = target_select
     adaptive_count_coverage_stop_mean = None
     adaptive_count_coverage_stop_max = None
@@ -5124,6 +5454,70 @@ def anchor_support_select_views(
             flush=True,
         )
 
+    if ma_safe:
+        root_conn = covis_strength[root].astype(np.float64, copy=True)
+        root_conn[root] = 0.0
+        finite_conn = np.isfinite(root_conn)
+        positive = finite_conn & (root_conn > 0)
+        pool_size = min(
+            n_total - 1,
+            max(target_select - 1, int(np.ceil(float(target_select) * ma_safe_pool_ratio))),
+        )
+        supportable_mask = support_counts >= support_min_neighbors
+        primary = np.flatnonzero(positive & supportable_mask).astype(np.int64)
+        if primary.size < max(target_select - 1, 1):
+            primary = np.flatnonzero(positive).astype(np.int64)
+        if primary.size:
+            primary = primary[np.argsort(-root_conn[primary], kind="stable")]
+        candidates = [int(i) for i in primary[:pool_size].tolist() if int(i) != root]
+
+        if len(candidates) < max(target_select - 1, 1):
+            order = np.argsort(-np.where(finite_conn, root_conn, -np.inf), kind="stable")
+            seen = set(candidates)
+            for idx in order:
+                idx = int(idx)
+                if idx == root or idx in seen:
+                    continue
+                candidates.append(idx)
+                seen.add(idx)
+                if len(candidates) >= pool_size:
+                    break
+
+        candidate_order = [root] + candidates
+        ordered = _prune_candidate_pool_to_budget(
+            centers,
+            covis_strength,
+            candidate_order,
+            target_select,
+            root,
+            support_tau,
+            alpha,
+            coverage_beta,
+            eps,
+            log_tag,
+            force_target_count=True,
+            coverage_first=True,
+        )
+        final_cov = np.linalg.norm(
+            centers[:, None, :] - centers[np.asarray(ordered, dtype=np.int64)][None, :, :],
+            axis=2,
+        ).min(axis=1)
+        ordered_ref = dist_to_ref[np.asarray(ordered, dtype=np.int64)]
+        ordered_root_conn = root_conn[np.asarray([i for i in ordered if int(i) != root], dtype=np.int64)]
+        root_conn_min = float(np.nanmin(ordered_root_conn)) if ordered_root_conn.size else 0.0
+        root_conn_median = float(np.nanmedian(ordered_root_conn)) if ordered_root_conn.size else 0.0
+        root_conn_p90 = _percentile_or_default(ordered_root_conn, 90, 0.0) if ordered_root_conn.size else 0.0
+        print(
+            f"[{log_tag}] MA-safe final stats: coverage_mean={float(np.nanmean(final_cov)):.4f}m, "
+            f"coverage_max={float(np.nanmax(final_cov)):.4f}m, "
+            f"ref_dist_mean={float(np.nanmean(ordered_ref)):.4f}m, "
+            f"ref_dist_max={float(np.nanmax(ordered_ref)):.4f}m, "
+            f"root_covis_min/median/p90={root_conn_min:.6g}/{root_conn_median:.6g}/{root_conn_p90:.6g}, "
+            f"candidate_pool={len(candidate_order)}, pool_ratio={ma_safe_pool_ratio:.3f}",
+            flush=True,
+        )
+        return ordered
+
     if use_full_candidate_pool:
         candidate_mask = np.ones(n_total, dtype=bool)
         candidate_mask[root] = False
@@ -5137,6 +5531,24 @@ def anchor_support_select_views(
         if candidates.size < max(target_select - 1, 1):
             candidates = np.flatnonzero(np.arange(n_total) != root).astype(np.int64)
         candidate_order = [root] + [int(i) for i in candidates]
+        print(
+            f"[{log_tag}] Full candidate source with MA-safe filtering: "
+            f"candidate_pool={len(candidate_order)}, adaptive_ref_limit={adaptive and use_ref_dist_max_limit}, "
+            f"supportable_filter={len(candidate_order) < n_total}.",
+            flush=True,
+        )
+        use_adaptive_prune = adaptive and use_target_coverage_max
+        prune_min_select = adaptive_count_min_select
+        prune_coverage_stop_mean = adaptive_count_coverage_stop_mean
+        prune_coverage_stop_max = adaptive_count_coverage_stop_max
+        if use_adaptive_prune and not adaptive_count_enabled:
+            prune_min_select = max(adaptive_min_views, int(np.ceil(0.85 * float(target_select))))
+            prune_min_select = max(1, min(prune_min_select, target_select))
+            if use_target_coverage_mean:
+                prune_coverage_stop_mean = max(target_coverage_mean, 1e-6)
+            if use_target_coverage_max:
+                prune_coverage_stop_max = max(target_coverage_max, 1e-6)
+
         ordered = _prune_candidate_pool_to_budget(
             centers,
             covis_strength,
@@ -5148,11 +5560,12 @@ def anchor_support_select_views(
             coverage_beta,
             eps,
             log_tag,
-            adaptive_count=adaptive_count_enabled,
-            min_select=adaptive_count_min_select,
-            coverage_stop_mean=adaptive_count_coverage_stop_mean,
-            coverage_stop_max=adaptive_count_coverage_stop_max,
+            adaptive_count=use_adaptive_prune,
+            min_select=prune_min_select,
+            coverage_stop_mean=prune_coverage_stop_mean,
+            coverage_stop_max=prune_coverage_stop_max,
             coverage_repair_order=coverage_repair_order,
+            force_target_count=True,
         )
         final_cov = np.linalg.norm(
             centers[:, None, :] - centers[np.asarray(ordered, dtype=np.int64)][None, :, :],
@@ -5209,7 +5622,7 @@ def anchor_support_select_views(
         return count
 
     def _coverage_target_met() -> bool:
-        if not adaptive_allow_early_stop:
+        if not allow_short_selection:
             return False
         checks: List[bool] = []
         if use_target_coverage_mean:
@@ -5405,7 +5818,7 @@ def anchor_support_select_views(
             raw_best_pos = int(np.argmax(score))
             raw_best_idx = int(candidates[raw_best_pos])
             raw_best_risky = _candidate_exceeds_ref_limits(raw_best_idx)
-            if len(selected_all) >= adaptive_min_views and _coverage_target_met() and raw_best_risky:
+            if allow_short_selection and len(selected_all) >= adaptive_min_views and _coverage_target_met() and raw_best_risky:
                 print(
                     f"[{log_tag}] Adaptive stop before risky filler idx={raw_best_idx}: "
                     f"selected={len(selected_all)}, coverage_mean={_coverage_mean():.4f}m, "
@@ -5416,14 +5829,20 @@ def anchor_support_select_views(
 
             keep = np.asarray([not _candidate_exceeds_ref_limits(int(idx)) for idx in candidates], dtype=bool)
             if not keep.any():
+                if allow_short_selection:
+                    print(
+                        f"[{log_tag}] Adaptive stop: no filler candidates satisfy ref-distance limits "
+                        f"(selected={len(selected_all)}, coverage_mean={_coverage_mean():.4f}m, "
+                        f"coverage_max={_coverage_max():.4f}m).",
+                        flush=True,
+                    )
+                    break
                 print(
-                    f"[{log_tag}] Adaptive stop: no filler candidates satisfy ref-distance limits "
-                    f"(selected={len(selected_all)}, coverage_mean={_coverage_mean():.4f}m, "
-                    f"coverage_max={_coverage_max():.4f}m).",
+                    f"[{log_tag}] Adaptive ref-distance limits exhausted; continuing to fill "
+                    f"{target_select} views because adaptive_view_count=False.",
                     flush=True,
                 )
-                break
-            if not keep.all():
+            elif not keep.all():
                 candidates = candidates[keep]
                 gains = gains[keep]
                 score = score[keep]
@@ -5433,7 +5852,7 @@ def anchor_support_select_views(
         selected_gain = float(gains[best_pos]) if gains.size else 0.0
         fillers.append(next_idx)
         _add_view(next_idx)
-        if adaptive and len(selected_all) >= adaptive_min_views:
+        if allow_short_selection and len(selected_all) >= adaptive_min_views:
             if selected_gain < min_coverage_gain:
                 low_gain_steps += 1
             else:
@@ -5542,6 +5961,10 @@ def select_memory_views(
     covis_far_anchor_budget: int = 2,
     covis_coverage_beta: float = 1.0,
     covis_candidate_pool_ratio: float = 1.0,
+    covis_ma_safe_asb: bool = False,
+    covis_ma_safe_pool_ratio: float = 3.0,
+    covis_native_group_asb: bool = False,
+    covis_native_anchor_candidates: int = 64,
     covis_adaptive_asb: bool = False,
     covis_adaptive_scene_stats: bool = True,
     covis_adaptive_view_count: bool = False,
@@ -5563,11 +5986,12 @@ def select_memory_views(
     3) 再否则：遍历 dataset item 抽 pose 做 FPS（慢）
 
     Args:
-        force_include_origin: When True (default), frame index 0 (scene origin) is
-            always included in the selection. This ensures MapAnything's internal
-            reference frame aligns with the scene world origin, eliminating
-            implicit coordinate offsets between features and point cloud.
+        force_include_origin: Legacy name retained for CLI compatibility. For
+            FPS-style modes, the fallback path now matches map-anything's
+            select_optimal_memory_indices: seed FPS with the frame closest to
+            the global mean camera center, not necessarily frame 0.
     """
+    selection_mode = canonicalize_wai_view_mode(selection_mode)
     if selection_mode != "anchor_support":
         try:
             from mapanything.tasks.ace.memory_selection import select_optimal_memory_indices  # pyright: ignore[reportMissingImports]
@@ -5589,10 +6013,22 @@ def select_memory_views(
 
     scene_center = centers.mean(axis=0).astype(np.float32) if centers is not None and len(centers) > 0 else None
 
+    ref_idx = int(np.argmin(np.linalg.norm(centers - scene_center.reshape(1, 3), axis=1)))
+
     if selection_mode == "anchor_support":
-        ref_idx = int(np.argmin(np.linalg.norm(centers - scene_center.reshape(1, 3), axis=1)))
         covis = _load_wai_pairwise_covisibility(dataset_path, scene_name, n_expected=len(centers))
         if covis is not None:
+            if covis_native_group_asb:
+                native_anchor, native_group = select_native_covis_group_anchor(
+                    centers,
+                    covis,
+                    n_memory,
+                    initial_index=ref_idx,
+                    candidate_anchor_count=covis_native_anchor_candidates,
+                )
+                _print_selection_coverage_stats(centers, native_group, "AnchorSupportNativeGroupEstimate")
+                return [int(native_anchor)], scene_center, [native_group]
+
             print(
                 f"[AnchorSupport] Selecting {n_memory} views with ref_idx={ref_idx}, "
                 f"alpha={covis_alpha}, eps={covis_eps}, tau={covis_tau}, ref_lambda={covis_ref_lambda}",
@@ -5616,6 +6052,8 @@ def select_memory_views(
                 far_anchor_budget=covis_far_anchor_budget,
                 coverage_beta=covis_coverage_beta,
                 candidate_pool_ratio=covis_candidate_pool_ratio,
+                ma_safe=covis_ma_safe_asb,
+                ma_safe_pool_ratio=covis_ma_safe_pool_ratio,
                 adaptive=covis_adaptive_asb,
                 adaptive_scene_stats=covis_adaptive_scene_stats,
                 adaptive_view_count=covis_adaptive_view_count,
@@ -5635,7 +6073,7 @@ def select_memory_views(
         indices = fps_select_views(centers, n_memory, force_include=[ref_idx])
         return indices, scene_center, [indices]
 
-    force_include = [0] if force_include_origin else None
+    force_include = [ref_idx] if force_include_origin else None
     indices = fps_select_views(centers, n_memory, force_include=force_include)
     return indices, scene_center, [indices]
 
@@ -5831,7 +6269,7 @@ def parse_args() -> ExtractionConfig:
         help=(
             'pooling 模式：'
             'bse=voxel hash + Otsu split；'
-            'pooled=旧 pooled baseline，强制 raw 点全局一次 voxel mean，忽略 BSE/Otsu/prepool/global_merge 开关；'
+            'pooled=map-anything 原版 pooled_GT baseline，强制 raw 点全局 SOR 后一次 voxel mean，忽略 BSE/Otsu/prepool/global_merge 开关；'
             'simple=底层简单 voxel mean；hybrid=全局 simple mean + 选择性 split。'
         ),
     )
@@ -5964,11 +6402,11 @@ def parse_args() -> ExtractionConfig:
         '--wai_view_mode',
         type=str,
         default='fps_flat',
-        choices=['fps_flat', 'original_multiview', 'anchor_support'],
+        choices=sorted(WAI_VIEW_MODE_ALIASES),
         help=(
-            'WAI 视图加载协议：fps_flat=每个 FPS index 只加载 1 张图，实际推理输入严格等于 FPS list；'
-            'original_multiview=复现 map-anything fps_memory.sh，dataset[idx] 一次返回 n_memory 个 covisibility views；'
-            'anchor_support=当前 Reference-aware Anchor+Support 选帧。'
+            'WAI 视图加载协议：fps_flat/fps_strict=每个 FPS index 只加载 1 张图，实际推理输入严格等于 FPS list；'
+            'original_multiview/first_fps_covis=复现 map-anything fps_memory.sh，首个 FPS anchor 一次返回 n_memory 个 covisibility views；'
+            'anchor_support/asb=当前 Reference-aware Anchor+Support 选帧。'
         ),
     )
     parser.add_argument(
@@ -6047,7 +6485,29 @@ def parse_args() -> ExtractionConfig:
         '--covis_candidate_pool_ratio',
         type=float,
         default=1.0,
-        help='anchor_support 内部候选池倍率；>1 时先多选候选再裁回 n_memory；<=0 表示使用全场景候选池。',
+        help='anchor_support 内部候选池倍率；>1 时先多选候选再裁回 n_memory；<=0 表示使用全场景候选池（仅建议诊断覆盖，不建议 MapAnything 单 batch 训练用）。',
+    )
+    parser.add_argument(
+        '--covis_ma_safe_asb',
+        action='store_true',
+        help='启用 MapAnything-safe ASB：先取 reference 高共视候选池，再在池内 coverage-greedy，避免全局低共视 batch。',
+    )
+    parser.add_argument(
+        '--covis_ma_safe_pool_ratio',
+        type=float,
+        default=3.0,
+        help='MapAnything-safe ASB 的 root-covis 候选池倍率；候选数约为 n_memory * ratio。',
+    )
+    parser.add_argument(
+        '--covis_native_group_asb',
+        action='store_true',
+        help='启用 native-group ASB：搜索覆盖较好的 WAI native covis anchor，然后由 dataset[anchor] 返回高共视 n_memory views。',
+    )
+    parser.add_argument(
+        '--covis_native_anchor_candidates',
+        type=int,
+        default=64,
+        help='native-group ASB 搜索的 FPS anchor 候选数量。',
     )
     parser.add_argument(
         '--covis_adaptive_asb',
@@ -6233,7 +6693,7 @@ def parse_args() -> ExtractionConfig:
         dataset_type=args.dataset_type,
         scene_name=args.scene_name,
         dataset_loader=args.dataset_loader,
-        wai_view_mode=args.wai_view_mode,
+        wai_view_mode=canonicalize_wai_view_mode(args.wai_view_mode),
         anchor_support_alpha=float(args.anchor_support_alpha),
         anchor_support_eps=float(args.anchor_support_eps),
         anchor_support_tau=float(args.anchor_support_tau),
@@ -6247,6 +6707,10 @@ def parse_args() -> ExtractionConfig:
         covis_far_anchor_budget=int(args.covis_far_anchor_budget),
         covis_coverage_beta=float(args.covis_coverage_beta),
         covis_candidate_pool_ratio=float(args.covis_candidate_pool_ratio),
+        covis_ma_safe_asb=bool(args.covis_ma_safe_asb),
+        covis_ma_safe_pool_ratio=float(args.covis_ma_safe_pool_ratio),
+        covis_native_group_asb=bool(args.covis_native_group_asb),
+        covis_native_anchor_candidates=int(args.covis_native_anchor_candidates),
         covis_adaptive_asb=bool(args.covis_adaptive_asb),
         covis_adaptive_scene_stats=not bool(args.covis_disable_adaptive_scene_stats),
         covis_adaptive_view_count=bool(args.covis_adaptive_view_count),
@@ -6284,6 +6748,9 @@ def parse_args() -> ExtractionConfig:
         config.use_otsu = False
         config.global_merge = False
         config.global_merge_voxel_size = None
+        if not config.enable_sor:
+            print("[Config] pool_mode=pooled: enabling original map-anything global SOR.", flush=True)
+        config.enable_sor = True
         if os.path.basename(config.output_path) == "memory_bse.pt":
             config.output_path = os.path.join(os.path.dirname(config.output_path), "memory_pooled.pt")
             print(
@@ -6386,7 +6853,10 @@ def main():
 
     # Load dataset
     print("[BSE Memory] Loading dataset...", flush=True)
-    if config.dataset_loader == "wai" and config.wai_view_mode == "original_multiview":
+    if config.dataset_loader == "wai" and (
+        config.wai_view_mode == "original_multiview"
+        or (config.wai_view_mode == "anchor_support" and config.covis_native_group_asb)
+    ):
         # Reproduce map-anything fps_memory.sh: with sequential WAI datasets,
         # dataset[idx] returns an anchor-centered covisibility sample of
         # num_views views. The first FPS anchor can therefore fill all memory
@@ -6443,6 +6913,10 @@ def main():
         covis_far_anchor_budget=config.covis_far_anchor_budget,
         covis_coverage_beta=config.covis_coverage_beta,
         covis_candidate_pool_ratio=config.covis_candidate_pool_ratio,
+        covis_ma_safe_asb=config.covis_ma_safe_asb,
+        covis_ma_safe_pool_ratio=config.covis_ma_safe_pool_ratio,
+        covis_native_group_asb=config.covis_native_group_asb,
+        covis_native_anchor_candidates=config.covis_native_anchor_candidates,
         covis_adaptive_asb=config.covis_adaptive_asb,
         covis_adaptive_scene_stats=config.covis_adaptive_scene_stats,
         covis_adaptive_view_count=config.covis_adaptive_view_count,
@@ -6617,6 +7091,10 @@ def main():
                             "far_anchor_budget": int(config.covis_far_anchor_budget),
                             "coverage_beta": float(config.covis_coverage_beta),
                             "candidate_pool_ratio": float(config.covis_candidate_pool_ratio),
+                            "ma_safe_asb": bool(config.covis_ma_safe_asb),
+                            "ma_safe_pool_ratio": float(config.covis_ma_safe_pool_ratio),
+                            "native_group_asb": bool(config.covis_native_group_asb),
+                            "native_anchor_candidates": int(config.covis_native_anchor_candidates),
                             "adaptive_asb": bool(config.covis_adaptive_asb),
                             "adaptive_scene_stats": bool(config.covis_adaptive_scene_stats),
                             "adaptive_view_count": bool(config.covis_adaptive_view_count),
@@ -6709,6 +7187,27 @@ def main():
     memory_gt_poses = memory_gt_poses[:probe_memory_views]
     loaded_view_records = loaded_view_records[:probe_memory_views]
     _write_loaded_view_records(loaded_view_records)
+    actual_loaded_indices = [
+        int(rec["actual_flat_idx"])
+        for rec in loaded_view_records
+        if isinstance(rec.get("actual_flat_idx"), (int, np.integer))
+    ]
+    if len(actual_loaded_indices) >= 2 and actual_loaded_indices != [int(i) for i in memory_indices[:len(actual_loaded_indices)]]:
+        print(
+            f"[SelectionCoverage] Recomputing coverage for actual loaded model-input views "
+            f"({len(actual_loaded_indices)} views).",
+            flush=True,
+        )
+        _export_selection_coverage_diagnostics(
+            train_dataset,
+            config.dataset_path,
+            scene_name,
+            actual_loaded_indices,
+            output_run_dir,
+            max_views=requested_memory_views,
+            adaptive_min_views=config.covis_adaptive_min_views,
+            tag="SelectionCoverage:LoadedViews",
+        )
     print(f"  [All {len(memory_views)} views loaded in {time.time()-t0:.1f}s]", flush=True)
 
     try:
@@ -6915,6 +7414,20 @@ def main():
     if scene_center_from_cameras is not None:
         pooled_scene_center = torch.as_tensor(scene_center_from_cameras, dtype=torch.float32)
 
+    selection_metadata = {
+        "selection_strategy": canonicalize_wai_view_mode(config.wai_view_mode),
+        "wai_view_mode": canonicalize_wai_view_mode(config.wai_view_mode),
+        "selected_memory_indices": [int(x) for x in memory_indices],
+        "memory_index_groups": [[int(x) for x in group] for group in memory_index_groups],
+        "dataset_num_views": int(dataset_num_views),
+        "scene_center_source": (
+            "mapanything.select_optimal_memory_indices.mean_all_camera_centers"
+            if canonicalize_wai_view_mode(config.wai_view_mode) != "anchor_support"
+            else "metadata.mean_all_camera_centers"
+        ),
+        "loaded_view_records": loaded_view_records,
+    }
+
     save_memory(
         config.output_path,
         result,
@@ -6924,6 +7437,7 @@ def main():
         layers_idx,
         scene_center=pooled_scene_center,
         config=config,
+        selection_metadata=selection_metadata,
     )
 
     # Save PLY for visualization

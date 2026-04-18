@@ -133,6 +133,12 @@ def estimate_memory_front_visibility(
     poses = all_poses.detach().float().cpu()
     if poses.ndim == 4 and poses.shape[1:] == (1, 4, 4):
         poses = poses[:, 0]
+    if poses.ndim == 4 and poses.shape[1:] == (1, 3, 4):
+        poses = poses[:, 0]
+    if poses.ndim == 3 and poses.shape[1:] == (3, 4):
+        bottom = torch.zeros(poses.shape[0], 1, 4, dtype=poses.dtype)
+        bottom[:, 0, 3] = 1.0
+        poses = torch.cat([poses, bottom], dim=1)
     if poses.ndim != 3 or poses.shape[1:] != (4, 4):
         return None
 
@@ -200,15 +206,39 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
             return torch.tensor(x, device=device)
 
         # Field mapping: extended extraction schema -> pooled training contract.
-        # `pooled_points` stays world-coordinate compatible; `points`/`points_norm`
-        # carry normalized coordinates for the full-pipeline norm path.
+        # For pool_mode=pooled, keep map-anything behavior exactly: pooled_points
+        # are world coordinates and normalization metadata is treated as trace-only.
+        # For BSE/hybrid extended files, keep the normalized-coordinate path unless
+        # bse_denorm_to_world=True is explicitly requested.
+        is_extended_pooled_world = str(payload.get("pool_mode", "")).lower() == "pooled"
         points_normalized = _to_tensor(payload.get("points_norm", payload["points"]))  # (raw-mu)/sigma
         points_world = _to_tensor(payload["points_world"]) if payload.get("points_world") is not None else None
         mu_tensor = _to_tensor(payload.get("normalization_mu", payload.get("mu")))  # centroid [3]
         sigma_val = payload.get("normalization_sigma", payload.get("sigma"))
         sigma_tensor = _to_tensor(sigma_val) if sigma_val is not None else None
 
-        if bse_denorm_to_world and points_world is not None:
+        if is_extended_pooled_world:
+            pooled_points = points_world if points_world is not None else _to_tensor(payload["pooled_points"])
+            _scene_center = payload.get("scene_center")
+            _scene_center_cam = payload.get("scene_center_cam")
+            if _scene_center is not None:
+                scene_center = _to_tensor(_scene_center)
+                _sc_src = "scene_center=pooled-compatible camera mean"
+            elif _scene_center_cam is not None:
+                scene_center = _to_tensor(_scene_center_cam)
+                _sc_src = "scene_center_cam=selected-view mean(camera_centers)"
+            else:
+                scene_center = mu_tensor.clone()
+                _sc_src = "mu=mean(pooled_points)"
+            norm_mu_out = None
+            norm_sigma_out = None
+            _logger.info(
+                "[LMC] Extended pooled WORLD path: pool_mode=pooled, using pooled_points/points_world directly. "
+                "scene_center=%s=(%.3f, %.3f, %.3f).",
+                _sc_src,
+                float(scene_center[0]), float(scene_center[1]), float(scene_center[2]),
+            )
+        elif bse_denorm_to_world and points_world is not None:
             pooled_points = points_world
             _scene_center = payload.get("scene_center")
             _scene_center_cam = payload.get("scene_center_cam")
@@ -316,10 +346,12 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
             raise ValueError(f"[LMC] BSE features contains Inf values.")
 
         # Map optional fields
-        pooled_colors = safe_to_device("colors")
+        pooled_colors = safe_to_device("pooled_colors")
+        if pooled_colors is None:
+            pooled_colors = safe_to_device("colors")
         # scene_center is set in the normalization/denorm branch above
         # (zeros for normalized, mu for denorm-to-world)
-        if not bse_denorm_to_world or sigma_tensor is None:
+        if (not is_extended_pooled_world) and (not bse_denorm_to_world or sigma_tensor is None):
             # Normalized path: scene_center=0, coords already centered
             scene_center = torch.zeros(3, device=device)
         # else: scene_center was already set to mu_tensor in the denorm branch above
@@ -645,7 +677,7 @@ def preflight_memory_features(
             _record(False, f"{name} is present but empty.")
             return None
         if name == "all_poses":
-            ok = value.ndim in (3, 4) and tuple(value.shape[-2:]) == (4, 4)
+            ok = value.ndim in (3, 4) and tuple(value.shape[-2:]) in ((3, 4), (4, 4))
         elif name == "all_intrinsics":
             ok = value.ndim in (3, 4) and tuple(value.shape[-2:]) == (3, 3)
         else:
