@@ -61,6 +61,7 @@ class BSEPooler:
         hybrid_split_min_std: float = 0.05,
         hybrid_min_cluster_size: int = 4,
         hybrid_min_split_points: int = 2,
+        cosine_chunk_size: int = 8192,
     ):
         """
         Args:
@@ -85,6 +86,8 @@ class BSEPooler:
                 consider splitting
             hybrid_min_split_points: Hybrid mode; minimum points in each Otsu
                 branch to accept the split
+            cosine_chunk_size: Chunk size for feature-to-cluster cosine
+                similarity. Smaller values reduce peak VRAM usage.
         """
         self.voxel_size = voxel_size
         self.use_otsu = use_otsu
@@ -96,6 +99,7 @@ class BSEPooler:
         self.hybrid_split_min_std = hybrid_split_min_std
         self.hybrid_min_cluster_size = hybrid_min_cluster_size
         self.hybrid_min_split_points = hybrid_min_split_points
+        self.cosine_chunk_size = max(1, int(cosine_chunk_size))
 
     def pool(
         self,
@@ -125,43 +129,43 @@ class BSEPooler:
                 - cluster_sizes: [N_pooled] number of points per cluster
         """
         cluster_ids = self._voxel_cluster_ids(points) if self.pool_mode == 'pooled' else self._voxel_hash(points)
+        features_fp32 = features if features.dtype == torch.float32 else features.float()
 
         if self.pool_mode in ('pooled', 'simple'):
             return self._scatter_mean_all(
                 points, features, colors, ray_dirs, cluster_ids,
                 camera_centers=camera_centers,
-                features_original=features.float(),
                 similarity=None,
             )
 
         if self.pool_mode == 'hybrid':
-            F_mean = self._scatter_mean(features.float(), cluster_ids)
-            sim = self._cosine_similarity(features.float(), F_mean[cluster_ids])
+            F_mean = self._scatter_mean(features_fp32, cluster_ids)
+            sim = self._cosine_similarity_by_cluster_ids(features_fp32, cluster_ids, F_mean)
             sub_ids, hybrid_stats = self._hybrid_selective_split(cluster_ids, sim)
             self._log_hybrid_stats(hybrid_stats, len(points))
+            del F_mean
             return self._scatter_mean_all(
                 points, features, colors, ray_dirs, sub_ids,
                 camera_centers=camera_centers,
-                features_original=features.float(),
                 similarity=sim
             )
 
         # Step 2: Compute cluster mean features (fp32 for stability)
-        F_mean = self._scatter_mean(features.float(), cluster_ids)
+        F_mean = self._scatter_mean(features_fp32, cluster_ids)
 
         # Step 3: Otsu adaptive thresholding
-        sim = self._cosine_similarity(features.float(), F_mean[cluster_ids])
+        sim = self._cosine_similarity_by_cluster_ids(features_fp32, cluster_ids, F_mean)
         tau = self._otsu_threshold(sim) if self.use_otsu else 0.90
 
         # Step 4: Binary split
         is_outlier = (sim < tau).long()
         sub_ids = cluster_ids * 2 + is_outlier
+        del F_mean
 
         # Step 5: Fine-grained pooling
         return self._scatter_mean_all(
             points, features, colors, ray_dirs, sub_ids,
             camera_centers=camera_centers,
-            features_original=features.float(),
             similarity=sim
         )
 
@@ -197,9 +201,43 @@ class BSEPooler:
 
     def _cosine_similarity(self, features: Tensor, cluster_means: Tensor) -> Tensor:
         """Compute cosine similarity between features and their cluster means."""
-        features_norm = torch.nn.functional.normalize(features, dim=1, eps=1e-6)
-        means_norm = torch.nn.functional.normalize(cluster_means, dim=1, eps=1e-6)
-        return (features_norm * means_norm).sum(dim=1)
+        if features.shape != cluster_means.shape:
+            raise ValueError(
+                f"features and cluster_means must have the same shape, got "
+                f"{tuple(features.shape)} vs {tuple(cluster_means.shape)}"
+            )
+
+        sim = torch.empty(features.shape[0], device=features.device, dtype=torch.float32)
+        for start in range(0, features.shape[0], self.cosine_chunk_size):
+            end = min(start + self.cosine_chunk_size, features.shape[0])
+            features_norm = torch.nn.functional.normalize(features[start:end].float(), dim=1, eps=1e-6)
+            means_norm = torch.nn.functional.normalize(cluster_means[start:end].float(), dim=1, eps=1e-6)
+            sim[start:end] = (features_norm * means_norm).sum(dim=1)
+        return sim
+
+    def _cosine_similarity_by_cluster_ids(
+        self,
+        features: Tensor,
+        cluster_ids: Tensor,
+        cluster_means: Tensor,
+    ) -> Tensor:
+        """Compute cosine similarity without materializing cluster_means[cluster_ids] for all rows."""
+        if features.shape[0] != cluster_ids.shape[0]:
+            raise ValueError(
+                f"features and cluster_ids must align on dim 0, got "
+                f"{tuple(features.shape)} vs {tuple(cluster_ids.shape)}"
+            )
+
+        means_norm = torch.nn.functional.normalize(cluster_means.float(), dim=1, eps=1e-6)
+        sim = torch.empty(features.shape[0], device=features.device, dtype=torch.float32)
+
+        for start in range(0, features.shape[0], self.cosine_chunk_size):
+            end = min(start + self.cosine_chunk_size, features.shape[0])
+            feat_chunk = torch.nn.functional.normalize(features[start:end].float(), dim=1, eps=1e-6)
+            mean_chunk = means_norm[cluster_ids[start:end]]
+            sim[start:end] = (feat_chunk * mean_chunk).sum(dim=1)
+
+        return sim
 
     def _otsu_threshold(self, sim: Tensor, check_unimodal: bool = True) -> float:
         """Otsu's method for adaptive threshold selection."""
@@ -340,7 +378,6 @@ class BSEPooler:
         ray_dirs: Tensor,
         cluster_ids: Tensor,
         camera_centers: Optional[Tensor] = None,
-        features_original: Optional[Tensor] = None,
         similarity: Optional[Tensor] = None
     ) -> Dict[str, Tensor]:
         """Pool all attributes by cluster mean with multiple ray strategies."""

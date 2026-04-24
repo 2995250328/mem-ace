@@ -18,7 +18,7 @@ import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
-from typing import Dict, List, Optional, Tuple, Protocol, Any
+from typing import Dict, List, Optional, Tuple, Protocol, Any, Sequence
 from dataclasses import dataclass, field
 
 # Add map-anything to path (optional - can use adapter instead)
@@ -738,7 +738,7 @@ def export_memory_views_visualization(
 # Schema Versioning
 # =============================================================================
 
-MEMORY_SCHEMA_VERSION = "1.4"  # Adds pooled_GT legacy aliases plus selection metadata.
+MEMORY_SCHEMA_VERSION = "1.5"  # Adds reference-contract metadata for C0/C1 preparation.
 CHECKPOINT_FILE = "extraction_checkpoint.json"
 
 # ace_depth/checkpoints/dinov2_vitl14_pretrain.pth → 常指向共享存储的软链接
@@ -865,6 +865,14 @@ class ExtractionConfig:
     scene_name: Optional[str] = None
     # 加载器：wai=MapAnything WAI 格式；ace=CamLocDatasetDINOv2（ACE 管线）
     dataset_loader: str = "wai"
+    # Reference contract. C0 keeps world-frame training as-is; C1 is reserved
+    # for later reference-coordinate learning experiments.
+    contract_mode: str = "C0"
+    # WAI memory extraction preprocessing. Keep this deterministic by default:
+    # only model normalization, no random resize/crop/color augmentation.
+    dataset_transform: str = "imgnorm"
+    dataset_data_norm_type: str = "dinov2"
+    dataset_aug_crop: int = 0
     # WAI view loading protocol:
     # fps_flat: dataset[idx] returns one view so actual model inputs match the
     #           original FPS-style memory list.
@@ -903,6 +911,26 @@ class ExtractionConfig:
     covis_gain_patience: int = 2
     covis_target_coverage_mean: float = 0.55
     covis_target_coverage_max: float = 2.0
+    covis_post_repair_asb: bool = False
+    covis_post_repair_max_swaps: int = 4
+    covis_post_repair_tail_percentile: float = 95.0
+    covis_post_repair_min_tail_improvement_m: float = 0.05
+    covis_post_repair_cluster_top_k: int = 3
+    # Phase 3: same-selected-set reference candidate gate before final
+    # MapAnything extraction. Keep disabled by default until validated.
+    enable_reference_policy_gate: bool = False
+    reference_policy_top_m: int = 4
+    reference_policy_light_min_selected_links: int = 2
+    reference_policy_probe_q90_m: float = 0.18
+    reference_policy_probe_max_m: float = 0.25
+    # Phase 4: offline clustered fallback package. Disabled by default so the
+    # validated single-memory path remains unchanged unless explicitly requested.
+    enable_cluster_fallback: bool = False
+    cluster_fallback_max_clusters: int = 2
+    cluster_fallback_max_split_depth: int = 2
+    cluster_fallback_min_cluster_size: int = 8
+    cluster_fallback_min_views_per_cluster: int = 8
+    cluster_fallback_min_positive_ratio: float = 0.02
     # 体素内多条视线方向池化：mean/dominant/first/all
     ray_pool_strategy: str = "mean"
     # 是否保存多种 ray 表示供对比（BSEPooler）
@@ -3240,6 +3268,96 @@ def two_pass_processing(
             os.remove(checkpoint_path)
 
 
+def _invert_c2w_pose(pose_c2w: torch.Tensor) -> torch.Tensor:
+    """Return world-to-camera transform for a camera-to-world pose."""
+    pose = pose_c2w.detach().cpu().float()
+    T_world_to_cam = torch.eye(4, dtype=torch.float32)
+    R = pose[:3, :3]
+    C = pose[:3, 3]
+    T_world_to_cam[:3, :3] = R.transpose(0, 1)
+    T_world_to_cam[:3, 3] = -R.transpose(0, 1).matmul(C)
+    return T_world_to_cam
+
+
+def _compute_points_ref_norm(points_ref: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """Normalize reference-frame points with the existing scalar-sigma convention."""
+    mu_ref = points_ref.mean(dim=0)
+    centered = points_ref - mu_ref.view(1, 3)
+    sigma_ref = torch.sqrt((centered.pow(2).mean(dim=0)).mean()).item()
+    if not np.isfinite(sigma_ref) or sigma_ref <= 1e-12:
+        sigma_ref = 1.0
+    return centered / float(sigma_ref), mu_ref.float(), float(sigma_ref)
+
+
+def _build_reference_contract_metadata(
+    points_world: torch.Tensor,
+    features_conditioned: torch.Tensor,
+    all_poses: Optional[torch.Tensor],
+    config: Optional[ExtractionConfig],
+    selection_metadata: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build C0/C1 reference-contract fields without changing default training."""
+    contract_mode = str(getattr(config, "contract_mode", "C0") if config is not None else "C0").upper()
+    if contract_mode not in {"C0", "C1"}:
+        contract_mode = "C0"
+
+    memory_mode = "single_forward"
+    reference_index = None
+    if selection_metadata:
+        memory_mode = str(selection_metadata.get("mode", selection_metadata.get("memory_mode", memory_mode)))
+        reference_index = selection_metadata.get("reference_index")
+        if reference_index is None:
+            selected = selection_metadata.get("selected_memory_indices")
+            if isinstance(selected, list) and selected:
+                reference_index = selected[0]
+    try:
+        reference_index = int(reference_index) if reference_index is not None else None
+    except (TypeError, ValueError):
+        reference_index = None
+
+    contract: Dict[str, Any] = {
+        "mode": memory_mode,
+        "contract_mode": contract_mode,
+        "features_conditioned": features_conditioned,
+        "points_ref": None,
+        "points_ref_norm": None,
+        "conditioning_reference": {
+            "reference_index": reference_index,
+            "T_ref_c2w_world": None,
+            "T_world_to_ref": None,
+        },
+        "normalization_ref": {
+            "mu_ref": None,
+            "sigma_ref": None,
+        },
+    }
+
+    if all_poses is None or all_poses.ndim != 3 or all_poses.shape[0] == 0:
+        return contract
+
+    T_ref_c2w_world = all_poses[0].detach().cpu().float()
+    T_world_to_ref = _invert_c2w_pose(T_ref_c2w_world)
+    R_ref = T_ref_c2w_world[:3, :3]
+    C_ref = T_ref_c2w_world[:3, 3]
+    points_world_f = points_world.detach().cpu().float()
+    # Row-vector form of P_ref = R_ref^T (P_world - C_ref).
+    points_ref = (points_world_f - C_ref.view(1, 3)).matmul(R_ref)
+    points_ref_norm, mu_ref, sigma_ref = _compute_points_ref_norm(points_ref)
+
+    contract["points_ref"] = points_ref
+    contract["points_ref_norm"] = points_ref_norm
+    contract["conditioning_reference"] = {
+        "reference_index": reference_index,
+        "T_ref_c2w_world": T_ref_c2w_world,
+        "T_world_to_ref": T_world_to_ref,
+    }
+    contract["normalization_ref"] = {
+        "mu_ref": mu_ref,
+        "sigma_ref": torch.as_tensor(float(sigma_ref), dtype=torch.float32),
+    }
+    return contract
+
+
 def save_memory(
     output_path: str,
     result: Dict[str, torch.Tensor],
@@ -3250,7 +3368,8 @@ def save_memory(
     scene_center: Optional[torch.Tensor] = None,
     config: Optional[ExtractionConfig] = None,
     selection_metadata: Optional[Dict[str, Any]] = None,
-) -> None:
+    return_memory_dict: bool = False,
+) -> Optional[Dict[str, Any]]:
     """
     Save memory to .pt file with extended schema and versioning.
 
@@ -3259,8 +3378,9 @@ def save_memory(
         - points: [N, 3] normalized coordinates, (points_world - mu) / sigma
         - points_norm: [N, 3] explicit normalized-coordinate alias
         - points_world: [N, 3] world coordinates
+        - points_ref / points_ref_norm: diagnostic reference-frame coordinates for C0, primary-ready for C1
         - pooled_points: [N, 3] legacy pooled-format alias, kept in world coordinates
-        - features / pooled_features: pooled feature tensor and legacy alias
+        - features / pooled_features / features_conditioned: pooled feature tensor and aliases
         - ray_dirs: Primary ray directions (based on ray_pool_strategy)
         - ray_dirs_mean: Mean + normalized (baseline)
         - ray_dirs_dominant: Dominant ray per cluster (optional)
@@ -3334,6 +3454,21 @@ def save_memory(
         memory_dict['all_intrinsics'] = all_intrinsics
     memory_dict['patch_stride'] = 14.0
 
+    contract_metadata = _build_reference_contract_metadata(
+        points_world,
+        features,
+        all_poses,
+        config,
+        selection_metadata,
+    )
+    memory_dict.update(contract_metadata)
+    if memory_dict.get('points_ref') is not None:
+        memory_dict['coordinate_space'].update({
+            'points_ref': 'reference_camera',
+            'points_ref_norm': 'reference_camera_normalized',
+            'conditioning_reference': 'camera_to_world/world_to_camera transforms for the first memory view',
+        })
+
     if config is not None:
         if config.pool_mode == "pooled":
             memory_dict['type'] = (
@@ -3365,18 +3500,29 @@ def save_memory(
             else None
         )
         memory_dict['voxel_size'] = float(config.voxel_size)
+        memory_dict['dataset_transform'] = str(config.dataset_transform)
+        memory_dict['dataset_data_norm_type'] = str(config.dataset_data_norm_type)
+        memory_dict['dataset_aug_crop'] = int(config.dataset_aug_crop)
+        memory_dict['contract_mode'] = str(config.contract_mode).upper()
         if config.scene_name is not None:
             memory_dict['scene'] = config.scene_name
 
     if selection_metadata:
         memory_dict['selection_metadata'] = selection_metadata
+        memory_dict['selection'] = selection_metadata
+        if "cluster_metadata" in selection_metadata:
+            memory_dict["cluster_metadata"] = selection_metadata["cluster_metadata"]
+        if "cluster_id" in selection_metadata:
+            memory_dict["cluster_id"] = int(selection_metadata["cluster_id"])
         for key in (
             'selection_strategy',
             'wai_view_mode',
             'selected_memory_indices',
+            'actual_loaded_view_indices',
             'memory_index_groups',
             'dataset_num_views',
             'scene_center_source',
+            'reference_index',
         ):
             if key in selection_metadata:
                 memory_dict[key] = selection_metadata[key]
@@ -3426,6 +3572,8 @@ def save_memory(
         )
     print(f"[Save] World points: {tuple(memory_dict['points_world'].shape)}")
     print(f"[Save] Normalized points: {tuple(memory_dict['points_norm'].shape)}")
+    if memory_dict.get('points_ref') is not None:
+        print(f"[Save] Reference points: {tuple(memory_dict['points_ref'].shape)} (contract={memory_dict['contract_mode']})")
     print("[Save] Legacy aliases: pooled_points=points_world, pooled_features=features")
     print(f"[Save] Ray representations: {[k for k in memory_dict.keys() if 'ray' in k or 'plucker' in k]}")
     if view_info is not None:
@@ -3433,6 +3581,9 @@ def save_memory(
         print(f"[Save] View info: camera_centers, camera_rotations, camera_intrinsics, plucker_main_rays")
         if 'all_scale_tokens' in memory_dict:
             print(f"[Save] Scale tokens: {memory_dict['all_scale_tokens'].shape}")
+    if return_memory_dict:
+        return memory_dict
+    return None
 
 
 def save_ply(
@@ -3577,6 +3728,9 @@ def load_dataset(
     scene_name: Optional[str] = None,
     n_views: int = 1,
     dataset_loader: str = "wai",
+    dataset_transform: str = "imgnorm",
+    dataset_data_norm_type: str = "dinov2",
+    dataset_aug_crop: int = 0,
 ):
     """
     Load dataset based on type and loader.
@@ -3627,8 +3781,14 @@ def load_dataset(
     # Common kwargs for BaseDataset
     base_kwargs = dict(
         resolution=518,
-        data_norm_type='dinov2',
-        transform='imgnorm',
+        data_norm_type=dataset_data_norm_type,
+        transform=dataset_transform,
+        aug_crop=int(dataset_aug_crop),
+    )
+    print(
+        f"[Dataset] WAI preprocessing: transform={dataset_transform}, "
+        f"data_norm_type={dataset_data_norm_type}, aug_crop={int(dataset_aug_crop)}",
+        flush=True,
     )
 
     if dataset_type == "7scenes":
@@ -4447,33 +4607,78 @@ def _selection_coverage_summary(
             positive = cov[np.isfinite(cov) & (cov > 0)]
             if positive.size:
                 tau = _percentile_or_default(positive, 95, float(np.nanmin(positive)))
-                adj = cov[np.ix_(selected_arr, selected_arr)] >= tau
-                seen_nodes = set()
-                components: List[int] = []
-                for start in range(len(selected_arr)):
-                    if start in seen_nodes:
-                        continue
-                    stack = [start]
-                    seen_nodes.add(start)
-                    comp_size = 0
-                    while stack:
-                        node = stack.pop()
-                        comp_size += 1
-                        for nxt in np.flatnonzero(adj[node]):
-                            nxt = int(nxt)
-                            if nxt not in seen_nodes:
-                                seen_nodes.add(nxt)
-                                stack.append(nxt)
-                    components.append(comp_size)
-                degrees = adj.sum(axis=1).astype(np.int64)
+
+                selected_covis = cov[np.ix_(selected_arr, selected_arr)].astype(np.float64, copy=True)
+                np.fill_diagonal(selected_covis, 0.0)
+                pair_vals = selected_covis[np.triu_indices(len(selected_arr), 1)]
+                pair_pos = pair_vals[np.isfinite(pair_vals) & (pair_vals > 0)]
+
+                def _graph_stats(adj: np.ndarray, tau_value: float) -> Dict[str, Any]:
+                    adj = np.asarray(adj, dtype=bool).copy()
+                    np.fill_diagonal(adj, False)
+                    seen_nodes = set()
+                    components: List[int] = []
+                    for start in range(len(selected_arr)):
+                        if start in seen_nodes:
+                            continue
+                        stack = [start]
+                        seen_nodes.add(start)
+                        comp_size = 0
+                        while stack:
+                            node = stack.pop()
+                            comp_size += 1
+                            for nxt in np.flatnonzero(adj[node]):
+                                nxt = int(nxt)
+                                if nxt not in seen_nodes:
+                                    seen_nodes.add(nxt)
+                                    stack.append(nxt)
+                        components.append(comp_size)
+                    degrees = adj.sum(axis=1).astype(np.int64)
+                    return {
+                        "tau": float(tau_value),
+                        "edge_count": int(adj.sum() // 2),
+                        "component_sizes": sorted([int(c) for c in components], reverse=True),
+                        "num_components": int(len(components)),
+                        "degree_min": int(degrees.min()) if degrees.size else 0,
+                        "degree_median": float(np.median(degrees)) if degrees.size else 0.0,
+                        "degree_max": int(degrees.max()) if degrees.size else 0,
+                        "isolated_count": int((degrees == 0).sum()) if degrees.size else 0,
+                    }
+
+                selected_pair_summary: Dict[str, Any] = {
+                    "num_pairs": int(pair_vals.size),
+                    "positive_edges": int(pair_pos.size),
+                    "positive_ratio": float(pair_pos.size / max(pair_vals.size, 1)),
+                    "q50": None,
+                    "q75": None,
+                    "q90": None,
+                    "q95": None,
+                    "max": None,
+                }
+                if pair_pos.size:
+                    selected_pair_summary.update({
+                        "q50": _q(pair_pos, 50),
+                        "q75": _q(pair_pos, 75),
+                        "q90": _q(pair_pos, 90),
+                        "q95": _q(pair_pos, 95),
+                        "max": float(np.nanmax(pair_pos)),
+                    })
+
+                graph_by_threshold: Dict[str, Any] = {
+                    "positive": _graph_stats(selected_covis > 0.0, 0.0),
+                    "global_q95": _graph_stats(selected_covis >= tau, tau),
+                }
+                if pair_pos.size:
+                    for qv in (50, 75, 90):
+                        qt = _q(pair_pos, qv)
+                        graph_by_threshold[f"selected_q{qv}"] = _graph_stats(selected_covis >= qt, qt)
+
+                out["selected_covisibility"] = selected_pair_summary
+                out["covis_graphs"] = graph_by_threshold
+                # Legacy key kept for compatibility with existing reports.
                 out["strong_covis_graph"] = {
                     "tau_q95": float(tau),
-                    "component_sizes": sorted([int(c) for c in components], reverse=True),
-                    "num_components": int(len(components)),
-                    "degree_min": int(degrees.min()) if degrees.size else 0,
-                    "degree_median": float(np.median(degrees)) if degrees.size else 0.0,
-                    "degree_max": int(degrees.max()) if degrees.size else 0,
-                    "isolated_count": int((degrees == 0).sum()) if degrees.size else 0,
+                    **graph_by_threshold["global_q95"],
                 }
 
     return out
@@ -4558,6 +4763,226 @@ def _export_selection_coverage_diagnostics(
         )
     except Exception as e:
         print(f"[{tag}] Diagnostics skipped ({type(e).__name__}: {e})", flush=True)
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert tensors / numpy scalars to JSON-serializable Python values."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return _json_safe(value.detach().cpu().item())
+        return _json_safe(value.detach().cpu().tolist())
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        val = float(value)
+        return val if np.isfinite(val) else None
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _error_distribution_summary(errors: Optional[List[float]]) -> Dict[str, Any]:
+    arr = np.asarray(errors or [], dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {
+            "count": 0,
+            "mean": None,
+            "median": None,
+            "q90": None,
+            "max": None,
+        }
+    return {
+        "count": int(arr.size),
+        "mean": float(np.mean(arr)),
+        "median": float(np.percentile(arr, 50)),
+        "q90": float(np.percentile(arr, 90)),
+        "max": float(np.max(arr)),
+    }
+
+
+def _write_memory_policy_report(
+    dataset: Any,
+    dataset_path: Optional[str],
+    scene_name: Optional[str],
+    selected_indices: List[int],
+    output_run_dir: str,
+    config: ExtractionConfig,
+    dataset_num_views: int,
+    memory_index_groups: List[List[int]],
+    loaded_view_records: List[Dict[str, Any]],
+    pose_ok: Optional[bool],
+    trans_errors: Optional[List[float]],
+    rot_errors: Optional[List[float]],
+    policy_decision: Optional[Dict[str, Any]] = None,
+    stop_info: Optional[Dict[str, Any]] = None,
+    selection_metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Write Phase-0 policy report without changing extraction behavior."""
+    try:
+        os.makedirs(output_run_dir, exist_ok=True)
+
+        centers = _extract_centers_from_flat_wai_dataset(dataset)
+        if centers is None and dataset_path is not None and scene_name:
+            centers = _extract_centers_from_wai_scene_meta(dataset_path, scene_name)
+        if centers is None and dataset_path is not None:
+            centers = _extract_centers_from_pose_dir(dataset_path, scene_name=scene_name)
+        if centers is None:
+            centers = _extract_centers_from_dataset_items(dataset)
+
+        coverage_stats = {
+            "mean": None,
+            "p95": None,
+            "max": None,
+        }
+        topology_stats = {
+            "num_components": None,
+            "isolated_count": None,
+            "degree_min": None,
+            "degree_median": None,
+        }
+        reference_risk_stats = {
+            "ref_dist_q50": None,
+            "ref_dist_q90": None,
+            "ref_dist_max": None,
+            "far_view_count": None,
+        }
+        selection_summary: Dict[str, Any] = {}
+
+        valid_selected = [int(i) for i in selected_indices if isinstance(i, (int, np.integer))]
+        if centers is not None and len(centers) > 0 and valid_selected:
+            covis = _load_wai_pairwise_covisibility(dataset_path, scene_name, n_expected=len(centers))
+            try:
+                selection_summary = _selection_coverage_summary(
+                    centers,
+                    valid_selected,
+                    ref_idx=valid_selected[0],
+                    covisibility=covis,
+                )
+                cov = selection_summary.get("coverage", {})
+                coverage_stats = {
+                    "mean": cov.get("mean"),
+                    "p95": cov.get("p95"),
+                    "max": cov.get("max"),
+                }
+                ref = selection_summary.get("ref_distance", {})
+                reference_risk_stats = {
+                    "ref_dist_q50": ref.get("median"),
+                    "ref_dist_q90": ref.get("p90"),
+                    "ref_dist_max": ref.get("max"),
+                    "far_view_count": None,
+                }
+                graph = selection_summary.get("covis_graphs", {}).get("positive")
+                if not graph:
+                    graph = selection_summary.get("strong_covis_graph", {})
+                if graph:
+                    topology_stats = {
+                        "num_components": graph.get("num_components"),
+                        "isolated_count": graph.get("isolated_count"),
+                        "degree_min": graph.get("degree_min"),
+                        "degree_median": graph.get("degree_median"),
+                        "edge_count": graph.get("edge_count"),
+                        "threshold": graph.get("tau"),
+                        "threshold_mode": "positive_covisibility" if "covis_graphs" in selection_summary else "legacy_strong_covis",
+                    }
+            except Exception as e:
+                selection_summary = {
+                    "error": f"{type(e).__name__}: {e}",
+                    "selected_indices": valid_selected,
+                }
+
+        trans_summary = _error_distribution_summary(trans_errors)
+        rot_summary = _error_distribution_summary(rot_errors)
+
+        report = {
+            "schema_version": "policy_report_v1",
+            "selection": {
+                "mode": canonicalize_wai_view_mode(config.wai_view_mode),
+                "memory_mode": "single_forward",
+                "contract_mode": str(config.contract_mode).upper(),
+                "selected_view_ids": [int(x) for x in valid_selected],
+                "reference_index": int(valid_selected[0]) if valid_selected else None,
+                "memory_index_groups": [[int(x) for x in group] for group in memory_index_groups],
+                "dataset_num_views": int(dataset_num_views),
+                "loaded_view_records": loaded_view_records,
+            },
+            "contract": {
+                "mode": "single_forward",
+                "contract_mode": str(config.contract_mode).upper(),
+                "default_training_target": "points_world" if str(config.contract_mode).upper() == "C0" else "points_ref_or_points_ref_norm",
+                "reference_index": int(valid_selected[0]) if valid_selected else None,
+            },
+            "coverage_stats": coverage_stats,
+            "topology_stats": topology_stats,
+            "reference_risk_stats": reference_risk_stats,
+            "probe_stats": {
+                "trans_q90": trans_summary["q90"],
+                "trans_max": trans_summary["max"],
+                "rot_q90": rot_summary["q90"],
+                "rot_max": rot_summary["max"],
+                "pose_eval_ok": pose_ok,
+                "translation_errors": trans_summary,
+                "rotation_errors": rot_summary,
+                "translation_ok_m": float(config.pose_eval_translation_ok_m),
+            },
+            "policy": policy_decision or {
+                "decision": "baseline",
+                "reason_codes": ["phase0_observation_only"],
+            },
+            "stop": stop_info or {
+                "stop_reason": None,
+                "final_view_count": int(len(valid_selected)),
+            },
+            "config": {
+                "dataset_loader": str(config.dataset_loader),
+                "dataset_type": str(config.dataset_type),
+                "scene_name": scene_name,
+                "n_memory": int(config.n_memory),
+                "contract_mode": str(config.contract_mode).upper(),
+                "wai_view_mode": canonicalize_wai_view_mode(config.wai_view_mode),
+                "covis_adaptive_asb": bool(config.covis_adaptive_asb),
+                "covis_adaptive_view_count": bool(config.covis_adaptive_view_count),
+                "covis_adaptive_min_views": int(config.covis_adaptive_min_views),
+                "covis_post_repair_asb": bool(config.covis_post_repair_asb),
+                "covis_post_repair_max_swaps": int(config.covis_post_repair_max_swaps),
+                "covis_post_repair_tail_percentile": float(config.covis_post_repair_tail_percentile),
+                "covis_post_repair_min_tail_improvement_m": float(config.covis_post_repair_min_tail_improvement_m),
+                "covis_post_repair_cluster_top_k": int(config.covis_post_repair_cluster_top_k),
+                "enable_reference_policy_gate": bool(config.enable_reference_policy_gate),
+                "reference_policy_top_m": int(config.reference_policy_top_m),
+                "reference_policy_light_min_selected_links": int(config.reference_policy_light_min_selected_links),
+                "reference_policy_probe_q90_m": float(config.reference_policy_probe_q90_m),
+                "reference_policy_probe_max_m": float(config.reference_policy_probe_max_m),
+                "enable_cluster_fallback": bool(config.enable_cluster_fallback),
+                "cluster_fallback_max_clusters": int(config.cluster_fallback_max_clusters),
+                "cluster_fallback_max_split_depth": int(config.cluster_fallback_max_split_depth),
+                "cluster_fallback_min_cluster_size": int(config.cluster_fallback_min_cluster_size),
+                "cluster_fallback_min_views_per_cluster": int(config.cluster_fallback_min_views_per_cluster),
+                "cluster_fallback_min_positive_ratio": float(config.cluster_fallback_min_positive_ratio),
+                "pose_prune_after_infer": bool(config.pose_prune_after_infer),
+                "use_model": str(config.use_model),
+            },
+            "selection_summary": selection_summary,
+        }
+        if selection_metadata and selection_metadata.get("repair") is not None:
+            report["repair"] = selection_metadata.get("repair")
+        if selection_metadata and selection_metadata.get("cluster_fallback") is not None:
+            report["cluster_fallback"] = selection_metadata.get("cluster_fallback")
+
+        report_path = os.path.join(output_run_dir, "memory_policy_report.json")
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(_json_safe(report), f, ensure_ascii=False, indent=2)
+        print(f"[PolicyReport] Saved: {report_path}", flush=True)
+    except Exception as e:
+        print(f"[PolicyReport] Skipped ({type(e).__name__}: {e})", flush=True)
 
 
 def _save_selection_coverage_topdown(
@@ -5161,6 +5586,436 @@ def _prune_candidate_pool_to_budget(
     return selected
 
 
+def _repair_fixed_budget_selected_set(
+    centers: np.ndarray,
+    covis_strength: np.ndarray,
+    selected: List[int],
+    root: int,
+    support_tau: float,
+    support_min_neighbors: int,
+    dist_to_ref: np.ndarray,
+    removal_order: Optional[List[int]] = None,
+    ref_dist_max_limit: Optional[float] = None,
+    ref_dist_mean_limit: Optional[float] = None,
+    max_swaps: int = 0,
+    tail_percentile: float = 95.0,
+    min_tail_improvement_m: float = 0.05,
+    target_coverage_max: Optional[float] = None,
+    cluster_top_k: int = 3,
+    log_tag: str = "CovisFPS:AnchorSupport",
+) -> Tuple[List[int], Dict[str, Any]]:
+    """Repair long-tail coverage holes by swapping low-value selected views.
+
+    This runs after the batch size is already fixed. It never changes the
+    selected count; it only replaces weak fillers/supports with candidates that
+    improve worst uncovered regions while preserving basic topology and
+    reference-risk constraints.
+    """
+    if max_swaps <= 0 or len(selected) <= 1:
+        return list(selected), {
+            "enabled": bool(max_swaps > 0),
+            "applied": False,
+            "swap_count": 0,
+            "swaps": [],
+        }
+
+    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+    n_total = int(centers.shape[0])
+    dist_to_ref = np.asarray(dist_to_ref, dtype=np.float64).reshape(-1)
+    root = int(root)
+
+    ordered: List[int] = []
+    seen = set()
+    for idx in selected:
+        idx = int(idx)
+        if 0 <= idx < n_total and idx not in seen:
+            ordered.append(idx)
+            seen.add(idx)
+    if root not in seen:
+        ordered.insert(0, root)
+        seen.add(root)
+
+    selected_set = set(ordered)
+    conn_threshold = float(support_tau) if np.isfinite(support_tau) and support_tau > 0 else 0.0
+    if removal_order is None:
+        removal_order = [int(idx) for idx in ordered if int(idx) != root]
+    else:
+        removal_seen = set()
+        merged_order: List[int] = []
+        for idx in removal_order:
+            idx = int(idx)
+            if idx != root and idx in selected_set and idx not in removal_seen:
+                merged_order.append(idx)
+                removal_seen.add(idx)
+        for idx in ordered:
+            idx = int(idx)
+            if idx != root and idx not in removal_seen:
+                merged_order.append(idx)
+                removal_seen.add(idx)
+        removal_order = merged_order
+    removal_cost = {
+        int(idx): float(pos) / float(max(len(removal_order), 1))
+        for pos, idx in enumerate(removal_order)
+    }
+
+    def _recompute_nearest(sel: List[int]) -> np.ndarray:
+        sel_arr = np.asarray(sel, dtype=np.int64)
+        return np.linalg.norm(centers[:, None, :] - centers[sel_arr][None, :, :], axis=2).min(axis=1)
+
+    def _recompute_nearest_and_owner(sel: List[int]) -> Tuple[np.ndarray, np.ndarray]:
+        sel_arr = np.asarray(sel, dtype=np.int64)
+        dmat = np.linalg.norm(centers[:, None, :] - centers[sel_arr][None, :, :], axis=2)
+        nearest_pos = np.argmin(dmat, axis=1)
+        return dmat[np.arange(dmat.shape[0]), nearest_pos], sel_arr[nearest_pos]
+
+    def _disconnected_count(sel: List[int]) -> int:
+        if len(sel) <= 1:
+            return 0
+        sel_arr = np.asarray(sel, dtype=np.int64)
+        count = 0
+        for idx in sel:
+            idx = int(idx)
+            if idx == root:
+                continue
+            others = sel_arr[sel_arr != idx]
+            if others.size == 0:
+                count += 1
+                continue
+            conn_vals = covis_strength[idx, others]
+            if conn_threshold > 0:
+                if int(np.sum(conn_vals >= conn_threshold)) < 1:
+                    count += 1
+            else:
+                finite_positive = conn_vals[np.isfinite(conn_vals) & (conn_vals > 0)]
+                if finite_positive.size == 0:
+                    count += 1
+        return count
+
+    def _selected_ref_mean(sel: List[int]) -> float:
+        sel_arr = np.asarray(sel, dtype=np.int64)
+        return float(np.nanmean(dist_to_ref[sel_arr])) if sel_arr.size else 0.0
+
+    def _graph_stats(sel: List[int]) -> Dict[str, Any]:
+        sel_arr = np.asarray(sel, dtype=np.int64)
+        if sel_arr.size <= 1:
+            return {
+                "edge_count": 0,
+                "positive_ratio": 0.0,
+                "component_count": int(sel_arr.size),
+                "isolated_count": int(sel_arr.size),
+            }
+        sub = covis_strength[np.ix_(sel_arr, sel_arr)].astype(np.float64)
+        np.fill_diagonal(sub, 0.0)
+        adj = np.isfinite(sub) & (sub > 0)
+        edge_count = int(np.triu(adj, k=1).sum())
+        degrees = adj.sum(axis=1).astype(np.int64)
+        visited = np.zeros(len(sel_arr), dtype=bool)
+        component_sizes: List[int] = []
+        for start in range(len(sel_arr)):
+            if visited[start]:
+                continue
+            stack = [start]
+            visited[start] = True
+            comp = 0
+            while stack:
+                cur = stack.pop()
+                comp += 1
+                nbrs = np.flatnonzero(adj[cur]).tolist()
+                for nxt in nbrs:
+                    if not visited[nxt]:
+                        visited[nxt] = True
+                        stack.append(int(nxt))
+            component_sizes.append(comp)
+        pair_count = max(int(len(sel_arr) * (len(sel_arr) - 1) / 2), 1)
+        return {
+            "edge_count": edge_count,
+            "positive_ratio": float(edge_count) / float(pair_count),
+            "component_count": int(len(component_sizes)),
+            "isolated_count": int((degrees == 0).sum()),
+        }
+
+    def _candidate_ref_excess(candidate: int, drop_idx: int, current_sel: List[int]) -> Tuple[float, float]:
+        candidate = int(candidate)
+        max_excess = 0.0
+        mean_excess = 0.0
+        if ref_dist_max_limit is not None and np.isfinite(ref_dist_max_limit) and ref_dist_max_limit > 0:
+            max_excess = max(0.0, float(dist_to_ref[candidate]) - float(ref_dist_max_limit))
+        if ref_dist_mean_limit is not None and np.isfinite(ref_dist_mean_limit) and ref_dist_mean_limit > 0:
+            kept = [int(i) for i in current_sel if int(i) != int(drop_idx)]
+            trial_mean = _selected_ref_mean(kept + [candidate])
+            mean_excess = max(0.0, float(trial_mean) - float(ref_dist_mean_limit))
+        return max_excess, mean_excess
+
+    current_nearest, current_owner = _recompute_nearest_and_owner(ordered)
+    initial_selected = list(ordered)
+    current_mean = float(np.nanmean(current_nearest)) if current_nearest.size else 0.0
+    current_p95 = _percentile_or_default(current_nearest, 95, current_mean)
+    current_max = float(np.nanmax(current_nearest)) if current_nearest.size else 0.0
+    initial_mean = float(current_mean)
+    initial_p95 = float(current_p95)
+    initial_max = float(current_max)
+    initial_graph = _graph_stats(ordered)
+    swap_records: List[Dict[str, Any]] = []
+    disconnected_limit = max(_disconnected_count(ordered), max(1, int(np.ceil(0.15 * float(max(len(ordered) - 1, 1))))))
+
+    swaps = 0
+    while swaps < int(max_swaps):
+        current_nearest, current_owner = _recompute_nearest_and_owner(ordered)
+        current_mean = float(np.nanmean(current_nearest)) if current_nearest.size else 0.0
+        current_p95 = _percentile_or_default(current_nearest, 95, current_mean)
+        current_max = float(np.nanmax(current_nearest)) if current_nearest.size else 0.0
+        if (
+            target_coverage_max is not None
+            and np.isfinite(target_coverage_max)
+            and target_coverage_max > 0
+            and current_max <= float(target_coverage_max)
+        ):
+            break
+
+        tail_threshold = _percentile_or_default(current_nearest, float(tail_percentile), current_max)
+        if np.isfinite(target_coverage_max) and target_coverage_max is not None and target_coverage_max > 0:
+            tail_threshold = max(tail_threshold, min(float(target_coverage_max), current_max))
+        if not np.isfinite(tail_threshold) or tail_threshold <= 0:
+            tail_threshold = current_p95 if np.isfinite(current_p95) and current_p95 > 0 else current_max
+        tail_idx = np.flatnonzero(current_nearest >= tail_threshold - 1e-9).astype(np.int64)
+        if tail_idx.size == 0:
+            tail_idx = np.argsort(-current_nearest)[: min(32, n_total)].astype(np.int64)
+        if tail_idx.size == 0:
+            break
+        owner_clusters: List[Tuple[int, np.ndarray]] = []
+        tail_owner = current_owner[tail_idx]
+        unique_owners = [int(idx) for idx in np.unique(tail_owner) if int(idx) != root]
+        for owner in unique_owners:
+            owner_mask = tail_owner == int(owner)
+            owner_idx = tail_idx[owner_mask]
+            if owner_idx.size == 0:
+                continue
+            owner_max = float(np.nanmax(current_nearest[owner_idx]))
+            owner_count = int(owner_idx.size)
+            owner_clusters.append((owner, owner_idx))
+        owner_clusters.sort(
+            key=lambda item: (
+                -float(np.nanmax(current_nearest[item[1]])),
+                -int(item[1].size),
+                removal_cost.get(int(item[0]), 1.0),
+            )
+        )
+        owner_clusters = owner_clusters[: max(1, int(cluster_top_k))]
+        worst_frame = int(owner_clusters[0][1][int(np.nanargmax(current_nearest[owner_clusters[0][1]]))])
+        tail_owner_order = [int(owner) for owner, _ in owner_clusters]
+
+        remaining = np.asarray([idx for idx in range(n_total) if idx not in selected_set], dtype=np.int64)
+        if remaining.size == 0:
+            break
+
+        selected_arr = np.asarray(ordered, dtype=np.int64)
+        conn = np.nanmax(covis_strength[np.ix_(remaining, selected_arr)], axis=1).astype(np.float64)
+        conn[~np.isfinite(conn)] = 0.0
+        if conn_threshold > 0:
+            strong_links = (covis_strength[np.ix_(remaining, selected_arr)] >= conn_threshold).sum(axis=1).astype(np.int64)
+            topo_mask = strong_links >= 1
+        else:
+            strong_links = (covis_strength[np.ix_(remaining, selected_arr)] > 0).sum(axis=1).astype(np.int64)
+            topo_mask = strong_links >= 1
+        remaining = remaining[topo_mask]
+        conn = conn[topo_mask]
+        strong_links = strong_links[topo_mask]
+        if remaining.size == 0:
+            print(
+                f"[{log_tag}] Post-repair stopped: no unselected candidates satisfy topology gate.",
+                flush=True,
+            )
+            break
+        d_worst = np.linalg.norm(centers[remaining] - centers[worst_frame][None, :], axis=1)
+        cluster_scores = np.zeros(len(remaining), dtype=np.float64)
+        cluster_local_positions: List[int] = []
+        cluster_local_seen = set()
+        finite_any = np.zeros(len(remaining), dtype=bool)
+        for cluster_rank, (owner, cluster_idx) in enumerate(owner_clusters):
+            d_cluster = np.linalg.norm(centers[remaining, None, :] - centers[cluster_idx][None, :, :], axis=2)
+            new_cluster_nearest = np.minimum(current_nearest[cluster_idx][None, :], d_cluster)
+            cluster_gain = (current_nearest[cluster_idx][None, :] - new_cluster_nearest).mean(axis=1)
+            cluster_max_reduction = float(np.nanmax(current_nearest[cluster_idx])) - np.nanmax(new_cluster_nearest, axis=1)
+            finite_gain = np.isfinite(cluster_gain) & np.isfinite(cluster_max_reduction)
+            if not finite_gain.any():
+                continue
+            finite_any |= finite_gain
+            cluster_gain[~finite_gain] = -np.inf
+            cluster_max_reduction[~finite_gain] = -np.inf
+            gain_max = float(np.nanmax(cluster_gain[np.isfinite(cluster_gain)])) if np.isfinite(cluster_gain).any() else 0.0
+            red_max = float(np.nanmax(cluster_max_reduction[np.isfinite(cluster_max_reduction)])) if np.isfinite(cluster_max_reduction).any() else 0.0
+            if not np.isfinite(gain_max) or gain_max <= 0:
+                gain_max = 1.0
+            if not np.isfinite(red_max) or red_max <= 0:
+                red_max = 1.0
+            cluster_weight = 1.0 / float(cluster_rank + 1)
+            cluster_scores += cluster_weight * (
+                3.0 * np.maximum(cluster_max_reduction, 0.0) / red_max
+                + 2.0 * np.maximum(cluster_gain, 0.0) / gain_max
+            )
+            cluster_center = centers[cluster_idx].mean(axis=0)
+            d_cluster_center = np.linalg.norm(centers[remaining] - cluster_center[None, :], axis=1)
+            local_radius = max(float(current_p95), float(target_coverage_max or 0.0), 0.75)
+            local_positions = np.flatnonzero(d_cluster_center <= local_radius).astype(np.int64)
+            if local_positions.size < 8:
+                local_positions = np.argsort(d_worst, kind="stable")[: min(16, len(remaining))].astype(np.int64)
+            else:
+                local_positions = local_positions[
+                    np.argsort(d_cluster_center[local_positions], kind="stable")[: min(16, len(local_positions))]
+                ]
+            for pos in local_positions.tolist():
+                ipos = int(pos)
+                if ipos not in cluster_local_seen:
+                    cluster_local_positions.append(ipos)
+                    cluster_local_seen.add(ipos)
+        if not finite_any.any():
+            break
+        conn_max = float(np.nanmax(conn)) if conn.size else 0.0
+        if not np.isfinite(conn_max) or conn_max <= 0:
+            conn_max = 1.0
+        candidate_score = cluster_scores + 0.15 * np.clip(conn / conn_max, 0.0, 1.0) + 0.05 * np.clip(strong_links.astype(np.float64), 0.0, 4.0)
+        shortlist_positions: List[int] = []
+        shortlist_seen = set()
+        for pos in np.argsort(-candidate_score, kind="stable")[: min(20, len(remaining))]:
+            ipos = int(pos)
+            if ipos not in shortlist_seen:
+                shortlist_positions.append(ipos)
+                shortlist_seen.add(ipos)
+        for pos in cluster_local_positions:
+            ipos = int(pos)
+            if ipos not in shortlist_seen:
+                shortlist_positions.append(ipos)
+                shortlist_seen.add(ipos)
+
+        best_trial = None
+        best_score = 0.0
+        iteration_removal_order = list(tail_owner_order)
+        iteration_removal_order.extend(int(idx) for idx in removal_order if int(idx) not in tail_owner_order)
+        max_ref_slack = max(0.35, 0.10 * float(ref_dist_max_limit or 0.0))
+        mean_ref_slack = max(0.15, 0.05 * float(ref_dist_mean_limit or 0.0))
+        for pos in shortlist_positions:
+            candidate = int(remaining[int(pos)])
+            cluster_proximity_bonus = 0.0
+            if np.isfinite(d_worst[int(pos)]):
+                cluster_proximity_bonus = 1.0 / max(float(d_worst[int(pos)]), 1e-3)
+            for drop_idx in iteration_removal_order:
+                drop_idx = int(drop_idx)
+                if drop_idx not in selected_set or drop_idx == root:
+                    continue
+                max_excess, mean_excess = _candidate_ref_excess(candidate, drop_idx, ordered)
+                if max_excess > max_ref_slack or mean_excess > mean_ref_slack:
+                    continue
+                trial = list(ordered)
+                trial_pos = trial.index(drop_idx)
+                trial[trial_pos] = candidate
+                trial_disc = _disconnected_count(trial)
+                if trial_disc > disconnected_limit:
+                    continue
+                trial_nearest, _ = _recompute_nearest_and_owner(trial)
+                trial_mean = float(np.nanmean(trial_nearest)) if trial_nearest.size else 0.0
+                trial_p95 = _percentile_or_default(trial_nearest, 95, trial_mean)
+                trial_max = float(np.nanmax(trial_nearest)) if trial_nearest.size else 0.0
+                improve_max = current_max - trial_max
+                improve_p95 = current_p95 - trial_p95
+                improve_mean = current_mean - trial_mean
+                owner_drop_bonus = 0.10 if drop_idx in tail_owner_order[:2] else 0.0
+                min_improve_max = float(min_tail_improvement_m) * (0.4 if owner_drop_bonus > 0 else 1.0)
+                min_improve_p95 = float(min_tail_improvement_m) * (0.2 if owner_drop_bonus > 0 else 0.5)
+                if improve_max < min_improve_max and improve_p95 < min_improve_p95:
+                    continue
+                score = (
+                    4.0 * max(improve_max, 0.0)
+                    + 2.0 * max(improve_p95, 0.0)
+                    + 0.5 * max(improve_mean, 0.0)
+                    + owner_drop_bonus
+                    + 0.01 * cluster_proximity_bonus
+                    - 0.30 * max_excess
+                    - 0.15 * mean_excess
+                    - 0.02 * float(removal_cost.get(drop_idx, 1.0))
+                )
+                if score > best_score + 1e-9:
+                    best_score = score
+                    best_trial = {
+                        "ordered": trial,
+                        "candidate": candidate,
+                        "drop_idx": drop_idx,
+                        "trial_max": trial_max,
+                        "trial_p95": trial_p95,
+                        "trial_mean": trial_mean,
+                        "max_excess": max_excess,
+                        "mean_excess": mean_excess,
+                        "cluster_owner_order": list(tail_owner_order),
+                    }
+
+        if best_trial is None:
+            print(
+                f"[{log_tag}] Post-repair stopped: no swap improved coverage tail "
+                f"(max={current_max:.4f}m, p95={current_p95:.4f}m, tail_q={tail_percentile:.1f}).",
+                flush=True,
+            )
+            break
+
+        ordered = list(best_trial["ordered"])
+        selected_set = set(ordered)
+        drop_idx = int(best_trial["drop_idx"])
+        candidate = int(best_trial["candidate"])
+        if drop_idx in removal_order:
+            removal_order[removal_order.index(drop_idx)] = candidate
+            removal_cost[candidate] = removal_cost.pop(drop_idx, 1.0)
+        swaps += 1
+        swap_records.append(
+            {
+                "swap_index": int(swaps),
+                "drop_idx": int(drop_idx),
+                "add_idx": int(candidate),
+                "coverage_max_before": float(current_max),
+                "coverage_max_after": float(best_trial["trial_max"]),
+                "coverage_p95_before": float(current_p95),
+                "coverage_p95_after": float(best_trial["trial_p95"]),
+                "coverage_mean_before": float(current_mean),
+                "coverage_mean_after": float(best_trial["trial_mean"]),
+                "ref_excess_max": float(best_trial["max_excess"]),
+                "ref_excess_mean": float(best_trial["mean_excess"]),
+                "cluster_owner_order": [int(x) for x in best_trial.get("cluster_owner_order", [])],
+            }
+        )
+        print(
+            f"[{log_tag}] Post-repair swap {swaps}/{int(max_swaps)}: drop={drop_idx} add={candidate}, "
+            f"coverage_max={current_max:.4f}->{float(best_trial['trial_max']):.4f}m, "
+            f"p95={current_p95:.4f}->{float(best_trial['trial_p95']):.4f}m, "
+            f"mean={current_mean:.4f}->{float(best_trial['trial_mean']):.4f}m, "
+            f"ref_excess(max/mean)={float(best_trial['max_excess']):.4f}/{float(best_trial['mean_excess']):.4f}",
+            flush=True,
+        )
+
+    final_nearest = _recompute_nearest(ordered)
+    final_graph = _graph_stats(ordered)
+    repair_info = {
+        "enabled": True,
+        "applied": bool(swap_records),
+        "swap_count": int(len(swap_records)),
+        "cluster_top_k": int(max(1, cluster_top_k)),
+        "tail_percentile": float(tail_percentile),
+        "min_tail_improvement_m": float(min_tail_improvement_m),
+        "selected_before": [int(x) for x in initial_selected],
+        "selected_after": [int(x) for x in ordered],
+        "coverage_before": {
+            "mean": float(initial_mean),
+            "p95": float(initial_p95),
+            "max": float(initial_max),
+        },
+        "coverage_after": {
+            "mean": float(np.nanmean(final_nearest)) if final_nearest.size else 0.0,
+            "p95": _percentile_or_default(final_nearest, 95, 0.0),
+            "max": float(np.nanmax(final_nearest)) if final_nearest.size else 0.0,
+        },
+        "graph_before": initial_graph,
+        "graph_after": final_graph,
+        "swaps": swap_records,
+    }
+    return ordered, repair_info
+
+
 def _native_covis_group_for_anchor(
     covis_strength: np.ndarray,
     root: int,
@@ -5274,6 +6129,844 @@ def select_native_covis_group_anchor(
     return best_anchor, best_group
 
 
+def select_anchor_support_reference(
+    centers: np.ndarray,
+    covisibility: np.ndarray,
+    initial_index: int,
+    candidate_count: int = 128,
+    log_tag: str = "CovisFPS:AnchorSupportRef",
+) -> int:
+    """
+    Choose a single-reference root for Anchor+Support.
+
+    The previous implementation always used the frame nearest to the global
+    camera-center mean. That is geometrically central, but on sparse WAI
+    covisibility graphs it can be a poor MapAnything reference. We keep the
+    search local to the scene center, then prefer the candidate with the
+    strongest local covisibility support.
+    """
+    centers = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+    n_total = int(centers.shape[0])
+    if n_total == 0:
+        return int(initial_index)
+
+    covis = np.asarray(covisibility)
+    covis_strength = np.maximum(covis[:n_total, :n_total], covis[:n_total, :n_total].T).astype(np.float64, copy=True)
+    np.fill_diagonal(covis_strength, 0.0)
+
+    scene_center = centers.mean(axis=0)
+    center_dist = np.linalg.norm(centers - scene_center.reshape(1, 3), axis=1).astype(np.float64)
+    candidate_count = max(1, min(int(candidate_count), n_total))
+    center_candidates = np.argsort(center_dist, kind="stable")[:candidate_count].astype(np.int64)
+    ref_idx = int(initial_index) if 0 <= int(initial_index) < n_total else int(center_candidates[0])
+    if ref_idx not in center_candidates:
+        center_candidates = np.concatenate(([ref_idx], center_candidates))
+
+    best_idx = ref_idx
+    best_key = (-1, -1.0, -1, -1.0, -float(center_dist[ref_idx]))
+    best_stats = None
+    ref_stats = None
+
+    for cand in center_candidates:
+        cand = int(cand)
+        dist = np.linalg.norm(centers - centers[cand], axis=1).astype(np.float64)
+        positive_dist = dist[np.isfinite(dist) & (dist > 0)]
+        local_limit = _percentile_or_default(positive_dist, 80, float(np.nanmax(positive_dist)) if positive_dist.size else 0.0)
+        local_mask = np.isfinite(dist) & (dist > 0)
+        if np.isfinite(local_limit) and local_limit > 0:
+            local_mask &= dist <= local_limit
+
+        row = covis_strength[cand].astype(np.float64, copy=False)
+        positive_mask = np.isfinite(row) & (row > 0)
+        local_positive = positive_mask & local_mask
+
+        local_pos_count = int(local_positive.sum())
+        local_pos_mean = float(row[local_positive].mean()) if local_pos_count > 0 else 0.0
+        pos_count = int(positive_mask.sum())
+        pos_mean = float(row[positive_mask].mean()) if pos_count > 0 else 0.0
+        key = (local_pos_count, local_pos_mean, pos_count, pos_mean, -float(center_dist[cand]))
+
+        stats = {
+            "idx": cand,
+            "center_dist": float(center_dist[cand]),
+            "local_pos_count": local_pos_count,
+            "local_pos_mean": local_pos_mean,
+            "pos_count": pos_count,
+            "pos_mean": pos_mean,
+        }
+        if cand == ref_idx:
+            ref_stats = stats
+        if key > best_key:
+            best_key = key
+            best_idx = cand
+            best_stats = stats
+
+    if best_stats is None:
+        best_stats = {
+            "idx": best_idx,
+            "center_dist": float(center_dist[best_idx]),
+            "local_pos_count": 0,
+            "local_pos_mean": 0.0,
+            "pos_count": 0,
+            "pos_mean": 0.0,
+        }
+    if ref_stats is None:
+        ref_stats = best_stats
+
+    print(
+        f"[{log_tag}] selected_ref={best_idx}, initial_ref={ref_idx}, candidates={len(center_candidates)}, "
+        f"selected_local_pos={best_stats['local_pos_count']}, selected_local_mean={best_stats['local_pos_mean']:.6g}, "
+        f"selected_pos={best_stats['pos_count']}, selected_pos_mean={best_stats['pos_mean']:.6g}, "
+        f"initial_local_pos={ref_stats['local_pos_count']}, initial_local_mean={ref_stats['local_pos_mean']:.6g}, "
+        f"initial_pos={ref_stats['pos_count']}, initial_pos_mean={ref_stats['pos_mean']:.6g}",
+        flush=True,
+    )
+    return int(best_idx)
+
+
+def _reference_candidate_stats(
+    selected_view_ids: Sequence[int],
+    centers: np.ndarray,
+    covisibility: Optional[np.ndarray],
+) -> List[Dict[str, Any]]:
+    """Cheap per-reference graph/geometry stats for a fixed selected set."""
+    selected = np.asarray([int(v) for v in selected_view_ids], dtype=np.int64)
+    if selected.size == 0:
+        return []
+
+    centers_np = np.asarray(centers, dtype=np.float64).reshape(-1, 3)
+    scene_center = centers_np.mean(axis=0)
+    if covisibility is None:
+        return [
+            {
+                "view_id": int(idx),
+                "center_dist": float(np.linalg.norm(centers_np[int(idx)] - scene_center)),
+                "selected_positive_links": 0,
+                "selected_positive_mean": 0.0,
+                "global_positive_links": 0,
+                "global_positive_mean": 0.0,
+            }
+            for idx in selected
+        ]
+
+    covis = np.asarray(covisibility)
+    covis_strength = np.maximum(covis, covis.T).astype(np.float64, copy=False)
+    np.fill_diagonal(covis_strength, 0.0)
+
+    rows: List[Dict[str, Any]] = []
+    for idx in selected:
+        row = covis_strength[int(idx)]
+        selected_row = row[selected]
+        selected_nonself = selected_row[selected != int(idx)]
+        selected_positive = selected_nonself[np.isfinite(selected_nonself) & (selected_nonself > 0)]
+        global_positive = row[np.isfinite(row) & (row > 0)]
+        rows.append(
+            {
+                "view_id": int(idx),
+                "center_dist": float(np.linalg.norm(centers_np[int(idx)] - scene_center)),
+                "selected_positive_links": int(selected_positive.size),
+                "selected_positive_mean": float(selected_positive.mean()) if selected_positive.size else 0.0,
+                "global_positive_links": int(global_positive.size),
+                "global_positive_mean": float(global_positive.mean()) if global_positive.size else 0.0,
+            }
+        )
+    return rows
+
+
+def _choose_reference_candidates_from_selected_set(
+    selected_view_ids: Sequence[int],
+    centers: np.ndarray,
+    covisibility: Optional[np.ndarray],
+    *,
+    current_reference: Optional[int],
+    top_m: int,
+) -> List[int]:
+    """Choose a small candidate set from the already selected views."""
+    selected = [int(v) for v in selected_view_ids]
+    if not selected:
+        return []
+
+    target = max(1, min(int(top_m), len(selected)))
+    rows = _reference_candidate_stats(selected, centers, covisibility)
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (
+            -int(r["selected_positive_links"]),
+            -float(r["selected_positive_mean"]),
+            -int(r["global_positive_links"]),
+            -float(r["global_positive_mean"]),
+            float(r["center_dist"]),
+        ),
+    )
+
+    ordered: List[int] = []
+    seen = set()
+    if current_reference is not None and int(current_reference) in selected:
+        ordered.append(int(current_reference))
+        seen.add(int(current_reference))
+    for row in rows_sorted:
+        view_id = int(row["view_id"])
+        if view_id in seen:
+            continue
+        ordered.append(view_id)
+        seen.add(view_id)
+        if len(ordered) >= target:
+            break
+    return ordered[:target]
+
+
+def _reorder_loaded_selection_for_reference(
+    reference_view_id: int,
+    raw_batches: Sequence[Any],
+    memory_views: Sequence[Dict[str, torch.Tensor]],
+    memory_gt_poses: Sequence[torch.Tensor],
+    loaded_view_records: Sequence[Dict[str, Any]],
+) -> Tuple[List[Any], List[Dict[str, torch.Tensor]], List[torch.Tensor], List[Dict[str, Any]]]:
+    """Move the chosen reference to slot 0 while keeping the selected set fixed."""
+    ref_pos = None
+    for i, rec in enumerate(loaded_view_records):
+        actual_idx = rec.get("actual_flat_idx")
+        fallback_idx = rec.get("selected_outer_fps_idx")
+        if actual_idx == reference_view_id or fallback_idx == reference_view_id:
+            ref_pos = int(i)
+            break
+    if ref_pos is None:
+        raise ValueError(f"Reference view id {reference_view_id} is not in the loaded selected set.")
+
+    order = [ref_pos] + [i for i in range(len(loaded_view_records)) if i != ref_pos]
+    re_raw = [raw_batches[i] for i in order]
+    re_views = [memory_views[i] for i in order]
+    re_gt = [memory_gt_poses[i] for i in order]
+    re_records: List[Dict[str, Any]] = []
+    for new_i, old_i in enumerate(order):
+        rec = dict(loaded_view_records[old_i])
+        rec["view_idx_original"] = int(old_i)
+        rec["view_idx"] = int(new_i)
+        rec["view_idx_reordered"] = int(new_i)
+        rec["is_reference"] = bool(new_i == 0)
+        re_records.append(rec)
+    return re_raw, re_views, re_gt, re_records
+
+
+def _clear_mapanything_stored_features(extractor: Any) -> None:
+    model = getattr(extractor, "model", None)
+    if model is None or not hasattr(model, "get_info_sharing_intermediate_features"):
+        return
+    try:
+        model.get_info_sharing_intermediate_features(clear=True)
+    except Exception:
+        pass
+
+
+def _run_reference_policy_probe(
+    extractor: Any,
+    candidate_refs: Sequence[int],
+    raw_batches: Sequence[Any],
+    memory_views: Sequence[Dict[str, torch.Tensor]],
+    memory_gt_poses: Sequence[torch.Tensor],
+    loaded_view_records: Sequence[Dict[str, Any]],
+    *,
+    translation_ok_m: float,
+    probe_q90_m: float,
+    probe_max_m: float,
+) -> List[Dict[str, Any]]:
+    """Run bounded MapAnything probes on reordered views for candidate refs."""
+    reports: List[Dict[str, Any]] = []
+    for ref_id in candidate_refs:
+        re_raw, re_views, re_gt, re_records = _reorder_loaded_selection_for_reference(
+            int(ref_id),
+            raw_batches,
+            memory_views,
+            memory_gt_poses,
+            loaded_view_records,
+        )
+        print(
+            f"[PolicyDecision] Probe candidate reference={int(ref_id)} "
+            f"with {len(re_views)} views in the fixed selected set.",
+            flush=True,
+        )
+        _clear_mapanything_stored_features(extractor)
+        with torch.no_grad():
+            predictions = extractor.model.infer(
+                re_views,
+                memory_efficient_inference=True,
+                use_amp=False,
+                ignore_depth_inputs=False,
+                ignore_pose_inputs=False,
+                ignore_calibration_inputs=False,
+            )
+        pose_ok, trans_errors, rot_errors = print_pose_prediction_vs_gt(
+            re_gt,
+            predictions,
+            translation_ok_m=translation_ok_m,
+            return_errors=True,
+        )
+        trans_summary = _error_distribution_summary(trans_errors)
+        rot_summary = _error_distribution_summary(rot_errors)
+        reports.append(
+            {
+                "reference_view_id": int(ref_id),
+                "pose_eval_ok": bool(pose_ok),
+                "probe_ok": bool(
+                    (trans_summary.get("q90") is not None and float(trans_summary["q90"]) < float(probe_q90_m))
+                    and (trans_summary.get("max") is not None and float(trans_summary["max"]) < float(probe_max_m))
+                ),
+                "thresholds": {
+                    "translation_ok_m": float(translation_ok_m),
+                    "probe_q90_m": float(probe_q90_m),
+                    "probe_max_m": float(probe_max_m),
+                },
+                "translation_summary": trans_summary,
+                "rotation_summary": rot_summary,
+                "loaded_view_records": re_records,
+                "selected_view_ids": [
+                    int(rec.get("actual_flat_idx", rec.get("selected_outer_fps_idx", -1)))
+                    for rec in re_records
+                ],
+            }
+        )
+    _clear_mapanything_stored_features(extractor)
+    return reports
+
+
+def _write_policy_decision_json(output_run_dir: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(output_run_dir, exist_ok=True)
+    out_path = os.path.join(output_run_dir, "policy_decision.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(_json_safe(payload), f, ensure_ascii=False, indent=2)
+    print(f"[PolicyDecision] Saved: {out_path}", flush=True)
+
+
+def _run_reference_policy_gate(
+    *,
+    centers: np.ndarray,
+    covisibility: np.ndarray,
+    selected_view_ids: Sequence[int],
+    current_reference: int,
+    raw_batches: Sequence[Any],
+    memory_views: Sequence[Dict[str, torch.Tensor]],
+    memory_gt_poses: Sequence[torch.Tensor],
+    loaded_view_records: Sequence[Dict[str, Any]],
+    extractor: Any,
+    config: ExtractionConfig,
+    output_run_dir: str,
+) -> Dict[str, Any]:
+    """Minimal Phase 3 gate on a fixed selected set."""
+    selected = [int(v) for v in selected_view_ids]
+    top_m = max(1, min(int(config.reference_policy_top_m), len(selected)))
+    candidate_stats = _reference_candidate_stats(selected, centers, covisibility)
+    stats_by_id = {int(row["view_id"]): row for row in candidate_stats}
+    candidate_refs = _choose_reference_candidates_from_selected_set(
+        selected,
+        centers,
+        covisibility,
+        current_reference=int(current_reference),
+        top_m=top_m,
+    )
+
+    light_results: List[Dict[str, Any]] = []
+    light_pass_refs: List[int] = []
+    n_selected = max(1, len(selected))
+    topology_component_limit = max(4, int(np.ceil(0.10 * float(n_selected))))
+    topology_isolated_limit = max(2, int(np.ceil(0.10 * float(max(n_selected - 1, 1)))))
+    coverage_mean_limit = (
+        float(config.covis_target_coverage_mean) * 1.5
+        if float(config.covis_target_coverage_mean) > 0
+        else float("inf")
+    )
+    coverage_max_limit = (
+        float(config.covis_target_coverage_max) * 1.5
+        if float(config.covis_target_coverage_max) > 0
+        else float("inf")
+    )
+    ref_q90_limit = (
+        max(float(config.covis_ref_dist_max_limit), float(config.covis_safe_dist_to_ref))
+        if float(config.covis_ref_dist_max_limit) > 0
+        else float("inf")
+    )
+    min_selected_links = max(1, int(config.reference_policy_light_min_selected_links))
+    strong_link_override = max(min_selected_links + 4, 6)
+
+    for ref_id in candidate_refs:
+        summary = _selection_coverage_summary(
+            centers,
+            selected,
+            ref_idx=int(ref_id),
+            covisibility=covisibility,
+        )
+        coverage = summary.get("coverage", {})
+        ref_distance = summary.get("ref_distance", {})
+        graph = summary.get("covis_graphs", {}).get("positive", {})
+        stats = stats_by_id.get(int(ref_id), {"view_id": int(ref_id)})
+        selected_positive_links = int(stats.get("selected_positive_links", 0))
+        ref_q90 = ref_distance.get("p90")
+        coverage_potential_ok = bool(
+            (coverage.get("mean") is None or float(coverage.get("mean")) <= coverage_mean_limit)
+            and (coverage.get("max") is None or float(coverage.get("max")) <= coverage_max_limit)
+        )
+        topology_potential_ok = bool(
+            (graph.get("num_components") is None or int(graph.get("num_components")) <= topology_component_limit)
+            and (graph.get("isolated_count") is None or int(graph.get("isolated_count")) <= topology_isolated_limit)
+        )
+        connectivity_potential_ok = bool(selected_positive_links >= min_selected_links)
+        ref_risk_potential_ok = bool(
+            connectivity_potential_ok and (
+                ref_q90 is None
+                or float(ref_q90) <= ref_q90_limit
+                or selected_positive_links >= strong_link_override
+            )
+        )
+        checks = {
+            "coverage_potential_ok": coverage_potential_ok,
+            "topology_potential_ok": topology_potential_ok,
+            "connectivity_potential_ok": connectivity_potential_ok,
+            "ref_risk_potential_ok": ref_risk_potential_ok,
+        }
+        # Coverage over the fixed selected set is reference-invariant and should
+        # stay diagnostic-only here; otherwise every candidate can be rejected
+        # for a batch-level issue that probe gate is meant to evaluate.
+        passed = bool(
+            topology_potential_ok
+            and connectivity_potential_ok
+            and ref_risk_potential_ok
+        )
+        if passed:
+            light_pass_refs.append(int(ref_id))
+        light_results.append(
+            {
+                "reference_view_id": int(ref_id),
+                "candidate_stats": stats,
+                "thresholds": {
+                    "coverage_mean_limit": None if not np.isfinite(coverage_mean_limit) else float(coverage_mean_limit),
+                    "coverage_max_limit": None if not np.isfinite(coverage_max_limit) else float(coverage_max_limit),
+                    "ref_q90_limit": None if not np.isfinite(ref_q90_limit) else float(ref_q90_limit),
+                    "min_selected_links": int(min_selected_links),
+                    "strong_link_override": int(strong_link_override),
+                },
+                "checks": checks,
+                "passed": passed,
+                "selection_summary": summary,
+            }
+        )
+
+    probe_reports: List[Dict[str, Any]] = []
+    if light_pass_refs:
+        probe_reports = _run_reference_policy_probe(
+            extractor,
+            light_pass_refs,
+            raw_batches,
+            memory_views,
+            memory_gt_poses,
+            loaded_view_records,
+            translation_ok_m=float(config.pose_eval_translation_ok_m),
+            probe_q90_m=float(config.reference_policy_probe_q90_m),
+            probe_max_m=float(config.reference_policy_probe_max_m),
+        )
+
+    selected_probe: Optional[Dict[str, Any]] = None
+    probe_pass = [row for row in probe_reports if bool(row.get("probe_ok"))]
+    if probe_pass:
+        selected_probe = min(
+            probe_pass,
+            key=lambda row: (
+                float(row["translation_summary"].get("mean", float("inf"))),
+                float(row["translation_summary"].get("q90", float("inf"))),
+                float(row["translation_summary"].get("max", float("inf"))),
+            ),
+        )
+        decision = "single_forward"
+        selected_reference = int(selected_probe["reference_view_id"])
+        reason_codes = ["probe_pass", "best_probe_mean_translation"]
+    else:
+        fallback_probe = min(
+            probe_reports,
+            key=lambda row: (
+                float(row["translation_summary"].get("mean", float("inf"))),
+                float(row["translation_summary"].get("q90", float("inf"))),
+                float(row["translation_summary"].get("max", float("inf"))),
+            ),
+        ) if probe_reports else None
+        selected_probe = fallback_probe
+        decision = "cluster_branch"
+        selected_reference = int(fallback_probe["reference_view_id"]) if fallback_probe is not None else int(current_reference)
+        reason_codes = ["no_candidate_passed_probe_gate"]
+        if fallback_probe is not None:
+            reason_codes.append("best_probe_fallback_saved_for_debug")
+
+    policy_decision = {
+        "schema_version": "policy_decision_v1",
+        "mode": decision,
+        "decision": decision,
+        "selected_reference": int(selected_reference),
+        "current_reference": int(current_reference),
+        "candidate_list": [int(x) for x in candidate_refs],
+        "light_gate": {
+            "candidate_count": int(len(candidate_refs)),
+            "passed_references": [int(x) for x in light_pass_refs],
+            "results": light_results,
+        },
+        "probe_gate": {
+            "candidate_count": int(len(probe_reports)),
+            "passed_references": [int(row["reference_view_id"]) for row in probe_pass],
+            "results": probe_reports,
+        },
+        "reason_codes": reason_codes,
+    }
+    _write_policy_decision_json(output_run_dir, policy_decision)
+    print(
+        f"[PolicyDecision] decision={decision}, current_ref={current_reference}, "
+        f"selected_ref={selected_reference}, candidates={candidate_refs}, "
+        f"light_pass={light_pass_refs}, probe_pass={[int(row['reference_view_id']) for row in probe_pass]}",
+        flush=True,
+    )
+    return policy_decision
+
+
+def _cluster_graph_stats(view_ids: Sequence[int], covisibility: np.ndarray) -> Dict[str, Any]:
+    """Compute lightweight connectivity stats for a proposed Phase-4 cluster."""
+    ids = [int(v) for v in view_ids]
+    if not ids:
+        return {"view_count": 0, "edge_count": 0, "positive_ratio": 0.0, "component_count": 0, "isolated_count": 0}
+    if len(ids) == 1:
+        return {"view_count": 1, "edge_count": 0, "positive_ratio": 0.0, "component_count": 1, "isolated_count": 1}
+
+    sub = np.asarray(covisibility, dtype=np.float64)[np.ix_(ids, ids)]
+    np.fill_diagonal(sub, 0.0)
+    adj = np.isfinite(sub) & (sub > 0)
+    edge_count = int(np.triu(adj, k=1).sum())
+    degrees = adj.sum(axis=1).astype(np.int64)
+    visited = np.zeros(len(ids), dtype=bool)
+    component_count = 0
+    for start in range(len(ids)):
+        if visited[start]:
+            continue
+        component_count += 1
+        stack = [start]
+        visited[start] = True
+        while stack:
+            cur = stack.pop()
+            for nxt in np.flatnonzero(adj[cur]).tolist():
+                nxt = int(nxt)
+                if not visited[nxt]:
+                    visited[nxt] = True
+                    stack.append(nxt)
+    pair_count = max(int(len(ids) * (len(ids) - 1) / 2), 1)
+    return {
+        "view_count": int(len(ids)),
+        "edge_count": int(edge_count),
+        "positive_ratio": float(edge_count) / float(pair_count),
+        "component_count": int(component_count),
+        "isolated_count": int((degrees == 0).sum()),
+    }
+
+
+def _cluster_is_light_feasible(stats: Dict[str, Any], config: ExtractionConfig) -> bool:
+    return bool(
+        int(stats.get("view_count", 0)) >= int(config.cluster_fallback_min_views_per_cluster)
+        and int(stats.get("component_count", 999999)) <= 1
+        and int(stats.get("isolated_count", 999999)) == 0
+        and float(stats.get("positive_ratio", 0.0)) >= float(config.cluster_fallback_min_positive_ratio)
+    )
+
+
+def _kmeans2_split_view_ids(view_ids: Sequence[int], centers: np.ndarray) -> Optional[Tuple[List[int], List[int]]]:
+    """Deterministic k=2 split on camera centers, avoiding an sklearn dependency."""
+    ids = [int(v) for v in view_ids]
+    if len(ids) < 2:
+        return None
+    pts = np.asarray(centers, dtype=np.float64)[ids]
+    centroid0 = pts[np.argmin(pts[:, 0])]
+    centroid1 = pts[int(np.argmax(np.linalg.norm(pts - centroid0.reshape(1, 3), axis=1)))]
+    labels = np.zeros(len(ids), dtype=np.int64)
+    for _ in range(16):
+        d0 = np.linalg.norm(pts - centroid0.reshape(1, 3), axis=1)
+        d1 = np.linalg.norm(pts - centroid1.reshape(1, 3), axis=1)
+        new_labels = (d1 < d0).astype(np.int64)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+        if np.any(labels == 0):
+            centroid0 = pts[labels == 0].mean(axis=0)
+        if np.any(labels == 1):
+            centroid1 = pts[labels == 1].mean(axis=0)
+    left = [ids[i] for i in range(len(ids)) if labels[i] == 0]
+    right = [ids[i] for i in range(len(ids)) if labels[i] == 1]
+    if not left or not right:
+        order = np.argsort(pts[:, 0])
+        mid = len(ids) // 2
+        left = [ids[int(i)] for i in order[:mid]]
+        right = [ids[int(i)] for i in order[mid:]]
+    if not left or not right:
+        return None
+    return left, right
+
+
+def _plan_cluster_fallback(
+    *,
+    centers: np.ndarray,
+    covisibility: np.ndarray,
+    selected_view_ids: Sequence[int],
+    config: ExtractionConfig,
+) -> Dict[str, Any]:
+    """Plan a bounded recursive k=2 cluster fallback over the selected set."""
+    selected = [int(v) for v in selected_view_ids]
+    clusters: List[Dict[str, Any]] = [{
+        "cluster_id": 0,
+        "parent_cluster_id": None,
+        "depth": 0,
+        "view_ids": selected,
+        "split_history": [],
+    }]
+    next_cluster_id = 1
+    max_clusters = max(1, int(config.cluster_fallback_max_clusters))
+    max_depth = max(0, int(config.cluster_fallback_max_split_depth))
+    min_cluster_size = max(1, int(config.cluster_fallback_min_cluster_size))
+
+    while len(clusters) < max_clusters:
+        for cluster in clusters:
+            stats = _cluster_graph_stats(cluster["view_ids"], covisibility)
+            cluster["light_stats"] = stats
+            cluster["light_feasible"] = _cluster_is_light_feasible(stats, config)
+
+        unsafe = [
+            c for c in clusters
+            if not bool(c.get("light_feasible"))
+            and int(c.get("depth", 0)) < max_depth
+            and len(c.get("view_ids", [])) >= min_cluster_size * 2
+        ]
+        if not unsafe:
+            break
+
+        target = max(unsafe, key=lambda c: len(c.get("view_ids", [])))
+        split = _kmeans2_split_view_ids(target["view_ids"], centers)
+        if split is None:
+            target["unsplittable_failure_reason"] = "kmeans2_empty_split"
+            break
+        left, right = split
+        if len(left) < min_cluster_size or len(right) < min_cluster_size:
+            target["unsplittable_failure_reason"] = "split_below_min_cluster_size"
+            break
+
+        clusters.remove(target)
+        parent_id = int(target["cluster_id"])
+        history = list(target.get("split_history", [])) + [parent_id]
+        clusters.extend([
+            {
+                "cluster_id": next_cluster_id,
+                "parent_cluster_id": parent_id,
+                "depth": int(target.get("depth", 0)) + 1,
+                "view_ids": left,
+                "split_history": history,
+            },
+            {
+                "cluster_id": next_cluster_id + 1,
+                "parent_cluster_id": parent_id,
+                "depth": int(target.get("depth", 0)) + 1,
+                "view_ids": right,
+                "split_history": history,
+            },
+        ])
+        next_cluster_id += 2
+
+    for cluster in clusters:
+        ids = [int(v) for v in cluster.get("view_ids", [])]
+        stats = _cluster_graph_stats(ids, covisibility)
+        feasible = _cluster_is_light_feasible(stats, config)
+        center = np.asarray(centers, dtype=np.float64)[ids].mean(axis=0) if ids else np.zeros(3, dtype=np.float64)
+        failure_reason = None
+        if not feasible:
+            if len(ids) < int(config.cluster_fallback_min_views_per_cluster):
+                failure_reason = "below_min_views_per_cluster"
+            elif int(stats.get("component_count", 0)) > 1:
+                failure_reason = "disconnected_covis_graph"
+            elif int(stats.get("isolated_count", 0)) > 0:
+                failure_reason = "isolated_views"
+            else:
+                failure_reason = "low_positive_ratio"
+        cluster["light_stats"] = stats
+        cluster["light_feasible"] = bool(feasible)
+        cluster["low_confidence"] = not bool(feasible)
+        cluster["unsplittable_failure_reason"] = cluster.get("unsplittable_failure_reason") or failure_reason
+        cluster["cluster_center_world"] = [float(x) for x in center.tolist()]
+
+    return {
+        "schema_version": "cluster_fallback_plan_v1",
+        "mode": "clustered",
+        "planner": "recursive_kmeans2_camera_centers",
+        "selected_view_ids": selected,
+        "limits": {
+            "max_num_clusters": int(config.cluster_fallback_max_clusters),
+            "max_split_depth": int(config.cluster_fallback_max_split_depth),
+            "min_cluster_size": int(config.cluster_fallback_min_cluster_size),
+            "min_views_per_cluster": int(config.cluster_fallback_min_views_per_cluster),
+            "min_positive_ratio": float(config.cluster_fallback_min_positive_ratio),
+        },
+        "clusters": clusters,
+    }
+
+
+def _write_cluster_fallback_json(output_run_dir: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(output_run_dir, exist_ok=True)
+    out_path = os.path.join(output_run_dir, "cluster_fallback_plan.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(_json_safe(payload), f, ensure_ascii=False, indent=2)
+    print(f"[ClusterFallback] Saved plan: {out_path}", flush=True)
+
+
+def _build_clustered_memory_package(
+    *,
+    output_path: str,
+    cluster_plan: Dict[str, Any],
+    centers: np.ndarray,
+    covisibility: np.ndarray,
+    raw_batches: Sequence[Any],
+    memory_views: Sequence[Dict[str, torch.Tensor]],
+    memory_gt_poses: Sequence[torch.Tensor],
+    loaded_view_records: Sequence[Dict[str, Any]],
+    extractor: Any,
+    pooler: BSEPooler,
+    config: ExtractionConfig,
+    layers_idx: Optional[List[Any]],
+    scene_center: Optional[torch.Tensor],
+) -> Optional[str]:
+    """Build sidecar cluster-local memories using the same single-domain constructor."""
+    id_to_pos: Dict[int, int] = {}
+    for pos, rec in enumerate(loaded_view_records):
+        actual_idx = rec.get("actual_flat_idx", rec.get("selected_outer_fps_idx"))
+        if isinstance(actual_idx, (int, np.integer)):
+            id_to_pos[int(actual_idx)] = int(pos)
+
+    package_clusters: List[Dict[str, Any]] = []
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    stem = Path(output_path).stem
+
+    for cluster in cluster_plan.get("clusters", []):
+        cluster_id = int(cluster.get("cluster_id", len(package_clusters)))
+        view_ids = [int(v) for v in cluster.get("view_ids", []) if int(v) in id_to_pos]
+        if not view_ids:
+            print(f"[ClusterFallback] Skip empty cluster {cluster_id}", flush=True)
+            continue
+        positions = [id_to_pos[v] for v in view_ids]
+        c_raw = [raw_batches[i] for i in positions]
+        c_views = []
+        for i in positions:
+            view = dict(memory_views[i])
+            # MapAnything infer validates input keys strictly; the compatibility
+            # alias is only added after infer for downstream pooling.
+            view.pop("depths", None)
+            c_views.append(view)
+        c_gt = [memory_gt_poses[i] for i in positions]
+        c_records = [loaded_view_records[i] for i in positions]
+
+        candidate_refs = _choose_reference_candidates_from_selected_set(
+            view_ids,
+            centers,
+            covisibility,
+            current_reference=view_ids[0],
+            top_m=1,
+        )
+        cluster_ref = int(candidate_refs[0]) if candidate_refs else int(view_ids[0])
+        c_raw, c_views, c_gt, c_records = _reorder_loaded_selection_for_reference(
+            cluster_ref,
+            c_raw,
+            c_views,
+            c_gt,
+            c_records,
+        )
+        print(
+            f"[ClusterFallback] Building cluster {cluster_id}: "
+            f"views={len(c_views)}, reference={cluster_ref}, low_confidence={bool(cluster.get('low_confidence'))}",
+            flush=True,
+        )
+
+        _clear_mapanything_stored_features(extractor)
+        with torch.no_grad():
+            predictions = extractor.model.infer(
+                c_views,
+                memory_efficient_inference=True,
+                use_amp=False,
+                ignore_depth_inputs=False,
+                ignore_pose_inputs=False,
+                ignore_calibration_inputs=False,
+            )
+        pose_ok, trans_errors, rot_errors = print_pose_prediction_vs_gt(
+            c_gt,
+            predictions,
+            translation_ok_m=float(config.pose_eval_translation_ok_m),
+            return_errors=True,
+        )
+        for view in c_views:
+            if 'depth_z' in view and 'depths' not in view:
+                view['depths'] = view['depth_z'].permute(0, 3, 1, 2)
+        stored_features = extractor.model.get_info_sharing_intermediate_features()
+        features_dict = extractor._process_saved_features(stored_features, len(c_views))
+        result, mu, sigma, view_info = two_pass_processing(
+            c_views,
+            c_raw,
+            features_dict,
+            pooler,
+            WelfordNormalizer(),
+            config,
+        )
+        cluster_metadata = {
+            "view_ids": view_ids,
+            "cluster_center_world": cluster.get("cluster_center_world"),
+            "low_confidence": bool(cluster.get("low_confidence", False)),
+            "failure_reason": cluster.get("unsplittable_failure_reason"),
+            "light_stats": cluster.get("light_stats", {}),
+            "pose_eval_ok": bool(pose_ok),
+            "pose_probe": {
+                "translation_summary": _error_distribution_summary(trans_errors),
+                "rotation_summary": _error_distribution_summary(rot_errors),
+            },
+        }
+        c_selected = [
+            int(rec.get("actual_flat_idx", rec.get("selected_outer_fps_idx", -1)))
+            for rec in c_records
+        ]
+        cluster_selection = {
+            "mode": "cluster_local",
+            "cluster_id": cluster_id,
+            "contract_mode": str(config.contract_mode).upper(),
+            "reference_index": int(cluster_ref),
+            "selection_strategy": "cluster_fallback",
+            "wai_view_mode": canonicalize_wai_view_mode(config.wai_view_mode),
+            "selected_memory_indices": c_selected,
+            "actual_loaded_view_indices": c_selected,
+            "memory_index_groups": [c_selected],
+            "dataset_num_views": len(centers),
+            "cluster_metadata": cluster_metadata,
+            "loaded_view_records": c_records,
+        }
+        cluster_path = os.path.join(output_dir, f"{stem}.cluster_{cluster_id:02d}.pt")
+        cluster_memory = save_memory(
+            cluster_path,
+            result,
+            mu,
+            sigma,
+            view_info,
+            layers_idx,
+            scene_center=scene_center,
+            config=config,
+            selection_metadata=cluster_selection,
+            return_memory_dict=True,
+        )
+        package_clusters.append(cluster_memory if cluster_memory is not None else {"cluster_metadata": cluster_metadata})
+
+    package = {
+        "schema_version": "clustered_memory_package_v1",
+        "mode": "clustered",
+        "contract_mode": str(config.contract_mode).upper(),
+        "policy": cluster_plan,
+        "clusters": package_clusters,
+    }
+    package_path = os.path.join(output_dir, f"{stem}.clustered.pt")
+    torch.save(package, package_path)
+    print(f"[ClusterFallback] Clustered memory package saved to: {package_path}", flush=True)
+    _clear_mapanything_stored_features(extractor)
+    return package_path
+
+
 def anchor_support_select_views(
     centers: np.ndarray,
     n_select: int,
@@ -5299,6 +6992,12 @@ def anchor_support_select_views(
     gain_patience: int = 2,
     target_coverage_mean: float = 0.55,
     target_coverage_max: float = 2.0,
+    post_repair: bool = False,
+    post_repair_max_swaps: int = 4,
+    post_repair_tail_percentile: float = 95.0,
+    post_repair_min_tail_improvement_m: float = 0.05,
+    post_repair_cluster_top_k: int = 3,
+    return_repair_info: bool = False,
     adaptive_scene_stats: bool = True,
     adaptive_allow_early_stop: bool = True,
     candidate_pool_ratio: float = 1.0,
@@ -5306,7 +7005,7 @@ def anchor_support_select_views(
     ma_safe: bool = False,
     ma_safe_pool_ratio: float = 3.0,
     log_tag: str = "CovisFPS:AnchorSupport",
-) -> List[int]:
+) -> Any:
     """
     Reference-aware Anchor+Support selection for one MapAnything forward.
 
@@ -5326,7 +7025,10 @@ def anchor_support_select_views(
         else min(max(target_select, int(np.ceil(float(target_select) * effective_candidate_pool_ratio))), n_total)
     )
     if target_select >= n_total:
-        return list(range(n_total))
+        ordered_all = list(range(n_total))
+        if return_repair_info:
+            return ordered_all, {"enabled": False, "applied": False, "swap_count": 0, "swaps": []}
+        return ordered_all
 
     covis = np.asarray(covisibility)
     if covis.shape[0] < n_total or covis.shape[1] < n_total:
@@ -5516,6 +7218,8 @@ def anchor_support_select_views(
             f"candidate_pool={len(candidate_order)}, pool_ratio={ma_safe_pool_ratio:.3f}",
             flush=True,
         )
+        if return_repair_info:
+            return ordered, {"enabled": False, "applied": False, "swap_count": 0, "swaps": []}
         return ordered
 
     if use_full_candidate_pool:
@@ -5579,6 +7283,8 @@ def anchor_support_select_views(
             f"ref_dist_max={float(np.nanmax(ordered_ref)):.4f}m, candidates={len(candidate_order)}",
             flush=True,
         )
+        if return_repair_info:
+            return ordered, {"enabled": False, "applied": False, "swap_count": 0, "swaps": []}
         return ordered
 
     selected_mask = np.zeros(n_total, dtype=bool)
@@ -5906,6 +7612,35 @@ def anchor_support_select_views(
         )
     else:
         ordered = ordered[:target_select]
+    if post_repair and ordered:
+        support_flat = [
+            int(support)
+            for anchor in anchors
+            for support in supports_by_anchor.get(anchor, [])
+        ]
+        removal_order = [int(idx) for idx in fillers]
+        removal_order.extend(int(idx) for idx in support_flat if int(idx) not in removal_order)
+        removal_order.extend(int(idx) for idx in anchors if int(idx) not in removal_order and int(idx) != root)
+        ordered, repair_info = _repair_fixed_budget_selected_set(
+            centers,
+            covis_strength,
+            ordered,
+            root,
+            support_tau,
+            support_min_neighbors,
+            dist_to_ref,
+            removal_order=removal_order,
+            ref_dist_max_limit=ref_dist_max_limit if use_ref_dist_max_limit else None,
+            ref_dist_mean_limit=ref_dist_mean_limit if use_ref_dist_mean_limit else None,
+            max_swaps=post_repair_max_swaps,
+            tail_percentile=post_repair_tail_percentile,
+            min_tail_improvement_m=post_repair_min_tail_improvement_m,
+            target_coverage_max=target_coverage_max if use_target_coverage_max else None,
+            cluster_top_k=post_repair_cluster_top_k,
+            log_tag=log_tag,
+        )
+    else:
+        repair_info = {"enabled": bool(post_repair), "applied": False, "swap_count": 0, "swaps": []}
     print(
         f"[{log_tag}] Final ordered views={len(ordered)}, anchors={len(anchors)}, "
         f"supports={sum(support_sizes)}, fillers={len(fillers)}, "
@@ -5938,6 +7673,8 @@ def anchor_support_select_views(
                 f"({len(ordered)} < {adaptive_min_views}).",
                 flush=True,
             )
+    if return_repair_info:
+        return ordered, repair_info
     return ordered
 
 
@@ -5976,7 +7713,13 @@ def select_memory_views(
     covis_gain_patience: int = 2,
     covis_target_coverage_mean: float = 0.55,
     covis_target_coverage_max: float = 2.0,
-) -> Tuple[List[int], Optional[np.ndarray], List[List[int]]]:
+    covis_post_repair_asb: bool = False,
+    covis_post_repair_max_swaps: int = 4,
+    covis_post_repair_tail_percentile: float = 95.0,
+    covis_post_repair_min_tail_improvement_m: float = 0.05,
+    covis_post_repair_cluster_top_k: int = 3,
+    return_selection_debug: bool = False,
+) -> Any:
     """
     选择 memory 视角（优先 FPS）。
 
@@ -5996,7 +7739,10 @@ def select_memory_views(
         try:
             from mapanything.tasks.ace.memory_selection import select_optimal_memory_indices  # pyright: ignore[reportMissingImports]
             memory_indices, scene_center = select_optimal_memory_indices(dataset, n_memory)
-            return memory_indices, scene_center, [memory_indices]
+            result = (memory_indices, scene_center, [memory_indices])
+            if return_selection_debug:
+                return (*result, {"repair": {"enabled": False, "applied": False, "swap_count": 0, "swaps": []}})
+            return result
         except ImportError:
             pass
 
@@ -6018,6 +7764,12 @@ def select_memory_views(
     if selection_mode == "anchor_support":
         covis = _load_wai_pairwise_covisibility(dataset_path, scene_name, n_expected=len(centers))
         if covis is not None:
+            ref_idx = select_anchor_support_reference(
+                centers,
+                covis,
+                initial_index=ref_idx,
+                candidate_count=max(64, min(len(centers), max(2 * int(n_memory), 128))),
+            )
             if covis_native_group_asb:
                 native_anchor, native_group = select_native_covis_group_anchor(
                     centers,
@@ -6027,14 +7779,17 @@ def select_memory_views(
                     candidate_anchor_count=covis_native_anchor_candidates,
                 )
                 _print_selection_coverage_stats(centers, native_group, "AnchorSupportNativeGroupEstimate")
-                return [int(native_anchor)], scene_center, [native_group]
+                result = ([int(native_anchor)], scene_center, [native_group])
+                if return_selection_debug:
+                    return (*result, {"repair": {"enabled": False, "applied": False, "swap_count": 0, "swaps": []}})
+                return result
 
             print(
                 f"[AnchorSupport] Selecting {n_memory} views with ref_idx={ref_idx}, "
                 f"alpha={covis_alpha}, eps={covis_eps}, tau={covis_tau}, ref_lambda={covis_ref_lambda}",
                 flush=True,
             )
-            indices = anchor_support_select_views(
+            indices_result = anchor_support_select_views(
                 centers,
                 n_memory,
                 covis,
@@ -6065,17 +7820,37 @@ def select_memory_views(
                 gain_patience=covis_gain_patience,
                 target_coverage_mean=covis_target_coverage_mean,
                 target_coverage_max=covis_target_coverage_max,
+                post_repair=covis_post_repair_asb,
+                post_repair_max_swaps=covis_post_repair_max_swaps,
+                post_repair_tail_percentile=covis_post_repair_tail_percentile,
+                post_repair_min_tail_improvement_m=covis_post_repair_min_tail_improvement_m,
+                post_repair_cluster_top_k=covis_post_repair_cluster_top_k,
+                return_repair_info=return_selection_debug,
             )
+            if return_selection_debug:
+                indices, repair_info = indices_result
+            else:
+                indices = indices_result
+                repair_info = {"enabled": False, "applied": False, "swap_count": 0, "swaps": []}
             groups = [indices]
             _print_selection_coverage_stats(centers, indices, "AnchorSupport")
-            return indices, scene_center, groups
+            result = (indices, scene_center, groups)
+            if return_selection_debug:
+                return (*result, {"repair": repair_info})
+            return result
         print("[AnchorSupport] Falling back to metadata FPS because covisibility is unavailable.", flush=True)
         indices = fps_select_views(centers, n_memory, force_include=[ref_idx])
-        return indices, scene_center, [indices]
+        result = (indices, scene_center, [indices])
+        if return_selection_debug:
+            return (*result, {"repair": {"enabled": False, "applied": False, "swap_count": 0, "swaps": []}})
+        return result
 
     force_include = [ref_idx] if force_include_origin else None
     indices = fps_select_views(centers, n_memory, force_include=force_include)
-    return indices, scene_center, [indices]
+    result = (indices, scene_center, [indices])
+    if return_selection_debug:
+        return (*result, {"repair": {"enabled": False, "applied": False, "swap_count": 0, "swaps": []}})
+    return result
 
 
 def convert_ace_tuple_to_dict(
@@ -6399,6 +8174,34 @@ def parse_args() -> ExtractionConfig:
         help='数据加载：wai=MapAnything WAI；ace=ACE CamLocDatasetDINOv2。',
     )
     parser.add_argument(
+        '--contract_mode',
+        type=str,
+        default='C0',
+        choices=['C0', 'C1', 'c0', 'c1'],
+        help='Reference contract：C0=默认 world-frame 训练路径；C1=预留 reference-coordinate learning 实验。',
+    )
+    parser.add_argument(
+        '--dataset_transform',
+        type=str,
+        default='imgnorm',
+        choices=['imgnorm', 'identity', 'colorjitter', 'colorjitter+grayscale+gaublur'],
+        help='WAI memory extraction 的图像 transform。默认 imgnorm，只做模型必要归一化；'
+        '不要在 memory 提取中使用 colorjitter 等随机增强。',
+    )
+    parser.add_argument(
+        '--dataset_data_norm_type',
+        type=str,
+        default='dinov2',
+        help='WAI memory extraction 的图像归一化类型；MapAnything/DINOv2 路线默认 dinov2。',
+    )
+    parser.add_argument(
+        '--dataset_aug_crop',
+        type=int,
+        default=0,
+        help='WAI memory extraction 的随机 aug_crop 像素范围。默认 0，禁用随机 resize/crop，'
+        '保证同一组选帧的 processed intrinsics 可复现。',
+    )
+    parser.add_argument(
         '--wai_view_mode',
         type=str,
         default='fps_flat',
@@ -6567,6 +8370,104 @@ def parse_args() -> ExtractionConfig:
         help='adaptive ASB coverage target：nearest-center max 小于等于该值才允许风险/低收益停止；<=0 关闭。',
     )
     parser.add_argument(
+        '--covis_post_repair_asb',
+        action='store_true',
+        help='启用 fixed-budget post-repair：在已选满的 ASB batch 上执行 coverage-hole swap，'
+        '优先替换低价值 filler/support 来压 long-tail uncovered 区域。',
+    )
+    parser.add_argument(
+        '--covis_post_repair_max_swaps',
+        type=int,
+        default=4,
+        help='fixed-budget post-repair 最多执行多少次 swap。',
+    )
+    parser.add_argument(
+        '--covis_post_repair_tail_percentile',
+        type=float,
+        default=95.0,
+        help='fixed-budget post-repair 聚焦的 coverage tail 分位数，例如 95 表示优先压 p95/max。',
+    )
+    parser.add_argument(
+        '--covis_post_repair_min_tail_improvement_m',
+        type=float,
+        default=0.05,
+        help='fixed-budget post-repair 接受 swap 的最小 tail 改善阈值（米）。',
+    )
+    parser.add_argument(
+        '--covis_post_repair_cluster_top_k',
+        type=int,
+        default=3,
+        help='fixed-budget post-repair 同时平衡多少个 top uncovered clusters。',
+    )
+    parser.add_argument(
+        '--enable_reference_policy_gate',
+        action='store_true',
+        default=False,
+        help='启用 Phase 3 最小 reference gate：在固定 selected set 上生成 Top-M reference 候选，'
+        '运行 light/probe gate，并输出 policy_decision.json。',
+    )
+    parser.add_argument(
+        '--reference_policy_top_m',
+        type=int,
+        default=4,
+        help='Phase 3 gate 的 Top-M reference 候选数量。',
+    )
+    parser.add_argument(
+        '--reference_policy_light_min_selected_links',
+        type=int,
+        default=2,
+        help='Phase 3 light gate：候选 reference 在当前 selected set 中至少需要多少条正共视连接。',
+    )
+    parser.add_argument(
+        '--reference_policy_probe_q90_m',
+        type=float,
+        default=0.18,
+        help='Phase 3 probe gate：translation q90 小于该值才视为 probe pass。',
+    )
+    parser.add_argument(
+        '--reference_policy_probe_max_m',
+        type=float,
+        default=0.25,
+        help='Phase 3 probe gate：translation max 小于该值才视为 probe pass。',
+    )
+    parser.add_argument(
+        '--enable_cluster_fallback',
+        action='store_true',
+        default=False,
+        help='启用 Phase 4 离线 clustered fallback：当 reference policy 判定 cluster_branch 时，'
+        '构建 cluster-local memory sidecar package。',
+    )
+    parser.add_argument(
+        '--cluster_fallback_max_clusters',
+        type=int,
+        default=2,
+        help='Phase 4 clustered fallback 最多生成多少个 cluster-local memories。',
+    )
+    parser.add_argument(
+        '--cluster_fallback_max_split_depth',
+        type=int,
+        default=2,
+        help='Phase 4 clustered fallback 递归二分最大深度。',
+    )
+    parser.add_argument(
+        '--cluster_fallback_min_cluster_size',
+        type=int,
+        default=8,
+        help='Phase 4 clustered fallback 单次 split 后每个子簇至少需要多少个 selected views。',
+    )
+    parser.add_argument(
+        '--cluster_fallback_min_views_per_cluster',
+        type=int,
+        default=8,
+        help='Phase 4 clustered fallback cluster-local memory 的最小视图数；不足会标记 low_confidence。',
+    )
+    parser.add_argument(
+        '--cluster_fallback_min_positive_ratio',
+        type=float,
+        default=0.02,
+        help='Phase 4 clustered fallback light feasibility 的最小正共视边比例。',
+    )
+    parser.add_argument(
         '--ray_pool_strategy',
         type=str,
         default='mean',
@@ -6693,6 +8594,10 @@ def parse_args() -> ExtractionConfig:
         dataset_type=args.dataset_type,
         scene_name=args.scene_name,
         dataset_loader=args.dataset_loader,
+        contract_mode=str(args.contract_mode).upper(),
+        dataset_transform=args.dataset_transform,
+        dataset_data_norm_type=args.dataset_data_norm_type,
+        dataset_aug_crop=int(args.dataset_aug_crop),
         wai_view_mode=canonicalize_wai_view_mode(args.wai_view_mode),
         anchor_support_alpha=float(args.anchor_support_alpha),
         anchor_support_eps=float(args.anchor_support_eps),
@@ -6721,6 +8626,22 @@ def parse_args() -> ExtractionConfig:
         covis_gain_patience=int(args.covis_gain_patience),
         covis_target_coverage_mean=float(args.covis_target_coverage_mean),
         covis_target_coverage_max=float(args.covis_target_coverage_max),
+        covis_post_repair_asb=bool(args.covis_post_repair_asb),
+        covis_post_repair_max_swaps=int(args.covis_post_repair_max_swaps),
+        covis_post_repair_tail_percentile=float(args.covis_post_repair_tail_percentile),
+        covis_post_repair_min_tail_improvement_m=float(args.covis_post_repair_min_tail_improvement_m),
+        covis_post_repair_cluster_top_k=int(args.covis_post_repair_cluster_top_k),
+        enable_reference_policy_gate=bool(args.enable_reference_policy_gate),
+        reference_policy_top_m=int(args.reference_policy_top_m),
+        reference_policy_light_min_selected_links=int(args.reference_policy_light_min_selected_links),
+        reference_policy_probe_q90_m=float(args.reference_policy_probe_q90_m),
+        reference_policy_probe_max_m=float(args.reference_policy_probe_max_m),
+        enable_cluster_fallback=bool(args.enable_cluster_fallback),
+        cluster_fallback_max_clusters=int(args.cluster_fallback_max_clusters),
+        cluster_fallback_max_split_depth=int(args.cluster_fallback_max_split_depth),
+        cluster_fallback_min_cluster_size=int(args.cluster_fallback_min_cluster_size),
+        cluster_fallback_min_views_per_cluster=int(args.cluster_fallback_min_views_per_cluster),
+        cluster_fallback_min_positive_ratio=float(args.cluster_fallback_min_positive_ratio),
         ray_pool_strategy=args.ray_pool_strategy,
         save_all_ray_strategies=args.save_all_ray_strategies,
         use_model=args.use_model,
@@ -6784,6 +8705,7 @@ def main():
     print(f"[BSE Memory] Scene: {scene_name} (type={dataset_type})")
     print(f"[BSE Memory] Output: {config.output_path}")
     print(f"[BSE Memory] N_MEMORY: {config.n_memory}, BSE: {config.use_bse}")
+    print(f"[BSE Memory] Contract mode: {config.contract_mode}")
     print(f"[BSE Memory] Pool mode: {config.pool_mode}")
     print(f"[BSE Memory] Prepool mode: {config.prepool_mode}")
     print(f"[BSE Memory] Voxel size: {config.voxel_size}, Otsu: {config.use_otsu}")
@@ -6870,12 +8792,27 @@ def main():
         f"[Data] WAI view mode: {config.wai_view_mode} (dataset_num_views={dataset_num_views})",
         flush=True,
     )
+    if config.dataset_loader == "wai":
+        print(
+            f"[Data] WAI preprocessing: transform={config.dataset_transform}, "
+            f"data_norm_type={config.dataset_data_norm_type}, aug_crop={config.dataset_aug_crop}",
+            flush=True,
+        )
+        if config.dataset_transform != "imgnorm" or int(config.dataset_aug_crop) != 0:
+            print(
+                "[Data] WARNING: memory extraction preprocessing is not deterministic no-augmentation "
+                "(expected transform=imgnorm and aug_crop=0). Use only for explicit augmentation ablations.",
+                flush=True,
+            )
     train_dataset = load_dataset(
         config.dataset_path,
         dataset_type=dataset_type,
         scene_name=scene_name,
         n_views=dataset_num_views,
         dataset_loader=config.dataset_loader,
+        dataset_transform=config.dataset_transform,
+        dataset_data_norm_type=config.dataset_data_norm_type,
+        dataset_aug_crop=config.dataset_aug_crop,
     )
     print(f"[BSE Memory] Train dataset: {len(train_dataset)} frames")
 
@@ -6894,7 +8831,7 @@ def main():
 
     # Select memory views
     print("[BSE Memory] Selecting memory views...", flush=True)
-    memory_indices, scene_center_from_cameras, memory_index_groups = select_memory_views(
+    memory_indices, scene_center_from_cameras, memory_index_groups, selection_debug = select_memory_views(
         train_dataset,
         probe_memory_views,
         dataset_path=config.dataset_path,
@@ -6928,6 +8865,12 @@ def main():
         covis_gain_patience=config.covis_gain_patience,
         covis_target_coverage_mean=config.covis_target_coverage_mean,
         covis_target_coverage_max=config.covis_target_coverage_max,
+        covis_post_repair_asb=config.covis_post_repair_asb,
+        covis_post_repair_max_swaps=config.covis_post_repair_max_swaps,
+        covis_post_repair_tail_percentile=config.covis_post_repair_tail_percentile,
+        covis_post_repair_min_tail_improvement_m=config.covis_post_repair_min_tail_improvement_m,
+        covis_post_repair_cluster_top_k=config.covis_post_repair_cluster_top_k,
+        return_selection_debug=True,
     )
     print(f"[BSE Memory] Selected {len(memory_indices)} views", flush=True)
     print(f"[Data] Selected memory indices ({len(memory_indices)}): {memory_indices}", flush=True)
@@ -7288,9 +9231,106 @@ def main():
                     dz[mask_invalid] = 0.0
                     v["depth_z"] = dz
 
+    policy_decision: Optional[Dict[str, Any]] = None
+    cluster_fallback_plan: Optional[Dict[str, Any]] = None
+    centers_for_policy: Optional[np.ndarray] = None
+    covis_for_policy: Optional[np.ndarray] = None
+    if (
+        bool(config.enable_reference_policy_gate)
+        and use_mapanything
+        and canonicalize_wai_view_mode(config.wai_view_mode) == "anchor_support"
+        and len(memory_views) >= 2
+    ):
+        policy_selected_indices = [
+            int(rec["actual_flat_idx"])
+            for rec in loaded_view_records
+            if isinstance(rec.get("actual_flat_idx"), (int, np.integer))
+        ]
+        if not policy_selected_indices:
+            policy_selected_indices = [int(x) for x in memory_indices if isinstance(x, (int, np.integer))]
+        current_reference = int(policy_selected_indices[0]) if policy_selected_indices else int(memory_indices[0])
+
+        centers_for_policy = _extract_centers_from_flat_wai_dataset(train_dataset)
+        if centers_for_policy is None and config.dataset_path is not None and scene_name:
+            centers_for_policy = _extract_centers_from_wai_scene_meta(config.dataset_path, scene_name)
+        if centers_for_policy is None and config.dataset_path is not None:
+            centers_for_policy = _extract_centers_from_pose_dir(config.dataset_path, scene_name=scene_name)
+        if centers_for_policy is None:
+            centers_for_policy = _extract_centers_from_dataset_items(train_dataset)
+
+        covis_for_policy = _load_wai_pairwise_covisibility(
+            config.dataset_path,
+            scene_name,
+            n_expected=len(centers_for_policy) if centers_for_policy is not None else None,
+        )
+        if centers_for_policy is not None and covis_for_policy is not None:
+            policy_decision = _run_reference_policy_gate(
+                centers=np.asarray(centers_for_policy, dtype=np.float64),
+                covisibility=np.asarray(covis_for_policy),
+                selected_view_ids=policy_selected_indices,
+                current_reference=current_reference,
+                raw_batches=raw_batches,
+                memory_views=memory_views,
+                memory_gt_poses=memory_gt_poses,
+                loaded_view_records=loaded_view_records,
+                extractor=extractor,
+                config=config,
+                output_run_dir=output_run_dir,
+            )
+            chosen_reference = int(policy_decision.get("selected_reference", current_reference))
+            if chosen_reference != current_reference:
+                raw_batches, memory_views, memory_gt_poses, loaded_view_records = _reorder_loaded_selection_for_reference(
+                    chosen_reference,
+                    raw_batches,
+                    memory_views,
+                    memory_gt_poses,
+                    loaded_view_records,
+                )
+                memory_indices = [
+                    int(rec.get("actual_flat_idx", rec.get("selected_outer_fps_idx", idx)))
+                    for idx, rec in enumerate(loaded_view_records)
+                ]
+                print(
+                    f"[PolicyDecision] Reordered final extraction batch: "
+                    f"reference {current_reference} -> {chosen_reference}",
+                    flush=True,
+                )
+                _write_loaded_view_records(loaded_view_records)
+            if policy_decision.get("decision") == "cluster_branch":
+                if bool(config.enable_cluster_fallback):
+                    cluster_fallback_plan = _plan_cluster_fallback(
+                        centers=np.asarray(centers_for_policy, dtype=np.float64),
+                        covisibility=np.asarray(covis_for_policy),
+                        selected_view_ids=policy_selected_indices,
+                        config=config,
+                    )
+                    cluster_fallback_plan["trigger_policy_decision"] = policy_decision
+                    _write_cluster_fallback_json(output_run_dir, cluster_fallback_plan)
+                    print(
+                        f"[ClusterFallback] cluster_branch predicted; planned "
+                        f"{len(cluster_fallback_plan.get('clusters', []))} cluster-local memories.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[PolicyDecision] cluster_branch predicted, but Phase 4 clustered extraction "
+                        "is disabled; continuing with the best single-forward fallback "
+                        f"reference {chosen_reference} for debugging only.",
+                        flush=True,
+                    )
+        else:
+            print(
+                "[PolicyDecision] Skipped reference policy gate because centers or covisibility "
+                "were unavailable.",
+                flush=True,
+            )
+
     # Extract features
     print("[BSE Memory] Extracting features...", flush=True)
 
+    pose_ok: Optional[bool] = None
+    trans_errors: List[float] = []
+    rot_errors: List[float] = []
     if use_mapanything:
         # MapAnything must run as one batch so all features share the same
         # internal reference frame.
@@ -7304,7 +9344,7 @@ def main():
                 ignore_calibration_inputs=False
             )
 
-        pose_ok, trans_errors, _rot_errors = print_pose_prediction_vs_gt(
+        pose_ok, trans_errors, rot_errors = print_pose_prediction_vs_gt(
             memory_gt_poses,
             predictions,
             translation_ok_m=config.pose_eval_translation_ok_m,
@@ -7371,7 +9411,7 @@ def main():
                         ignore_pose_inputs=False,
                         ignore_calibration_inputs=False,
                     )
-                pose_ok, trans_errors, _rot_errors = print_pose_prediction_vs_gt(
+                pose_ok, trans_errors, rot_errors = print_pose_prediction_vs_gt(
                     memory_gt_poses,
                     predictions,
                     translation_ok_m=config.pose_eval_translation_ok_m,
@@ -7414,10 +9454,24 @@ def main():
     if scene_center_from_cameras is not None:
         pooled_scene_center = torch.as_tensor(scene_center_from_cameras, dtype=torch.float32)
 
+    policy_selected_indices: List[int] = []
+    for rec in loaded_view_records:
+        actual_idx = rec.get("actual_flat_idx")
+        if isinstance(actual_idx, (int, np.integer)):
+            policy_selected_indices.append(int(actual_idx))
+    if not policy_selected_indices:
+        policy_selected_indices = [int(x) for x in memory_indices if isinstance(x, (int, np.integer))]
+    reference_index = int(policy_selected_indices[0]) if policy_selected_indices else None
+
     selection_metadata = {
+        "mode": "single_forward",
+        "contract_mode": str(config.contract_mode).upper(),
+        "reference_index": reference_index,
+        "policy_decision": policy_decision,
         "selection_strategy": canonicalize_wai_view_mode(config.wai_view_mode),
         "wai_view_mode": canonicalize_wai_view_mode(config.wai_view_mode),
         "selected_memory_indices": [int(x) for x in memory_indices],
+        "actual_loaded_view_indices": [int(x) for x in policy_selected_indices],
         "memory_index_groups": [[int(x) for x in group] for group in memory_index_groups],
         "dataset_num_views": int(dataset_num_views),
         "scene_center_source": (
@@ -7425,8 +9479,14 @@ def main():
             if canonicalize_wai_view_mode(config.wai_view_mode) != "anchor_support"
             else "metadata.mean_all_camera_centers"
         ),
+        "dataset_transform": str(config.dataset_transform),
+        "dataset_data_norm_type": str(config.dataset_data_norm_type),
+        "dataset_aug_crop": int(config.dataset_aug_crop),
         "loaded_view_records": loaded_view_records,
+        "repair": selection_debug.get("repair", {}) if isinstance(selection_debug, dict) else {},
     }
+    if cluster_fallback_plan is not None:
+        selection_metadata["cluster_fallback"] = cluster_fallback_plan
 
     save_memory(
         config.output_path,
@@ -7437,6 +9497,47 @@ def main():
         layers_idx,
         scene_center=pooled_scene_center,
         config=config,
+        selection_metadata=selection_metadata,
+    )
+
+    if (
+        cluster_fallback_plan is not None
+        and use_mapanything
+        and centers_for_policy is not None
+        and covis_for_policy is not None
+    ):
+        package_path = _build_clustered_memory_package(
+            output_path=config.output_path,
+            cluster_plan=cluster_fallback_plan,
+            centers=np.asarray(centers_for_policy, dtype=np.float64),
+            covisibility=np.asarray(covis_for_policy),
+            raw_batches=raw_batches,
+            memory_views=memory_views,
+            memory_gt_poses=memory_gt_poses,
+            loaded_view_records=loaded_view_records,
+            extractor=extractor,
+            pooler=pooler,
+            config=config,
+            layers_idx=layers_idx,
+            scene_center=pooled_scene_center,
+        )
+        if package_path is not None:
+            selection_metadata["cluster_fallback"]["package_path"] = package_path
+
+    _write_memory_policy_report(
+        train_dataset,
+        config.dataset_path,
+        scene_name,
+        policy_selected_indices,
+        output_run_dir,
+        config,
+        dataset_num_views,
+        memory_index_groups,
+        loaded_view_records,
+        pose_ok,
+        trans_errors,
+        rot_errors,
+        policy_decision=policy_decision,
         selection_metadata=selection_metadata,
     )
 

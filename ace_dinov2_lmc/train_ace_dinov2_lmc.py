@@ -56,6 +56,69 @@ print("train_ace_dinov2_lmc: ready, configuring logging.", flush=True)
 logging.basicConfig(level=logging.INFO)
 _logger = logging.getLogger(__name__)
 
+TRAIN_PRESET_DEFAULTS = {
+    "memory_compare_ace_g_v1": {
+        "use_lmc": True,
+        "lmc_flow": "ace_g",
+        "lmc_memory_preflight_strict": True,
+        "lmc_scene_center_max_distance": 4.0,
+        "lmc_head_mean_max_shift": 4.0,
+        "bse_denorm_to_world": True,
+        "ace_g_fusion_in_s2": True,
+        "ace_g_cross_iter_eval": True,
+        "buffer_batch_size": 1,
+        "samples_per_image": 384,
+        "s1_batch_size": 16,
+        "s1_use_buffer": True,
+        "s1_loss_mode": "sample_per_image",
+        "s1_buffer_refill_mode": "full",
+        "experiment_root": (Path(__file__).parent / "04_evaluation" / "train_compare").resolve(),
+        "experiment_subdir": "memory_pooled_vs_asb",
+    },
+}
+
+
+def _collect_cli_flags(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    cli_flags = set()
+    for token in argv:
+        if token == "--":
+            break
+        if not token.startswith("--"):
+            continue
+        cli_flags.add(token.split("=", 1)[0])
+    return cli_flags
+
+
+def _apply_train_preset(args):
+    preset = getattr(args, "train_preset", "none")
+    if preset == "none":
+        return
+
+    preset_defaults = TRAIN_PRESET_DEFAULTS.get(preset)
+    if preset_defaults is None:
+        _logger.warning("[Train preset] unknown preset=%s, ignore.", preset)
+        return
+
+    cli_flags = _collect_cli_flags()
+    applied = []
+    skipped = []
+    for key, value in preset_defaults.items():
+        flag = f"--{key}"
+        if flag in cli_flags:
+            skipped.append(flag)
+            continue
+        setattr(args, key, copy.deepcopy(value))
+        applied.append(f"{key}={value}")
+
+    _logger.info(
+        "[Train preset] %s applied defaults (CLI overrides respected): %s",
+        preset,
+        ", ".join(applied) if applied else "none",
+    )
+    if skipped:
+        _logger.info("[Train preset] %s skipped explicit CLI flags: %s", preset, ", ".join(sorted(skipped)))
+
 
 def _validate_args(args):
     if args.image_resolution % 14 != 0:
@@ -537,6 +600,7 @@ def _log_configuration_summary(args, output_layout, full_log_path):
     _logger.info("Full Log     : %s", full_log_path)
     _logger.info("Device       : %s", args.device)
     _logger.info("LMC          : %s", f"ON (mode={args.lmc_mode})" if args.use_lmc else "OFF")
+    _logger.info("Train preset : %s", getattr(args, "train_preset", "none"))
     _logger.info("LMC profile  : %s", args.lmc_profile if args.use_lmc else "n/a")
     _logger.info("LMC flow     : %s", getattr(args, 'lmc_flow', 'iterative'))
     if not args.use_lmc and args.vanilla_iterations > 1:
@@ -579,6 +643,12 @@ def _log_configuration_summary(args, output_layout, full_log_path):
         _logger.info(
             "S2 LR boost  : first=%.2f, later=%.2f | warmup_steps=%d",
             args.s2_lr_boost_first, args.s2_lr_boost_later, args.s2_lr_warmup_steps,
+        )
+        _logger.info(
+            "S2 polish    : epochs=%d, head_lr=%.2e, fusion_lr_ratio=%.4f",
+            args.s2_polish_epochs,
+            args.s2_polish_head_lr,
+            args.s2_polish_fusion_lr_ratio,
         )
         _logger.info(
             "S2 step rewind: first=%.2f, later=%.2f, tau=%.1f",
@@ -639,6 +709,7 @@ def _log_configuration_summary(args, output_layout, full_log_path):
 
 
 def setup_experiment(args):
+    _apply_train_preset(args)
     _validate_args(args)
     _apply_baseline_contract(args)
     _apply_lmc_profile(args)

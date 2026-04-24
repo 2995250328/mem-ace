@@ -34,9 +34,9 @@ def main():
     if result.returncode != 0:
         sys.exit(result.returncode)
 
-    scene_name = data["scene_name"]
+    scene_name = data.get("scene_name") or Path(data["scene"]).name
     eval_session = data.get("eval_session") or "eval"
-    output_dir = Path(data["output_dir"])
+    output_dir = Path(data.get("output_dir") or Path(data["output_map"]).parent)
     eval_results_base = output_dir / "eval_results"
     # test_ace_dinov2.py writes last_eval_dir.txt with the run subdir (timestamp_scene_session)
     last_eval_file = eval_results_base / "last_eval_dir.txt"
@@ -82,12 +82,16 @@ def main():
     }
 
     eval_log_path = eval_output_dir / "eval_log.txt"
+    model_label = data.get("model_label") or "ACE"
     with open(eval_log_path, "w", encoding="utf-8") as f:
-        f.write("# DINOv2-ACE evaluation after training\n")
+        f.write(f"# {model_label} evaluation after training\n")
         f.write(f"# Generated: {datetime.now().isoformat()}\n")
         f.write(f"# Scene: {data['scene']}\n")
         f.write(f"# Model: {data['output_map']}\n")
-        f.write(f"# Epochs: {data['epochs']}  image_resolution: {data['image_resolution']}\n")
+        if "epochs" in data:
+            f.write(f"# Epochs: {data['epochs']}  image_resolution: {data['image_resolution']}\n")
+        else:
+            f.write(f"# image_resolution: {data.get('image_resolution', 'unknown')}\n")
         f.write("\n")
         f.write(f"median_rotation_deg\t{eval_result['median_rErr']:.4f}\n")
         f.write(f"median_translation_cm\t{eval_result['median_tErr']:.4f}\n")

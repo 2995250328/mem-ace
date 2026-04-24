@@ -117,6 +117,12 @@ if __name__ == "__main__":
     parser.add_argument("--eval_after_train", type=_strtobool, default=True)
     parser.add_argument("--eval_session", type=str, default="post_train")
     parser.add_argument("--post_train_eval_device", type=str, default="cuda:0")
+    parser.add_argument(
+        "--eval_output_dir",
+        type=Path,
+        default=None,
+        help="Optional directory for post-train eval outputs; default is <model_dir>/eval_results/<timestamp>_*.",
+    )
 
     args = parser.parse_args()
 
@@ -219,6 +225,8 @@ if __name__ == "__main__":
                 "--device",
                 device_for_cmd,
             ]
+            if args.eval_output_dir is not None:
+                cmd.extend(["--eval_output_dir", str(Path(args.eval_output_dir).resolve())])
             _logger.info("Eval command: %s", " ".join(cmd))
 
             json_path = Path(args.output_map).parent / "post_train_eval_eupe.json"
@@ -226,8 +234,14 @@ if __name__ == "__main__":
                 "cmd": cmd,
                 "cwd": os.getcwd(),
                 "env": {key: str(value) for key, value in eval_env.items()},
+                "model_label": "EUPE-ACE",
+                "output_dir": str(Path(args.output_map).parent),
                 "output_map": str(args.output_map),
                 "scene": str(args.scene),
+                "scene_name": scene_name,
+                "eval_session": str(args.eval_session),
+                "eval_output_dir": str(Path(args.eval_output_dir).resolve()) if args.eval_output_dir is not None else None,
+                "epochs": int(args.epochs),
                 "image_resolution": args.image_resolution,
             }
             json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

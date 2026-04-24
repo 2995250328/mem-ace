@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -66,6 +66,122 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         },
     }
 
+    @staticmethod
+    def _tensor_to_config_value(value: Any):
+        """Convert tensors inside nested metadata to checkpoint-friendly Python values."""
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return float(value.detach().cpu().item())
+            return value.detach().cpu().tolist()
+        if isinstance(value, dict):
+            return {k: TrainerACEDINOv2LMC._tensor_to_config_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [TrainerACEDINOv2LMC._tensor_to_config_value(v) for v in value]
+        if isinstance(value, tuple):
+            return [TrainerACEDINOv2LMC._tensor_to_config_value(v) for v in value]
+        return value
+
+    def _build_reference_contract_state(
+        self,
+        *,
+        memory_contract_mode: str,
+        reference_index: Optional[int],
+        conditioning_reference: Dict[str, Any],
+        normalization_ref: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Prepare the runtime contract that interprets head outputs."""
+        contract_mode = str(memory_contract_mode or "C0").upper()
+        state: Dict[str, Any] = {
+            "enabled": contract_mode == "C1",
+            "contract_mode": contract_mode,
+            "reference_index": reference_index,
+            "output_space": "points_world",
+            "conditioning_reference": {},
+            "normalization_ref": {},
+            "head_mean": None,
+        }
+        if contract_mode != "C1":
+            return state
+
+        T_ref_c2w_world = conditioning_reference.get("T_ref_c2w_world")
+        if T_ref_c2w_world is None:
+            raise ValueError("[LMC] contract_mode=C1 requires conditioning_reference.T_ref_c2w_world.")
+        if not isinstance(T_ref_c2w_world, torch.Tensor):
+            T_ref_c2w_world = torch.as_tensor(T_ref_c2w_world, dtype=torch.float32, device=self.device)
+        else:
+            T_ref_c2w_world = T_ref_c2w_world.to(self.device).float()
+        if tuple(T_ref_c2w_world.shape) != (4, 4):
+            raise ValueError(
+                f"[LMC] conditioning_reference.T_ref_c2w_world has invalid shape "
+                f"{tuple(T_ref_c2w_world.shape)}, expected (4, 4)."
+            )
+
+        T_world_to_ref = conditioning_reference.get("T_world_to_ref")
+        if T_world_to_ref is not None:
+            if not isinstance(T_world_to_ref, torch.Tensor):
+                T_world_to_ref = torch.as_tensor(T_world_to_ref, dtype=torch.float32, device=self.device)
+            else:
+                T_world_to_ref = T_world_to_ref.to(self.device).float()
+
+        mu_ref = normalization_ref.get("mu_ref")
+        sigma_ref = normalization_ref.get("sigma_ref")
+        has_ref_norm = mu_ref is not None and sigma_ref is not None
+        if has_ref_norm:
+            if not isinstance(mu_ref, torch.Tensor):
+                mu_ref = torch.as_tensor(mu_ref, dtype=torch.float32, device=self.device)
+            else:
+                mu_ref = mu_ref.to(self.device).float()
+            sigma_ref = float(torch.as_tensor(sigma_ref, dtype=torch.float32).item())
+            if not math.isfinite(sigma_ref) or sigma_ref <= 1e-12:
+                has_ref_norm = False
+
+        if has_ref_norm:
+            output_space = "points_ref_norm"
+            head_mean = torch.zeros(3, device=self.device, dtype=torch.float32)
+        else:
+            output_space = "points_ref"
+            head_mean = mu_ref if isinstance(mu_ref, torch.Tensor) else torch.zeros(3, device=self.device, dtype=torch.float32)
+
+        state.update({
+            "output_space": output_space,
+            "conditioning_reference": {
+                "reference_index": reference_index,
+                "T_ref_c2w_world": T_ref_c2w_world,
+                "T_world_to_ref": T_world_to_ref,
+            },
+            "normalization_ref": {
+                "mu_ref": mu_ref if has_ref_norm else None,
+                "sigma_ref": sigma_ref if has_ref_norm else None,
+            },
+            "head_mean": head_mean.detach().clone().float(),
+        })
+        return state
+
+    def _recover_pred_scene_to_training_world(self, pred_scene_B3HW: torch.Tensor) -> torch.Tensor:
+        """Map head outputs to the world coordinate space used by the reprojection loss."""
+        contract = getattr(self, "reference_contract_state", None)
+        if not contract or not contract.get("enabled", False):
+            return pred_scene_B3HW
+
+        pred_world = pred_scene_B3HW
+        if contract["output_space"] == "points_ref_norm":
+            mu_ref = contract["normalization_ref"]["mu_ref"].to(pred_world.device, dtype=pred_world.dtype)
+            sigma_ref = float(contract["normalization_ref"]["sigma_ref"])
+            pred_world = pred_world * sigma_ref + mu_ref.view(1, 3, 1, 1)
+
+        T_ref_c2w_world = contract["conditioning_reference"]["T_ref_c2w_world"].to(
+            pred_world.device, dtype=pred_world.dtype
+        )
+        R_ref = T_ref_c2w_world[:3, :3]
+        C_ref = T_ref_c2w_world[:3, 3]
+        pred_world = torch.einsum("ij,bjhw->bihw", R_ref, pred_world) + C_ref.view(1, 3, 1, 1)
+
+        # Reprojection still operates in the trainer's current world space.
+        if self.coord_sigma is not None and self.coord_mu is not None:
+            mu = self.coord_mu.to(pred_world.device, dtype=pred_world.dtype).view(1, 3, 1, 1)
+            pred_world = (pred_world - mu) / float(self.coord_sigma)
+        return pred_world
+
     def __init__(self, options):
         # Determine if LMC is active *before* parent __init__
         self.use_lmc = getattr(options, 'use_lmc', False)
@@ -115,6 +231,53 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             )
         else:
             self.memory_preflight_report = None
+
+        conditioning_reference = bank_data.get("conditioning_reference")
+        if not isinstance(conditioning_reference, dict):
+            conditioning_reference = {}
+        normalization_ref = bank_data.get("normalization_ref")
+        if not isinstance(normalization_ref, dict):
+            normalization_ref = {}
+        memory_contract_mode = str(bank_data.get("contract_mode", "C0")).upper()
+        memory_mode = str(bank_data.get("mode", "single_forward"))
+        reference_index = bank_data.get("reference_index", conditioning_reference.get("reference_index"))
+        try:
+            reference_index = int(reference_index) if reference_index is not None else None
+        except (TypeError, ValueError):
+            reference_index = None
+
+        self.reference_contract_state = self._build_reference_contract_state(
+            memory_contract_mode=memory_contract_mode,
+            reference_index=reference_index,
+            conditioning_reference=conditioning_reference,
+            normalization_ref=normalization_ref,
+        )
+        self.memory_contract_info = {
+            "memory_mode": memory_mode,
+            "contract_mode": memory_contract_mode,
+            "reference_index": reference_index,
+            "has_points_ref": bank_data.get("points_ref") is not None,
+            "has_points_ref_norm": bank_data.get("points_ref_norm") is not None,
+            "has_conditioning_reference": bool(conditioning_reference),
+            "has_normalization_ref": isinstance(bank_data.get("normalization_ref"), dict),
+            "training_target": self.reference_contract_state["output_space"],
+        }
+        _logger.info(
+            "[LMC] Memory contract: mode=%s, contract=%s, reference_index=%s, "
+            "points_ref=%s, points_ref_norm=%s, output_space=%s",
+            self.memory_contract_info["memory_mode"],
+            self.memory_contract_info["contract_mode"],
+            self.memory_contract_info["reference_index"],
+            self.memory_contract_info["has_points_ref"],
+            self.memory_contract_info["has_points_ref_norm"],
+            self.memory_contract_info["training_target"],
+        )
+        if self.reference_contract_state.get("enabled", False):
+            _logger.info(
+                "[LMC] C1 recovery enabled: output_space=%s, reference_index=%s",
+                self.reference_contract_state["output_space"],
+                self.reference_contract_state["reference_index"],
+            )
 
         # Build memory_dict with batch dim, like map-anything train_ace.py
         def _unsqueeze0(t):
@@ -280,7 +443,22 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             # Normalization metadata for test-time de-normalization
             'normalization_mu': self.coord_mu.cpu().tolist() if self.coord_mu is not None else None,
             'normalization_sigma': self.coord_sigma if self.coord_sigma is not None else None,
+            'memory_mode': self.memory_contract_info['memory_mode'],
+            'memory_contract_mode': self.memory_contract_info['contract_mode'],
+            'memory_reference_index': self.memory_contract_info['reference_index'],
+            'memory_training_target': self.memory_contract_info['training_target'],
+            'reference_output_space': self.reference_contract_state['output_space'],
+            'memory_has_points_ref': self.memory_contract_info['has_points_ref'],
+            'memory_has_points_ref_norm': self.memory_contract_info['has_points_ref_norm'],
+            'conditioning_reference': self._tensor_to_config_value(
+                self.reference_contract_state.get('conditioning_reference')
+            ),
+            'normalization_ref': self._tensor_to_config_value(
+                self.reference_contract_state.get('normalization_ref')
+            ),
         }
+        if self.reference_contract_state.get("enabled", False):
+            self._align_head_mean_to_scene_center()
 
         # --- Build compressor (same as map-anything: input_dim/compress_dim = per-layer feature_dim) ---
         pe_normalize_input = bool(getattr(options, 'pe_normalize_input', False))
@@ -327,6 +505,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.s2_lr_boost_first = getattr(options, 's2_lr_boost_first', 1.2)
         self.s2_lr_boost_later = getattr(options, 's2_lr_boost_later', 1.0)
         self.s2_lr_warmup_steps = getattr(options, 's2_lr_warmup_steps', 0)
+        self.s2_polish_epochs = max(0, int(getattr(options, 's2_polish_epochs', 0)))
+        self.s2_polish_head_lr = float(getattr(options, 's2_polish_head_lr', 1e-4))
+        self.s2_polish_fusion_lr_ratio = max(0.0, float(getattr(options, 's2_polish_fusion_lr_ratio', 0.005)))
         self.lmc_profile = str(getattr(options, 'lmc_profile', 'legacy'))
         self.mapany_flow_profile = (self.lmc_profile == 'mapany_flow_v1')
         self.s1_use_buffer = bool(getattr(options, 's1_use_buffer', False))
@@ -686,6 +867,21 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         """After head reset in LMC path: set head.mean buffer to memory scene_center so coordinate anchor is consistent."""
         if not self.use_lmc or not hasattr(self, 'memory_dict'):
             return
+        contract = getattr(self, "reference_contract_state", None)
+        if contract and contract.get("enabled", False):
+            target = contract.get("head_mean")
+            if target is None:
+                return
+            target = target.detach().to(self.device, dtype=self.regressor.heads.mean.dtype).view(1, 3, 1, 1)
+            self.regressor.heads.mean.copy_(target)
+            _logger.info(
+                "[LMC] Head mean aligned to %s anchor for C1. target=(%.3f,%.3f,%.3f)",
+                contract["output_space"],
+                float(target.view(-1)[0]),
+                float(target.view(-1)[1]),
+                float(target.view(-1)[2]),
+            )
+            return
         sc = self.memory_dict.get('scene_center')
         if sc is None:
             return
@@ -960,6 +1156,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         mask_flat = image_mask_B1HW.flatten()
 
         pred_scene_B3HW = self.regressor.get_scene_coordinates(fused_feats_BCHW)
+        pred_scene_B3HW = self._recover_pred_scene_to_training_world(pred_scene_B3HW)
         pred_scene_N31 = pred_scene_B3HW.permute(0, 2, 3, 1).reshape(N, 3).unsqueeze(-1).float()
         pred_scene_N41 = to_homogeneous(pred_scene_N31)
 
@@ -1058,6 +1255,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
         pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(features_bCHW)
+        pred_scene_coords_b3HW = self._recover_pred_scene_to_training_world(pred_scene_coords_b3HW)
 
         pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
         pred_scene_coords_b41 = to_homogeneous(pred_scene_coords_b31)
@@ -1957,6 +2155,59 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             " [ACE-G R2: fusion trainable, compressor frozen]" if ace_g_fusion_in_s2 else "",
         )
 
+    def _run_s2_polish_phase(self, iteration_idx):
+        """Run an optional low-LR S2 refinement pass on the current buffer."""
+        if self.s2_polish_epochs <= 0:
+            return
+        if self.s2_polish_head_lr <= 0:
+            _logger.warning(
+                "[S2-Polish] Skipping because s2_polish_head_lr=%.2e <= 0.",
+                self.s2_polish_head_lr,
+            )
+            return
+
+        ace_g_fusion_in_s2 = (
+            self.lmc_flow == 'ace_g'
+            and getattr(self.options, 'ace_g_fusion_in_s2', False)
+        )
+        head_lr = self.s2_polish_head_lr
+        if ace_g_fusion_in_s2:
+            fusion_lr = head_lr * self.s2_polish_fusion_lr_ratio
+            self.optimizer_head = optim.AdamW([
+                {'params': self.regressor.heads.parameters(), 'lr': head_lr},
+                {'params': self.fusion.parameters(), 'lr': fusion_lr},
+            ])
+            max_lrs = [head_lr, fusion_lr]
+            _logger.info(
+                "[S2-Polish] iter=%d epochs=%d head_lr=%.2e fusion_lr=%.2e "
+                "(ratio=%.4f, constant LR)",
+                iteration_idx + 1,
+                self.s2_polish_epochs,
+                head_lr,
+                fusion_lr,
+                self.s2_polish_fusion_lr_ratio,
+            )
+        else:
+            self.optimizer_head = optim.AdamW(self.regressor.heads.parameters(), lr=head_lr)
+            max_lrs = [head_lr]
+            _logger.info(
+                "[S2-Polish] iter=%d epochs=%d head_lr=%.2e (constant LR)",
+                iteration_idx + 1,
+                self.s2_polish_epochs,
+                head_lr,
+            )
+
+        # Keep local_s2_step untouched: in per_iter mode this pins ReproLoss at the
+        # low-clamp tail, matching the late-S2 refinement regime we want to test.
+        self.scheduler_head = optim.lr_scheduler.LambdaLR(
+            self.optimizer_head,
+            lr_lambda=[lambda _step: 1.0 for _ in max_lrs],
+        )
+        self.current_lmc_iter = iteration_idx
+        for polish_epoch in range(self.s2_polish_epochs):
+            self.epoch = self.options.epochs + polish_epoch
+            self.run_epoch()
+
     # ------------------------------------------------------------------
     # Iteration eval / best-checkpoint helpers
     # ------------------------------------------------------------------
@@ -2433,6 +2684,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             _logger.info(f"[S2-G] Training head for {self.options.epochs} epochs")
             for self.epoch in range(self.options.epochs):
                 self.run_epoch()
+            self._run_s2_polish_phase(it)
 
             # Clean up cached compressor output
             self._s2_compressor_out = None
@@ -2595,6 +2847,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         with autocast("cuda", enabled=self.options.use_half):
             pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(features_bCHW)
+        pred_scene_coords_b3HW = self._recover_pred_scene_to_training_world(pred_scene_coords_b3HW)
 
         pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
         pred_scene_coords_b41 = to_homogeneous(pred_scene_coords_b31)
@@ -2753,6 +3006,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 with torch.no_grad():
                     fused_bCHW = self._fuse_features(features_bCHW, self._s2_compressor_out)
             pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(fused_bCHW)
+        pred_scene_coords_b3HW = self._recover_pred_scene_to_training_world(pred_scene_coords_b3HW)
 
         pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
         pred_scene_coords_b41 = to_homogeneous(pred_scene_coords_b31)

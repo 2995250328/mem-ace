@@ -132,6 +132,18 @@ fi
 # N_VIEWS — 传给 --n_memory：参与 memory 提取的帧数
 N_VIEWS="${N_VIEWS:-20}"
 
+# Reference contract. C0 keeps current world-frame training/eval behavior;
+# C1 is reserved for reference-coordinate learning experiments.
+CONTRACT_MODE="${CONTRACT_MODE:-C0}"
+
+# WAI memory extraction preprocessing.
+# Keep this deterministic by default: no random resize/crop/color augmentation,
+# only model-required normalization. This avoids processed intrinsics changing
+# between runs with the same selected views.
+WAI_TRANSFORM="${WAI_TRANSFORM:-imgnorm}"
+WAI_DATA_NORM_TYPE="${WAI_DATA_NORM_TYPE:-dinov2}"
+WAI_AUG_CROP="${WAI_AUG_CROP:-0}"
+
 # WAI_VIEW_MODE — WAI 视图加载协议：
 #   fps_flat / fps_strict=每个 FPS index 只加载 1 张图，实际推理输入严格等于 FPS list
 #   original_multiview / first_fps_covis=复现 map-anything fps_memory.sh，首个 FPS anchor 返回 n_views 个 covisibility views
@@ -188,10 +200,26 @@ ASB_MIN_COVERAGE_GAIN="${ASB_MIN_COVERAGE_GAIN:-${COVIS_MIN_COVERAGE_GAIN:-0.01}
 ASB_GAIN_PATIENCE="${ASB_GAIN_PATIENCE:-${COVIS_GAIN_PATIENCE:-2}}"
 ASB_TARGET_COVERAGE_MEAN="${ASB_TARGET_COVERAGE_MEAN:-${COVIS_TARGET_COVERAGE_MEAN:-0.55}}"
 ASB_TARGET_COVERAGE_MAX="${ASB_TARGET_COVERAGE_MAX:-${COVIS_TARGET_COVERAGE_MAX:-2.0}}"
+ASB_POST_REPAIR="${ASB_POST_REPAIR:-${COVIS_POST_REPAIR_ASB:-false}}"
+ASB_POST_REPAIR_MAX_SWAPS="${ASB_POST_REPAIR_MAX_SWAPS:-${COVIS_POST_REPAIR_MAX_SWAPS:-4}}"
+ASB_POST_REPAIR_TAIL_PERCENTILE="${ASB_POST_REPAIR_TAIL_PERCENTILE:-${COVIS_POST_REPAIR_TAIL_PERCENTILE:-95.0}}"
+ASB_POST_REPAIR_MIN_TAIL_IMPROVEMENT_M="${ASB_POST_REPAIR_MIN_TAIL_IMPROVEMENT_M:-${COVIS_POST_REPAIR_MIN_TAIL_IMPROVEMENT_M:-0.05}}"
+ASB_POST_REPAIR_CLUSTER_TOP_K="${ASB_POST_REPAIR_CLUSTER_TOP_K:-${COVIS_POST_REPAIR_CLUSTER_TOP_K:-3}}"
 ASB_POSE_PRUNE="${ASB_POSE_PRUNE:-${COVIS_POSE_PRUNE:-false}}"
 ASB_POSE_PRUNE_MIN_VIEWS="${ASB_POSE_PRUNE_MIN_VIEWS:-${COVIS_POSE_PRUNE_MIN_VIEWS:-20}}"
 ASB_POSE_PRUNE_KEEP_RATIO="${ASB_POSE_PRUNE_KEEP_RATIO:-${COVIS_POSE_PRUNE_KEEP_RATIO:-0.70}}"
 ASB_POSE_PRUNE_MAD_K="${ASB_POSE_PRUNE_MAD_K:-${COVIS_POSE_PRUNE_MAD_K:-2.5}}"
+ENABLE_REFERENCE_POLICY_GATE="${ENABLE_REFERENCE_POLICY_GATE:-false}"
+REFERENCE_POLICY_TOP_M="${REFERENCE_POLICY_TOP_M:-4}"
+REFERENCE_POLICY_LIGHT_MIN_SELECTED_LINKS="${REFERENCE_POLICY_LIGHT_MIN_SELECTED_LINKS:-2}"
+REFERENCE_POLICY_PROBE_Q90_M="${REFERENCE_POLICY_PROBE_Q90_M:-0.18}"
+REFERENCE_POLICY_PROBE_MAX_M="${REFERENCE_POLICY_PROBE_MAX_M:-0.25}"
+ENABLE_CLUSTER_FALLBACK="${ENABLE_CLUSTER_FALLBACK:-false}"
+CLUSTER_FALLBACK_MAX_CLUSTERS="${CLUSTER_FALLBACK_MAX_CLUSTERS:-2}"
+CLUSTER_FALLBACK_MAX_SPLIT_DEPTH="${CLUSTER_FALLBACK_MAX_SPLIT_DEPTH:-2}"
+CLUSTER_FALLBACK_MIN_CLUSTER_SIZE="${CLUSTER_FALLBACK_MIN_CLUSTER_SIZE:-8}"
+CLUSTER_FALLBACK_MIN_VIEWS_PER_CLUSTER="${CLUSTER_FALLBACK_MIN_VIEWS_PER_CLUSTER:-8}"
+CLUSTER_FALLBACK_MIN_POSITIVE_RATIO="${CLUSTER_FALLBACK_MIN_POSITIVE_RATIO:-0.02}"
 
 # GPU_ID — 仅设置 CUDA_VISIBLE_DEVICES；Python 仍使用 --device cuda:0（即「可见 GPU 列表中的第 0 块」）
 GPU_ID="${GPU_ID:-1}"
@@ -301,6 +329,12 @@ if [ "$POOL_MODE" = "bse" ]; then
     CONFIG_TAG="${CONFIG_TAG}_ut${UNIMODAL_THRESHOLD}"
 fi
 if [ "$DATASET_LOADER" = "wai" ]; then
+    _preproc_tag_transform="$(printf '%s' "$WAI_TRANSFORM" | tr -c '[:alnum:]' '_' | sed 's/_\\+/_/g; s/^_//; s/_$//')"
+    if [ "$WAI_AUG_CROP" = "0" ] && [ "$WAI_TRANSFORM" = "imgnorm" ]; then
+        CONFIG_TAG="${CONFIG_TAG}_noaug"
+    else
+        CONFIG_TAG="${CONFIG_TAG}_${_preproc_tag_transform}_aug${WAI_AUG_CROP}"
+    fi
     case "$WAI_VIEW_MODE" in
         original_multiview)
             CONFIG_TAG="${CONFIG_TAG}_original"
@@ -328,6 +362,21 @@ if [ "$DATASET_LOADER" = "wai" ]; then
             case "${ASB_NATIVE_GROUP,,}" in
                 true|1|yes|y|on)
                     CONFIG_TAG="${CONFIG_TAG}_native${ASB_NATIVE_ANCHOR_CANDIDATES}"
+                    ;;
+            esac
+            case "${ENABLE_REFERENCE_POLICY_GATE,,}" in
+                true|1|yes|y|on)
+                    CONFIG_TAG="${CONFIG_TAG}_rgate${REFERENCE_POLICY_TOP_M}"
+                    ;;
+            esac
+            case "${ASB_POST_REPAIR,,}" in
+                true|1|yes|y|on)
+                    CONFIG_TAG="${CONFIG_TAG}_prepair${ASB_POST_REPAIR_MAX_SWAPS}"
+                    ;;
+            esac
+            case "${ENABLE_CLUSTER_FALLBACK,,}" in
+                true|1|yes|y|on)
+                    CONFIG_TAG="${CONFIG_TAG}_cfb${CLUSTER_FALLBACK_MAX_CLUSTERS}"
                     ;;
             esac
             ;;
@@ -410,11 +459,18 @@ echo "    root:       $DATASET_ROOT"
 echo "    path:       $DATASET_PATH"
 echo "    scene:      $SCENE_TRAIN → $SCENE_TEST"
 echo "    n_views:    $N_VIEWS"
+echo "    contract:   $CONTRACT_MODE"
+if [ "$DATASET_LOADER" = "wai" ]; then
+echo "    preprocessing: transform=$WAI_TRANSFORM data_norm=$WAI_DATA_NORM_TYPE aug_crop=$WAI_AUG_CROP"
+fi
 echo "    wai_view_mode: $WAI_VIEW_MODE"
 if [ "$WAI_VIEW_MODE" = "anchor_support" ]; then
 echo "    anchor_support: alpha=$ASB_ALPHA eps=$ASB_EPS tau=$ASB_TAU ref_lambda=$ASB_REF_LAMBDA anchor_count=$ASB_ANCHOR_COUNT support_per_anchor=$ASB_SUPPORT_PER_ANCHOR support_tau=$ASB_SUPPORT_TAU support_min_neighbors=$ASB_SUPPORT_MIN_NEIGHBORS safe_dist=$ASB_SAFE_DIST_TO_REF far_views=$ASB_FAR_VIEW_BUDGET far_anchors=$ASB_FAR_ANCHOR_BUDGET coverage_beta=$ASB_COVERAGE_BETA candidate_pool_ratio=$ASB_CANDIDATE_POOL_RATIO ma_safe=$ASB_MA_SAFE ma_safe_pool_ratio=$ASB_MA_SAFE_POOL_RATIO native_group=$ASB_NATIVE_GROUP native_anchor_candidates=$ASB_NATIVE_ANCHOR_CANDIDATES"
 echo "    adaptive_asb: enabled=$ASB_ADAPTIVE scene_stats=$ASB_SCENE_STATS adaptive_view_count=$ASB_ADAPTIVE_VIEW_COUNT min_views=$ASB_MIN_VIEWS ref_max=$ASB_REF_DIST_MAX_LIMIT ref_mean=$ASB_REF_DIST_MEAN_LIMIT target_cov_mean=$ASB_TARGET_COVERAGE_MEAN target_cov_max=$ASB_TARGET_COVERAGE_MAX min_gain=$ASB_MIN_COVERAGE_GAIN patience=$ASB_GAIN_PATIENCE"
+echo "    post_repair: enabled=$ASB_POST_REPAIR max_swaps=$ASB_POST_REPAIR_MAX_SWAPS tail_percentile=$ASB_POST_REPAIR_TAIL_PERCENTILE min_tail_improvement_m=$ASB_POST_REPAIR_MIN_TAIL_IMPROVEMENT_M cluster_top_k=$ASB_POST_REPAIR_CLUSTER_TOP_K"
 echo "    pose_prune: enabled=$ASB_POSE_PRUNE min_views=$ASB_POSE_PRUNE_MIN_VIEWS keep_ratio=$ASB_POSE_PRUNE_KEEP_RATIO mad_k=$ASB_POSE_PRUNE_MAD_K"
+echo "    reference_policy_gate: enabled=$ENABLE_REFERENCE_POLICY_GATE top_m=$REFERENCE_POLICY_TOP_M min_links=$REFERENCE_POLICY_LIGHT_MIN_SELECTED_LINKS probe_q90=$REFERENCE_POLICY_PROBE_Q90_M probe_max=$REFERENCE_POLICY_PROBE_MAX_M"
+echo "    cluster_fallback: enabled=$ENABLE_CLUSTER_FALLBACK max_clusters=$CLUSTER_FALLBACK_MAX_CLUSTERS max_depth=$CLUSTER_FALLBACK_MAX_SPLIT_DEPTH min_cluster_size=$CLUSTER_FALLBACK_MIN_CLUSTER_SIZE min_views=$CLUSTER_FALLBACK_MIN_VIEWS_PER_CLUSTER min_pos_ratio=$CLUSTER_FALLBACK_MIN_POSITIVE_RATIO"
 fi
 echo "    temp_dir:   $TEMP_DIR"
 echo ""
@@ -497,6 +553,10 @@ if [ "$POOL_MODE" = "hybrid" ]; then
 fi
 PYTHON_ARGS="$PYTHON_ARGS --dataset_type $DATASET_TYPE"
 PYTHON_ARGS="$PYTHON_ARGS --dataset_loader $DATASET_LOADER"
+PYTHON_ARGS="$PYTHON_ARGS --contract_mode $CONTRACT_MODE"
+PYTHON_ARGS="$PYTHON_ARGS --dataset_transform $WAI_TRANSFORM"
+PYTHON_ARGS="$PYTHON_ARGS --dataset_data_norm_type $WAI_DATA_NORM_TYPE"
+PYTHON_ARGS="$PYTHON_ARGS --dataset_aug_crop $WAI_AUG_CROP"
 PYTHON_ARGS="$PYTHON_ARGS --wai_view_mode $WAI_VIEW_MODE"
 if [ "$WAI_VIEW_MODE" = "anchor_support" ]; then
     PYTHON_ARGS="$PYTHON_ARGS --anchor_support_alpha $ASB_ALPHA"
@@ -546,6 +606,15 @@ if [ "$WAI_VIEW_MODE" = "anchor_support" ]; then
     PYTHON_ARGS="$PYTHON_ARGS --covis_gain_patience $ASB_GAIN_PATIENCE"
     PYTHON_ARGS="$PYTHON_ARGS --covis_target_coverage_mean $ASB_TARGET_COVERAGE_MEAN"
     PYTHON_ARGS="$PYTHON_ARGS --covis_target_coverage_max $ASB_TARGET_COVERAGE_MAX"
+    case "${ASB_POST_REPAIR,,}" in
+        true|1|yes|y|on)
+            PYTHON_ARGS="$PYTHON_ARGS --covis_post_repair_asb"
+            ;;
+    esac
+    PYTHON_ARGS="$PYTHON_ARGS --covis_post_repair_max_swaps $ASB_POST_REPAIR_MAX_SWAPS"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_post_repair_tail_percentile $ASB_POST_REPAIR_TAIL_PERCENTILE"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_post_repair_min_tail_improvement_m $ASB_POST_REPAIR_MIN_TAIL_IMPROVEMENT_M"
+    PYTHON_ARGS="$PYTHON_ARGS --covis_post_repair_cluster_top_k $ASB_POST_REPAIR_CLUSTER_TOP_K"
     case "${ASB_POSE_PRUNE,,}" in
         true|1|yes|y|on)
             PYTHON_ARGS="$PYTHON_ARGS --pose_prune_after_infer"
@@ -554,6 +623,25 @@ if [ "$WAI_VIEW_MODE" = "anchor_support" ]; then
     PYTHON_ARGS="$PYTHON_ARGS --pose_prune_min_views $ASB_POSE_PRUNE_MIN_VIEWS"
     PYTHON_ARGS="$PYTHON_ARGS --pose_prune_min_keep_ratio $ASB_POSE_PRUNE_KEEP_RATIO"
     PYTHON_ARGS="$PYTHON_ARGS --pose_prune_mad_k $ASB_POSE_PRUNE_MAD_K"
+    case "${ENABLE_REFERENCE_POLICY_GATE,,}" in
+        true|1|yes|y|on)
+            PYTHON_ARGS="$PYTHON_ARGS --enable_reference_policy_gate"
+            ;;
+    esac
+    PYTHON_ARGS="$PYTHON_ARGS --reference_policy_top_m $REFERENCE_POLICY_TOP_M"
+    PYTHON_ARGS="$PYTHON_ARGS --reference_policy_light_min_selected_links $REFERENCE_POLICY_LIGHT_MIN_SELECTED_LINKS"
+    PYTHON_ARGS="$PYTHON_ARGS --reference_policy_probe_q90_m $REFERENCE_POLICY_PROBE_Q90_M"
+    PYTHON_ARGS="$PYTHON_ARGS --reference_policy_probe_max_m $REFERENCE_POLICY_PROBE_MAX_M"
+    case "${ENABLE_CLUSTER_FALLBACK,,}" in
+        true|1|yes|y|on)
+            PYTHON_ARGS="$PYTHON_ARGS --enable_cluster_fallback"
+            ;;
+    esac
+    PYTHON_ARGS="$PYTHON_ARGS --cluster_fallback_max_clusters $CLUSTER_FALLBACK_MAX_CLUSTERS"
+    PYTHON_ARGS="$PYTHON_ARGS --cluster_fallback_max_split_depth $CLUSTER_FALLBACK_MAX_SPLIT_DEPTH"
+    PYTHON_ARGS="$PYTHON_ARGS --cluster_fallback_min_cluster_size $CLUSTER_FALLBACK_MIN_CLUSTER_SIZE"
+    PYTHON_ARGS="$PYTHON_ARGS --cluster_fallback_min_views_per_cluster $CLUSTER_FALLBACK_MIN_VIEWS_PER_CLUSTER"
+    PYTHON_ARGS="$PYTHON_ARGS --cluster_fallback_min_positive_ratio $CLUSTER_FALLBACK_MIN_POSITIVE_RATIO"
 fi
 PYTHON_ARGS="$PYTHON_ARGS --scene_name $SCENE_TRAIN"
 PYTHON_ARGS="$PYTHON_ARGS --depth_valid_range $DEPTH_MIN $DEPTH_MAX"
@@ -609,6 +697,10 @@ cat > "${OUTPUT_DIR}/extraction_config.json" <<EOF
     "scene_train": "$SCENE_TRAIN",
     "scene_test": "$SCENE_TEST",
     "n_views": $N_VIEWS,
+    "contract_mode": "$CONTRACT_MODE",
+    "wai_transform": "$WAI_TRANSFORM",
+    "wai_data_norm_type": "$WAI_DATA_NORM_TYPE",
+    "wai_aug_crop": $WAI_AUG_CROP,
     "wai_view_mode": "$WAI_VIEW_MODE",
     "anchor_support_alpha": $ASB_ALPHA,
     "anchor_support_eps": $ASB_EPS,
@@ -637,10 +729,26 @@ cat > "${OUTPUT_DIR}/extraction_config.json" <<EOF
     "anchor_support_gain_patience": $ASB_GAIN_PATIENCE,
     "anchor_support_target_coverage_mean": $ASB_TARGET_COVERAGE_MEAN,
     "anchor_support_target_coverage_max": $ASB_TARGET_COVERAGE_MAX,
+    "anchor_support_post_repair": "$ASB_POST_REPAIR",
+    "anchor_support_post_repair_max_swaps": $ASB_POST_REPAIR_MAX_SWAPS,
+    "anchor_support_post_repair_tail_percentile": $ASB_POST_REPAIR_TAIL_PERCENTILE,
+    "anchor_support_post_repair_min_tail_improvement_m": $ASB_POST_REPAIR_MIN_TAIL_IMPROVEMENT_M,
+    "anchor_support_post_repair_cluster_top_k": $ASB_POST_REPAIR_CLUSTER_TOP_K,
     "anchor_support_pose_prune": "$ASB_POSE_PRUNE",
     "anchor_support_pose_prune_min_views": $ASB_POSE_PRUNE_MIN_VIEWS,
     "anchor_support_pose_prune_keep_ratio": $ASB_POSE_PRUNE_KEEP_RATIO,
     "anchor_support_pose_prune_mad_k": $ASB_POSE_PRUNE_MAD_K,
+    "enable_reference_policy_gate": "$ENABLE_REFERENCE_POLICY_GATE",
+    "reference_policy_top_m": $REFERENCE_POLICY_TOP_M,
+    "reference_policy_light_min_selected_links": $REFERENCE_POLICY_LIGHT_MIN_SELECTED_LINKS,
+    "reference_policy_probe_q90_m": $REFERENCE_POLICY_PROBE_Q90_M,
+    "reference_policy_probe_max_m": $REFERENCE_POLICY_PROBE_MAX_M,
+    "enable_cluster_fallback": "$ENABLE_CLUSTER_FALLBACK",
+    "cluster_fallback_max_clusters": $CLUSTER_FALLBACK_MAX_CLUSTERS,
+    "cluster_fallback_max_split_depth": $CLUSTER_FALLBACK_MAX_SPLIT_DEPTH,
+    "cluster_fallback_min_cluster_size": $CLUSTER_FALLBACK_MIN_CLUSTER_SIZE,
+    "cluster_fallback_min_views_per_cluster": $CLUSTER_FALLBACK_MIN_VIEWS_PER_CLUSTER,
+    "cluster_fallback_min_positive_ratio": $CLUSTER_FALLBACK_MIN_POSITIVE_RATIO,
     "voxel_size": $VOXEL_SIZE,
     "pool_mode": "$POOL_MODE",
     "prepool_mode": "$PREPOOL_MODE",

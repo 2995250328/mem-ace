@@ -10,6 +10,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any, Dict
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -38,6 +39,88 @@ from dataset_dinov2 import CamLocDatasetDINOv2
 
 logging.basicConfig(level=logging.INFO)
 _logger = logging.getLogger(__name__)
+
+
+def _to_tensor(value: Any, *, dtype=torch.float32):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().to(dtype=dtype)
+    return torch.as_tensor(value, dtype=dtype)
+
+
+def _build_reference_eval_state(lmc_config: Dict[str, Any], bank_data: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Resolve C1 recovery metadata from checkpoint config, with memory-file fallback."""
+    contract_mode = str(lmc_config.get("memory_contract_mode", "C0")).upper()
+    state: Dict[str, Any] = {
+        "enabled": contract_mode == "C1",
+        "contract_mode": contract_mode,
+        "output_space": str(lmc_config.get("reference_output_space", lmc_config.get("memory_training_target", "points_world"))),
+        "conditioning_reference": None,
+        "normalization_ref": None,
+    }
+    if contract_mode != "C1":
+        return state
+
+    conditioning_reference = lmc_config.get("conditioning_reference")
+    if (
+        (not isinstance(conditioning_reference, dict) or conditioning_reference.get("T_ref_c2w_world") is None)
+        and isinstance(bank_data, dict)
+    ):
+        conditioning_reference = bank_data.get("conditioning_reference")
+    if not isinstance(conditioning_reference, dict):
+        raise ValueError("[Eval] contract_mode=C1 requires conditioning_reference in checkpoint or memory file.")
+
+    normalization_ref = lmc_config.get("normalization_ref")
+    if (
+        (not isinstance(normalization_ref, dict) or normalization_ref.get("mu_ref") is None)
+        and isinstance(bank_data, dict)
+    ):
+        normalization_ref = bank_data.get("normalization_ref")
+    if not isinstance(normalization_ref, dict):
+        normalization_ref = {}
+
+    T_ref_c2w_world = _to_tensor(conditioning_reference.get("T_ref_c2w_world"))
+    if T_ref_c2w_world is None or tuple(T_ref_c2w_world.shape) != (4, 4):
+        raise ValueError("[Eval] C1 checkpoint is missing a valid T_ref_c2w_world recovery transform.")
+
+    mu_ref = _to_tensor(normalization_ref.get("mu_ref"))
+    sigma_ref = normalization_ref.get("sigma_ref")
+    if sigma_ref is not None:
+        sigma_ref = float(torch.as_tensor(sigma_ref, dtype=torch.float32).item())
+
+    state["conditioning_reference"] = {
+        "reference_index": conditioning_reference.get("reference_index"),
+        "T_ref_c2w_world": T_ref_c2w_world,
+        "T_world_to_ref": _to_tensor(conditioning_reference.get("T_world_to_ref")),
+    }
+    state["normalization_ref"] = {
+        "mu_ref": mu_ref,
+        "sigma_ref": sigma_ref,
+    }
+    return state
+
+
+def _recover_pred_scene_to_world(scene_coordinates_B3HW: torch.Tensor, ref_state: Dict[str, Any]) -> torch.Tensor:
+    """Convert C1 outputs from reference space back to dataset world coordinates."""
+    if not ref_state.get("enabled", False):
+        return scene_coordinates_B3HW
+
+    pred_world = scene_coordinates_B3HW
+    if ref_state.get("output_space") == "points_ref_norm":
+        mu_ref = ref_state["normalization_ref"].get("mu_ref")
+        sigma_ref = ref_state["normalization_ref"].get("sigma_ref")
+        if mu_ref is None or sigma_ref is None:
+            raise ValueError("[Eval] output_space=points_ref_norm but normalization_ref is incomplete.")
+        pred_world = pred_world * float(sigma_ref) + mu_ref.view(1, 3, 1, 1)
+
+    T_ref_c2w_world = ref_state["conditioning_reference"]["T_ref_c2w_world"].to(
+        dtype=pred_world.dtype, device=pred_world.device
+    )
+    R_ref = T_ref_c2w_world[:3, :3]
+    C_ref = T_ref_c2w_world[:3, 3]
+    pred_world = torch.einsum("ij,bjhw->bihw", R_ref, pred_world) + C_ref.view(1, 3, 1, 1)
+    return pred_world
 
 
 def _strtobool(x):
@@ -111,6 +194,8 @@ def run_evaluation_lmc(opt):
     compressor = None
     fusion = None
     memory_dict = None
+    bank_data = None
+    reference_eval_state = {"enabled": False, "contract_mode": "C0", "output_space": "points_world"}
     compressor_out_cached = None  # single compression result, reused for all test frames
 
     if is_lmc and memory_path is not None:
@@ -148,6 +233,13 @@ def run_evaluation_lmc(opt):
 
         _logger.info(f"[LMC] Loading memory from {memory_path}")
         bank_data = load_memory_features(str(memory_path), device)
+        reference_eval_state = _build_reference_eval_state(lmc_config, bank_data)
+        if reference_eval_state.get("enabled", False):
+            _logger.info(
+                "[LMC] Eval C1 recovery enabled: output_space=%s, reference_index=%s",
+                reference_eval_state["output_space"],
+                reference_eval_state["conditioning_reference"].get("reference_index"),
+            )
 
         def _unsqueeze0(t):
             if t is None:
@@ -234,16 +326,19 @@ def run_evaluation_lmc(opt):
 
             # De-normalize predictions if full-pipeline normalization was used during training
             if is_lmc and lmc_config is not None:
-                norm_mu = lmc_config.get('normalization_mu')
-                norm_sigma = lmc_config.get('normalization_sigma')
-                if norm_mu is not None and norm_sigma is not None:
-                    mu_t = torch.tensor(norm_mu, dtype=torch.float32).view(1, 3, 1, 1)
-                    sigma_t = float(norm_sigma)
-                    scene_coordinates_B3HW = scene_coordinates_B3HW * sigma_t + mu_t
-                    _logger.debug(
-                        "[LMC] De-normalized scene coords: sigma=%.4f, mu=(%.3f,%.3f,%.3f)",
-                        sigma_t, float(mu_t[0, 0, 0, 0]), float(mu_t[0, 1, 0, 0]), float(mu_t[0, 2, 0, 0]),
-                    )
+                if reference_eval_state.get("enabled", False):
+                    scene_coordinates_B3HW = _recover_pred_scene_to_world(scene_coordinates_B3HW, reference_eval_state)
+                else:
+                    norm_mu = lmc_config.get('normalization_mu')
+                    norm_sigma = lmc_config.get('normalization_sigma')
+                    if norm_mu is not None and norm_sigma is not None:
+                        mu_t = torch.tensor(norm_mu, dtype=torch.float32).view(1, 3, 1, 1)
+                        sigma_t = float(norm_sigma)
+                        scene_coordinates_B3HW = scene_coordinates_B3HW * sigma_t + mu_t
+                        _logger.debug(
+                            "[LMC] De-normalized scene coords: sigma=%.4f, mu=(%.3f,%.3f,%.3f)",
+                            sigma_t, float(mu_t[0, 0, 0, 0]), float(mu_t[0, 1, 0, 0]), float(mu_t[0, 2, 0, 0]),
+                        )
 
             if isinstance(filenames, str):
                 filenames = (filenames,)

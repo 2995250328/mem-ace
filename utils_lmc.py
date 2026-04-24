@@ -15,6 +15,19 @@ import torch
 _logger = logging.getLogger(__name__)
 
 
+def _nested_to_device(value: Any, device: torch.device):
+    """Recursively move tensors inside nested containers onto ``device``."""
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {k: _nested_to_device(v, device) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_nested_to_device(v, device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_nested_to_device(v, device) for v in value)
+    return value
+
+
 def setup_cuda_environment():
     """在导入 torch 相关训练模块前设置 CUDA_VISIBLE_DEVICES。"""
     pre_parser = argparse.ArgumentParser(add_help=False)
@@ -400,6 +413,13 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
         t_elapsed = time.time() - t_start
         _logger.info("[LMC] Extended pooled memory loaded in %.2fs", t_elapsed)
 
+        conditioning_reference = _nested_to_device(payload.get("conditioning_reference"), device)
+        normalization_ref = _nested_to_device(payload.get("normalization_ref"), device)
+        selection = _nested_to_device(payload.get("selection"), device)
+        reference_index = payload.get("reference_index")
+        if reference_index is None and isinstance(conditioning_reference, dict):
+            reference_index = conditioning_reference.get("reference_index")
+
         return {
             "type": "pooled",
             "pooled_points": pooled_points,          # NORMALIZED or WORLD (if bse_denorm_to_world)
@@ -431,6 +451,14 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
             "view_camera_rotations": safe_to_device("view_camera_rotations"),
             "view_camera_intrinsics": safe_to_device("view_camera_intrinsics"),
             "view_plucker_main_rays": safe_to_device("view_plucker_main_rays"),
+            "mode": payload.get("mode", "single_forward"),
+            "contract_mode": payload.get("contract_mode", "C0"),
+            "reference_index": reference_index,
+            "points_ref": safe_to_device("points_ref"),
+            "points_ref_norm": safe_to_device("points_ref_norm"),
+            "conditioning_reference": conditioning_reference,
+            "normalization_ref": normalization_ref,
+            "selection": selection,
         }
 
     # === Pooled format detection ===
@@ -556,6 +584,13 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
         t_elapsed = time.time() - t_start
         _logger.info("[LMC] Memory loaded in %.2fs", t_elapsed)
 
+        conditioning_reference = _nested_to_device(payload.get("conditioning_reference"), device)
+        normalization_ref = _nested_to_device(payload.get("normalization_ref"), device)
+        selection = _nested_to_device(payload.get("selection"), device)
+        reference_index = payload.get("reference_index")
+        if reference_index is None and isinstance(conditioning_reference, dict):
+            reference_index = conditioning_reference.get("reference_index")
+
         return {
             "type": "pooled",
             "pooled_points": pooled_points,
@@ -586,6 +621,14 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
             "view_camera_rotations": safe_to_device("view_camera_rotations"),
             "view_camera_intrinsics": safe_to_device("view_camera_intrinsics"),
             "view_plucker_main_rays": safe_to_device("view_plucker_main_rays"),
+            "mode": payload.get("mode", "single_forward"),
+            "contract_mode": payload.get("contract_mode", "C0"),
+            "reference_index": reference_index,
+            "points_ref": safe_to_device("points_ref"),
+            "points_ref_norm": safe_to_device("points_ref_norm"),
+            "conditioning_reference": conditioning_reference,
+            "normalization_ref": normalization_ref,
+            "selection": selection,
         }
     if "intermediate" in payload or "final" in payload:
         raise ValueError(

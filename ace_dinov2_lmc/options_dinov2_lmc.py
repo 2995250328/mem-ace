@@ -315,6 +315,18 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         help='是否启用 GeoLMC 两阶段迭代训练。False 时退化为 vanilla。',
     )
     parser.add_argument(
+        '--train_preset',
+        type=str,
+        default='none',
+        choices=['none', 'memory_compare_ace_g_v1'],
+        help=(
+            '训练预设。none=不改动 parser 默认值；'
+            'memory_compare_ace_g_v1=当前 memory compare/ACE-G 常用配置，'
+            '会自动补齐 use_lmc、ace_g、strict preflight、scene/head 容差、'
+            'BSE world-point 路径、S1 buffer 训练，以及 train_compare 输出目录。'
+        ),
+    )
+    parser.add_argument(
         '--lmc_profile',
         type=str,
         default='legacy',
@@ -820,6 +832,30 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
             ' 当预测完全发散（相机坐标偏差达数百万米）时防止 loss 爆炸。'
             ' 设为 0 表示禁用裁剪（不推荐，等同于旧行为）。'
             ' 默认 1000.0 对室内外场景均适用。'
+        ),
+    )
+    parser.add_argument(
+        '--s2_polish_epochs',
+        type=int,
+        default=0,
+        help=(
+            '每轮常规 S2 训练后追加的低学习率精修 epoch 数。'
+            ' 默认 0 表示关闭；用于诊断 late-iter 低 LR refinement 是否可前移。'
+        ),
+    )
+    parser.add_argument(
+        '--s2_polish_head_lr',
+        type=float,
+        default=1e-4,
+        help='S2 polish 阶段 head 的固定学习率。',
+    )
+    parser.add_argument(
+        '--s2_polish_fusion_lr_ratio',
+        type=float,
+        default=0.005,
+        help=(
+            'ACE-G R2 polish 阶段 fusion 学习率相对 head 学习率的比例。'
+            ' 仅在 ace_g_fusion_in_s2=True 时生效。'
         ),
     )
 
