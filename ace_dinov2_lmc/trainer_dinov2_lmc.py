@@ -4,6 +4,7 @@
 # Memory loading mirrors map-anything/tasks/ace/utils.py load_memory_features.
 
 import gc
+import json
 import logging
 import math
 import os
@@ -11,7 +12,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any, Dict, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -21,10 +22,12 @@ import torch
 import torch.nn.functional as Fnn
 import torch.optim as optim
 import torchvision.transforms.functional as TF
+from skimage.transform import rotate, resize
 from torch.amp import autocast
 from torch.utils.data import DataLoader, sampler
 from tqdm import tqdm
 
+from ace_network_dinov2 import Regressor
 from ace_util import to_homogeneous
 from trainer_dinov2 import TrainerACEDINOv2, set_seed
 from ace_compressor import GeoLMC
@@ -326,6 +329,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
     def _sample_buffer_indices(self, image_mask_N1, coord_valid_N1, features_to_select, use_replacement):
         image_weights = image_mask_N1.view(-1).float()
+        sample_generator = self._get_training_generator(image_weights.device)
         if features_to_select <= 0:
             return None
         aux_weight = float(getattr(self.options, "c1_aux_ref_loss_weight", 0.0))
@@ -335,14 +339,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 image_weights,
                 features_to_select,
                 replacement=use_replacement,
-                generator=self.sampling_generator,
+                generator=sample_generator,
             )
 
         valid_coord_idx = torch.where(coord_weights > 0)[0]
         n_aux = min(int(valid_coord_idx.numel()), features_to_select)
         pieces = []
         if n_aux > 0:
-            perm = torch.randperm(valid_coord_idx.numel(), device=valid_coord_idx.device, generator=self.sampling_generator)
+            coord_generator = self._get_training_generator(valid_coord_idx.device)
+            perm = torch.randperm(valid_coord_idx.numel(), device=valid_coord_idx.device, generator=coord_generator)
             pieces.append(valid_coord_idx[perm[:n_aux]])
         n_random = features_to_select - n_aux
         if n_random > 0:
@@ -350,20 +355,382 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 image_weights,
                 n_random,
                 replacement=use_replacement,
-                generator=self.sampling_generator,
+                generator=sample_generator,
             ))
         return torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0]
+
+    def _infer_c1_aux_depth_dir(self, train_root: Path) -> Optional[Path]:
+        explicit_root = getattr(self.options, "c1_aux_depth_root", None)
+        depth_kind = str(getattr(self.options, "c1_aux_depth_kind", "gt_depth") or "gt_depth")
+        if explicit_root is not None and str(explicit_root):
+            explicit_root = Path(explicit_root)
+            if explicit_root.name in {"gt_depth", "colmap_depth"}:
+                return explicit_root
+            return explicit_root / depth_kind
+
+        scene_name = train_root.parent.name
+        data_root = Path(os.environ.get("ACE_DATA_ROOT", "/home/xwh/data"))
+        candidates = [
+            data_root / "mapanything-dataset" / "wai_data" / "indoor6" / f"{scene_name}_train" / depth_kind,
+            data_root / "mapanything-dataset" / "wai_data" / "indoor6" / scene_name / depth_kind,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
+
+    @staticmethod
+    def _load_wai_depth_npy(path: Path) -> np.ndarray:
+        depth = np.load(path).astype(np.float64, copy=False)
+        if depth.ndim == 3:
+            depth = np.squeeze(depth)
+        if depth.ndim != 2:
+            raise ValueError(f"Unsupported aux depth shape {depth.shape} in {path}")
+        depth = np.where(np.isfinite(depth), depth, 0.0)
+        return depth
+
+    @staticmethod
+    def _depth_to_patch_scene_coords(
+        depth: np.ndarray,
+        pose: torch.Tensor,
+        image_hw,
+        focal_length,
+        centre_point,
+    ) -> torch.Tensor:
+        """Project resized metric depth to patch-level raw world scene coordinates."""
+        image_h, image_w = image_hw
+        if tuple(depth.shape) != (image_h, image_w):
+            depth = resize(
+                depth,
+                (image_h, image_w),
+                order=0,
+                preserve_range=True,
+                anti_aliasing=False,
+            )
+
+        stride = int(Regressor.OUTPUT_SUBSAMPLE)
+        offset_x = int(stride / 2)
+        offset_y = int(stride / 2)
+        coords_h = math.ceil(image_h / stride)
+        coords_w = math.ceil(image_w / stride)
+        depth_patch = depth[offset_y::stride, offset_x::stride][:coords_h, :coords_w]
+
+        coords = torch.zeros((3, coords_h, coords_w), dtype=torch.float32)
+        if depth_patch.size == 0:
+            return coords
+
+        valid = np.isfinite(depth_patch) & (depth_patch > 0.0) & (depth_patch <= 1000.0)
+        if not np.any(valid):
+            return coords
+
+        yy, xx = np.meshgrid(
+            np.arange(depth_patch.shape[0], dtype=np.float64),
+            np.arange(depth_patch.shape[1], dtype=np.float64),
+            indexing="ij",
+        )
+        px = xx * stride + offset_x
+        py = yy * stride + offset_y
+
+        if centre_point:
+            fx = float(focal_length[0])
+            fy = float(focal_length[1])
+            cx = float(centre_point[0])
+            cy = float(centre_point[1])
+        else:
+            fx = float(focal_length)
+            fy = float(focal_length)
+            cx = image_w / 2.0
+            cy = image_h / 2.0
+
+        eye = np.ones((4, depth_patch.shape[0], depth_patch.shape[1]), dtype=np.float64)
+        eye[0] = ((px - cx) / fx) * depth_patch
+        eye[1] = ((py - cy) / fy) * depth_patch
+        eye[2] = depth_patch
+        eye[:, ~valid] = 0.0
+
+        scene = np.matmul(pose.numpy(), eye.reshape(4, -1)).reshape(4, depth_patch.shape[0], depth_patch.shape[1])
+        coords[:, : scene.shape[1], : scene.shape[2]] = torch.from_numpy(scene[:3]).float()
+        return coords
+
+    @staticmethod
+    def _frame_intrinsics_from_meta(frame: Dict[str, Any]) -> np.ndarray:
+        return np.asarray(
+            [
+                [float(frame["fl_x"]), 0.0, float(frame["cx"])],
+                [0.0, float(frame["fl_y"]), float(frame["cy"])],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def _pose_key(pose: np.ndarray, decimals: int = 5):
+        return tuple(np.round(pose.reshape(-1), decimals=decimals).tolist())
+
+    def _build_aux_depth_map_from_scene_meta(self, dataset, depth_dir: Path):
+        scene_root = depth_dir.parent
+        meta_path = scene_root / "scene_meta.json"
+        if not meta_path.exists():
+            return None
+
+        depth_kind = str(getattr(self.options, "c1_aux_depth_kind", depth_dir.name) or depth_dir.name)
+        with meta_path.open("r", encoding="utf-8") as f:
+            frames = json.load(f).get("frames", [])
+        if not frames:
+            return None
+
+        pose_to_frames: Dict[tuple, list[Dict[str, Any]]] = {}
+        meta_poses = []
+        for frame in frames:
+            if "transform_matrix" not in frame or depth_kind not in frame:
+                continue
+            pose = np.asarray(frame["transform_matrix"], dtype=np.float64)
+            if pose.shape != (4, 4):
+                continue
+            pose_to_frames.setdefault(self._pose_key(pose), []).append(frame)
+            meta_poses.append((pose.reshape(-1), frame))
+
+        if not meta_poses:
+            return None
+
+        depth_paths = [None] * len(getattr(dataset, "rgb_files", []))
+        matched = 0
+        fallback_matched = 0
+        bad_intrinsics = 0
+        missing_depth = 0
+        used_frame_names = set()
+        meta_pose_mat = np.stack([p for p, _ in meta_poses], axis=0)
+
+        for real_idx, pose_file in enumerate(dataset.pose_files):
+            ace_pose = np.loadtxt(pose_file).astype(np.float64)
+            ace_k = np.loadtxt(dataset.calibration_files[real_idx]).astype(np.float64)
+            if ace_pose.shape != (4, 4) or ace_k.shape != (3, 3):
+                continue
+
+            candidates = pose_to_frames.get(self._pose_key(ace_pose), [])
+            chosen = None
+            if candidates:
+                chosen = min(
+                    candidates,
+                    key=lambda fr: float(np.max(np.abs(self._frame_intrinsics_from_meta(fr) - ace_k))),
+                )
+            else:
+                # Rare truncation/rounding mismatch: fall back to nearest pose with a strict tolerance.
+                pose_diffs = np.max(np.abs(meta_pose_mat - ace_pose.reshape(1, -1)), axis=1)
+                best_idx = int(np.argmin(pose_diffs))
+                if float(pose_diffs[best_idx]) <= 1e-4:
+                    chosen = meta_poses[best_idx][1]
+                    fallback_matched += 1
+
+            if chosen is None:
+                continue
+
+            k_diff = float(np.max(np.abs(self._frame_intrinsics_from_meta(chosen) - ace_k)))
+            if k_diff > 1e-2:
+                bad_intrinsics += 1
+                continue
+
+            rel_depth = Path(chosen[depth_kind])
+            depth_path = scene_root / rel_depth
+            if not depth_path.exists():
+                missing_depth += 1
+                continue
+            depth_paths[real_idx] = depth_path
+            matched += 1
+            used_frame_names.add(str(chosen.get("frame_name", rel_depth.stem)))
+
+        _logger.info(
+            "[LMC] C1 aux depth scene_meta alignment: meta=%s, matched=%d/%d, fallback_pose=%d, "
+            "bad_intrinsics=%d, missing_depth=%d, unique_meta_frames=%d",
+            meta_path,
+            matched,
+            len(depth_paths),
+            fallback_matched,
+            bad_intrinsics,
+            missing_depth,
+            len(used_frame_names),
+        )
+        if matched == 0:
+            raise ValueError(
+                f"[LMC] C1 aux depth scene_meta alignment found no pose/calibration matches: {meta_path}"
+            )
+        return depth_paths
+
+    def _attach_ace_aux_depth_dataset(self, dataset, train_root: Path, depth_dir: Path):
+        if not depth_dir.exists():
+            raise FileNotFoundError(
+                f"[LMC] C1 aux_ref requested but aux depth dir is missing: {depth_dir}. "
+                "Set --c1_aux_depth_root or provide ACE train/depth."
+            )
+
+        rgb_files = getattr(dataset, "rgb_files", [])
+        depth_paths_by_index = self._build_aux_depth_map_from_scene_meta(dataset, depth_dir)
+        if depth_paths_by_index is None:
+            depth_files = {
+                p.stem.replace("image-", ""): p
+                for p in depth_dir.iterdir()
+                if p.is_file() and p.suffix.lower() == ".npy"
+            }
+            rgb_ids = {Path(p).stem for p in rgb_files}
+            matched = sorted(rgb_ids & set(depth_files))
+            missing = sorted(rgb_ids - set(depth_files))
+            extra = sorted(set(depth_files) - rgb_ids)
+            if len(matched) == 0:
+                raise ValueError(
+                    f"[LMC] C1 aux depth has no overlap with ACE RGB frames: rgb_dir={train_root / 'rgb'}, depth_dir={depth_dir}"
+                )
+            depth_paths_by_index = [depth_files.get(Path(p).stem) for p in rgb_files]
+            _logger.warning(
+                "[LMC] C1 aux depth fell back to filename alignment: dir=%s, matched=%d/%d, missing=%d, extra=%d. "
+                "Use a WAI scene_meta.json whenever possible.",
+                depth_dir,
+                len(matched),
+                len(rgb_ids),
+                len(missing),
+                len(extra),
+            )
+            if missing:
+                _logger.warning("[LMC] C1 aux depth missing first frames: %s", missing[:20])
+
+        original_get_single_item = dataset._get_single_item
+
+        def _get_single_item_with_aux_depth(ds, idx, image_height):
+            # Keep the original path for non-ACE edge cases.
+            idx = int(idx)
+            real_idx = int(ds.valid_file_indices[idx])
+            rgb_path = Path(ds.rgb_files[real_idx])
+            depth_path = depth_paths_by_index[real_idx] if real_idx < len(depth_paths_by_index) else None
+
+            image = ds._load_image(real_idx)
+            k = np.loadtxt(ds.calibration_files[real_idx])
+            if k.size == 1:
+                focal_length = float(k)
+                centre_point = None
+            elif k.shape == (3, 3):
+                k = k.tolist()
+                focal_length = [float(k[0][0]), float(k[1][1])]
+                centre_point = [float(k[0][2]), float(k[1][2])]
+            else:
+                raise ValueError("Calibration file must contain either a 3x3 matrix or a single float.")
+
+            image_height_rounded = ds._round_to_patch_size(image_height)
+            h_scale = image_height_rounded / image.shape[0]
+            if centre_point:
+                centre_point = [centre_point[0] * h_scale, centre_point[1] * h_scale]
+                focal_length = [focal_length[0] * h_scale, focal_length[1] * h_scale]
+            else:
+                focal_length *= h_scale
+
+            image = ds._resize_image(image, image_height_rounded)
+            current_width = image.size[0]
+            target_width = ds.image_width if ds.image_width is not None else ds._round_to_patch_size(current_width)
+            if target_width != current_width:
+                image = TF.resize(image, (image_height_rounded, target_width))
+                w_scale = target_width / current_width
+                if centre_point:
+                    centre_point[0] *= w_scale
+                    focal_length[0] *= w_scale
+                else:
+                    focal_length *= w_scale
+
+            image_hw = (image.size[1], image.size[0])
+            if depth_path is None:
+                depth = np.zeros(image_hw, dtype=np.float64)
+            else:
+                depth = TrainerACEDINOv2LMC._load_wai_depth_npy(depth_path)
+                if tuple(depth.shape) != tuple(image_hw):
+                    depth = resize(
+                        depth,
+                        image_hw,
+                        order=0,
+                        preserve_range=True,
+                        anti_aliasing=False,
+                    )
+
+            image_mask = torch.ones((1, image.size[1], image.size[0]))
+            image = ds.image_transform(image)
+            pose = ds._load_pose(real_idx)
+
+            if ds.augment:
+                angle = random.uniform(-ds.aug_rotation, ds.aug_rotation)
+                image = ds._rotate_image(image, angle, 1, "reflect")
+                image_mask = ds._rotate_image(image_mask, angle, order=1, mode="constant")
+                depth = rotate(depth, angle, order=0, mode="constant", preserve_range=True)
+
+                angle_rad = angle * math.pi / 180.0
+                pose_rot = torch.eye(4)
+                pose_rot[0, 0] = math.cos(angle_rad)
+                pose_rot[0, 1] = -math.sin(angle_rad)
+                pose_rot[1, 0] = math.sin(angle_rad)
+                pose_rot[1, 1] = math.cos(angle_rad)
+                pose = torch.matmul(pose, pose_rot)
+
+            coords = TrainerACEDINOv2LMC._depth_to_patch_scene_coords(
+                depth,
+                pose,
+                image_hw=(image.shape[1], image.shape[2]),
+                focal_length=focal_length,
+                centre_point=centre_point,
+            )
+
+            if ds.use_half and torch.cuda.is_available():
+                image = image.half()
+            image_mask = image_mask > 0
+            pose_inv = pose.inverse()
+
+            intrinsics = torch.eye(3)
+            if centre_point:
+                intrinsics[0, 2] = centre_point[0]
+                intrinsics[1, 2] = centre_point[1]
+                intrinsics[0, 0] = focal_length[0]
+                intrinsics[1, 1] = focal_length[1]
+            else:
+                intrinsics[0, 2] = image.shape[2] / 2
+                intrinsics[1, 2] = image.shape[1] / 2
+                intrinsics[0, 0] = focal_length
+                intrinsics[1, 1] = focal_length
+
+            return image, image_mask, pose, pose_inv, intrinsics, intrinsics.inverse(), coords, str(rgb_path)
+
+        dataset._lmc_original_get_single_item = original_get_single_item
+        dataset._lmc_aux_depth_dir = depth_dir
+        dataset._lmc_aux_depth_missing_count = sum(path is None for path in depth_paths_by_index)
+        dataset._get_single_item = MethodType(_get_single_item_with_aux_depth, dataset)
+        return dataset
 
     def _warn_missing_aux_ref_coords_once(self):
         if float(getattr(self.options, "c1_aux_ref_loss_weight", 0.0)) <= 0.0:
             return
-        if getattr(self, "_warned_missing_aux_ref_coords", False):
-            return
-        _logger.warning(
-            "[LMC] --c1_aux_ref_loss_weight > 0 but this dataset batch has no GT scene coords; "
-            "aux_ref_loss will be skipped for these samples."
+        raise ValueError(
+            "[LMC] --c1_aux_ref_loss_weight > 0 but this dataset batch has no GT scene coords. "
+            "Auxiliary coordinate supervision requires patch-level scene coordinates from depth. "
+            "For indoor6_ace exports, provide train/depth or use a dataset backend that returns coords."
         )
-        self._warned_missing_aux_ref_coords = True
+
+    def _build_train_dataset(self, image_width=None, augment=False, aug_rotation=0, aug_scale_max=1.0, aug_scale_min=1.0):
+        dataset = super()._build_train_dataset(
+            image_width=image_width,
+            augment=augment,
+            aug_rotation=aug_rotation,
+            aug_scale_max=aug_scale_max,
+            aug_scale_min=aug_scale_min,
+        )
+        if (
+            float(getattr(self.options, "c1_aux_ref_loss_weight", 0.0)) > 0.0
+            and getattr(self.options, "data_backend", "ace") == "ace"
+            and hasattr(dataset, "init")
+        ):
+            train_root = self._get_train_root()
+            ace_depth_dir = train_root / "depth"
+            if ace_depth_dir.exists():
+                dataset.init = True
+                dataset.sparse = False
+                dataset.eye = False
+                dataset.coord_files = sorted(ace_depth_dir.iterdir())
+            else:
+                depth_dir = self._infer_c1_aux_depth_dir(train_root)
+                dataset = self._attach_ace_aux_depth_dataset(dataset, train_root, depth_dir)
+        return dataset
 
     def __init__(self, options):
         # Determine if LMC is active *before* parent __init__
@@ -648,14 +1015,23 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 self._depth_min_eff, self._depth_max_eff, self._depth_target_eff,
             )
 
+        pe_normalize_input = bool(getattr(options, 'pe_normalize_input', False))
+        lmc_fps_start_policy = str(getattr(options, 'lmc_fps_start_policy', 'farthest_from_center'))
+
         self.lmc_config = {
             'use_lmc': True,
             'lmc_mode': lmc_mode,
             'num_latent_tokens': num_latent_tokens,
+            'num_fine': num_fine,
+            'num_coarse': num_coarse,
             'num_attn_layers': num_attn_layers,
             'use_scale_token': use_scale_token,
             'compress_dim': feature_dim,
             'num_layers': num_layers,
+            'geo_sigma': geo_sigma,
+            'pe_normalize_input': pe_normalize_input,
+            'lmc_fps_start_policy': lmc_fps_start_policy,
+            'backbone_feature_dim': backbone_feature_dim,
             'scale_token_dim': scale_token_dim,
             'memory_path': str(memory_path),
             # Normalization metadata for test-time de-normalization
@@ -685,7 +1061,6 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self._align_head_mean_to_scene_center()
 
         # --- Build compressor (same as map-anything: input_dim/compress_dim = per-layer feature_dim) ---
-        pe_normalize_input = bool(getattr(options, 'pe_normalize_input', False))
         self.compressor = GeoLMC(
             input_dim=feature_dim,
             compress_dim=feature_dim,
@@ -699,6 +1074,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             scale_token_dim=scale_token_dim,
             num_attn_layers=num_attn_layers,
             pe_normalize_input=pe_normalize_input,
+            fps_start_policy=lmc_fps_start_policy,
         ).to(self.device)
 
         # --- Build fusion (query=backbone 1024, memory=compressor output feature_dim) ---

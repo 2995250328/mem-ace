@@ -447,6 +447,24 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        '--c1_aux_depth_root',
+        type=Path,
+        default=None,
+        help=(
+            'C1 aux_ref 使用的外部深度目录或 WAI scene 根目录。'
+            '若指向 scene 根目录，会自动追加 --c1_aux_depth_kind；'
+            '若为空，ACE backend 会按 ACE_DATA_ROOT 自动查找 '
+            'mapanything-dataset/wai_data/indoor6/<scene>_train/<depth_kind>。'
+        ),
+    )
+    parser.add_argument(
+        '--c1_aux_depth_kind',
+        type=str,
+        default='gt_depth',
+        choices=['gt_depth', 'colmap_depth'],
+        help='C1 aux_ref 自动查找或 scene 根目录下使用的 WAI 深度子目录。',
+    )
+    parser.add_argument(
         '--c1_aux_ref_sample_ratio',
         type=float,
         default=0.5,
@@ -514,6 +532,16 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         default='global',
         choices=['global', 'local', 'hierarchical', 'learned'],
         help='GeoLMC 模式：global/local/hierarchical/learned。',
+    )
+    parser.add_argument(
+        '--lmc_fps_start_policy',
+        type=str,
+        default='farthest_from_center',
+        choices=['farthest_from_center', 'lowest_index', 'highest_index', 'legacy_random'],
+        help=(
+            'GeoLMC FPS 初始点策略。默认 farthest_from_center 是确定性的，'
+            '保证训练和推理压缩出同一组 latent coordinates；legacy_random 用于回退旧随机行为。'
+        ),
     )
     parser.add_argument(
         '--lmc_auto_mode_by_visibility',

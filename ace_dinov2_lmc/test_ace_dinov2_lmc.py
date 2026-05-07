@@ -271,16 +271,21 @@ def run_evaluation_lmc(opt):
         # Build compressor/fusion with same dims as training (per-layer feature_dim from memory)
         compress_dim = lmc_config.get('compress_dim', 1024)
         num_layers = lmc_config.get('num_layers', 1)
-        backbone_feature_dim = 1024
+        backbone_feature_dim = lmc_config.get('backbone_feature_dim', 1024)
         compressor = GeoLMC(
             input_dim=compress_dim,
             compress_dim=compress_dim,
             num_latent_tokens=lmc_config.get('num_latent_tokens', 64),
+            num_fine=lmc_config.get('num_fine', 128),
+            num_coarse=lmc_config.get('num_coarse', 16),
             mode=lmc_config.get('lmc_mode', 'global'),
             num_layers=num_layers,
+            geo_sigma=lmc_config.get('geo_sigma', 0.5),
             use_scale_token=lmc_config.get('use_scale_token', True),
             scale_token_dim=lmc_config.get('scale_token_dim', 1024),
             num_attn_layers=lmc_config.get('num_attn_layers', 2),
+            pe_normalize_input=lmc_config.get('pe_normalize_input', False),
+            fps_start_policy=lmc_config.get('lmc_fps_start_policy', 'farthest_from_center'),
         ).to(device)
         compressor.load_state_dict(checkpoint['compressor_state_dict'])
         compressor.eval()

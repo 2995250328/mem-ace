@@ -53,6 +53,20 @@ Why defer these:
 
 ### 1. Make global FPS deterministic or checkpoint the selected latent set
 
+Status: fixed in code on 2026-05-07.
+
+Implemented first change:
+
+- `farthest_point_sampling()` now has an explicit `start_policy`.
+- Default policy is deterministic `farthest_from_center`.
+- `legacy_random` is retained as an opt-in rollback path via `--lmc_fps_start_policy legacy_random`.
+- Training stores `lmc_fps_start_policy` in `lmc_config`.
+- Evaluation rebuilds `GeoLMC` from the saved `lmc_config`, so train/eval use the same FPS start policy.
+
+Residual note:
+
+- Old checkpoints do not contain the selected latent coordinates and cannot exactly recover their original random FPS start. They will use the deterministic default unless evaluated with a manually patched config or retrained with the new setting.
+
 Location:
 
 - `/home/xwh/project/ace_depth/ace_compressor.py:43`

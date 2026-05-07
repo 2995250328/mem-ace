@@ -40,13 +40,29 @@ class FourierPositionEncoding(nn.Module):
         return self.mlp(fourier)
 
 
-def farthest_point_sampling(points, K):
-    """GPU-accelerated Farthest Point Sampling."""
+def farthest_point_sampling(points, K, start_policy="farthest_from_center", scene_center=None, generator=None):
+    """GPU-accelerated Farthest Point Sampling with explicit first-point policy."""
     B, N, C = points.shape
     device = points.device
     centroids = torch.zeros((B, K), dtype=torch.long, device=device)
     distance = torch.ones((B, N), dtype=points.dtype, device=device) * 1e10
-    farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
+    if start_policy == "legacy_random":
+        farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device, generator=generator)
+    elif start_policy == "lowest_index":
+        farthest = torch.zeros((B,), dtype=torch.long, device=device)
+    elif start_policy == "highest_index":
+        farthest = torch.full((B,), N - 1, dtype=torch.long, device=device)
+    elif start_policy == "farthest_from_center":
+        if scene_center is None:
+            center = points.mean(dim=1)
+        else:
+            center = scene_center.to(device=device, dtype=points.dtype)
+            if center.ndim == 1:
+                center = center.unsqueeze(0).expand(B, -1)
+        dist_to_center = torch.sum((points - center.unsqueeze(1)) ** 2, dim=-1)
+        farthest = torch.argmax(dist_to_center, dim=1)
+    else:
+        raise ValueError(f"Unsupported FPS start policy: {start_policy}")
     batch_indices = torch.arange(B, dtype=torch.long, device=device)
     for i in range(K):
         centroids[:, i] = farthest
@@ -247,7 +263,8 @@ class GeoLMC(nn.Module):
                  use_scale_token=True,
                  scale_token_dim=None,
                  num_attn_layers=2,
-                 pe_normalize_input=False):
+                 pe_normalize_input=False,
+                 fps_start_policy="farthest_from_center"):
         super().__init__()
 
         self.mode = mode
@@ -256,6 +273,7 @@ class GeoLMC(nn.Module):
         self.K_coarse = num_coarse
         self.num_layers = num_layers
         self.use_scale_token = use_scale_token
+        self.fps_start_policy = fps_start_policy
 
         # --- Input Projection ---
         self.total_input_dim = input_dim * num_layers
@@ -363,12 +381,21 @@ class GeoLMC(nn.Module):
 
         # --- Hierarchical ---
         if self.mode == 'hierarchical':
-            idx_fine = farthest_point_sampling(pooled_points, self.K_fine)
+            idx_fine = farthest_point_sampling(
+                pooled_points,
+                self.K_fine,
+                start_policy=self.fps_start_policy,
+                scene_center=scene_center,
+            )
             coords_fine = torch.gather(
                 pooled_points, 1,
                 idx_fine.unsqueeze(-1).expand(-1, -1, 3))
             idx_coarse_local = farthest_point_sampling(
-                coords_fine, self.K_coarse)
+                coords_fine,
+                self.K_coarse,
+                start_policy=self.fps_start_policy,
+                scene_center=scene_center,
+            )
             coords_coarse = torch.gather(
                 coords_fine, 1,
                 idx_coarse_local.unsqueeze(-1).expand(-1, -1, 3))
@@ -394,7 +421,12 @@ class GeoLMC(nn.Module):
         # --- Single Level (global / local) ---
         K_curr = self.K
         if pooled_points.shape[1] > K_curr:
-            fps_idx = farthest_point_sampling(pooled_points, K_curr)
+            fps_idx = farthest_point_sampling(
+                pooled_points,
+                K_curr,
+                start_policy=self.fps_start_policy,
+                scene_center=scene_center,
+            )
             latent_coords = torch.gather(
                 pooled_points, 1,
                 fps_idx.unsqueeze(-1).expand(-1, -1, 3))
