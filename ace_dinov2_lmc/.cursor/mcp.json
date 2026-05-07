@@ -1,0 +1,35 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/home/xwh/project"
+      ]
+    },
+    "git": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-git",
+        "--repository",
+        "/home/xwh/project/ace_depth"
+      ]
+    },
+    "fetch": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-fetch"
+      ]
+    },
+    "coderag": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@sylphx/coderag-mcp",
+        "--root=/home/xwh/project/ace_depth/ace_dinov2_lmc"
+      ]
+    }
+  }
+}

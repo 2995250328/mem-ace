@@ -1,0 +1,12 @@
+---
+description: Use when aggregating ACE-DINOv2-LMC experiment results from eval logs, summaries, and reference markdown tables.
+globs: []
+alwaysApply: false
+---
+
+# ACE Result Aggregation
+
+1. Scan all `*_eval_log.txt` and `eval_summary_*.txt` in the experiment directory.
+2. Use one explicit best-of aggregation rule.
+3. Tie best metrics back to exact files and iterations.
+4. Update or compare reference markdown tables with the same rule.

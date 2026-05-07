@@ -1,0 +1,12 @@
+---
+description: Use when composing or reviewing ACE-DINOv2-LMC train commands, including project root, scene path, memory path, output naming, GPUs, and runtime knobs.
+globs: []
+alwaysApply: false
+---
+
+# ACE Training Command Composer
+
+1. Run commands from the correct project root.
+2. Resolve vanilla vs LMC mode and preset.
+3. Align scene path, memory path, and output checkpoint naming.
+4. Distinguish throughput tweaks from training-dynamics changes.

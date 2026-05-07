@@ -1,0 +1,12 @@
+---
+description: Use when working on ACE-DINOv2-LMC memory extraction, including recipe resolution, view-selection flags, clustered vs non-clustered outputs, and output validation.
+globs: []
+alwaysApply: false
+---
+
+# ACE Memory Extraction Workflow
+
+1. Record scene, dataset type, view count, pool mode, contract mode, and view-selection knobs.
+2. Distinguish shell-env extraction from direct Python extraction.
+3. Check clustered vs non-clustered outputs explicitly.
+4. Verify exact timestamp directory and expected output files.

@@ -2,12 +2,15 @@
 """Argument parser builder for ACE DINOv2 + LMC training."""
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils_lmc import _strtobool
+
+DATA_ROOT = Path(os.environ.get("ACE_DATA_ROOT", "/home/xwh/data"))
 
 
 def get_lmc_train_parser() -> argparse.ArgumentParser:
@@ -41,7 +44,7 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--wai_repo_root',
         type=Path,
-        default=Path(__file__).resolve().parents[1] / 'map-anything',
+        default=DATA_ROOT / 'map-anything',
         help='map-anything 仓库根目录（用于导入 WAI 读取工具）。',
     )
     parser.add_argument(
@@ -103,7 +106,7 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--dinov2_path',
         type=Path,
-        default=Path('/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth'),
+        default=DATA_ROOT / 'checkpoints' / 'dinov2_vitl14_pretrain.pth',
         help='DINOv2 ViT-L/14 预训练权重路径。',
     )
     parser.add_argument(
@@ -420,6 +423,28 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         help='BSE memory: 将归一化坐标 (raw-mu)/sigma 还原为世界坐标 raw，'
              '后续 pipeline 与 pooled 版本完全一致（scene_center=mu，head.mean=mu，无 depth scaling）。'
              '用于验证归一化是否为性能下降根因。',
+    )
+    parser.add_argument(
+        '--c1_ref_norm_alpha',
+        type=float,
+        default=1.0,
+        help=(
+            '仅对 contract_mode=C1 且使用 points_ref_norm 的路径生效：'
+            '将 normalized reference target/runtime memory 整体乘以 alpha。'
+            'alpha>1 会放大 target 数值范围，便于观察高精度 metric 是否因归一化压缩过强而受损。'
+            '默认 1.0 表示保持现状。'
+        ),
+    )
+    parser.add_argument(
+        '--c1_aux_ref_loss_weight',
+        type=float,
+        default=0.0,
+        help=(
+            '仅对 contract_mode=C1 生效：在主 normalized-C1 reprojection loss 之外，'
+            '额外加入一个 reference-frame SmoothL1 辅助监督。'
+            '监督目标使用 dataset 返回的真实 world scene coordinates 经过 world->ref 变换后的 points_ref。'
+            '默认 0.0 表示关闭；建议首轮实验从 0.1 开始。'
+        ),
     )
     parser.add_argument(
         '--lmc_head_mean_max_shift',
@@ -902,6 +927,43 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=str,
         default='cuda:0',
         help='训练后最终评估使用的设备。默认 cuda:0（与训练同进程，trainer 释放后 GPU 可用）；OOM 时可设为 cpu。',
+    )
+    parser.add_argument(
+        '--eval_deterministic',
+        type=_strtobool,
+        default=False,
+        help='是否启用评估去随机性：固定 PyTorch/DataLoader/DSAC*（若扩展支持 set_seed）。False 时回到旧随机评估行为。',
+    )
+    parser.add_argument(
+        '--eval_dsacstar_seed',
+        type=int,
+        default=1305,
+        help='评估时 DSAC* 的基础随机种子。若 dsacstar 扩展暴露了 set_seed，将用于固定 RANSAC 采样。',
+    )
+    parser.add_argument(
+        '--eval_dsacstar_seed_per_frame',
+        type=_strtobool,
+        default=True,
+        help='是否对每一帧使用 base_seed + frame_idx 的 DSAC* 种子，降低线程调度带来的抖动。',
+    )
+    parser.add_argument(
+        '--eval_num_workers',
+        type=int,
+        default=6,
+        help='评估 DataLoader 的 worker 数；会配合固定 worker seed 使用。',
+    )
+    parser.add_argument(
+        '--post_train_eval_seeds',
+        type=int,
+        nargs='+',
+        default=[1305],
+        help='训练结束后最终评估使用的 seed 列表；多个 seed 时写入聚合后的中位数结果。',
+    )
+    parser.add_argument(
+        '--post_train_hypotheses',
+        type=int,
+        default=64,
+        help='训练结束后最终评估使用的 RANSAC hypotheses 数量。',
     )
 
     return parser

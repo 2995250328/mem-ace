@@ -1,0 +1,13 @@
+---
+description: Use when checkpoint save/load/resume behavior affects correctness or result comparability in DL/CV training.
+globs: []
+alwaysApply: false
+---
+
+# DL / Vision Checkpoint And Resume Integrity
+
+1. Identify checkpoint types and intended use.
+2. Verify model, optimizer, scheduler, scaler, and counter restoration behavior.
+3. Distinguish weight-only load from true resume.
+4. Check whether resumed runs overwrite or branch outputs.
+5. State whether resumed metrics are directly comparable.

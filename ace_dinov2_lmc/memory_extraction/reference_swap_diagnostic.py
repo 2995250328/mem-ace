@@ -391,8 +391,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--covis_target_coverage_max", type=float, default=2.0)
     parser.add_argument("--pose_eval_translation_ok_m", type=float, default=0.1)
     parser.add_argument("--model_config", type=str, default="default")
-    parser.add_argument("--model_checkpoint", type=str, default="/mnt/storage/xwh/checkpoints/facebook_map-anything.pth")
-    parser.add_argument("--dinov2_checkpoint", type=str, default="/home/xwh/project/ace_depth/checkpoints/dinov2_vitl14_pretrain.pth")
+    data_root = Path(os.environ.get("ACE_DATA_ROOT", "/home/xwh/data"))
+    parser.add_argument("--model_checkpoint", type=str, default=str(data_root / "checkpoints" / "facebook_map-anything.pth"))
+    parser.add_argument("--dinov2_checkpoint", type=str, default=str(data_root / "checkpoints" / "dinov2_vitl14_pretrain.pth"))
     parser.add_argument("--num_reference_candidates", type=int, default=4)
     parser.add_argument(
         "--reference_indices",

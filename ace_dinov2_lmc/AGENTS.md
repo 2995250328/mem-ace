@@ -25,3 +25,20 @@ There is no dedicated `pytest` suite in this directory. Validation is command-dr
 
 ## Commit & Pull Request Guidelines
 Recent history mixes concise version tags (`v1.6`), scoped research commits (`research(...): stage 1 complete`), and short Chinese progress summaries. Prefer a scoped, imperative subject that names the subsystem, for example `memory_extraction: tighten ACE loader path checks`. PRs should state the motivation, affected flow (`vanilla`, `iterative`, or `ace_g`), exact commands run, GPU/device assumptions, and key metrics or output paths. Include logs or screenshots only when they clarify regressions or evaluation results.
+
+## Local Agent Skills
+This repository also ships project-local agent skills and MCP configuration for DL / vision workflows:
+
+- skills for Claude Code: `.claude/skills`
+- skills for Codex: `.codex_skills`
+- rules for Cursor: `.cursor/rules`
+- project MCP config for Claude Code / Cursor: `.mcp.json`
+
+Prefer these local skills for:
+
+- repo onboarding
+- GPU / throughput tuning
+- experiment result aggregation
+- training failure triage
+- dataset contract review
+- paper-to-code planning

@@ -1,0 +1,13 @@
+---
+description: Use when turning a deep learning or vision paper into implementation tasks, ablations, configs, and verification steps.
+globs: []
+alwaysApply: false
+---
+
+# DL / Vision Paper To Code
+
+1. Extract architecture, losses, augmentation, schedule, and metric protocol.
+2. Separate mandatory reproduction details from optional improvements.
+3. Map paper concepts to model, data, training, eval, and reporting code.
+4. Build a baseline + ablation matrix.
+5. Define verification criteria before implementation.

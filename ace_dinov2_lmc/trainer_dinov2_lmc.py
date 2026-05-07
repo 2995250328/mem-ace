@@ -7,6 +7,7 @@ import gc
 import logging
 import math
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -15,11 +16,14 @@ from typing import Any, Dict, Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import numpy as np
 import torch
+import torch.nn.functional as Fnn
 import torch.optim as optim
 import torchvision.transforms.functional as TF
 from torch.amp import autocast
 from torch.utils.data import DataLoader, sampler
+from tqdm import tqdm
 
 from ace_util import to_homogeneous
 from trainer_dinov2 import TrainerACEDINOv2, set_seed
@@ -52,6 +56,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 "gt_poses_inv": {"rank": 3, "shape_suffix": (3, 4), "dtype": torch.float32},
                 "intrinsics": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
                 "intrinsics_inv": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
+                "gt_scene_coords_world": {"rank": 2, "shape_suffix": (3,), "dtype": torch.float32},
             },
         },
         "raw_buffer": {
@@ -62,6 +67,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 "gt_poses_inv": {"rank": 3, "shape_suffix": (3, 4), "dtype": torch.float32},
                 "intrinsics": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
                 "intrinsics_inv": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
+                "gt_scene_coords_world": {"rank": 2, "shape_suffix": (3,), "dtype": torch.float32},
             },
         },
     }
@@ -81,6 +87,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return [TrainerACEDINOv2LMC._tensor_to_config_value(v) for v in value]
         return value
 
+    def _get_training_generator(self, device: Optional[torch.device] = None) -> torch.Generator:
+        """Return the training RNG that matches the target tensor device."""
+        target_device = torch.device(device) if device is not None else self.device
+        if target_device.type == "cuda":
+            if not hasattr(self, "_training_generator_cuda") or self._training_generator_cuda is None:
+                self._training_generator_cuda = torch.Generator(device=target_device).manual_seed(self.base_seed + 8191)
+            return self._training_generator_cuda
+        if not hasattr(self, "_training_generator_cpu") or self._training_generator_cpu is None:
+            self._training_generator_cpu = torch.Generator().manual_seed(self.base_seed + 8191)
+        return self._training_generator_cpu
+
     def _build_reference_contract_state(
         self,
         *,
@@ -88,6 +105,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         reference_index: Optional[int],
         conditioning_reference: Dict[str, Any],
         normalization_ref: Dict[str, Any],
+        scene_center_world: Optional[torch.Tensor],
+        scene_center_ref: Optional[torch.Tensor],
+        scene_center_ref_norm: Optional[torch.Tensor],
     ) -> Dict[str, Any]:
         """Prepare the runtime contract that interprets head outputs."""
         contract_mode = str(memory_contract_mode or "C0").upper()
@@ -125,6 +145,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         mu_ref = normalization_ref.get("mu_ref")
         sigma_ref = normalization_ref.get("sigma_ref")
+        ref_norm_alpha = float(normalization_ref.get("alpha", 1.0) or 1.0)
         has_ref_norm = mu_ref is not None and sigma_ref is not None
         if has_ref_norm:
             if not isinstance(mu_ref, torch.Tensor):
@@ -132,15 +153,28 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             else:
                 mu_ref = mu_ref.to(self.device).float()
             sigma_ref = float(torch.as_tensor(sigma_ref, dtype=torch.float32).item())
-            if not math.isfinite(sigma_ref) or sigma_ref <= 1e-12:
+            if (
+                not math.isfinite(sigma_ref)
+                or sigma_ref <= 1e-12
+                or not math.isfinite(ref_norm_alpha)
+                or ref_norm_alpha <= 0
+            ):
                 has_ref_norm = False
 
         if has_ref_norm:
             output_space = "points_ref_norm"
-            head_mean = torch.zeros(3, device=self.device, dtype=torch.float32)
+            if isinstance(scene_center_ref_norm, torch.Tensor):
+                head_mean = scene_center_ref_norm.to(self.device).float().view(-1)[:3]
+            else:
+                head_mean = torch.zeros(3, device=self.device, dtype=torch.float32)
         else:
             output_space = "points_ref"
-            head_mean = mu_ref if isinstance(mu_ref, torch.Tensor) else torch.zeros(3, device=self.device, dtype=torch.float32)
+            if isinstance(scene_center_ref, torch.Tensor):
+                head_mean = scene_center_ref.to(self.device).float().view(-1)[:3]
+            elif isinstance(mu_ref, torch.Tensor):
+                head_mean = mu_ref
+            else:
+                head_mean = torch.zeros(3, device=self.device, dtype=torch.float32)
 
         state.update({
             "output_space": output_space,
@@ -152,6 +186,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "normalization_ref": {
                 "mu_ref": mu_ref if has_ref_norm else None,
                 "sigma_ref": sigma_ref if has_ref_norm else None,
+                "alpha": ref_norm_alpha if has_ref_norm else 1.0,
             },
             "head_mean": head_mean.detach().clone().float(),
         })
@@ -167,7 +202,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if contract["output_space"] == "points_ref_norm":
             mu_ref = contract["normalization_ref"]["mu_ref"].to(pred_world.device, dtype=pred_world.dtype)
             sigma_ref = float(contract["normalization_ref"]["sigma_ref"])
-            pred_world = pred_world * sigma_ref + mu_ref.view(1, 3, 1, 1)
+            ref_norm_alpha = float(contract["normalization_ref"].get("alpha", 1.0) or 1.0)
+            pred_world = pred_world * (sigma_ref / ref_norm_alpha) + mu_ref.view(1, 3, 1, 1)
 
         T_ref_c2w_world = contract["conditioning_reference"]["T_ref_c2w_world"].to(
             pred_world.device, dtype=pred_world.dtype
@@ -182,6 +218,73 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             pred_world = (pred_world - mu) / float(self.coord_sigma)
         return pred_world
 
+    def _recover_pred_scene_to_reference(self, pred_scene_B3HW: torch.Tensor) -> Optional[torch.Tensor]:
+        """Recover C1 head outputs to raw reference-frame coordinates."""
+        contract = getattr(self, "reference_contract_state", None)
+        if not contract or not contract.get("enabled", False):
+            return None
+
+        pred_ref = pred_scene_B3HW
+        if contract["output_space"] == "points_ref_norm":
+            mu_ref = contract["normalization_ref"]["mu_ref"]
+            sigma_ref = contract["normalization_ref"]["sigma_ref"]
+            ref_norm_alpha = float(contract["normalization_ref"].get("alpha", 1.0) or 1.0)
+            if mu_ref is None or sigma_ref is None:
+                return None
+            mu_ref = mu_ref.to(pred_ref.device, dtype=pred_ref.dtype)
+            pred_ref = pred_ref * (float(sigma_ref) / ref_norm_alpha) + mu_ref.view(1, 3, 1, 1)
+        return pred_ref
+
+    def _world_to_reference(self, points_world_N3: torch.Tensor) -> Optional[torch.Tensor]:
+        """Map raw world scene coordinates to raw reference-frame coordinates."""
+        contract = getattr(self, "reference_contract_state", None)
+        if not contract or not contract.get("enabled", False):
+            return None
+
+        T_world_to_ref = contract["conditioning_reference"].get("T_world_to_ref")
+        if T_world_to_ref is None:
+            T_ref_c2w_world = contract["conditioning_reference"]["T_ref_c2w_world"]
+            R_ref = T_ref_c2w_world[:3, :3]
+            C_ref = T_ref_c2w_world[:3, 3]
+            return torch.einsum("ij,nj->ni", R_ref.transpose(0, 1), points_world_N3 - C_ref.view(1, 3))
+
+        T_world_to_ref = T_world_to_ref.to(points_world_N3.device, dtype=points_world_N3.dtype)
+        R = T_world_to_ref[:3, :3]
+        t = T_world_to_ref[:3, 3]
+        return torch.einsum("ij,nj->ni", R, points_world_N3) + t.view(1, 3)
+
+    def _compute_c1_aux_ref_loss(
+        self,
+        pred_scene_B3HW: torch.Tensor,
+        gt_scene_coords_world_N3: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        weight = float(getattr(self.options, "c1_aux_ref_loss_weight", 0.0))
+        if weight <= 0.0 or gt_scene_coords_world_N3 is None:
+            return pred_scene_B3HW.new_zeros(())
+
+        pred_ref_B3HW = self._recover_pred_scene_to_reference(pred_scene_B3HW)
+        if pred_ref_B3HW is None:
+            return pred_scene_B3HW.new_zeros(())
+
+        pred_ref_N3 = pred_ref_B3HW.permute(0, 2, 3, 1).reshape(-1, 3).float()
+        gt_world_N3 = gt_scene_coords_world_N3.reshape(-1, 3).to(pred_ref_N3.device, dtype=pred_ref_N3.dtype)
+        gt_ref_N3 = self._world_to_reference(gt_world_N3)
+        if gt_ref_N3 is None:
+            return pred_scene_B3HW.new_zeros(())
+
+        valid_mask = torch.isfinite(pred_ref_N3).all(dim=1) & torch.isfinite(gt_ref_N3).all(dim=1)
+        valid_mask &= (gt_world_N3.abs().sum(dim=1) > 0)
+        if not bool(valid_mask.any().item()):
+            return pred_scene_B3HW.new_zeros(())
+
+        aux_loss = Fnn.smooth_l1_loss(
+            pred_ref_N3[valid_mask],
+            gt_ref_N3[valid_mask],
+            reduction="mean",
+            beta=1.0,
+        )
+        return aux_loss * weight
+
     def __init__(self, options):
         # Determine if LMC is active *before* parent __init__
         self.use_lmc = getattr(options, 'use_lmc', False)
@@ -191,6 +294,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         # Parent builds: dataset, regressor, optimizer, scheduler, loss, buffer
         super().__init__(options)
+        self._training_generator_cpu = torch.Generator().manual_seed(self.base_seed + 8191)
+        self._training_generator_cuda = None
+        if torch.cuda.is_available():
+            self._training_generator_cuda = torch.Generator(device=self.device).manual_seed(self.base_seed + 8191)
 
         # Common iteration/eval policy (used by both LMC and vanilla-iterative mode)
         self.vanilla_iterations = max(1, int(getattr(options, 'vanilla_iterations', 1)))
@@ -215,7 +322,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         # --- Load pre-saved memory (same as map-anything train_ace + load_memory_features) ---
         _logger.info("[LMC] Loading memory from %s", memory_path)
         _bse_denorm = bool(getattr(options, "bse_denorm_to_world", False))
-        bank_data = load_memory_features(str(memory_path), self.device, bse_denorm_to_world=_bse_denorm)
+        c1_ref_norm_alpha = float(getattr(options, "c1_ref_norm_alpha", 1.0))
+        bank_data = load_memory_features(
+            str(memory_path),
+            self.device,
+            bse_denorm_to_world=_bse_denorm,
+            c1_ref_norm_alpha=c1_ref_norm_alpha,
+        )
         if bool(getattr(options, "lmc_memory_preflight", True)):
             preflight_report = preflight_memory_features(
                 bank_data,
@@ -240,6 +353,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             normalization_ref = {}
         memory_contract_mode = str(bank_data.get("contract_mode", "C0")).upper()
         memory_mode = str(bank_data.get("mode", "single_forward"))
+        scene_center_world = bank_data.get("scene_center_world")
+        if scene_center_world is None:
+            scene_center_world = bank_data.get("scene_center")
+        if scene_center_world is None:
+            scene_center_world = bank_data.get("scene_center_cam")
+        scene_center_ref = bank_data.get("scene_center_ref")
+        scene_center_ref_norm = bank_data.get("scene_center_ref_norm")
         reference_index = bank_data.get("reference_index", conditioning_reference.get("reference_index"))
         try:
             reference_index = int(reference_index) if reference_index is not None else None
@@ -251,6 +371,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             reference_index=reference_index,
             conditioning_reference=conditioning_reference,
             normalization_ref=normalization_ref,
+            scene_center_world=scene_center_world,
+            scene_center_ref=scene_center_ref,
+            scene_center_ref_norm=scene_center_ref_norm,
         )
         self.memory_contract_info = {
             "memory_mode": memory_mode,
@@ -261,6 +384,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "has_conditioning_reference": bool(conditioning_reference),
             "has_normalization_ref": isinstance(bank_data.get("normalization_ref"), dict),
             "training_target": self.reference_contract_state["output_space"],
+            "has_scene_center_world": scene_center_world is not None,
+            "has_scene_center_ref": scene_center_ref is not None,
+            "has_scene_center_ref_norm": scene_center_ref_norm is not None,
         }
         _logger.info(
             "[LMC] Memory contract: mode=%s, contract=%s, reference_index=%s, "
@@ -291,17 +417,29 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 return t.unsqueeze(0)
             return t
 
-        scene_center = bank_data.get("scene_center")
+        scene_center = bank_data.get("scene_center_contract")
+        if scene_center is None:
+            if self.reference_contract_state.get("enabled", False):
+                if self.reference_contract_state["output_space"] == "points_ref_norm":
+                    scene_center = scene_center_ref_norm
+                else:
+                    scene_center = scene_center_ref
+            if scene_center is None:
+                scene_center = scene_center_world
         if scene_center is None:
             pts = bank_data["pooled_points"]
             scene_center = pts.mean(dim=0)
             _logger.info("[LMC] scene_center missing in file, using mean(pooled_points)")
-        self._validate_memory_scene_consistency(bank_data, scene_center)
+        scene_center_world_for_check = scene_center_world if scene_center_world is not None else scene_center
+        self._validate_memory_scene_consistency(bank_data, scene_center_world_for_check)
 
         self.memory_dict = {
             "pooled_points": _unsqueeze0(bank_data["pooled_points"]),
             "pooled_features": _unsqueeze0(bank_data["pooled_features"]),
             "scene_center": _unsqueeze0(scene_center),
+            "scene_center_world": _unsqueeze0(scene_center_world) if scene_center_world is not None else None,
+            "scene_center_ref": _unsqueeze0(scene_center_ref) if scene_center_ref is not None else None,
+            "scene_center_ref_norm": _unsqueeze0(scene_center_ref_norm) if scene_center_ref_norm is not None else None,
             "all_scale_tokens": _unsqueeze0(bank_data.get("all_scale_tokens")) if bank_data.get("all_scale_tokens") is not None else None,
         }
         for opt_key in (
@@ -448,8 +586,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'memory_reference_index': self.memory_contract_info['reference_index'],
             'memory_training_target': self.memory_contract_info['training_target'],
             'reference_output_space': self.reference_contract_state['output_space'],
+            'c1_ref_norm_alpha': float(self.reference_contract_state.get('normalization_ref', {}).get('alpha', 1.0) or 1.0),
+            'c1_aux_ref_loss_weight': float(getattr(self.options, 'c1_aux_ref_loss_weight', 0.0)),
             'memory_has_points_ref': self.memory_contract_info['has_points_ref'],
             'memory_has_points_ref_norm': self.memory_contract_info['has_points_ref_norm'],
+            'memory_has_scene_center_world': self.memory_contract_info['has_scene_center_world'],
+            'memory_has_scene_center_ref': self.memory_contract_info['has_scene_center_ref'],
+            'memory_has_scene_center_ref_norm': self.memory_contract_info['has_scene_center_ref_norm'],
             'conditioning_reference': self._tensor_to_config_value(
                 self.reference_contract_state.get('conditioning_reference')
             ),
@@ -778,8 +921,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         dataset_center = self.dataset.mean_cam_center.detach().float().view(-1).cpu()
         mem_center = scene_center.detach().float().view(-1).cpu()
 
-        # Skip center distance check when using normalized coordinates (scene_center=0)
-        if hasattr(self, 'coord_sigma') and self.coord_sigma is not None:
+        # Skip only when the provided center itself is the synthetic zero anchor.
+        if (
+            hasattr(self, 'coord_sigma')
+            and self.coord_sigma is not None
+            and mem_center.numel() >= 3
+            and float(torch.linalg.norm(mem_center[:3]).item()) <= 1e-6
+        ):
             _logger.info(
                 "[LMC] Skipping center distance check (normalized coordinates, scene_center=0). "
                 "dataset.mean_cam_center=(%.3f, %.3f, %.3f)",
@@ -827,6 +975,183 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     float(cmin[2]), float(cmax[2]),
                     mean_dist,
                 )
+
+    def _create_training_buffer_with_scene_coords(self, buffer_size=None):
+        """Local variant of create_training_buffer() that also stores GT scene coordinates."""
+        torch.backends.cudnn.benchmark = False
+        effective_size = self.options.training_buffer_size if buffer_size is None else buffer_size
+        self._current_buffer_size = effective_size
+
+        buffer_batch_size = getattr(self.options, 'buffer_batch_size', 10)
+        if buffer_batch_size > 1:
+            buffer_image_width = getattr(self.options, 'buffer_image_width', None)
+            if buffer_image_width is None:
+                buffer_image_width = (self.options.image_resolution * 4 // 3 + 13) // 14 * 14
+            buffer_dataset = self._build_train_dataset(
+                image_width=buffer_image_width,
+                augment=False,
+                aug_rotation=0,
+                aug_scale_max=1.0,
+                aug_scale_min=1.0,
+            )
+        else:
+            buffer_dataset = self.dataset
+
+        batch_sampler = sampler.BatchSampler(
+            sampler.RandomSampler(buffer_dataset, generator=self.batch_generator),
+            batch_size=buffer_batch_size,
+            drop_last=False,
+        )
+
+        def seed_worker(worker_id):
+            worker_seed = torch.initial_seed() % 2**32
+            np.random.seed(worker_seed)
+            random.seed(worker_seed)
+
+        training_dataloader = DataLoader(
+            dataset=buffer_dataset,
+            sampler=batch_sampler,
+            batch_size=None,
+            worker_init_fn=seed_worker,
+            generator=self.loader_generator,
+            pin_memory=True,
+            num_workers=self.num_data_loader_workers,
+            persistent_workers=self.num_data_loader_workers > 0,
+            timeout=60 if self.num_data_loader_workers > 0 else 0,
+        )
+
+        _logger.info("Starting creation of the training buffer.")
+        buffer_on_cpu = getattr(self.options, "buffer_on_cpu", False)
+        buffer_device = torch.device("cpu") if buffer_on_cpu else self.device
+        if buffer_on_cpu:
+            _logger.info("Buffer will be allocated on CPU (buffer_on_cpu=True) to avoid GPU OOM.")
+
+        self.training_buffer = {
+            'features': torch.empty(
+                (effective_size, self.regressor.feature_dim),
+                dtype=(torch.float32, torch.float16)[self.options.use_half],
+                device=buffer_device,
+            ),
+            'target_px': torch.empty((effective_size, 2), dtype=torch.float32, device=buffer_device),
+            'gt_poses_inv': torch.empty((effective_size, 3, 4), dtype=torch.float32, device=buffer_device),
+            'intrinsics': torch.empty((effective_size, 3, 3), dtype=torch.float32, device=buffer_device),
+            'intrinsics_inv': torch.empty((effective_size, 3, 3), dtype=torch.float32, device=buffer_device),
+            'gt_scene_coords_world': torch.empty((effective_size, 3), dtype=torch.float32, device=buffer_device),
+        }
+
+        self.regressor.eval()
+        with torch.no_grad():
+            buffer_idx = 0
+            dataset_passes = 0
+            sampled_total = 0
+            sampled_duplicates = 0
+            pbar = tqdm(
+                total=effective_size,
+                unit="samples",
+                unit_scale=True,
+                desc="Buffer",
+                dynamic_ncols=True,
+            )
+
+            while buffer_idx < effective_size:
+                dataset_passes += 1
+                for batch in training_dataloader:
+                    image_BCHW, image_mask_B1HW, _, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, coords_B3HW, _ = batch
+
+                    image_BCHW = image_BCHW.to(self.device, non_blocking=True)
+                    image_mask_B1HW = image_mask_B1HW.to(self.device, non_blocking=True)
+                    gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True)
+                    intrinsics_B33 = intrinsics_B33.to(self.device, non_blocking=True)
+                    intrinsics_inv_B33 = intrinsics_inv_B33.to(self.device, non_blocking=True)
+                    coords_B3HW = coords_B3HW.to(self.device, non_blocking=True).float()
+
+                    if gt_pose_inv_B44.shape[1] == 4:
+                        gt_pose_inv_B34 = gt_pose_inv_B44[:, :3, :]
+                    else:
+                        gt_pose_inv_B34 = gt_pose_inv_B44
+
+                    if image_BCHW.dtype == torch.float16:
+                        image_BCHW = image_BCHW.float()
+
+                    with autocast("cuda", enabled=self.options.use_half):
+                        features_BCHW = self.regressor.get_features(image_BCHW)
+
+                    B, C, H, W = features_BCHW.shape
+                    image_mask_B1HW = TF.resize(image_mask_B1HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
+                    image_mask_B1HW = image_mask_B1HW.bool()
+                    if tuple(coords_B3HW.shape[-2:]) != (H, W):
+                        coords_B3HW = Fnn.interpolate(coords_B3HW, size=(H, W), mode="nearest")
+
+                    if image_mask_B1HW.sum() == 0:
+                        continue
+
+                    pixel_positions_B2HW = self.pixel_grid_2HW[:, :H, :W].clone().unsqueeze(0).expand(B, 2, H, W)
+                    gt_pose_inv = gt_pose_inv_B34.unsqueeze(1).expand(B, H * W, 3, 4).reshape(-1, 3, 4)
+                    intrinsics = intrinsics_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
+                    intrinsics_inv = intrinsics_inv_B33.unsqueeze(1).expand(B, H * W, 3, 3).reshape(-1, 3, 3)
+
+                    def normalize_shape(tensor_in):
+                        return tensor_in.transpose(0, 1).flatten(1).transpose(0, 1)
+
+                    batch_data = {
+                        'features': normalize_shape(features_BCHW),
+                        'target_px': normalize_shape(pixel_positions_B2HW),
+                        'gt_poses_inv': gt_pose_inv,
+                        'intrinsics': intrinsics,
+                        'intrinsics_inv': intrinsics_inv,
+                        'gt_scene_coords_world': normalize_shape(coords_B3HW),
+                    }
+
+                    image_mask_B1HW = image_mask_B1HW.float()
+                    image_mask_N1 = normalize_shape(image_mask_B1HW)
+                    replacement_cfg = getattr(self.options, "buffer_sampling_replacement", None)
+                    use_replacement = True if replacement_cfg is None else bool(replacement_cfg)
+                    features_to_select = min(
+                        self.options.samples_per_image * B,
+                        effective_size - buffer_idx,
+                    )
+                    if not use_replacement:
+                        valid_count = int((image_mask_N1.view(-1) > 0).sum().item())
+                        features_to_select = min(features_to_select, valid_count)
+                    if features_to_select <= 0:
+                        continue
+                    sample_idxs = torch.multinomial(
+                        image_mask_N1.view(-1),
+                        features_to_select,
+                        replacement=use_replacement,
+                        generator=self.sampling_generator,
+                    )
+                    sampled_total += int(sample_idxs.numel())
+                    sampled_duplicates += int(sample_idxs.numel() - torch.unique(sample_idxs).numel())
+
+                    for k in batch_data:
+                        batch_data[k] = batch_data[k][sample_idxs].to(buffer_device, non_blocking=True)
+                    buffer_offset = buffer_idx + features_to_select
+                    for k in batch_data:
+                        self.training_buffer[k][buffer_idx:buffer_offset] = batch_data[k]
+
+                    buffer_idx = buffer_offset
+                    pbar.update(features_to_select)
+                    pbar.set_postfix(n_pass=dataset_passes)
+                    if buffer_idx >= effective_size:
+                        break
+
+            pbar.close()
+
+        buffer_memory = sum(v.element_size() * v.nelement() for v in self.training_buffer.values()) / (1024**3)
+        dup_ratio = (sampled_duplicates / sampled_total) if sampled_total > 0 else 0.0
+        replacement_cfg = getattr(self.options, "buffer_sampling_replacement", None)
+        use_replacement = True if replacement_cfg is None else bool(replacement_cfg)
+        _logger.info("Created buffer of {:.2f}GB with {} passes (buffer_batch_size={}).".format(
+            buffer_memory, dataset_passes, buffer_batch_size))
+        _logger.info(
+            "Buffer sampling stats: replacement=%s, duplicate_ratio=%.4f (%d/%d).",
+            use_replacement,
+            dup_ratio,
+            sampled_duplicates,
+            sampled_total,
+        )
+        self.regressor.train()
 
     # ------------------------------------------------------------------
     # Optimizer rebuild (includes compressor + fusion + head)
@@ -1023,7 +1348,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         self.regressor.get_features = fused_get_features
         try:
-            super().create_training_buffer()
+            self._create_training_buffer_with_scene_coords()
         finally:
             self.regressor.get_features = original_get_features
             self.options.training_buffer_size = orig_buf_size
@@ -1068,7 +1393,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         try:
             # Backbone should be in eval mode for deterministic feature extraction.
             self.regressor.eval()
-            super().create_training_buffer()
+            self._create_training_buffer_with_scene_coords()
         finally:
             self.options.training_buffer_size = orig_buf_size
             self.regressor.train()
@@ -1142,7 +1467,16 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     SANITY_PIXEL_ERR = 50000.0
     SANITY_COORD_VAL = 10000.0
 
-    def _s1_compute_loss_full_map(self, fused_feats_BCHW, gt_pose_inv_B34, K_B33, invK_B33, image_mask_B1HW, s1_step=0):
+    def _s1_compute_loss_full_map(
+        self,
+        fused_feats_BCHW,
+        gt_pose_inv_B34,
+        K_B33,
+        invK_B33,
+        image_mask_B1HW,
+        gt_scene_coords_B3HW=None,
+        s1_step=0,
+    ):
         """Full E2E: head on (B,C,H,W), repro loss on spatial positions (optionally subsampled).
         Aligns with map-anything:
         - Only pixels inside image_mask contribute (same as buffer only storing valid_mask pixels).
@@ -1222,6 +1556,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         loss_invalid = invalid_abs[invalid_mask].sum()
 
         loss = (loss_valid + loss_invalid) / N
+        if gt_scene_coords_B3HW is not None:
+            if tuple(gt_scene_coords_B3HW.shape[-2:]) != (H, W):
+                gt_scene_coords_B3HW = Fnn.interpolate(gt_scene_coords_B3HW, size=(H, W), mode="nearest")
+            gt_scene_coords_N3 = gt_scene_coords_B3HW.permute(0, 2, 3, 1).reshape(N, 3)
+            loss = loss + (self._compute_c1_aux_ref_loss(pred_scene_B3HW, gt_scene_coords_N3) / N)
         fraction_valid = float(valid_flat.sum() / N)
         finite_l1 = repro_l1_b1[torch.isfinite(repro_l1_b1).flatten()]
         finite_l2 = repro_l2_b1[torch.isfinite(repro_l2_b1).flatten()]
@@ -1236,7 +1575,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         }
         return loss, stats
 
-    def _s1_compute_loss_from_features(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33):
+    def _s1_compute_loss_from_features(
+        self,
+        features_bC,
+        target_px_b2,
+        gt_inv_poses_b34,
+        Ks_b33,
+        invKs_b33,
+        gt_scene_coords_world_b3=None,
+    ):
         """Compute ace_depth reprojection loss from sampled fused features (same formula as TrainerACEDINOv2.training_step)."""
         channels = features_bC.shape[1]
 
@@ -1294,6 +1641,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         loss_invalid = invalid_abs.masked_select(invalid_mask_b11).sum()
 
         loss = (loss_valid + loss_invalid) / batch_size
+        loss = loss + self._compute_c1_aux_ref_loss(pred_scene_coords_b3HW, gt_scene_coords_world_b3)
         fraction_valid = float(valid_mask_b1.sum() / batch_size)
         finite_l1 = reprojection_error_l1_b1[torch.isfinite(reprojection_error_l1_b1)]
         finite_l2 = reprojection_error_l2_b1[torch.isfinite(reprojection_error_l2_b1)]
@@ -1469,7 +1817,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         t0 = time.time()
 
         prev_device = previous_buffer["features"].device
-        keep_indices = torch.randperm(previous_size, generator=self.training_generator, device=prev_device)[:keep_count]
+        keep_indices = torch.randperm(
+            previous_size,
+            generator=self._get_training_generator(prev_device),
+            device=prev_device,
+        )[:keep_count]
         kept_buffer = self._slice_training_buffer_rows(previous_buffer, "raw_buffer", keep_indices)
         self.training_buffer = None
         del previous_buffer
@@ -1570,7 +1922,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 skipped_sample += 1
                 continue
             sample_idxs = torch.randint(
-                0, buffer_len, (draw_bs,), generator=self.training_generator, device=buf_device
+                0,
+                buffer_len,
+                (draw_bs,),
+                generator=self._get_training_generator(buf_device),
+                device=buf_device,
             )
 
             def _to_dev(t):
@@ -1823,13 +2179,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 )
                 break
             batch = next(s1_iterator)
-            image_BCHW, image_mask_B1HW, _, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, _, _ = batch
+            image_BCHW, image_mask_B1HW, _, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, gt_scene_coords_B3HW, _ = batch
 
             image_BCHW = image_BCHW.to(self.device, non_blocking=True)
             image_mask_B1HW = image_mask_B1HW.to(self.device, non_blocking=True)
             gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True)
             intrinsics_B33 = intrinsics_B33.to(self.device, non_blocking=True)
             intrinsics_inv_B33 = intrinsics_inv_B33.to(self.device, non_blocking=True)
+            gt_scene_coords_B3HW = gt_scene_coords_B3HW.to(self.device, non_blocking=True).float()
 
             if gt_pose_inv_B44.shape[1] == 4:
                 gt_pose_inv_B34 = gt_pose_inv_B44[:, :3, :]
@@ -1860,6 +2217,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     s1_step = iteration_idx * n_steps + update_step
                     loss, s1_stats = self._s1_compute_loss_full_map(
                         fused_feats, gt_pose_inv_B34, intrinsics_B33, intrinsics_inv_B33, image_mask_B1HW,
+                        gt_scene_coords_B3HW=gt_scene_coords_B3HW,
                         s1_step=s1_step,
                     )
                 else:
@@ -1877,6 +2235,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         'gt_poses_inv': gt_pose_inv,
                         'intrinsics': intrinsics,
                         'intrinsics_inv': intrinsics_inv,
+                        'gt_scene_coords_world': normalize_shape(
+                            Fnn.interpolate(gt_scene_coords_B3HW, size=(H, W), mode="nearest")
+                            if tuple(gt_scene_coords_B3HW.shape[-2:]) != (H, W) else gt_scene_coords_B3HW
+                        ),
                     }
 
                     image_mask_N1 = normalize_shape(image_mask_B1HW.float())
@@ -1918,6 +2280,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         batch_data['gt_poses_inv'].contiguous(),
                         batch_data['intrinsics'].contiguous(),
                         batch_data['intrinsics_inv'].contiguous(),
+                        batch_data['gt_scene_coords_world'].contiguous(),
                     )
 
             if loss is None:
@@ -2263,6 +2626,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             image_resolution=self.options.image_resolution,
             session=f"iter_{iter_idx+1:02d}",
             hypotheses=64,
+            eval_deterministic=getattr(self.options, 'eval_deterministic', False),
+            dsacstar_seed=getattr(self.options, 'eval_dsacstar_seed', 1305),
+            dsacstar_seed_per_frame=getattr(self.options, 'eval_dsacstar_seed_per_frame', True),
+            eval_num_workers=getattr(self.options, 'eval_num_workers', 6),
             threshold=10,
             inlieralpha=100,
             maxpixelerror=100,
@@ -2277,6 +2644,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return float(eval_result.get('pct5', 0.0))
         if self.best_metric == 'pct10_5':
             return float(eval_result.get('pct10_5', 0.0))
+        if self.best_metric == 'composite':
+            pct5 = float(eval_result.get('pct5', 0.0))
+            med_t = float(eval_result.get('median_tErr', 1e9))  # cm
+            med_r = float(eval_result.get('median_rErr', 1e9))  # deg
+            return pct5 - 2.0 * med_t - 2.0 * med_r
         if self.best_metric == 'rt_error':
             # Lower error is better; convert to a score where larger is better.
             med_t = float(eval_result.get('median_tErr', 1e9))  # cm
@@ -2787,7 +3159,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         buffer_len = buf['features'].shape[0]
         buf_device = buf['features'].device
         # Randperm on same device as buffer so indexing is cheap (no cross-device)
-        random_indices = torch.randperm(buffer_len, generator=self.training_generator, device=buf_device)
+        random_indices = torch.randperm(
+            buffer_len,
+            generator=self._get_training_generator(buf_device),
+            device=buf_device,
+        )
         for batch_start in range(0, buffer_len, self.options.batch_size):
             batch_end = batch_start + self.options.batch_size
             if batch_end > buffer_len:
@@ -2806,6 +3182,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 _to_dev(buf['gt_poses_inv'][random_batch_indices]),
                 _to_dev(buf['intrinsics'][random_batch_indices]),
                 _to_dev(buf['intrinsics_inv'][random_batch_indices]),
+                _to_dev(buf['gt_scene_coords_world'][random_batch_indices]),
             )
             if not bool(getattr(self, "_s2_update_applied_last", True)):
                 continue
@@ -2813,7 +3190,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self.global_s2_step += 1
             self.local_s2_step += 1
 
-    def training_step(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33):
+    def training_step(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None):
         """When LMC S2: use step_eff for ReproLoss and head-only optimizer/scheduler."""
         if not self.use_lmc or self.optimizer_head is None:
             return super().training_step(features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33)
@@ -2897,6 +3274,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             delta_cam_b31 = delta_cam_b31.clamp(max=self._loss_invalid_max_delta)
         loss_invalid = delta_cam_b31.masked_select(invalid_mask_b11).sum()
         loss = (loss_valid + loss_invalid) / batch_size
+        loss = loss + self._compute_c1_aux_ref_loss(pred_scene_coords_b3HW, gt_scene_coords_world_b3)
 
         # Guard NaN/Inf: truly skip optimizer/scheduler updates to avoid consuming LR schedule.
         loss_is_finite = bool(torch.isfinite(loss).all().item())
@@ -2963,7 +3341,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             )
         return loss
 
-    def _training_step_ace_g(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33):
+    def _training_step_ace_g(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None):
         """ACE-G S2 training step: apply fusion on-the-fly then head.
 
         Key difference from training_step(): raw backbone features are fused
@@ -3048,6 +3426,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             delta_cam_b31 = delta_cam_b31.clamp(max=self._loss_invalid_max_delta)
         loss_invalid = delta_cam_b31.masked_select(invalid_mask_b11).sum()
         loss = (loss_valid + loss_invalid) / batch_size
+        loss = loss + self._compute_c1_aux_ref_loss(pred_scene_coords_b3HW, gt_scene_coords_world_b3)
 
         loss_is_finite = bool(torch.isfinite(loss).all().item())
         loss_for_log = float(loss.item()) if loss_is_finite else -1.0

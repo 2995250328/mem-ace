@@ -22,6 +22,7 @@ set -e
 # ace_depth 根目录（用于默认 checkpoint 软链接：checkpoints/dinov2_vitl14_pretrain.pth）
 _EXTRACT_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _ACE_DEPTH_ROOT="$(cd "$_EXTRACT_SCRIPT_DIR/../.." && pwd)"
+ACE_DATA_ROOT="${ACE_DATA_ROOT:-/home/xwh/data}"
 
 # =============================================================================
 # 配置参数（与 run_memory_extraction.py 的 ExtractionConfig / parse_args 对应）
@@ -54,9 +55,9 @@ SCENE_TRAIN="${SCENE_TRAIN//$'\ufeff'/}"
 # SevenScenesWAI(ROOT=DATASET_PATH, specific_scene_name=SCENE_TRAIN, ...)
 if [ -z "$DATASET_ROOT" ]; then
     case "$DATASET_TYPE" in
-        7scenes)  DATASET_ROOT="/mnt/storage/xwh/mapanything-dataset/wai_data/7scenes" ;;
-        indoor6)  DATASET_ROOT="/mnt/storage/xwh/mapanything-dataset/wai_data/indoor6" ;;
-        *)        DATASET_ROOT="/mnt/storage/xwh" ;;
+        7scenes)  DATASET_ROOT="$ACE_DATA_ROOT/mapanything-dataset/wai_data/7scenes" ;;
+        indoor6)  DATASET_ROOT="$ACE_DATA_ROOT/mapanything-dataset/wai_data/indoor6" ;;
+        *)        DATASET_ROOT="$ACE_DATA_ROOT" ;;
     esac
 fi
 
@@ -283,7 +284,7 @@ if [ -z "${DINOV2_CHECKPOINT:-}" ] || [ ! -f "$DINOV2_CHECKPOINT" ]; then
     if [ -f "$_ACE_DEPTH_ROOT/checkpoints/dinov2_vitl14_pretrain.pth" ]; then
         DINOV2_CHECKPOINT="$_ACE_DEPTH_ROOT/checkpoints/dinov2_vitl14_pretrain.pth"
     else
-        DINOV2_CHECKPOINT="/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth"
+        DINOV2_CHECKPOINT="$ACE_DATA_ROOT/checkpoints/dinov2_vitl14_pretrain.pth"
     fi
 fi
 
@@ -293,7 +294,7 @@ USE_MODEL="${USE_MODEL:-mapanything}"
 # MODEL_STR / MODEL_CHECKPOINT — --model_str / --model_checkpoint（仅 USE_MODEL=mapanything 时追加）
 # MODEL_CONFIG — 可选；若设置则追加 --model_config（Hydra YAML 路径）
 MODEL_STR="${MODEL_STR:-mapanything_store_intermediates_ace}"
-MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-/mnt/storage/xwh/checkpoints/facebook_map-anything.pth}"
+MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-$ACE_DATA_ROOT/checkpoints/facebook_map-anything.pth}"
 
 # DINOV2_INTERMEDIATE_LAYERS — 空格分隔的整数，传给 --dinov2_intermediate_layers；空则 Python 用默认 8 层
 DINOV2_INTERMEDIATE_LAYERS="${DINOV2_INTERMEDIATE_LAYERS:-}"
@@ -431,7 +432,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # ace_depth 的上一级（如 ~/project），其下可有软链 uniception/ 覆盖 site-packages 便于改源码
 WORKSPACE_ROOT="$(cd "$PROJECT_ROOT/.." && pwd)"
-MAP_ANYTHING_PATH="/home/xwh/project/map-anything"
+MAP_ANYTHING_PATH="${MAP_ANYTHING_PATH:-$ACE_DATA_ROOT/map-anything}"
 
 PYTHONPATH_ADDITIONS=""
 if [ -d "$MAP_ANYTHING_PATH" ]; then

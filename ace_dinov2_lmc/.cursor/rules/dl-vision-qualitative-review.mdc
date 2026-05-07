@@ -1,0 +1,13 @@
+---
+description: Use when reviewing qualitative vision outputs such as overlays, retrieval panels, failure cases, heatmaps, or scene visualizations.
+globs: []
+alwaysApply: false
+---
+
+# DL / Vision Qualitative Review
+
+1. Link every visual artifact to exact provenance.
+2. Define the qualitative question before judging.
+3. Compare visuals with metrics and known failure modes.
+4. Prefer repeated patterns over isolated examples.
+5. Call out visual/metric disagreements explicitly.

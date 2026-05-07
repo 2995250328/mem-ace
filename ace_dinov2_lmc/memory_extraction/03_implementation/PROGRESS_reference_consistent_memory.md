@@ -1,6 +1,6 @@
 # Reference-Consistent Memory Progress
 
-Last updated: 2026-04-23
+Last updated: 2026-04-30
 
 This file records the current implementation state of
 `EXECUTION_PLAN_reference_consistent_memory.md` so a new conversation can
@@ -167,6 +167,25 @@ Definition of done for future turns touching this project:
   `two_pass_processing()` constructor, and saves a sidecar
   `memory_bse.clustered.pt` package plus per-cluster `.pt` files. The main
   single-memory output remains unchanged for backward-compatible training.
+- 2026-04-25: Validated the offline Phase 4 path on
+  `scene3/60v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate6_prepair12_cfb2_sor_gm_l2/20260425_130557`.
+  Extraction produced `cluster_fallback_plan.json`,
+  `memory_bse.clustered.pt`, `memory_bse.cluster_01.pt`, and
+  `memory_bse.cluster_02.pt` as intended. The policy still predicts
+  `cluster_branch`; both clusters are currently marked `low_confidence=true`
+  with `disconnected_covis_graph`, so the code path is working but scene3 is
+  not yet cleanly decomposed. Added a small helper
+  `memory_extraction/emit_cluster_train_commands.py` to emit one training
+  command per cluster-local memory, and updated the loader to raise a clear
+  error if `memory_bse.clustered.pt` is passed directly into train/eval.
+- 2026-04-30: The later `C1` milestones are now recorded in
+  `KEY_RESULTS_reference_consistent_memory.md`: `scene2a` single-memory `C1`
+  completed end-to-end but still trails repaired `C0`; `scene3` single-memory
+  `C1` remains diagnostic; `scene1` and `scene4a` same-recipe `C1` runs were
+  validated cross-scene. Future large-scale multi-scene training ideas are now
+  tracked separately in repository-root memo
+  `C1_NORMALIZED_PRETRAINING_MEMO.md` so they do not mix with the current
+  memory-extraction mainline.
 
 ## 1. Resume Checklist
 
@@ -592,12 +611,22 @@ Current evidence motivating this work:
 
 Missing:
 
-- Minimal predictor comparison workflow required by the execution plan.
-- No final `contract_mode_default` decision has been recorded.
+- Formal closeout of the `scene2a` same-selected-set `C0 vs C1` comparison in
+  the progress / handoff documents.
+- No final `contract_mode_default` decision has been recorded in this file.
+
+Current evidence already available elsewhere:
+
+- `scene2a` repaired `C0` remains the best validated single-memory baseline.
+- `scene2a` single-memory `C1` now completes extraction + train + eval
+  end-to-end.
+- The current same-recipe `C1` result does not beat repaired `C0` on `acc5`
+  or median translation.
 
 Status:
 
-- Not implemented.
+- Partial. The experiment evidence exists, but this file has not yet been
+  brought up to date with the final Q1b conclusion.
 
 ### 3.3 Phase 2 selector completion
 
@@ -656,6 +685,22 @@ Missing:
 Status:
 
 - Not implemented.
+
+### 3.7 Future multi-scene normalized-C1 training line
+
+Deferred, not part of the current memory-extraction closeout:
+
+- weaker normalization / scaled normalized target
+- metric auxiliary loss on recovered `points_ref` or `points_world`
+- large-scale multi-scene shared pretraining experiments
+
+Tracking location:
+
+- `/home/xwh/project/ace_depth/ace_dinov2_lmc/C1_NORMALIZED_PRETRAINING_MEMO.md`
+
+Status:
+
+- Design memo only. No implementation or runnable CLI flag exists yet.
 
 ## 4. Current Diagnosis About scene2a_train
 
@@ -872,26 +917,41 @@ Best metrics:
 
 Ordered next steps:
 
-1. Treat the repaired Phase 4 `scene2a` run as the current best C0 baseline.
-2. Use the completed Phase 0 rerun, not the older under-trained Phase 0 result,
-   as the main baseline comparison.
-3. Do not launch another unchanged ACE-G training run from the same repaired
-   `scene2a` selected set; `20260423_103144` reproduces `20260422_122243` and
-   mainly adds report structure.
-4. Do not launch more unchanged single-forward training on `scene3_train`; both
-   40-view and 60-view policies predicted `cluster_branch`, and the 60-view
-   fallback training has already been run as a diagnostic.
-5. Use the completed `scene3_train` fallback training only as a negative-control
-   diagnostic, not as a policy success case.
-6. Validate Phase 4 cluster fallback extraction on `scene3_train` with
-   `ENABLE_CLUSTER_FALLBACK=true`. Check `cluster_fallback_plan.json`,
-   `memory_bse.clustered.pt`, per-cluster `.pt` files, low-confidence flags,
-   and per-cluster pose probe summaries before touching training/eval.
-7. Keep the first cluster fallback version offline/extraction-only; do not
-   implement query-time ensemble until clustered memory construction is
-   observable.
-8. After cluster fallback memory construction is validated on `scene3_train`,
-   move to Q1b C0 vs C1 comparison.
+1. Treat the repaired Phase 4 `scene2a` run as the current best single-memory
+   `C0` baseline, and treat the completed `scene2a` single-memory `C1` run as
+   evidence that `C1` works end-to-end but does not yet beat repaired `C0`.
+2. Formally close out `Q1b` in the handoff / progress layer: keep default
+   single-memory policy on repaired `C0`; do not promote `C1` to default yet.
+3. Do not launch another unchanged single-memory run on `scene2a`, `scene3`,
+   or additional cross-scene same-recipe `C1` scenes. The current missing
+   evidence is no longer “does single-memory `C1` run?”.
+4. `scene3 cluster-local C1` is now closed end-to-end:
+   - `C1` cluster-fallback extraction validated on `20260430_222156`
+   - `cluster_01` and `cluster_02` both trained successfully
+   - ensemble eval reached `acc25=97.78`, `acc5=68.57`,
+     median `0.6657 deg / 3.3866 cm`
+   - this is close to the older cluster-local `C0` ensemble but still
+     slightly weaker overall
+5. Do not spend more GPU time on more same-shape `scene3` single-memory or
+   repeated cluster-local `C1` reruns unless a deterministic-eval discrepancy
+   needs to be resolved.
+6. Keep the future multi-scene training ideas separate from the current
+   memory-extraction mainline. Track weaker normalization (`alpha > 1`) and
+   metric auxiliary loss only in
+   `/home/xwh/project/ace_depth/ace_dinov2_lmc/C1_NORMALIZED_PRETRAINING_MEMO.md`
+   as a separate research line.
+7. After `scene3 cluster-local C1`, the next optional mechanism study
+   should be a strictly single-scene `scene2a` matrix, not a new cross-scene
+   sweep. Keep it minimal:
+   - `C1 points_ref_norm(alpha=2)`
+   - `C1 points_ref_norm + aux_ref_loss`
+   - one third run only if needed (`alpha=4`, tuned aux weight, or the
+     combined variant)
+8. Treat these post-mainline mechanism studies as diagnosis of normalized-C1
+   fine-precision behavior. Evaluate them primarily by:
+   - `acc5`
+   - median translation
+   while requiring `acc25` to remain close to the current `C1` baseline.
 
 ## 7. Validation Performed So Far
 
@@ -915,10 +975,15 @@ python -m ace_dinov2_lmc.memory_extraction.reference_swap_diagnostic --help
 
 Not yet completed:
 
-- full C1 training/eval experiment after the latest recovery changes
-- Phase 4 cluster fallback construction for `scene3_train`
-- downstream training/evaluation support for clustered memory packages after
-  construction is implemented
+- deterministic eval should remain available as a comparison tool, but it does
+  not need to be forced as the always-on default; some random DSAC variation is
+  acceptable as long as key judgments are rechecked when needed
+- for future cheap evals, key checkpoints should by default be evaluated
+  `5` times and recorded as best-of over the saved `eval_summary_*.txt` files
+- the first `scene2a` weaker-normalization (`alpha > 1`) mechanism run
+- the first `scene2a` `aux_ref_loss` mechanism run
+- shared-model multi-memory training path
+- clustered package as a first-class training input interface
 
 ## 8. Notes For Future Conversations
 

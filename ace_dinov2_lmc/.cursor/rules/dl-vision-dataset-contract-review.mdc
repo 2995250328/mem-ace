@@ -1,0 +1,13 @@
+---
+description: Use when auditing dataset layout, annotations, transforms, split conventions, scene naming, or dataloader assumptions in DL/CV repositories.
+globs: []
+alwaysApply: false
+---
+
+# DL / Vision Dataset Contract Review
+
+1. Find dataset classes, backend selectors, and split logic.
+2. Record required files, directories, metadata, and annotation schemas.
+3. Record transforms, normalization, and sampling assumptions.
+4. Compare code assumptions with actual directory layout.
+5. Produce a preflight validation checklist.

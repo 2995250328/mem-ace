@@ -554,7 +554,7 @@ where:
 
 ```bash
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
+    /home/xwh/data/7Scenes/pgt_7scenes_chess \
     output/chess_memory.pt \
     --n_memory 100 \
     --voxel_size 0.05 \
@@ -565,7 +565,7 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 
 **Expected output**:
 ```
-[BSE Memory] Dataset: /mnt/storage/xwh/7Scenes/pgt_7scenes_chess
+[BSE Memory] Dataset: /home/xwh/data/7Scenes/pgt_7scenes_chess
 [BSE Memory] Output: output/chess_memory.pt
 [BSE Memory] N_MEMORY: 100, BSE: True
 [BSE Memory] Voxel size: 0.05, Otsu: True

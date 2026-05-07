@@ -316,7 +316,7 @@ mu, sigma = welford.finalize()
 conda activate mapanything
 
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
+    /home/xwh/data/7Scenes/pgt_7scenes_chess \
     output/test_memory.pt \
     --n_memory 5 \
     --device cuda:0

@@ -338,7 +338,7 @@ For detailed DINOv2 usage instructions, see `DINOV2_USAGE.md`.
 
 ## ACE DINOv2 with GeoLMC (Geometric Latent Memory Compression)
 
-<!-- Updated 2026-03-30: replaced entire section to match actual GeoLMC implementation -->
+<!-- Updated 2026-04-29: added ASB view selection, single-forward constraint -->
 
 The GeoLMC variant extends ACE DINOv2 with:
 - **GeoLMC compressor**: Cross-attention based scene memory compression into K latent tokens
@@ -348,6 +348,13 @@ The GeoLMC variant extends ACE DINOv2 with:
 **Two training modes:**
 - **Vanilla** (`--use_lmc False`): Standard ACE single-stage buffer training
 - **LMC** (`--use_lmc True`): Two-stage iterative training with memory compression
+
+**Memory extraction view selection modes** (set via `WAI_VIEW_MODE`):
+- `fps_flat`: Pure FPS, good coverage, no covisibility guarantee
+- `original_multiview`: MapAnything original — high covisibility, may cover only a local region
+- `anchor_support` / `asb`: Reference-aware Anchor+Support selection (recommended). Adaptive view count supported (`ASB_ADAPTIVE=true`).
+
+**Critical**: Memory extraction must use a **single** MapAnything forward. Multi-group inference produces incompatible coordinate frames because MapAnything uses `T_rel = inv(T_0) @ T_i` internally.
 
 For detailed documentation, see `ace_dinov2_lmc/CLAUDE.md` and `ace_dinov2_lmc/README.md`.
 

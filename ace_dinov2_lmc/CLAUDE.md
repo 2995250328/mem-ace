@@ -2,6 +2,35 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Local Agent Stack
+
+Project-local skills live in:
+
+- `.claude/skills`
+
+Project-scoped MCP config lives in:
+
+- `.mcp.json`
+- `.cursor/mcp.json`
+
+Preferred local skill families for this repo:
+
+- `dl-vision-repo-workflow`
+- `dl-vision-gpu-performance`
+- `dl-vision-experiment-reporting`
+- `dl-vision-training-failure-triage`
+- `dl-vision-dataset-contract-review`
+- `dl-vision-paper-to-code`
+
+When a task matches one of these scopes, prefer using the local project skill before falling back to generic reasoning.
+
+To expose this project-local stack into the usual user-level locations for Claude Code, Codex, and Cursor, run:
+
+```bash
+cd /home/xwh/project/ace_depth/ace_dinov2_lmc
+bash sync_local_agent_stack.sh
+```
+
 ## Project Overview
 
 ACE-DINOv2-LMC: Accelerated Coordinate Encoding with DINOv2 ViT-L/14 backbone and GeoLMC (Geometric Latent Memory Compression) two-stage iterative training for visual camera relocalization.
@@ -20,7 +49,7 @@ conda activate ace               # PyTorch 2.0.0, CUDA 11.8, Python 3.8
 cd dsacstar && python setup.py install && cd ..
 ```
 
-DINOv2 weights: `/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth`
+DINOv2 weights: `/home/xwh/data/checkpoints/dinov2_vitl14_pretrain.pth`
 
 ## Commands
 
@@ -31,13 +60,13 @@ All commands run from the project root (`ace_depth/`).
 **ACE-G flow (LMC, main use case):**
 ```bash
 python ace_dinov2_lmc/train_ace_dinov2_lmc.py \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
+    /home/xwh/data/7Scenes/pgt_7scenes_heads \
     heads_aceg_full_refill.pt \
     --device cuda:3 \
     --run_name heads_aceg_full_refill \
     --use_lmc True \
     --memory_path /path/to/7Scenes_heads_train_pooled_GT_patch.pt \
-    --dinov2_path /mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
+    --dinov2_path /home/xwh/data/checkpoints/dinov2_vitl14_pretrain.pth \
     --lmc_flow ace_g --lmc_mode global \
     --num_latent_tokens 64 --lmc_iterations 28 \
     --lmc_warmup_steps 2000 --lmc_train_steps 600 \
@@ -60,7 +89,7 @@ python ace_dinov2_lmc/train_ace_dinov2_lmc.py \
 **Vanilla (no LMC):**
 ```bash
 python ace_dinov2_lmc/train_ace_dinov2_lmc.py \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
+    /home/xwh/data/7Scenes/pgt_7scenes_chess \
     chess_vanilla.pt \
     --use_lmc False --device cuda:0
 ```
@@ -69,7 +98,7 @@ python ace_dinov2_lmc/train_ace_dinov2_lmc.py \
 
 ```bash
 python ace_dinov2_lmc/test_ace_dinov2_lmc.py \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
+    /home/xwh/data/7Scenes/pgt_7scenes_heads \
     output/.../best_K64_it28_heads_aceg_full_refill.pt \
     --device cuda:0 --session lmc_test
 ```
@@ -77,19 +106,22 @@ python ace_dinov2_lmc/test_ace_dinov2_lmc.py \
 ### Memory Extraction
 
 ```bash
-# 7-Scenes chess, 20 views (default)
+# 7-Scenes chess, 20 views (default, fps_flat)
 bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
 # Override via env vars
 SCENE_TRAIN=fire_train N_VIEWS=40 bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
-# Indoor6
+# Indoor6 with Anchor-Support view selection (recommended for MapAnything)
 DATASET_TYPE=indoor6 SCENE_TRAIN=scene2a_train N_VIEWS=40 \
+    WAI_VIEW_MODE=anchor_support \
+    ASB_ADAPTIVE=true ASB_ADAPTIVE_VIEW_COUNT=true \
+    ASB_SCENE_STATS=true \
     bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
 # Direct Python
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess output/memory.pt \
+    /home/xwh/data/7Scenes/pgt_7scenes_chess output/memory.pt \
     --n_memory 20 --dataset_type 7scenes --device cuda:0
 
 # Validate extracted memory
@@ -102,7 +134,68 @@ for scene in chess fire heads office pumpkin redkitchen stairs; do
 done
 ```
 
-Shell script env vars: `DATASET_TYPE` (7scenes/indoor6), `SCENE_TRAIN` (chess_train), `N_VIEWS` (20), `VOXEL_SIZE` (0.05), `USE_MODEL` (mapanything/dinov2), `GPU_ID` (0).
+#### View Selection Modes (`--wai_view_mode` / `WAI_VIEW_MODE`)
+
+| Mode | Description |
+|------|-------------|
+| `fps_flat` | Each FPS index loads 1 image. Good spatial coverage, no covisibility guarantee. |
+| `original_multiview` | First FPS anchor returns `n_memory` covisibility views (map-anything original). High covisibility but may only cover a local region. |
+| `anchor_support` / `asb` | Reference-aware Anchor+Support+Filler selection. Anchors cover the scene, supports provide local high-covisibility around each anchor, fillers use remaining budget for coverage. Recommended for MapAnything. |
+
+**Critical constraint**: MapAnything internally uses `T_rel = inv(T_0) @ T_i` (reference-relative geometry). Multi-group inference (different `T_0` per group) produces incompatible coordinate frames and must NOT be used. Always use single forward.
+
+#### Anchor-Support Parameters
+
+Core scoring: `score = (eps + gain_norm)^β × (eps + covis_norm)^α × exp(-λ × dist_to_ref / ref_scale)`
+
+| Env Var | CLI Flag | Default | Description |
+|---------|----------|---------|-------------|
+| `ASB_ALPHA` | `--anchor_support_alpha` | 1.0 | Covisibility exponent weight |
+| `ASB_REF_LAMBDA` | `--covis_ref_lambda` | 0.0 | Reference distance soft penalty |
+| `ASB_ANCHOR_COUNT` | `--covis_anchor_count` | 0 (auto) | Number of coverage anchors |
+| `ASB_SUPPORT_PER_ANCHOR` | `--covis_support_per_anchor` | 3 | High-covis neighbors per anchor |
+| `ASB_SUPPORT_TAU` | `--covis_support_tau` | 1e-4 | Strong support covis threshold |
+| `ASB_SAFE_DIST_TO_REF` | `--covis_safe_dist_to_ref` | 3.0 | Distance considered "safe" from reference |
+| `ASB_FAR_VIEW_BUDGET` | `--covis_far_view_budget` | 8 | Max views exceeding safe distance |
+| `ASB_FAR_ANCHOR_BUDGET` | `--covis_far_anchor_budget` | 2 | Max anchors exceeding safe distance |
+
+#### Adaptive ASB (`ASB_ADAPTIVE=true`)
+
+When enabled, `N_VIEWS` becomes a physical upper bound (max_views). The algorithm may select fewer views based on coverage targets and risk limits. Scene-adaptive statistics auto-derive thresholds from `scene_meta.json` and covisibility matrix.
+
+| Env Var | CLI Flag | Default | Description |
+|---------|----------|---------|-------------|
+| `ASB_ADAPTIVE` | `--covis_adaptive_asb` | false | Enable adaptive ASB mode |
+| `ASB_SCENE_STATS` | `--covis_adaptive_scene_stats` | true | Auto-derive thresholds from scene statistics |
+| `ASB_ADAPTIVE_VIEW_COUNT` | `--covis_adaptive_view_count` | false | Allow selecting fewer than N_VIEWS |
+| `ASB_MIN_VIEWS` | `--covis_adaptive_min_views` | 28 | Minimum views before early stop |
+| `ASB_REF_DIST_MAX_LIMIT` | `--covis_ref_dist_max_limit` | 4.2 | Hard cap on max ref distance (meters) |
+| `ASB_REF_DIST_MEAN_LIMIT` | `--covis_ref_dist_mean_limit` | 2.7 | Hard cap on mean ref distance (meters) |
+| `ASB_MIN_COVERAGE_GAIN` | `--covis_min_coverage_gain` | 0.01 | Min coverage improvement per bundle |
+| `ASB_GAIN_PATIENCE` | `--covis_gain_patience` | 2 | Consecutive low-gain bundles before stop |
+| `ASB_TARGET_COVERAGE_MEAN` | `--covis_target_coverage_mean` | 0.55 | Target mean nearest-center distance (m) |
+| `ASB_TARGET_COVERAGE_MAX` | `--covis_target_coverage_max` | 2.0 | Target max nearest-center distance (m) |
+
+Early stop triggers when ALL of: `min_views reached` AND `coverage targets met` AND `next candidate is risky or no good candidates remain`. Risk limits (`ref_dist_max/mean_limit`) reject candidates that would exceed them.
+
+#### Post-Repair and Other ASB Options
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `ASB_POST_REPAIR` | false | Post-selection repair: swap weak-covis views with nearby stronger alternatives |
+| `ASB_POST_REPAIR_MAX_SWAPS` | 4 | Maximum swaps during repair |
+| `ASB_POSE_PRUNE` | false | Post-inference PoseEval-based pruning (requires MapAnything forward) |
+
+#### Shell Script Core Env Vars
+
+`DATASET_TYPE` (7scenes/indoor6), `SCENE_TRAIN` (chess_train), `N_VIEWS` (20, becomes max_views with adaptive), `VOXEL_SIZE` (0.05), `USE_MODEL` (mapanything/dinov2), `GPU_ID` (0), `POOL_MODE` (bse/pooled/simple/hybrid), `DATASET_LOADER` (wai/ace).
+
+#### Coverage Diagnostics
+
+Each ASB run outputs:
+- `selection_coverage_report.json`: coverage percentiles, ref distance distribution, FPS baseline comparison, scene-adaptive target checks
+- `selection_coverage_topdown.png`: PCA top-down grid visualization
+- `loaded_model_input_views.json`: per-view group assignment and source info
 
 ## Architecture
 
@@ -181,9 +274,9 @@ Two buffer schemas exist:
 |------|------|
 | `bse_pooling.py` | BSE (Bilateral Supervoxel Extraction) with ray strategies and Otsu thresholding |
 | `welford_meter.py` | Streaming normalization (Welford's online algorithm) |
-| `run_memory_extraction.py` | Main extraction script |
+| `run_memory_extraction.py` | Main extraction script — dataset loading, view selection (fps_flat/original_multiview/anchor_support), feature extraction (MapAnything/DINOv2), BSE pooling, memory save. ~8500 lines. |
 | `validate_memory.py` | Memory file validation |
-| `extract_memory.sh` | Shell launcher (env-var driven) |
+| `extract_memory.sh` | Shell launcher (env-var driven, 30+ configurable parameters) |
 
 ### Research Stage Directories
 
@@ -299,6 +392,7 @@ The test script (`test_ace_dinov2_lmc.py`) auto-detects checkpoint type by check
 3. **Memory File Required**: LMC mode requires pre-built memory file (pooled format with `pooled_points`/`pooled_features` keys)
 4. **Memory Preflight**: `--lmc_memory_preflight True` validates memory file dimensions match the model before training starts
 5. **GPU Memory**: ~12-16GB VRAM for training with default settings
+6. **Single MapAnything Forward**: Memory extraction must use a single MapAnything forward pass. Multi-group inference produces incompatible coordinate frames because MapAnything internally uses `T_rel = inv(T_0) @ T_i` — each group would have a different reference frame. Never split views into separate forwards.
 
 ## Development & Debugging
 
@@ -310,16 +404,16 @@ SCENE_TRAIN=heads_train N_VIEWS=20 bash ace_dinov2_lmc/memory_extraction/extract
 
 # 2. Train with reduced iterations for debugging
 python ace_dinov2_lmc/train_ace_dinov2_lmc.py \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads debug_run.pt \
+    /home/xwh/data/7Scenes/pgt_7scenes_heads debug_run.pt \
     --device cuda:0 --use_lmc True \
     --memory_path <extracted_memory.pt> \
-    --dinov2_path /mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
+    --dinov2_path /home/xwh/data/checkpoints/dinov2_vitl14_pretrain.pth \
     --lmc_iterations 2 --epochs 2 --training_buffer_size 500000 \
     --run_name debug
 
 # 3. Test checkpoint
 python ace_dinov2_lmc/test_ace_dinov2_lmc.py \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
+    /home/xwh/data/7Scenes/pgt_7scenes_heads \
     ace_dinov2_lmc/04_evaluation/debug/<timestamp>/best_*.pt \
     --device cuda:0 --session debug
 ```

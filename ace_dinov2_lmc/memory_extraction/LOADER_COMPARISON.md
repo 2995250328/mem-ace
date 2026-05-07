@@ -50,7 +50,7 @@
       - `from mapanything.datasets.wai.seven_scenes import SevenScenesWAI`
       - `from mapanything.datasets.wai.indoor6 import Indoor6WAI`
     - 从环境变量或默认路径获取 `dataset_metadata_dir`：
-      - `MAPANYTHING_DATASET_METADATA_DIR` 或 `/mnt/storage/xwh/map-anything/mapanything_dataset_metadata`
+      - `MAPANYTHING_DATASET_METADATA_DIR` 或 `/home/xwh/data/map-anything/mapanything_dataset_metadata`
     - 定义公共参数：
       - `base_kwargs = dict(resolution=518, data_norm_type='dinov2', transform='imgnorm')`
     - 当 `dataset_type == "7scenes"` 时：

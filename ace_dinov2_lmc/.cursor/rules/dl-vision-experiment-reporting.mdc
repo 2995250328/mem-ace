@@ -1,0 +1,17 @@
+---
+description: Use when aggregating training/eval results from multiple logs, summaries, checkpoints, and run directories in deep learning projects.
+globs: []
+alwaysApply: false
+---
+
+# DL / Vision Experiment Reporting
+
+When summarizing experiments:
+
+1. Inventory run directories and timestamps.
+2. Separate raw logs, eval logs, iter summaries, and post-train summaries.
+3. Normalize metric names, units, and best-direction.
+4. Resolve disagreements between files explicitly.
+5. Report exact provenance for every best result.
+
+Never mix incompatible metric definitions silently.

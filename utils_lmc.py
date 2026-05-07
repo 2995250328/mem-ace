@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import logging
 import os
 import re
@@ -184,7 +185,12 @@ def estimate_memory_front_visibility(
     }
 
 
-def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: bool = False) -> Dict[str, Any]:
+def load_memory_features(
+    path: str,
+    device: torch.device,
+    bse_denorm_to_world: bool = False,
+    c1_ref_norm_alpha: float = 1.0,
+) -> Dict[str, Any]:
     """
     Load memory tensors from disk (same contract as map-anything load_memory_features).
     Supports POOLED memory bank format; unknown format raises with available keys.
@@ -197,7 +203,30 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
     - _meta traceability dict added to returned dict.
     """
     t_start = time.time()
+    c1_ref_norm_alpha = float(c1_ref_norm_alpha)
+    if not math.isfinite(c1_ref_norm_alpha) or c1_ref_norm_alpha <= 0:
+        raise ValueError(
+            f"[LMC] c1_ref_norm_alpha must be a positive finite float, got {c1_ref_norm_alpha!r}."
+        )
     payload = torch.load(path, map_location=device, weights_only=False)
+
+    if str(payload.get("mode", "")) == "clustered" and isinstance(payload.get("clusters"), list):
+        package_name = Path(path).name
+        base = package_name[: -len(".clustered.pt")] if package_name.endswith(".clustered.pt") else Path(path).stem
+        hints = []
+        for idx, cluster in enumerate(payload.get("clusters", []), start=1):
+            if not isinstance(cluster, dict):
+                continue
+            cluster_id = int(cluster.get("cluster_id", idx))
+            cluster_path = cluster.get("memory_path") or f"{base}.cluster_{cluster_id:02d}.pt"
+            hints.append(f"cluster {cluster_id}: {cluster_path}")
+            if len(hints) >= 4:
+                break
+        hint_text = "; ".join(hints) if hints else "use one of the sibling memory_bse.cluster_XX.pt files"
+        raise ValueError(
+            "[LMC] clustered memory package is not directly supported by train/eval yet. "
+            f"Pass a per-cluster memory file instead. Examples from {Path(path).name}: {hint_text}"
+        )
 
     def safe_to_device(key: str):
         val = payload.get(key)
@@ -218,6 +247,7 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
                 return x.to(device)
             return torch.tensor(x, device=device)
 
+        contract_mode = str(payload.get("contract_mode", "C0")).upper()
         # Field mapping: extended extraction schema -> pooled training contract.
         # For pool_mode=pooled, keep map-anything behavior exactly: pooled_points
         # are world coordinates and normalization metadata is treated as trace-only.
@@ -226,11 +256,80 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
         is_extended_pooled_world = str(payload.get("pool_mode", "")).lower() == "pooled"
         points_normalized = _to_tensor(payload.get("points_norm", payload["points"]))  # (raw-mu)/sigma
         points_world = _to_tensor(payload["points_world"]) if payload.get("points_world") is not None else None
+        points_ref = safe_to_device("points_ref")
+        points_ref_norm = safe_to_device("points_ref_norm")
         mu_tensor = _to_tensor(payload.get("normalization_mu", payload.get("mu")))  # centroid [3]
         sigma_val = payload.get("normalization_sigma", payload.get("sigma"))
         sigma_tensor = _to_tensor(sigma_val) if sigma_val is not None else None
+        scene_center_world = safe_to_device("scene_center_world")
+        if scene_center_world is None:
+            scene_center_world = safe_to_device("scene_center")
+        if scene_center_world is None:
+            scene_center_world = safe_to_device("scene_center_cam")
+        scene_center_ref = safe_to_device("scene_center_ref")
+        scene_center_ref_norm = safe_to_device("scene_center_ref_norm")
+        scene_center_contract = safe_to_device("scene_center_contract")
+        scene_center_contract_space = payload.get("scene_center_contract_space")
+        conditioning_reference = _nested_to_device(payload.get("conditioning_reference"), device)
+        normalization_ref = _nested_to_device(payload.get("normalization_ref"), device)
+        if not isinstance(normalization_ref, dict):
+            normalization_ref = {}
+        normalization_ref = dict(normalization_ref)
+        selection = _nested_to_device(payload.get("selection"), device)
+        reference_index = payload.get("reference_index")
+        if reference_index is None and isinstance(conditioning_reference, dict):
+            reference_index = conditioning_reference.get("reference_index")
 
-        if is_extended_pooled_world:
+        if contract_mode == "C1" and (points_ref is not None or points_ref_norm is not None):
+            if points_ref_norm is not None:
+                if c1_ref_norm_alpha != 1.0:
+                    points_ref_norm = points_ref_norm * float(c1_ref_norm_alpha)
+                    if scene_center_ref_norm is not None:
+                        scene_center_ref_norm = scene_center_ref_norm * float(c1_ref_norm_alpha)
+                    if (
+                        scene_center_contract is not None
+                        and scene_center_contract_space == "reference_camera_normalized"
+                    ):
+                        scene_center_contract = scene_center_contract * float(c1_ref_norm_alpha)
+                pooled_points = points_ref_norm
+                if scene_center_ref_norm is not None:
+                    scene_center = scene_center_ref_norm
+                    _sc_src = "scene_center_ref_norm=normalized mean(camera_centers)"
+                elif scene_center_contract is not None and scene_center_contract_space == "reference_camera_normalized":
+                    scene_center = scene_center_contract
+                    _sc_src = "scene_center_contract=normalized mean(camera_centers)"
+                else:
+                    scene_center = torch.zeros(3, device=device)
+                    _sc_src = "fallback=zeros(3)"
+                normalization_ref["alpha"] = float(c1_ref_norm_alpha)
+                _logger.info(
+                    "[LMC] C1 REF-NORM path: using points_ref_norm for memory compression "
+                    "(alpha=%.3f). scene_center=%s=(%.3f, %.3f, %.3f).",
+                    float(c1_ref_norm_alpha),
+                    _sc_src,
+                    float(scene_center[0]), float(scene_center[1]), float(scene_center[2]),
+                )
+            else:
+                pooled_points = points_ref
+                normalization_ref["alpha"] = 1.0
+                if scene_center_ref is not None:
+                    scene_center = scene_center_ref
+                    _sc_src = "scene_center_ref=mean(camera_centers) in reference frame"
+                elif scene_center_contract is not None and scene_center_contract_space == "reference_camera":
+                    scene_center = scene_center_contract
+                    _sc_src = "scene_center_contract=mean(camera_centers) in reference frame"
+                else:
+                    scene_center = torch.zeros(3, device=device)
+                    _sc_src = "fallback=zeros(3)"
+                _logger.info(
+                    "[LMC] C1 REF path: using points_ref for memory compression. "
+                    "scene_center=%s=(%.3f, %.3f, %.3f).",
+                    _sc_src,
+                    float(scene_center[0]), float(scene_center[1]), float(scene_center[2]),
+                )
+            norm_mu_out = mu_tensor
+            norm_sigma_out = sigma_tensor
+        elif is_extended_pooled_world:
             pooled_points = points_world if points_world is not None else _to_tensor(payload["pooled_points"])
             _scene_center = payload.get("scene_center")
             _scene_center_cam = payload.get("scene_center_cam")
@@ -362,9 +461,13 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
         pooled_colors = safe_to_device("pooled_colors")
         if pooled_colors is None:
             pooled_colors = safe_to_device("colors")
-        # scene_center is set in the normalization/denorm branch above
-        # (zeros for normalized, mu for denorm-to-world)
-        if (not is_extended_pooled_world) and (not bse_denorm_to_world or sigma_tensor is None):
+        # scene_center is set in the normalization/denorm branch above.
+        # Keep the legacy normalized-path zero anchor only for C0-style normalized memories.
+        if (
+            contract_mode != "C1"
+            and (not is_extended_pooled_world)
+            and (not bse_denorm_to_world or sigma_tensor is None)
+        ):
             # Normalized path: scene_center=0, coords already centered
             scene_center = torch.zeros(3, device=device)
         # else: scene_center was already set to mu_tensor in the denorm branch above
@@ -413,13 +516,6 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
         t_elapsed = time.time() - t_start
         _logger.info("[LMC] Extended pooled memory loaded in %.2fs", t_elapsed)
 
-        conditioning_reference = _nested_to_device(payload.get("conditioning_reference"), device)
-        normalization_ref = _nested_to_device(payload.get("normalization_ref"), device)
-        selection = _nested_to_device(payload.get("selection"), device)
-        reference_index = payload.get("reference_index")
-        if reference_index is None and isinstance(conditioning_reference, dict):
-            reference_index = conditioning_reference.get("reference_index")
-
         return {
             "type": "pooled",
             "pooled_points": pooled_points,          # NORMALIZED or WORLD (if bse_denorm_to_world)
@@ -459,6 +555,11 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
             "conditioning_reference": conditioning_reference,
             "normalization_ref": normalization_ref,
             "selection": selection,
+            "scene_center_world": scene_center_world,
+            "scene_center_ref": scene_center_ref,
+            "scene_center_ref_norm": scene_center_ref_norm,
+            "scene_center_contract": scene_center_contract,
+            "scene_center_contract_space": scene_center_contract_space,
         }
 
     # === Pooled format detection ===
@@ -629,6 +730,11 @@ def load_memory_features(path: str, device: torch.device, bse_denorm_to_world: b
             "conditioning_reference": conditioning_reference,
             "normalization_ref": normalization_ref,
             "selection": selection,
+            "scene_center_world": safe_to_device("scene_center_world"),
+            "scene_center_ref": safe_to_device("scene_center_ref"),
+            "scene_center_ref_norm": safe_to_device("scene_center_ref_norm"),
+            "scene_center_contract": safe_to_device("scene_center_contract"),
+            "scene_center_contract_space": payload.get("scene_center_contract_space"),
         }
     if "intermediate" in payload or "final" in payload:
         raise ValueError(

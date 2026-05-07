@@ -19,6 +19,7 @@ import argparse
 import copy
 import json
 import logging
+import numpy as np
 import os
 import shutil
 import sys
@@ -72,10 +73,61 @@ TRAIN_PRESET_DEFAULTS = {
         "s1_use_buffer": True,
         "s1_loss_mode": "sample_per_image",
         "s1_buffer_refill_mode": "full",
+        "best_metric": "pct5",
+        "eval_deterministic": False,
+        "post_train_eval_seeds": [1305],
+        "post_train_hypotheses": 64,
+        "experiment_root": (Path(__file__).parent / "04_evaluation" / "train_compare").resolve(),
+        "experiment_subdir": "memory_pooled_vs_asb",
+    },
+    "memory_compare_ace_g_v2": {
+        "use_lmc": True,
+        "lmc_flow": "ace_g",
+        "lmc_memory_preflight_strict": True,
+        "lmc_scene_center_max_distance": 4.0,
+        "lmc_head_mean_max_shift": 4.0,
+        "bse_denorm_to_world": True,
+        "ace_g_fusion_in_s2": True,
+        "ace_g_cross_iter_eval": True,
+        "buffer_batch_size": 1,
+        "samples_per_image": 384,
+        "s1_batch_size": 16,
+        "s1_use_buffer": True,
+        "s1_loss_mode": "sample_per_image",
+        "s1_buffer_refill_mode": "full",
+        "best_metric": "composite",
+        "eval_deterministic": True,
+        "eval_dsacstar_seed": 1305,
+        "eval_dsacstar_seed_per_frame": True,
+        "post_train_eval_seeds": [1305, 2026, 4242],
+        "post_train_hypotheses": 256,
         "experiment_root": (Path(__file__).parent / "04_evaluation" / "train_compare").resolve(),
         "experiment_subdir": "memory_pooled_vs_asb",
     },
 }
+
+
+def _normalize_eval_device_for_visible_cuda(device_str):
+    """
+    Keep eval on the logical CUDA device exposed inside this process.
+
+    setup_cuda_environment() maps a physical --device like cuda:1 to
+    CUDA_VISIBLE_DEVICES=1 before torch import. After that, the process sees
+    that GPU as logical cuda:0, so passing cuda:1 to the in-process evaluator is
+    an invalid device ordinal.
+    """
+    device_str = str(device_str or "cuda:0")
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if device_str.startswith("cuda:") and visible:
+        visible_ids = [x.strip() for x in visible.split(",") if x.strip()]
+        if len(visible_ids) == 1 and device_str != "cuda:0":
+            _logger.info(
+                "Normalizing eval device %s -> cuda:0 because CUDA_VISIBLE_DEVICES=%s.",
+                device_str,
+                visible,
+            )
+            return "cuda:0"
+    return device_str
 
 
 def _collect_cli_flags(argv=None):
@@ -252,7 +304,9 @@ def _run_standard_eval(args, output_map, session):
     """
     from test_ace_dinov2 import run_evaluation
 
-    eval_device = getattr(args, "post_train_eval_device", "cuda:0")
+    eval_device = _normalize_eval_device_for_visible_cuda(
+        getattr(args, "post_train_eval_device", "cuda:0")
+    )
     eval_opt = argparse.Namespace(
         scene=args.scene,
         network=output_map,
@@ -260,6 +314,10 @@ def _run_standard_eval(args, output_map, session):
         device=eval_device,
         image_resolution=args.image_resolution,
         session=session,
+        eval_deterministic=getattr(args, "eval_deterministic", False),
+        dsacstar_seed=getattr(args, "eval_dsacstar_seed", 1305),
+        dsacstar_seed_per_frame=getattr(args, "eval_dsacstar_seed_per_frame", True),
+        eval_num_workers=getattr(args, "eval_num_workers", 6),
         render_visualization=False,
     )
     return run_evaluation(eval_opt)
@@ -275,6 +333,14 @@ def _score_standard_eval(result, metric):
         return float(result["pct2"])
     if metric == "pct1":
         return float(result["pct1"])
+    if metric == "composite":
+        return (
+            float(result["pct5"])
+            - 2.0 * float(result["median_tErr"])
+            - 2.0 * float(result["median_rErr"])
+        )
+    if metric == "rt_error":
+        return -float(result["median_rErr"]) - float(result["median_tErr"])
     if metric == "median":
         return -float(result["median_rErr"]) - float(result["median_tErr"])
     return float(result["pct5"])
@@ -732,22 +798,55 @@ def run_post_train_eval(args, trainer):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-        _logger.info("Freed trainer; running eval on %s.", args.post_train_eval_device)
+        eval_device = _normalize_eval_device_for_visible_cuda(
+            getattr(args, "post_train_eval_device", "cuda:0")
+        )
+        _logger.info("Freed trainer; running eval on %s.", eval_device)
 
         from test_ace_dinov2_lmc import run_evaluation_lmc
         # 使用 --post_train_eval_device，默认 cuda:0 以加速评测
-        eval_device = getattr(args, "post_train_eval_device", "cuda:0")
-        eval_opt = argparse.Namespace(
-            scene=args.scene,
-            network=args.output_map,
-            dinov2_path=args.dinov2_path,
-            device=eval_device,
-            image_resolution=args.image_resolution,
-            session=args.eval_session,
-            render_visualization=False,
-        )
-        result = run_evaluation_lmc(eval_opt)
-        _logger.info("========== Post-train Eval (current errors) ==========")
+        post_train_seeds = [int(s) for s in getattr(args, "post_train_eval_seeds", [1305])]
+        post_train_hypotheses = int(getattr(args, "post_train_hypotheses", 64))
+        seed_results = []
+        for seed in post_train_seeds:
+            session_name = args.eval_session
+            if len(post_train_seeds) > 1:
+                session_name = f"{args.eval_session}_seed{seed}"
+            eval_opt = argparse.Namespace(
+                scene=args.scene,
+                network=args.output_map,
+                dinov2_path=args.dinov2_path,
+                device=eval_device,
+                image_resolution=args.image_resolution,
+                session=session_name,
+                hypotheses=post_train_hypotheses,
+                eval_deterministic=getattr(args, "eval_deterministic", False),
+                dsacstar_seed=seed,
+                dsacstar_seed_per_frame=getattr(args, "eval_dsacstar_seed_per_frame", True),
+                eval_num_workers=getattr(args, "eval_num_workers", 6),
+                render_visualization=False,
+            )
+            result = run_evaluation_lmc(eval_opt)
+            result["seed"] = seed
+            seed_results.append(result)
+
+        result = dict(seed_results[0])
+        if len(seed_results) > 1:
+            agg_keys = [
+                "median_rErr",
+                "median_tErr",
+                "pct25_5",
+                "pct10_5",
+                "pct5",
+                "pct2",
+                "pct1",
+                "avg_time",
+            ]
+            for key in agg_keys:
+                result[key] = float(np.median([r[key] for r in seed_results]))
+            result["total_frames"] = int(seed_results[0]["total_frames"])
+
+        _logger.info("========== Post-train Eval (aggregated) ==========")
         _logger.info(
             "  Median: %.2f deg, %.2f cm | 25cm/5deg: %.2f%% | 10cm/5deg: %.2f%% | 5cm/5deg: %.2f%% | "
             "2cm/2deg: %.2f%% | 1cm/1deg: %.2f%%",
@@ -757,10 +856,20 @@ def run_post_train_eval(args, trainer):
         )
         _logger.info("  Avg time: %.2f ms | Frames: %d",
                      result['avg_time'] * 1000, result['total_frames'])
+        if len(seed_results) > 1:
+            _logger.info(
+                "  Seeds: %s | hypotheses=%d | aggregation=median",
+                ",".join(str(r["seed"]) for r in seed_results),
+                post_train_hypotheses,
+            )
         _logger.info("=====================================================")
         # 写入 run_dir 便于与 training_full_log 一起查看
         eval_log_path = args.run_dir / "post_train_eval.txt"
         with open(eval_log_path, "w", encoding="utf-8") as f:
+            f.write(f"eval_deterministic\t{bool(getattr(args, 'eval_deterministic', False))}\n")
+            f.write(f"aggregation\t{'median' if len(seed_results) > 1 else 'single'}\n")
+            f.write(f"seeds\t{','.join(str(r['seed']) for r in seed_results)}\n")
+            f.write(f"hypotheses\t{post_train_hypotheses}\n")
             f.write(f"median_rotation_deg\t{result['median_rErr']:.4f}\n")
             f.write(f"median_translation_cm\t{result['median_tErr']:.4f}\n")
             f.write(f"accuracy_25cm5deg_pct\t{result['pct25_5']:.2f}\n")
@@ -770,6 +879,19 @@ def run_post_train_eval(args, trainer):
             f.write(f"accuracy_1cm1deg_pct\t{result['pct1']:.2f}\n")
             f.write(f"avg_time_per_frame_ms\t{result['avg_time'] * 1000:.2f}\n")
             f.write(f"total_frames\t{result['total_frames']}\n")
+        if len(seed_results) > 1:
+            raw_eval_path = args.run_dir / "post_train_eval_seed_runs.txt"
+            with open(raw_eval_path, "w", encoding="utf-8") as f:
+                f.write("# seed-wise post-train evaluation results\n")
+                f.write("seed\tmedian_rErr\tmedian_tErr\tpct25_5\tpct10_5\tpct5\tpct2\tpct1\tavg_time_ms\ttotal_frames\n")
+                for seed_result in seed_results:
+                    f.write(
+                        f"{seed_result['seed']}\t{seed_result['median_rErr']:.4f}\t{seed_result['median_tErr']:.4f}\t"
+                        f"{seed_result['pct25_5']:.2f}\t{seed_result['pct10_5']:.2f}\t{seed_result['pct5']:.2f}\t"
+                        f"{seed_result['pct2']:.2f}\t{seed_result['pct1']:.2f}\t"
+                        f"{seed_result['avg_time'] * 1000:.2f}\t{seed_result['total_frames']}\n"
+                    )
+            _logger.info("Seed-wise eval summary written to: %s", raw_eval_path)
         _logger.info("Eval summary also written to: %s", eval_log_path)
     except Exception as e:
         _logger.warning("Post-training eval failed: %s", e, exc_info=True)

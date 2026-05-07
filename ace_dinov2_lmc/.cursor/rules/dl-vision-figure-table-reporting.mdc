@@ -1,0 +1,13 @@
+---
+description: Use when converting deep learning and vision experiment results into tables, plots, and concise result narratives.
+globs: []
+alwaysApply: false
+---
+
+# DL / Vision Figure And Table Reporting
+
+1. Normalize metric definitions and units before plotting.
+2. Define the comparison axis clearly.
+3. Choose the simplest artifact that answers the comparison.
+4. Preserve exact file provenance for every reported number.
+5. Write a short narrative stating improvements, regressions, and ambiguities.

@@ -1,0 +1,17 @@
+---
+description: Use when a deep learning or vision task depends on papers, benchmarks, ablations, or method reproduction.
+globs: []
+alwaysApply: false
+---
+
+# DL / Vision Research Support
+
+When research drives implementation:
+
+1. Clarify whether the task is reproduction, adaptation, comparison, or survey.
+2. Extract architecture, data, augmentation, losses, schedule, metrics, and eval protocol.
+3. Convert paper claims into concrete code tasks.
+4. Build a baseline + ablation experiment matrix.
+5. Align reporting with benchmark conventions.
+
+Do not treat paper prose as implementation truth until matched to code or appendix details.

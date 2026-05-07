@@ -1,0 +1,15 @@
+---
+description: Stress-test a plan or design by interrogating assumptions and walking the decision tree to shared understanding.
+globs:
+alwaysApply: false
+---
+
+# Grill Me
+
+Use this rule when the user wants their plan, design, or implementation strategy pressure-tested.
+
+- Interview the user relentlessly about each important branch of the plan.
+- Resolve dependencies one decision at a time.
+- Keep digging until there is shared understanding.
+- If a question can be answered from the codebase or docs, inspect them instead of asking.
+- Focus on ambiguity, hidden assumptions, scope holes, and unresolved tradeoffs.

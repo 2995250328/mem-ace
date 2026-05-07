@@ -52,17 +52,17 @@ WAI_VIEW_MODE=covis_fps COVIS_FPS_ALPHA=1.0 COVIS_FPS_TAU=-1.0 \
 #   If DATASET_ROOT already has rgb/, no appending is done.
 
 # 7-Scenes chess — script auto-appends /train (pgt_7scenes_chess/ has no rgb/, but pgt_7scenes_chess/train/ does)
-DATASET_LOADER=ace DATASET_ROOT=/mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
+DATASET_LOADER=ace DATASET_ROOT=/home/xwh/data/7Scenes/pgt_7scenes_chess \
   SCENE_TRAIN=train N_VIEWS=20 GPU_ID=0 \
   bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
 # 7-Scenes heads — same auto-append logic
-DATASET_LOADER=ace DATASET_ROOT=/mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
+DATASET_LOADER=ace DATASET_ROOT=/home/xwh/data/7Scenes/pgt_7scenes_heads \
   SCENE_TRAIN=train N_VIEWS=20 GPU_ID=0 \
   bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
 # Indoor6 scene2a — same format (scene2a/ has train/rgb/)
-DATASET_LOADER=ace DATASET_ROOT=/mnt/storage/xwh/indoor6_ace/scene2a \
+DATASET_LOADER=ace DATASET_ROOT=/home/xwh/data/indoor6_ace/scene2a \
   SCENE_TRAIN=train N_VIEWS=40 GPU_ID=0 \
   bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
@@ -84,7 +84,7 @@ ENABLE_SOR=false bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
 ```bash
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /mnt/storage/xwh/mapanything-dataset/wai_data/7scenes \
+    /home/xwh/data/mapanything-dataset/wai_data/7scenes \
     /path/to/out/memory.pt \
     --n_memory 20 \
     --dataset_type 7scenes \
@@ -101,7 +101,7 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 ```bash
 # dataset_path points to dir with rgb/ (7-Scenes: pgt_7scenes_chess/train/)
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess/train \
+    /home/xwh/data/7Scenes/pgt_7scenes_chess/train \
     /path/to/out/memory.pt \
     --n_memory 20 \
     --dataset_loader ace \
@@ -110,7 +110,7 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 
 # Indoor6: same, point directly to train/ directory
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /mnt/storage/xwh/indoor6_ace/scene2a/train \
+    /home/xwh/data/indoor6_ace/scene2a/train \
     /path/to/out/memory.pt \
     --n_memory 40 \
     --dataset_loader ace \
@@ -129,7 +129,7 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 | Depth source | WAI format depth map (COLMAP sparse / GT) | ACE format depth map |
 | Normalization | MapAnything style | ImageNet (DINOv2) |
 | Shell auto-append | No appending (WAI DATASET_ROOT is the dataset root) | If `DATASET_ROOT/` has no `rgb/`, auto-appends `/${SCENE_TRAIN}` |
-| Compatible data | `/mnt/storage/xwh/mapanything-dataset/wai_data/` | `/mnt/storage/xwh/7Scenes/pgt_7scenes_*/`, `/mnt/storage/xwh/indoor6_ace/*/` |
+| Compatible data | `/home/xwh/data/mapanything-dataset/wai_data/` | `/home/xwh/data/7Scenes/pgt_7scenes_*/`, `/home/xwh/data/indoor6_ace/*/` |
 
 **ACE path concatenation rule**: When `DATASET_LOADER=ace`, the shell script checks if `DATASET_ROOT/rgb/` exists:
 - If yes → uses `DATASET_ROOT` directly as `dataset_path`
@@ -179,7 +179,7 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 | `--model_str` | None | MapAnything model config string (default: `mapanything_store_intermediates_ace`) |
 | `--model_config` | None | MapAnything config path |
 | `--model_checkpoint` | None | MapAnything checkpoint path |
-| `--dinov2_checkpoint` | `/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth` | DINOv2 weights |
+| `--dinov2_checkpoint` | `/home/xwh/data/checkpoints/dinov2_vitl14_pretrain.pth` | DINOv2 weights |
 | `--dinov2_intermediate_layers` | None | DINOv2 block indices for multi-scale (default: 8 DPT layers) |
 | `--use_patch_based` | False | Patch-based vs bilinear upsampling |
 
@@ -223,7 +223,7 @@ MapAnything WAI format dataset. Requires `--scene_name` parameter. The `dataset_
 ```bash
 # 7-Scenes
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /mnt/storage/xwh/mapanything-dataset/wai_data/7scenes \
+    /home/xwh/data/mapanything-dataset/wai_data/7scenes \
     output/memory.pt \
     --dataset_loader wai \
     --dataset_type 7scenes \
@@ -232,7 +232,7 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 
 # Indoor6
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /mnt/storage/xwh/mapanything-dataset/wai_data/indoor6 \
+    /home/xwh/data/mapanything-dataset/wai_data/indoor6 \
     output/memory.pt \
     --dataset_loader wai \
     --dataset_type indoor6 \
@@ -248,7 +248,7 @@ ACE-format dataset loader. `dataset_path` points directly to the directory conta
 ```bash
 # 7-Scenes: dataset_path points to the train/ directory
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess/train \
+    /home/xwh/data/7Scenes/pgt_7scenes_chess/train \
     output/memory.pt \
     --dataset_loader ace \
     --n_memory 20 \
@@ -256,7 +256,7 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 
 # Indoor6: same, point to train/ directory
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /mnt/storage/xwh/indoor6_ace/scene2a/train \
+    /home/xwh/data/indoor6_ace/scene2a/train \
     output/memory.pt \
     --dataset_loader ace \
     --n_memory 40 \
@@ -334,8 +334,8 @@ All parameters are set via environment variables:
 
 | DATASET_TYPE | Resolved Path | Example |
 |--------------|---------------|---------|
-| `7scenes` | `/mnt/storage/xwh/7Scenes/pgt_7scenes_<scene>` | `chess_train` → `/mnt/storage/xwh/7Scenes/pgt_7scenes_chess` |
-| `indoor6` | `/mnt/storage/xwh/mapanything-dataset/wai_data/indoor6` | `scene2a_train` → `.../scene2a_train` |
+| `7scenes` | `/home/xwh/data/7Scenes/pgt_7scenes_<scene>` | `chess_train` → `/home/xwh/data/7Scenes/pgt_7scenes_chess` |
+| `indoor6` | `/home/xwh/data/mapanything-dataset/wai_data/indoor6` | `scene2a_train` → `.../scene2a_train` |
 | `custom` | `$DATASET_ROOT/$SCENE_TRAIN` | user-specified |
 
 **Depth range auto-derivation:**
@@ -375,10 +375,10 @@ All parameters are set via environment variables:
 |----------|---------|-------------|
 | `USE_PATCH_BASED` | `false` | Patch-based (grid) vs bilinear upsampling |
 | `USE_L2_NORMALIZATION` | `true` | L2 normalize features |
-| `DINOV2_CHECKPOINT` | `/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth` | DINOv2 weights |
+| `DINOV2_CHECKPOINT` | `/home/xwh/data/checkpoints/dinov2_vitl14_pretrain.pth` | DINOv2 weights |
 | `USE_MODEL` | `mapanything` | Feature extractor: `mapanything` or `dinov2` |
 | `MODEL_STR` | `mapanything_store_intermediates_ace` | MapAnything config name |
-| `MODEL_CHECKPOINT` | `/mnt/storage/xwh/checkpoints/facebook_map-anything.pth` | MapAnything checkpoint |
+| `MODEL_CHECKPOINT` | `/home/xwh/data/checkpoints/facebook_map-anything.pth` | MapAnything checkpoint |
 
 ### Output
 
@@ -459,29 +459,125 @@ for scene in scene1 scene2a scene3 scene4a scene5 scene6; do
 done
 ```
 
+### Reference-consistent C1 validation for Indoor6
+
+Use this recipe when you want to compare the same extraction/training setting
+across multiple scenes. It keeps the memory extraction contract fixed at `C1`
+and uses the same `anchor_support + reference gate + post-repair` path that is
+currently used for the `scene2a`/`scene3` validation runs.
+
+```bash
+GPU_ID=0 \
+ACE_DATA_ROOT=/home/xwh/data \
+DATASET_ROOT=/home/xwh/data/mapanything-dataset/wai_data/indoor6 \
+DATASET_TYPE=indoor6 \
+SCENE_TRAIN=scene2a_train \
+N_VIEWS=40 \
+OUTPUT_ROOT=/home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/04_evaluation/memory_extract \
+CONTRACT_MODE=C1 \
+WAI_VIEW_MODE=anchor_support \
+WAI_TRANSFORM=imgnorm \
+WAI_AUG_CROP=0 \
+POOL_MODE=bse \
+VOXEL_SIZE=0.05 \
+USE_OTSU=true \
+UNIMODAL_THRESHOLD=0.02 \
+PREPOOL_MODE=per_view \
+ENABLE_SOR=true \
+GLOBAL_MERGE=true \
+USE_L2_NORMALIZATION=true \
+ASB_ADAPTIVE=true \
+ASB_CANDIDATE_POOL_RATIO=1.0 \
+ENABLE_REFERENCE_POLICY_GATE=true \
+REFERENCE_POLICY_TOP_M=4 \
+REFERENCE_POLICY_LIGHT_MIN_SELECTED_LINKS=2 \
+REFERENCE_POLICY_PROBE_Q90_M=0.18 \
+REFERENCE_POLICY_PROBE_MAX_M=0.25 \
+ASB_POST_REPAIR=true \
+ASB_POST_REPAIR_MAX_SWAPS=8 \
+ASB_POST_REPAIR_TAIL_PERCENTILE=95.0 \
+ASB_POST_REPAIR_MIN_TAIL_IMPROVEMENT_M=0.02 \
+ASB_POST_REPAIR_CLUSTER_TOP_K=3 \
+bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+```
+
+For `scene3`, keep the same recipe and switch only `SCENE_TRAIN=scene3_train`
+and `GPU_ID=1` if you want to run it on a second card.
+
+After extraction, train with the generated `memory_bse.pt`:
+
+```bash
+ACE_DATA_ROOT=/home/xwh/data \
+python ace_dinov2_lmc/train_ace_dinov2_lmc.py \
+  /home/xwh/data/indoor6_ace/scene2a \
+  scene2a_c1_<timestamp>.pt \
+  --train_preset memory_compare_ace_g_v1 \
+  --data_backend ace \
+  --device cuda:0 \
+  --post_train_eval_device cuda:0 \
+  --use_lmc True \
+  --memory_path /home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/04_evaluation/memory_extract/scene2a/40v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate4_prepair8_sor_gm_l2/<timestamp>/memory_bse.pt \
+  --lmc_mode global \
+  --experiment_subdir memory_pooled_vs_asb_c1 \
+  --buffer_on_cpu False \
+  --batch_size 10240
+```
+
+```bash
+ACE_DATA_ROOT=/home/xwh/data \
+python ace_dinov2_lmc/train_ace_dinov2_lmc.py \
+  /home/xwh/data/indoor6_ace/scene3 \
+  scene3_c1_<timestamp>.pt \
+  --train_preset memory_compare_ace_g_v1 \
+  --data_backend ace \
+  --device cuda:1 \
+  --post_train_eval_device cuda:1 \
+  --use_lmc True \
+  --memory_path /home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/04_evaluation/memory_extract/scene3/40v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate4_prepair8_sor_gm_l2/<timestamp>/memory_bse.pt \
+  --lmc_mode global \
+  --experiment_subdir memory_pooled_vs_asb_c1 \
+  --buffer_on_cpu False \
+  --batch_size 10240
+```
+
+Key parameters:
+
+- `CONTRACT_MODE=C1`: write `points_ref` / `points_ref_norm` as the primary
+  contract instead of world coordinates.
+- `WAI_VIEW_MODE=anchor_support`: use the anchor/support selection path instead
+  of plain FPS.
+- `ENABLE_REFERENCE_POLICY_GATE=true`: enable the top-M reference gate before
+  extraction completes.
+- `ASB_POST_REPAIR=true`: enable coverage-tail repair after the selected set is
+  filled.
+- `buffer_on_cpu=False`: keep the training buffer on GPU during ACE-G training.
+- `batch_size=10240`: increase the S2 training batch size for higher throughput.
+- `buffer_batch_size` remains at its preset default of `1` unless explicitly
+  overridden.
+
 ### Using ACE dataset loader
 
 ```bash
 # 7-Scenes chess
-DATASET_LOADER=ace DATASET_ROOT=/mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
+DATASET_LOADER=ace DATASET_ROOT=/home/xwh/data/7Scenes/pgt_7scenes_chess \
     SCENE_TRAIN=train N_VIEWS=20 GPU_ID=0 \
     bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
 # 7-Scenes batch
 for scene in chess fire heads office pumpkin redkitchen stairs; do
-    DATASET_LOADER=ace DATASET_ROOT=/mnt/storage/xwh/7Scenes/pgt_7scenes_${scene} \
+    DATASET_LOADER=ace DATASET_ROOT=/home/xwh/data/7Scenes/pgt_7scenes_${scene} \
         SCENE_TRAIN=train N_VIEWS=20 GPU_ID=0 \
         bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 done
 
 # Indoor6 scene2a
-DATASET_LOADER=ace DATASET_ROOT=/mnt/storage/xwh/indoor6_ace/scene2a \
+DATASET_LOADER=ace DATASET_ROOT=/home/xwh/data/indoor6_ace/scene2a \
     SCENE_TRAIN=train N_VIEWS=40 GPU_ID=0 \
     bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
 # Indoor6 batch
 for scene in scene1 scene2a scene3 scene4a scene5 scene6; do
-    DATASET_LOADER=ace DATASET_ROOT=/mnt/storage/xwh/indoor6_ace/${scene} \
+    DATASET_LOADER=ace DATASET_ROOT=/home/xwh/data/indoor6_ace/${scene} \
         SCENE_TRAIN=train N_VIEWS=40 GPU_ID=0 \
         bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 done
@@ -510,7 +606,7 @@ This generates a PLY file for visualization in MeshLab, CloudCompare, or Open3D.
 | Depth validation phase stalls | Vectorized coloring used for very dense depth; check disk I/O and Matplotlib backend |
 | OOM | Reduce `N_VIEWS`, increase `VOXEL_SIZE`, use smaller GPU |
 | Dataset not found | Check `DATASET_ROOT` and `SCENE_TRAIN`; script prints resolved path |
-| `mapanything` import error | Script auto-adds `/home/xwh/project/map-anything` to PYTHONPATH; visualization falls back to built-in implementation |
+| `mapanything` import error | Script auto-adds `/home/xwh/data/map-anything` to PYTHONPATH; visualization falls back to built-in implementation |
 | Slow processing | Increase `VOXEL_SIZE`, disable `ENABLE_SOR` |
 
 ## Dependencies

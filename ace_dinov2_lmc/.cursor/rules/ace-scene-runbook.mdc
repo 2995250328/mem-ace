@@ -1,0 +1,12 @@
+---
+description: Use when planning or documenting scene-level ACE-DINOv2-LMC workflows such as Indoor6 scene2a/scene3 validation, diagnostics, clustering, and next-step gating.
+globs: []
+alwaysApply: false
+---
+
+# ACE Scene Runbook
+
+1. Define the scene objective and evidence level.
+2. Lay out extraction, training, eval, aggregation, and gating stages.
+3. Record exact commands and timestamped result locations.
+4. State the condition required before moving to the next scene or phase.

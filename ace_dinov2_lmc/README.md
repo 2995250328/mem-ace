@@ -65,13 +65,13 @@ The standard configuration used in experiments. **Requires a pre-built pooled me
 **7-Scenes example:**
 ```bash
 python train_ace_dinov2_lmc.py \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
+    /home/xwh/data/7Scenes/pgt_7scenes_heads \
     heads_aceg_full_refill.pt \
     --device cuda:3 \
     --run_name heads_aceg_full_refill \
     --use_lmc True \
     --memory_path /path/to/7Scenes_heads_train_pooled_GT_patch.pt \
-    --dinov2_path /mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth \
+    --dinov2_path /home/xwh/data/checkpoints/dinov2_vitl14_pretrain.pth \
     --lmc_flow ace_g \
     --lmc_mode global \
     --num_latent_tokens 64 \
@@ -107,7 +107,7 @@ python train_ace_dinov2_lmc.py \
 **Indoor6 example** (large scene, add `--lmc_scene_center_max_distance 4.0`):
 ```bash
 python train_ace_dinov2_lmc.py \
-    /mnt/storage/xwh/indoor6_ace/scene3 \
+    /home/xwh/data/indoor6_ace/scene3 \
     scene3_aceg_full_refill.pt \
     --device cuda:1 \
     --run_name scene3_aceg_full_refill \
@@ -121,7 +121,7 @@ python train_ace_dinov2_lmc.py \
 
 ```bash
 python train_ace_dinov2_lmc.py \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
+    /home/xwh/data/7Scenes/pgt_7scenes_chess \
     chess_vanilla.pt \
     --use_lmc False \
     --device cuda:0
@@ -131,7 +131,7 @@ python train_ace_dinov2_lmc.py \
 
 ```bash
 python test_ace_dinov2_lmc.py \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
+    /home/xwh/data/7Scenes/pgt_7scenes_heads \
     output/.../best_K64_it28_heads_aceg_full_refill.pt \
     --device cuda:0 \
     --session lmc_test
@@ -146,3 +146,7 @@ python test_ace_dinov2_lmc.py \
 | `02_architecture/` | System architecture |
 | `03_implementation/` | Implementation notes |
 | `04_evaluation/` | Evaluation plans and logs |
+
+Current ACE-G global audit and refactor TODO:
+
+- `ACE_G_GLOBAL_CODE_AUDIT_TODO.md`

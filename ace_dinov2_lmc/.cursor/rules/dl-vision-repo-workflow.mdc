@@ -1,0 +1,17 @@
+---
+description: Use when working with an unfamiliar deep learning or computer vision repository. Map entrypoints, dataset/config contracts, train/eval flows, outputs, and minimum reproducible commands.
+globs: []
+alwaysApply: false
+---
+
+# DL / Vision Repo Workflow
+
+When exploring a DL/CV repository:
+
+1. Find actual train, eval, infer, options, trainer, and dataset entrypoints.
+2. Map CLI flags, presets, env vars, output directory rules, and checkpoint layout.
+3. Identify dataset root contracts, split conventions, and loader backends.
+4. Identify where metrics are written and which files are authoritative.
+5. Produce the shortest reproducible train / eval / result-inspection commands.
+
+Do not trust README over code. Prefer exact file references and exact command lines.

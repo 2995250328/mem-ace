@@ -7,6 +7,7 @@ import argparse
 import logging
 import math
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -39,6 +40,53 @@ from dataset_dinov2 import CamLocDatasetDINOv2
 
 logging.basicConfig(level=logging.INFO)
 _logger = logging.getLogger(__name__)
+DATA_ROOT = Path(os.environ.get("ACE_DATA_ROOT", "/home/xwh/data"))
+_WARNED_DSACSTAR_SEEDING = False
+
+
+def _normalize_device_for_visible_cuda(device_str):
+    """Map a physical cuda:N request to logical cuda:0 after CUDA_VISIBLE_DEVICES narrowing."""
+    device_str = str(device_str or "cuda:0")
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if device_str.startswith("cuda:") and visible:
+        visible_ids = [x.strip() for x in visible.split(",") if x.strip()]
+        if len(visible_ids) == 1 and device_str != "cuda:0":
+            _logger.info(
+                "[Eval] Normalizing device %s -> cuda:0 because CUDA_VISIBLE_DEVICES=%s.",
+                device_str,
+                visible,
+            )
+            return "cuda:0"
+    return device_str
+
+
+def _configure_eval_determinism(seed: int):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def _seed_eval_worker(worker_id: int):
+    worker_seed = (torch.initial_seed() + worker_id) % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def _maybe_set_dsacstar_seed(seed: int) -> bool:
+    global _WARNED_DSACSTAR_SEEDING
+    if hasattr(dsacstar, 'set_seed'):
+        dsacstar.set_seed(int(seed))
+        return True
+    if not _WARNED_DSACSTAR_SEEDING:
+        _logger.warning(
+            "[Eval] dsacstar extension does not expose set_seed(); RANSAC is still stochastic until ../dsacstar is rebuilt."
+        )
+        _WARNED_DSACSTAR_SEEDING = True
+    return False
 
 
 def _to_tensor(value: Any, *, dtype=torch.float32):
@@ -86,8 +134,10 @@ def _build_reference_eval_state(lmc_config: Dict[str, Any], bank_data: Dict[str,
 
     mu_ref = _to_tensor(normalization_ref.get("mu_ref"))
     sigma_ref = normalization_ref.get("sigma_ref")
+    ref_norm_alpha = lmc_config.get("c1_ref_norm_alpha", normalization_ref.get("alpha", 1.0))
     if sigma_ref is not None:
         sigma_ref = float(torch.as_tensor(sigma_ref, dtype=torch.float32).item())
+    ref_norm_alpha = float(torch.as_tensor(ref_norm_alpha, dtype=torch.float32).item())
 
     state["conditioning_reference"] = {
         "reference_index": conditioning_reference.get("reference_index"),
@@ -97,6 +147,7 @@ def _build_reference_eval_state(lmc_config: Dict[str, Any], bank_data: Dict[str,
     state["normalization_ref"] = {
         "mu_ref": mu_ref,
         "sigma_ref": sigma_ref,
+        "alpha": ref_norm_alpha,
     }
     return state
 
@@ -110,9 +161,10 @@ def _recover_pred_scene_to_world(scene_coordinates_B3HW: torch.Tensor, ref_state
     if ref_state.get("output_space") == "points_ref_norm":
         mu_ref = ref_state["normalization_ref"].get("mu_ref")
         sigma_ref = ref_state["normalization_ref"].get("sigma_ref")
+        ref_norm_alpha = ref_state["normalization_ref"].get("alpha", 1.0)
         if mu_ref is None or sigma_ref is None:
             raise ValueError("[Eval] output_space=points_ref_norm but normalization_ref is incomplete.")
-        pred_world = pred_world * float(sigma_ref) + mu_ref.view(1, 3, 1, 1)
+        pred_world = pred_world * (float(sigma_ref) / float(ref_norm_alpha)) + mu_ref.view(1, 3, 1, 1)
 
     T_ref_c2w_world = ref_state["conditioning_reference"]["T_ref_c2w_world"].to(
         dtype=pred_world.dtype, device=pred_world.device
@@ -144,7 +196,7 @@ def run_evaluation_lmc(opt):
 
     Returns dict with median_rErr, median_tErr, pct5, etc.
     """
-    device = torch.device(opt.device)
+    device = torch.device(_normalize_device_for_visible_cuda(opt.device))
     dinov2_path = Path(opt.dinov2_path)
     head_network_path = Path(opt.network)
     scene_path = Path(opt.scene)
@@ -154,10 +206,24 @@ def run_evaluation_lmc(opt):
     threshold = getattr(opt, 'threshold', 10)
     inlieralpha = getattr(opt, 'inlieralpha', 100)
     maxpixelerror = getattr(opt, 'maxpixelerror', 100)
+    eval_deterministic = bool(getattr(opt, 'eval_deterministic', False))
+    dsacstar_seed = int(getattr(opt, 'dsacstar_seed', 1305))
+    dsacstar_seed_per_frame = bool(getattr(opt, 'dsacstar_seed_per_frame', True))
+    eval_num_workers = int(getattr(opt, 'eval_num_workers', 6))
+
+    if eval_deterministic:
+        _configure_eval_determinism(dsacstar_seed)
 
     if image_resolution % 14 != 0:
         image_resolution = (image_resolution // 14) * 14
 
+    _logger.info(
+        "[Eval] mode=%s dsacstar_seed=%s per_frame_seed=%s num_workers=%d",
+        "deterministic" if eval_deterministic else "legacy-random",
+        dsacstar_seed if eval_deterministic else "disabled",
+        dsacstar_seed_per_frame if eval_deterministic else "disabled",
+        eval_num_workers,
+    )
     _logger.info("[Eval] device=%s  cuda_available=%s  cuda_device_count=%d",
                  device, torch.cuda.is_available(),
                  torch.cuda.device_count() if torch.cuda.is_available() else 0)
@@ -232,7 +298,8 @@ def run_evaluation_lmc(opt):
         from utils_lmc import load_memory_features
 
         _logger.info(f"[LMC] Loading memory from {memory_path}")
-        bank_data = load_memory_features(str(memory_path), device)
+        c1_ref_norm_alpha = float(lmc_config.get("c1_ref_norm_alpha", 1.0) or 1.0)
+        bank_data = load_memory_features(str(memory_path), device, c1_ref_norm_alpha=c1_ref_norm_alpha)
         reference_eval_state = _build_reference_eval_state(lmc_config, bank_data)
         if reference_eval_state.get("enabled", False):
             _logger.info(
@@ -269,11 +336,24 @@ def run_evaluation_lmc(opt):
     testset = CamLocDatasetDINOv2(
         scene_path / "test", mode=0, use_half=False,
         image_height=image_resolution, augment=False)
-    testset_loader = DataLoader(testset, shuffle=False, num_workers=6)
+    loader_generator = None
+    worker_init_fn = None
+    if eval_deterministic:
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(dsacstar_seed)
+        worker_init_fn = _seed_eval_worker
+    testset_loader = DataLoader(
+        testset,
+        shuffle=False,
+        num_workers=eval_num_workers,
+        worker_init_fn=worker_init_fn,
+        generator=loader_generator,
+    )
     _logger.info(f"Test images: {len(testset)}")
 
     # Output files
-    output_dir = head_network_path.parent
+    output_dir = Path(getattr(opt, 'output_dir', head_network_path.parent) or head_network_path.parent)
+    output_dir.mkdir(parents=True, exist_ok=True)
     scene_name = scene_path.name
     test_log_file = output_dir / f'test_{scene_name}_{session}.txt'
     pose_log_file = output_dir / f'poses_{scene_name}_{session}.txt'
@@ -287,6 +367,7 @@ def run_evaluation_lmc(opt):
     num_batches = 0
     rErrs, tErrs = [], []
     pct25_5 = pct10_5 = pct5 = pct2 = pct1 = 0
+    frame_idx = 0
 
     with torch.no_grad():
         for image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames in testset_loader:
@@ -350,6 +431,9 @@ def run_evaluation_lmc(opt):
                 ppY = intrinsics_33[1, 2].item()
                 frame_name = Path(frame_path).name
                 out_pose = torch.zeros((4, 4))
+                if eval_deterministic:
+                    frame_seed = dsacstar_seed + frame_idx if dsacstar_seed_per_frame else dsacstar_seed
+                    _maybe_set_dsacstar_seed(frame_seed)
 
                 inlier_count = dsacstar.forward_rgb(
                     scene_coordinates_3HW.unsqueeze(0), out_pose,
@@ -392,6 +476,7 @@ def run_evaluation_lmc(opt):
                     f"{frame_name} {q_w} {q_xyz[0].item()} {q_xyz[1].item()} "
                     f"{q_xyz[2].item()} {t[0]} {t[1]} {t[2]} "
                     f"{r_err} {t_err} {inlier_count}\n")
+                frame_idx += 1
 
             avg_batch_time += time.time() - batch_start_time
             num_batches += 1
@@ -423,7 +508,8 @@ def run_evaluation_lmc(opt):
     pose_log.close()
 
     # 写入当前误差汇总，便于训练/复现时查看
-    output_dir = Path(opt.network).parent
+    output_dir = Path(getattr(opt, 'output_dir', Path(opt.network).parent) or Path(opt.network).parent)
+    output_dir.mkdir(parents=True, exist_ok=True)
     scene_name = Path(opt.scene).name
     session = getattr(opt, 'session', '') or 'eval'
     eval_summary_file = output_dir / f"eval_summary_{scene_name}_{session}.txt"
@@ -454,13 +540,20 @@ def run_evaluation_lmc(opt):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Test ACE DINOv2 (with optional LMC)',
+        description='Test ACE DINOv2 (with optional LMC or multi-checkpoint ensemble)',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument('scene', type=Path)
     parser.add_argument('network', type=Path, help='Path to checkpoint')
     parser.add_argument('--dinov2_path', type=Path,
-                        default=Path('/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth'))
+                        default=DATA_ROOT / 'checkpoints' / 'dinov2_vitl14_pretrain.pth')
+    parser.add_argument('--ensemble_networks', nargs='*', type=Path, default=None,
+                        help='Additional checkpoints for joint evaluation. When set, the primary positional '
+                             '`network` plus these checkpoints are evaluated per-frame and the final pose is '
+                             'selected by DSAC inlier count.')
+    parser.add_argument('--output_dir', type=Path, default=None,
+                        help='Optional directory for eval outputs. For ensemble mode this is the joint-eval '
+                             'output directory; for single-checkpoint mode it overrides the checkpoint parent.')
     parser.add_argument('--session', '-sid', default='')
     parser.add_argument('--image_resolution', type=int, default=518)
     parser.add_argument('--device', type=str, default='cuda')
@@ -468,8 +561,20 @@ if __name__ == '__main__':
     parser.add_argument('--threshold', '-t', type=float, default=10)
     parser.add_argument('--inlieralpha', '-ia', type=float, default=100)
     parser.add_argument('--maxpixelerror', '-maxerrr', type=float, default=100)
+    parser.add_argument('--eval_deterministic', type=_strtobool, default=False)
+    parser.add_argument('--dsacstar_seed', type=int, default=1305)
+    parser.add_argument('--dsacstar_seed_per_frame', type=_strtobool, default=True)
+    parser.add_argument('--eval_num_workers', type=int, default=6)
     parser.add_argument('--log_per_frame', type=_strtobool, default=False,
                         help='Print each frame’s rErr (deg) and tErr (cm) after evaluation.')
 
     opt = parser.parse_args()
-    run_evaluation_lmc(opt)
+    if opt.ensemble_networks:
+        from test_ace_dinov2_lmc_ensemble import run_ensemble_evaluation
+
+        opt.networks = [opt.network, *opt.ensemble_networks]
+        if not opt.session:
+            opt.session = 'ensemble'
+        run_ensemble_evaluation(opt)
+    else:
+        run_evaluation_lmc(opt)

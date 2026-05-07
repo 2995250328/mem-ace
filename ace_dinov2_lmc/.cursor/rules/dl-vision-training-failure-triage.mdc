@@ -1,0 +1,13 @@
+---
+description: Use when a deep learning or vision training job crashes, hangs, diverges, or resumes incorrectly.
+globs: []
+alwaysApply: false
+---
+
+# DL / Vision Training Failure Triage
+
+1. Reconstruct the exact failing command and environment.
+2. Find the first real exception, not wrapper noise.
+3. Classify the failing stage: startup, data, forward, backward, optimizer, checkpoint, eval, or resume.
+4. Check path, shape, dtype, device, checkpoint, and metric-contract mismatches.
+5. Propose the narrowest safe fix and a verification command.

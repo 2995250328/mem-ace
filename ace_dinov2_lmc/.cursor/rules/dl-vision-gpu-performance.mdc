@@ -1,0 +1,18 @@
+---
+description: Use when a deep learning or vision project needs CUDA debugging, memory tuning, throughput improvement, profiling, or safe batch-size scaling.
+globs: []
+alwaysApply: false
+---
+
+# DL / Vision GPU Performance
+
+When tuning performance:
+
+1. Baseline first: device, precision, batch size, utilization, memory, workers, steps/sec.
+2. Classify the bottleneck: compute, memory, input pipeline, or synchronization.
+3. Verify device compatibility for model, buffers, generators, indices, and auxiliary tensors.
+4. Review throughput knobs: AMP, batch size, accumulation, pinned memory, workers, prefetching, compile mode.
+5. Profile before larger refactors.
+6. Change one thing at a time and re-measure.
+
+Separate pure throughput changes from training-dynamics changes.

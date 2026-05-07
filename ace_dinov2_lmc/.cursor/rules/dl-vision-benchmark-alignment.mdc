@@ -1,0 +1,12 @@
+---
+description: Use when comparing a DL/CV repository against a benchmark, paper, baseline, or prior internal result.
+globs: []
+alwaysApply: false
+---
+
+# DL / Vision Benchmark Alignment
+
+1. Write down the benchmark contract.
+2. Write down the repository’s actual contract.
+3. List all fairness-relevant mismatches.
+4. State whether the comparison is exact, approximate, or invalid.

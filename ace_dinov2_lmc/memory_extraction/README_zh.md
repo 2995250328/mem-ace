@@ -51,17 +51,17 @@ WAI_VIEW_MODE=covis_fps COVIS_FPS_ALPHA=1.0 COVIS_FPS_TAU=-1.0 \
 #   若 DATASET_ROOT 下已有 rgb/，则不做拼接。
 
 # 7-Scenes chess — 脚本自动拼接 /train（pgt_7scenes_chess/ 下无 rgb/，但 pgt_7scenes_chess/train/ 下有）
-DATASET_LOADER=ace DATASET_ROOT=/mnt/storage/xwh/7Scenes/pgt_7scenes_chess \
+DATASET_LOADER=ace DATASET_ROOT=/home/xwh/data/7Scenes/pgt_7scenes_chess \
   SCENE_TRAIN=train N_VIEWS=20 GPU_ID=0 \
   bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
 # 7-Scenes heads — 同上，自动拼接
-DATASET_LOADER=ace DATASET_ROOT=/mnt/storage/xwh/7Scenes/pgt_7scenes_heads \
+DATASET_LOADER=ace DATASET_ROOT=/home/xwh/data/7Scenes/pgt_7scenes_heads \
   SCENE_TRAIN=train N_VIEWS=20 GPU_ID=0 \
   bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
 # Indoor6 scene2a — 同样格式（scene2a/ 下有 train/rgb/）
-DATASET_LOADER=ace DATASET_ROOT=/mnt/storage/xwh/indoor6_ace/scene2a \
+DATASET_LOADER=ace DATASET_ROOT=/home/xwh/data/indoor6_ace/scene2a \
   SCENE_TRAIN=train N_VIEWS=40 GPU_ID=0 \
   bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
@@ -83,7 +83,7 @@ ENABLE_SOR=false bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
 
 ```bash
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /mnt/storage/xwh/mapanything-dataset/wai_data/7scenes \
+    /home/xwh/data/mapanything-dataset/wai_data/7scenes \
     /path/to/out/memory.pt \
     --n_memory 20 \
     --dataset_type 7scenes \
@@ -100,7 +100,7 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 ```bash
 # dataset_path 指向含 rgb/ 的目录（7-Scenes: pgt_7scenes_chess/train/）
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /mnt/storage/xwh/7Scenes/pgt_7scenes_chess/train \
+    /home/xwh/data/7Scenes/pgt_7scenes_chess/train \
     /path/to/out/memory.pt \
     --n_memory 20 \
     --dataset_loader ace \
@@ -109,7 +109,7 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 
 # Indoor6: 同样直接指向 train/ 目录
 python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
-    /mnt/storage/xwh/indoor6_ace/scene2a/train \
+    /home/xwh/data/indoor6_ace/scene2a/train \
     /path/to/out/memory.pt \
     --n_memory 40 \
     --dataset_loader ace \
@@ -128,7 +128,7 @@ python -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
 | 深度来源 | WAI 格式 depth map（COLMAP sparse / GT） | ACE 格式 depth map |
 | 归一化 | MapAnything 风格 | ImageNet（DINOv2） |
 | Shell 自动拼接 | 不拼接（WAI 的 DATASET_ROOT 即数据集根） | 若 `DATASET_ROOT/` 下无 `rgb/`，自动拼接 `/${SCENE_TRAIN}` |
-| 适用数据 | `/mnt/storage/xwh/mapanything-dataset/wai_data/` | `/mnt/storage/xwh/7Scenes/pgt_7scenes_*/`、`/mnt/storage/xwh/indoor6_ace/*/` |
+| 适用数据 | `/home/xwh/data/mapanything-dataset/wai_data/` | `/home/xwh/data/7Scenes/pgt_7scenes_*/`、`/home/xwh/data/indoor6_ace/*/` |
 
 **ACE 路径拼接规则**：Shell 脚本在 `DATASET_LOADER=ace` 时会检查 `DATASET_ROOT/rgb/` 是否存在：
 - 若存在 → 直接用 `DATASET_ROOT` 作为 `dataset_path`
@@ -212,8 +212,8 @@ memory_extract/
 
 | DATASET_TYPE | `DATASET_PATH`（传给 Python 的根路径） | 说明 |
 |--------------|----------------------------------------|------|
-| `7scenes` | `/mnt/storage/xwh/mapanything-dataset/wai_data/7scenes`（或 `DATASET_ROOT`） | `SCENE_TRAIN=chess_train` 等由数据集类解析 |
-| `indoor6` | `/mnt/storage/xwh/mapanything-dataset/wai_data/indoor6`（或 `DATASET_ROOT`） | WAI Indoor6 ROOT；`SCENE_TRAIN=scene2a_train` 指定场景划分 |
+| `7scenes` | `/home/xwh/data/mapanything-dataset/wai_data/7scenes`（或 `DATASET_ROOT`） | `SCENE_TRAIN=chess_train` 等由数据集类解析 |
+| `indoor6` | `/home/xwh/data/mapanything-dataset/wai_data/indoor6`（或 `DATASET_ROOT`） | WAI Indoor6 ROOT；`SCENE_TRAIN=scene2a_train` 指定场景划分 |
 | `custom` | `$DATASET_ROOT` | 用户自定义 |
 
 **深度范围自动适配：**
@@ -245,7 +245,7 @@ memory_extract/
 | `USE_MODEL` | `mapanything` | 特征提取器：`mapanything`（默认）或 `dinov2` |
 | `USE_PATCH_BASED` | `false` | Patch 方式（网格）vs 双线性上采样 |
 | `USE_L2_NORMALIZATION` | `true` | 拼接前对特征做 L2 归一化 |
-| `DINOV2_CHECKPOINT` | `/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth` | DINOv2 权重（fallback 时使用） |
+| `DINOV2_CHECKPOINT` | `/home/xwh/data/checkpoints/dinov2_vitl14_pretrain.pth` | DINOv2 权重（fallback 时使用） |
 
 ### 输出
 
@@ -277,7 +277,7 @@ memory_extract/
 | `--covis_fps_eps` | `1e-6` | `covis_fps` soft score epsilon |
 | `--covis_fps_tau` | `-1.0` | `covis_fps` 硬共视阈值，`<0` 关闭 |
 | `--covis_max_dist_to_ref` | `-1.0` | `covis_fps` 局部性约束：候选帧到 reference 帧 camera center 的最大距离（米）；`<0` 关闭 |
-| `--dinov2_checkpoint` | /mnt/storage/xwh/checkpoints/... | DINOv2 权重（fallback 时使用） |
+| `--dinov2_checkpoint` | /home/xwh/data/checkpoints/... | DINOv2 权重（fallback 时使用） |
 | `--use_model` | `mapanything` | 特征提取器：`mapanything`（默认）或 `dinov2` |
 
 ## 输出格式
@@ -364,6 +364,96 @@ for scene in scene1 scene2a scene3 scene4a scene5 scene6; do
 done
 ```
 
+### Reference-consistent 的 C1 验证
+
+当你要在多个 Indoor6 场景上做同口径验证时，可以固定这套提取配置：
+`C1 + anchor_support + reference gate + post-repair`。这和当前 `scene2a`
+以及 `scene3` 的验证方式一致。
+
+```bash
+GPU_ID=0 \
+ACE_DATA_ROOT=/home/xwh/data \
+DATASET_ROOT=/home/xwh/data/mapanything-dataset/wai_data/indoor6 \
+DATASET_TYPE=indoor6 \
+SCENE_TRAIN=scene2a_train \
+N_VIEWS=40 \
+OUTPUT_ROOT=/home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/04_evaluation/memory_extract \
+CONTRACT_MODE=C1 \
+WAI_VIEW_MODE=anchor_support \
+WAI_TRANSFORM=imgnorm \
+WAI_AUG_CROP=0 \
+POOL_MODE=bse \
+VOXEL_SIZE=0.05 \
+USE_OTSU=true \
+UNIMODAL_THRESHOLD=0.02 \
+PREPOOL_MODE=per_view \
+ENABLE_SOR=true \
+GLOBAL_MERGE=true \
+USE_L2_NORMALIZATION=true \
+ASB_ADAPTIVE=true \
+ASB_CANDIDATE_POOL_RATIO=1.0 \
+ENABLE_REFERENCE_POLICY_GATE=true \
+REFERENCE_POLICY_TOP_M=4 \
+REFERENCE_POLICY_LIGHT_MIN_SELECTED_LINKS=2 \
+REFERENCE_POLICY_PROBE_Q90_M=0.18 \
+REFERENCE_POLICY_PROBE_MAX_M=0.25 \
+ASB_POST_REPAIR=true \
+ASB_POST_REPAIR_MAX_SWAPS=8 \
+ASB_POST_REPAIR_TAIL_PERCENTILE=95.0 \
+ASB_POST_REPAIR_MIN_TAIL_IMPROVEMENT_M=0.02 \
+ASB_POST_REPAIR_CLUSTER_TOP_K=3 \
+bash ace_dinov2_lmc/memory_extraction/extract_memory.sh
+```
+
+`scene3` 只要把 `SCENE_TRAIN=scene3_train`，并在需要并行跑时把
+`GPU_ID=1` 即可。
+
+提取完成后，训练命令模板如下：
+
+```bash
+ACE_DATA_ROOT=/home/xwh/data \
+python ace_dinov2_lmc/train_ace_dinov2_lmc.py \
+  /home/xwh/data/indoor6_ace/scene2a \
+  scene2a_c1_<timestamp>.pt \
+  --train_preset memory_compare_ace_g_v1 \
+  --data_backend ace \
+  --device cuda:0 \
+  --post_train_eval_device cuda:0 \
+  --use_lmc True \
+  --memory_path /home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/04_evaluation/memory_extract/scene2a/40v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate4_prepair8_sor_gm_l2/<timestamp>/memory_bse.pt \
+  --lmc_mode global \
+  --experiment_subdir memory_pooled_vs_asb_c1 \
+  --buffer_on_cpu False \
+  --batch_size 10240
+```
+
+```bash
+ACE_DATA_ROOT=/home/xwh/data \
+python ace_dinov2_lmc/train_ace_dinov2_lmc.py \
+  /home/xwh/data/indoor6_ace/scene3 \
+  scene3_c1_<timestamp>.pt \
+  --train_preset memory_compare_ace_g_v1 \
+  --data_backend ace \
+  --device cuda:1 \
+  --post_train_eval_device cuda:1 \
+  --use_lmc True \
+  --memory_path /home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/04_evaluation/memory_extract/scene3/40v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate4_prepair8_sor_gm_l2/<timestamp>/memory_bse.pt \
+  --lmc_mode global \
+  --experiment_subdir memory_pooled_vs_asb_c1 \
+  --buffer_on_cpu False \
+  --batch_size 10240
+```
+
+关键参数含义：
+
+- `CONTRACT_MODE=C1`：把主监督切到 `points_ref` / `points_ref_norm`。
+- `WAI_VIEW_MODE=anchor_support`：使用 anchor/support 选帧，而不是普通 FPS。
+- `ENABLE_REFERENCE_POLICY_GATE=true`：先做 top-M reference gate，再继续提取。
+- `ASB_POST_REPAIR=true`：selected set 填满后启用 coverage-tail repair。
+- `buffer_on_cpu=False`：训练时把 buffer 留在 GPU。
+- `batch_size=10240`：提高 S2 训练 batch size。
+- `buffer_batch_size` 保持预设默认 `1`，不额外放大。
+
 ## 故障排除
 
 | 问题 | 解决方案 |
@@ -374,7 +464,7 @@ done
 | 深度校验阶段长时间无输出 | 极稠密有效深度时已改用向量化上色；仍慢时可检查磁盘与 Matplotlib 后端 |
 | 内存不足 | 减少 `N_VIEWS`，增大 `VOXEL_SIZE`，或使用更大显存的 GPU |
 | 数据集找不到 | 检查 `DATASET_ROOT` 和 `SCENE_TRAIN`；脚本会打印推导路径 |
-| `mapanything` 导入错误 | 脚本自动将 `/home/xwh/project/map-anything` 加入 PYTHONPATH；可视化会回退到内置实现 |
+| `mapanything` 导入错误 | 脚本自动将 `/home/xwh/data/map-anything` 加入 PYTHONPATH；可视化会回退到内置实现 |
 | 处理速度慢 | 增大 `VOXEL_SIZE`，或设置 `ENABLE_SOR=false` |
 
 ## 依赖

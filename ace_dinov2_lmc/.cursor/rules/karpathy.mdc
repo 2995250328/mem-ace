@@ -1,0 +1,36 @@
+---
+description: Enable strict coding discipline inspired by Andrej Karpathy. Use when you want the agent to be extra careful about assumptions, simplicity, and surgical changes.
+globs:
+alwaysApply: false
+---
+
+# Karpathy Guidelines
+
+Use this rule when the task should be handled with unusually strict engineering discipline.
+
+## Think Before Coding
+
+- State assumptions explicitly.
+- If multiple interpretations exist, surface them instead of picking silently.
+- If something is unclear, stop and ask.
+- If a simpler approach exists, say so.
+
+## Simplicity First
+
+- Write the minimum code that solves the requested problem.
+- Do not add speculative abstractions or configurability.
+- Do not add features beyond the request.
+- If a solution feels overcomplicated, simplify it.
+
+## Surgical Changes
+
+- Touch only what is necessary for the request.
+- Do not refactor adjacent code unless it is required.
+- Match the local style.
+- Remove dead code only if your own changes made it unused.
+
+## Goal-Driven Execution
+
+- Define concrete success criteria before editing.
+- Prefer verifiable checks over vague completion claims.
+- For multi-step work, keep a short step -> verify plan.

@@ -1,0 +1,13 @@
+---
+description: Use when coordinating multiple DL/CV experiments across scenes, datasets, GPUs, seeds, ablations, or evaluation phases.
+globs: []
+alwaysApply: false
+---
+
+# DL / Vision Experiment Orchestration
+
+1. Build the experiment matrix first.
+2. Use stable, machine-parsable run naming.
+3. Map jobs to GPUs and dependencies explicitly.
+4. Define which artifacts are official outputs.
+5. Define restart/resume rules before launching batches.

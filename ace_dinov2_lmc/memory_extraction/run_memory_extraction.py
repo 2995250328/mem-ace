@@ -738,11 +738,12 @@ def export_memory_views_visualization(
 # Schema Versioning
 # =============================================================================
 
-MEMORY_SCHEMA_VERSION = "1.5"  # Adds reference-contract metadata for C0/C1 preparation.
+MEMORY_SCHEMA_VERSION = "1.6"  # Adds explicit world/ref scene-center metadata for single-memory C1.
 CHECKPOINT_FILE = "extraction_checkpoint.json"
 
 # ace_depth/checkpoints/dinov2_vitl14_pretrain.pth → 常指向共享存储的软链接
 _ACE_DEPTH_ROOT = Path(__file__).resolve().parents[2]
+_ACE_DATA_ROOT = Path(os.environ.get("ACE_DATA_ROOT", "/home/xwh/data"))
 
 
 def resolve_dinov2_checkpoint_path(explicit: Optional[str] = None) -> str:
@@ -759,8 +760,7 @@ def resolve_dinov2_checkpoint_path(explicit: Optional[str] = None) -> str:
     if repo_link.is_file():
         return str(repo_link)
     candidates = (
-        "/mnt/storage/xwh/checkpoints/dinov2_vitl14_pretrain.pth",
-        "/Data/xwh/checkpoints/dinov2_vitl14_pretrain.pth",
+        str(_ACE_DATA_ROOT / "checkpoints" / "dinov2_vitl14_pretrain.pth"),
     )
     for p in candidates:
         if os.path.isfile(p):
@@ -3289,12 +3289,22 @@ def _compute_points_ref_norm(points_ref: torch.Tensor) -> Tuple[torch.Tensor, to
     return centered / float(sigma_ref), mu_ref.float(), float(sigma_ref)
 
 
+def _world_points_to_ref(points_world: torch.Tensor, T_ref_c2w_world: torch.Tensor) -> torch.Tensor:
+    """Convert world-space row-vector points to the selected reference camera frame."""
+    points_world_f = points_world.detach().cpu().float()
+    T_ref = T_ref_c2w_world.detach().cpu().float()
+    R_ref = T_ref[:3, :3]
+    C_ref = T_ref[:3, 3]
+    return (points_world_f - C_ref.view(1, 3)).matmul(R_ref)
+
+
 def _build_reference_contract_metadata(
     points_world: torch.Tensor,
     features_conditioned: torch.Tensor,
     all_poses: Optional[torch.Tensor],
     config: Optional[ExtractionConfig],
     selection_metadata: Optional[Dict[str, Any]],
+    scene_center_world: Optional[torch.Tensor] = None,
 ) -> Dict[str, Any]:
     """Build C0/C1 reference-contract fields without changing default training."""
     contract_mode = str(getattr(config, "contract_mode", "C0") if config is not None else "C0").upper()
@@ -3321,6 +3331,11 @@ def _build_reference_contract_metadata(
         "features_conditioned": features_conditioned,
         "points_ref": None,
         "points_ref_norm": None,
+        "scene_center_world": scene_center_world.detach().cpu().float() if isinstance(scene_center_world, torch.Tensor) else None,
+        "scene_center_ref": None,
+        "scene_center_ref_norm": None,
+        "scene_center_contract": scene_center_world.detach().cpu().float() if isinstance(scene_center_world, torch.Tensor) else None,
+        "scene_center_contract_space": "world" if isinstance(scene_center_world, torch.Tensor) else None,
         "conditioning_reference": {
             "reference_index": reference_index,
             "T_ref_c2w_world": None,
@@ -3337,11 +3352,7 @@ def _build_reference_contract_metadata(
 
     T_ref_c2w_world = all_poses[0].detach().cpu().float()
     T_world_to_ref = _invert_c2w_pose(T_ref_c2w_world)
-    R_ref = T_ref_c2w_world[:3, :3]
-    C_ref = T_ref_c2w_world[:3, 3]
-    points_world_f = points_world.detach().cpu().float()
-    # Row-vector form of P_ref = R_ref^T (P_world - C_ref).
-    points_ref = (points_world_f - C_ref.view(1, 3)).matmul(R_ref)
+    points_ref = _world_points_to_ref(points_world, T_ref_c2w_world)
     points_ref_norm, mu_ref, sigma_ref = _compute_points_ref_norm(points_ref)
 
     contract["points_ref"] = points_ref
@@ -3355,6 +3366,18 @@ def _build_reference_contract_metadata(
         "mu_ref": mu_ref,
         "sigma_ref": torch.as_tensor(float(sigma_ref), dtype=torch.float32),
     }
+    if isinstance(scene_center_world, torch.Tensor):
+        scene_center_world_cpu = scene_center_world.detach().cpu().float().view(1, 3)
+        scene_center_ref = _world_points_to_ref(scene_center_world_cpu, T_ref_c2w_world).view(3)
+        scene_center_ref_norm = ((scene_center_ref - mu_ref.view(3)) / float(sigma_ref)).view(3)
+        contract["scene_center_ref"] = scene_center_ref
+        contract["scene_center_ref_norm"] = scene_center_ref_norm
+        if contract_mode == "C1":
+            contract["scene_center_contract"] = scene_center_ref_norm
+            contract["scene_center_contract_space"] = "reference_camera_normalized"
+        else:
+            contract["scene_center_contract"] = scene_center_world.detach().cpu().float()
+            contract["scene_center_contract_space"] = "world"
     return contract
 
 
@@ -3460,6 +3483,7 @@ def save_memory(
         all_poses,
         config,
         selection_metadata,
+        scene_center_world=scene_center,
     )
     memory_dict.update(contract_metadata)
     if memory_dict.get('points_ref') is not None:
@@ -3467,6 +3491,10 @@ def save_memory(
             'points_ref': 'reference_camera',
             'points_ref_norm': 'reference_camera_normalized',
             'conditioning_reference': 'camera_to_world/world_to_camera transforms for the first memory view',
+            'scene_center_world': 'world_camera_mean',
+            'scene_center_ref': 'reference_camera',
+            'scene_center_ref_norm': 'reference_camera_normalized',
+            'scene_center_contract': memory_dict.get('scene_center_contract_space', 'world'),
         })
 
     if config is not None:
@@ -3528,7 +3556,7 @@ def save_memory(
                 memory_dict[key] = selection_metadata[key]
 
     if scene_center is not None:
-        memory_dict['scene_center'] = scene_center.cpu().float()  # [3] pooled-compatible scene anchor
+        memory_dict['scene_center'] = scene_center.cpu().float()  # [3] backward-compatible world camera-mean anchor
 
     # Add optional ray representations
     if 'ray_dirs_dominant' in result:
@@ -3565,6 +3593,10 @@ def save_memory(
     print(f"[Save] Scene sigma: {sigma:.4f}")
     if scene_center is not None:
         print(f"[Save] Scene center: {scene_center.cpu().float().tolist()}")
+    if memory_dict.get('scene_center_ref') is not None:
+        print(f"[Save] Scene center ref: {memory_dict['scene_center_ref'].cpu().float().tolist()}")
+    if memory_dict.get('scene_center_ref_norm') is not None:
+        print(f"[Save] Scene center ref norm: {memory_dict['scene_center_ref_norm'].cpu().float().tolist()}")
     if config is not None:
         print(
             f"[Save] Pooling: pool_mode={config.pool_mode}, prepool_mode={config.prepool_mode}, "
@@ -3775,7 +3807,7 @@ def load_dataset(
     # Determine dataset_metadata_dir
     metadata_dir = os.environ.get(
         "MAPANYTHING_DATASET_METADATA_DIR",
-        "/mnt/storage/xwh/map-anything/mapanything_dataset_metadata"
+        str(_ACE_DATA_ROOT / "map-anything" / "mapanything_dataset_metadata")
     )
 
     # Common kwargs for BaseDataset
@@ -6951,7 +6983,13 @@ def _build_clustered_memory_package(
             selection_metadata=cluster_selection,
             return_memory_dict=True,
         )
-        package_clusters.append(cluster_memory if cluster_memory is not None else {"cluster_metadata": cluster_metadata})
+        cluster_entry = cluster_memory if cluster_memory is not None else {"cluster_metadata": cluster_metadata}
+        if isinstance(cluster_entry, dict):
+            cluster_entry = dict(cluster_entry)
+            # Keep the sidecar package relocatable: store a path relative to the
+            # package directory instead of an absolute path tied to one machine.
+            cluster_entry["memory_path"] = os.path.basename(cluster_path)
+        package_clusters.append(cluster_entry)
 
     package = {
         "schema_version": "clustered_memory_package_v1",
@@ -9190,7 +9228,7 @@ def main():
             extractor = MapAnythingExtractor(
                 "mapanything",
                 config.model_config or "default",
-                config.model_checkpoint or "/mnt/storage/xwh/checkpoints/facebook_map-anything.pth",
+                config.model_checkpoint or str(_ACE_DATA_ROOT / "checkpoints" / "facebook_map-anything.pth"),
                 device=str(device),
                 dinov2_checkpoint=config.dinov2_checkpoint,
             )

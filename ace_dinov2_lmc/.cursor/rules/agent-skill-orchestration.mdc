@@ -1,0 +1,81 @@
+---
+description: Use when the request is ambiguous, costly, multi-step, research-heavy, experiment-heavy, or debugging-heavy and should be routed through multiple skills instead of answered in one shot.
+globs:
+alwaysApply: false
+---
+
+# Agent Skill Orchestration
+
+For high-cost or ambiguous work, use an explicit chain instead of responding in one hop.
+
+## Quick Router
+
+- unclear request -> `superpowers-brainstorming`
+- explicit plan request -> `superpowers-writing-plans`
+- "review my plan" / "what am I missing" -> `grill-me`
+- debugging / instability -> `superpowers-systematic-debugging`
+- repo understanding -> `dl-vision-repo-workflow`
+- paper to implementation -> `paper-lookup` + `literature-review` + `dl-vision-paper-to-code`
+- training / extraction command work -> `ace-training-command-composer` or `ace-memory-extraction-workflow`
+- results / benchmark comparison -> `ace-result-aggregation` + `dl-vision-experiment-reporting`
+
+Then add:
+
+- `grill-me` before locking important decisions
+- `karpathy` during implementation tightening
+- verification skills before completion
+
+## Default Chains
+
+### Clarify -> Plan -> Critique
+
+Use when requirements are unclear or there are multiple plausible solutions:
+
+- `superpowers-using-superpowers`
+- `superpowers-brainstorming`
+- `superpowers-writing-plans`
+- `grill-me`
+- `karpathy`
+
+### Retrieve -> Synthesize -> Challenge
+
+Use when the task needs strong evidence or technical synthesis:
+
+- `dl-vision-repo-workflow`
+- `paper-lookup`
+- `literature-review`
+- `dl-vision-paper-to-code`
+- `grill-me`
+- `karpathy`
+
+### Experiment Work
+
+Use when building or evaluating training / memory / benchmark runs:
+
+- `dl-vision-experiment-orchestration`
+- `dl-vision-benchmark-alignment`
+- `dl-vision-experiment-reporting`
+- `ace-training-command-composer` or `ace-memory-extraction-workflow`
+- `grill-me`
+
+### Debugging
+
+Use when isolating failures:
+
+- `superpowers-systematic-debugging`
+- `dl-vision-training-failure-triage`
+- `dl-vision-checkpoint-resume-integrity`
+- `dl-vision-gpu-performance`
+- `superpowers-verification-before-completion`
+- `karpathy`
+
+## Repo-Specific Pairings
+
+- memory extraction: `ace-memory-extraction-workflow` -> `grill-me` -> `karpathy`
+- training commands: `ace-training-command-composer` -> `dl-vision-experiment-orchestration` -> `grill-me`
+- result synthesis: `ace-result-aggregation` -> `dl-vision-experiment-reporting` -> `dl-vision-benchmark-alignment`
+- runbook decisions: `ace-scene-runbook` -> `grill-me` -> `karpathy`
+
+## Rule
+
+If a weak answer would waste GPU time, engineering effort, or research cycles, use a chain, not a single skill.
