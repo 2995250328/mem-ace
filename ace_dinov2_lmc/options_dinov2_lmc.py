@@ -447,6 +447,16 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        '--c1_aux_ref_sample_ratio',
+        type=float,
+        default=0.5,
+        help=(
+            '已保留兼容但当前不再作为固定比例使用。'
+            '启用 --c1_aux_ref_loss_weight 时，采样会优先纳入当前 batch 内全部可用真实深度有效 patch；'
+            '若不足 samples_per_image/buffer 预算，再从常规 image mask 随机补齐。'
+        ),
+    )
+    parser.add_argument(
         '--lmc_head_mean_max_shift',
         type=float,
         default=3.0,

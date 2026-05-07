@@ -57,6 +57,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 "intrinsics": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
                 "intrinsics_inv": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
                 "gt_scene_coords_world": {"rank": 2, "shape_suffix": (3,), "dtype": torch.float32},
+                "gt_scene_coords_valid": {"rank": 2, "shape_suffix": (1,), "dtype": torch.bool},
             },
         },
         "raw_buffer": {
@@ -68,6 +69,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 "intrinsics": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
                 "intrinsics_inv": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
                 "gt_scene_coords_world": {"rank": 2, "shape_suffix": (3,), "dtype": torch.float32},
+                "gt_scene_coords_valid": {"rank": 2, "shape_suffix": (1,), "dtype": torch.bool},
             },
         },
     }
@@ -257,16 +259,26 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self,
         pred_scene_B3HW: torch.Tensor,
         gt_scene_coords_world_N3: Optional[torch.Tensor],
+        gt_scene_coords_valid_N1: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Auxiliary metric loss in raw reference-frame coordinates.
+
+        Callers pass predictions after _recover_pred_scene_to_training_world(),
+        because the main ACE reprojection loss uses that same coordinate space.
+        """
         weight = float(getattr(self.options, "c1_aux_ref_loss_weight", 0.0))
         if weight <= 0.0 or gt_scene_coords_world_N3 is None:
             return pred_scene_B3HW.new_zeros(())
 
-        pred_ref_B3HW = self._recover_pred_scene_to_reference(pred_scene_B3HW)
-        if pred_ref_B3HW is None:
-            return pred_scene_B3HW.new_zeros(())
+        pred_world_B3HW = pred_scene_B3HW
+        if self.coord_sigma is not None and self.coord_mu is not None:
+            mu = self.coord_mu.to(pred_world_B3HW.device, dtype=pred_world_B3HW.dtype).view(1, 3, 1, 1)
+            pred_world_B3HW = pred_world_B3HW * float(self.coord_sigma) + mu
 
-        pred_ref_N3 = pred_ref_B3HW.permute(0, 2, 3, 1).reshape(-1, 3).float()
+        pred_world_N3 = pred_world_B3HW.permute(0, 2, 3, 1).reshape(-1, 3).float()
+        pred_ref_N3 = self._world_to_reference(pred_world_N3)
+        if pred_ref_N3 is None:
+            return pred_scene_B3HW.new_zeros(())
         gt_world_N3 = gt_scene_coords_world_N3.reshape(-1, 3).to(pred_ref_N3.device, dtype=pred_ref_N3.dtype)
         gt_ref_N3 = self._world_to_reference(gt_world_N3)
         if gt_ref_N3 is None:
@@ -274,6 +286,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         valid_mask = torch.isfinite(pred_ref_N3).all(dim=1) & torch.isfinite(gt_ref_N3).all(dim=1)
         valid_mask &= (gt_world_N3.abs().sum(dim=1) > 0)
+        if gt_scene_coords_valid_N1 is not None:
+            valid_mask &= gt_scene_coords_valid_N1.reshape(-1).to(valid_mask.device).bool()
         if not bool(valid_mask.any().item()):
             return pred_scene_B3HW.new_zeros(())
 
@@ -284,6 +298,72 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             beta=1.0,
         )
         return aux_loss * weight
+
+    def _extract_gt_scene_coords_from_batch(self, batch, image_BCHW: Optional[torch.Tensor] = None):
+        """Return GT world scene coords from dataset batch when the backend provides them."""
+        if not isinstance(batch, (list, tuple)):
+            return None
+        for item in reversed(batch):
+            if not torch.is_tensor(item):
+                continue
+            if image_BCHW is not None and item is image_BCHW:
+                continue
+            if item.ndim == 4 and item.shape[1] == 3:
+                return item
+        return None
+
+    def _scene_coords_valid_mask(self, coords_B3HW: Optional[torch.Tensor], size_hw=None, device=None):
+        if coords_B3HW is None:
+            if size_hw is None:
+                return None
+            H, W = size_hw
+            return torch.zeros((1, 1, H, W), dtype=torch.bool, device=device or self.device)
+        valid_B1HW = torch.isfinite(coords_B3HW).all(dim=1, keepdim=True)
+        valid_B1HW &= coords_B3HW.abs().sum(dim=1, keepdim=True) > 0
+        if size_hw is not None and tuple(valid_B1HW.shape[-2:]) != tuple(size_hw):
+            valid_B1HW = Fnn.interpolate(valid_B1HW.float(), size=size_hw, mode="nearest") > 0.5
+        return valid_B1HW
+
+    def _sample_buffer_indices(self, image_mask_N1, coord_valid_N1, features_to_select, use_replacement):
+        image_weights = image_mask_N1.view(-1).float()
+        if features_to_select <= 0:
+            return None
+        aux_weight = float(getattr(self.options, "c1_aux_ref_loss_weight", 0.0))
+        coord_weights = coord_valid_N1.view(-1).float() if coord_valid_N1 is not None else None
+        if aux_weight <= 0.0 or coord_weights is None or float(coord_weights.sum().item()) <= 0.0:
+            return torch.multinomial(
+                image_weights,
+                features_to_select,
+                replacement=use_replacement,
+                generator=self.sampling_generator,
+            )
+
+        valid_coord_idx = torch.where(coord_weights > 0)[0]
+        n_aux = min(int(valid_coord_idx.numel()), features_to_select)
+        pieces = []
+        if n_aux > 0:
+            perm = torch.randperm(valid_coord_idx.numel(), device=valid_coord_idx.device, generator=self.sampling_generator)
+            pieces.append(valid_coord_idx[perm[:n_aux]])
+        n_random = features_to_select - n_aux
+        if n_random > 0:
+            pieces.append(torch.multinomial(
+                image_weights,
+                n_random,
+                replacement=use_replacement,
+                generator=self.sampling_generator,
+            ))
+        return torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0]
+
+    def _warn_missing_aux_ref_coords_once(self):
+        if float(getattr(self.options, "c1_aux_ref_loss_weight", 0.0)) <= 0.0:
+            return
+        if getattr(self, "_warned_missing_aux_ref_coords", False):
+            return
+        _logger.warning(
+            "[LMC] --c1_aux_ref_loss_weight > 0 but this dataset batch has no GT scene coords; "
+            "aux_ref_loss will be skipped for these samples."
+        )
+        self._warned_missing_aux_ref_coords = True
 
     def __init__(self, options):
         # Determine if LMC is active *before* parent __init__
@@ -588,6 +668,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'reference_output_space': self.reference_contract_state['output_space'],
             'c1_ref_norm_alpha': float(self.reference_contract_state.get('normalization_ref', {}).get('alpha', 1.0) or 1.0),
             'c1_aux_ref_loss_weight': float(getattr(self.options, 'c1_aux_ref_loss_weight', 0.0)),
+            'c1_aux_ref_sample_ratio': float(getattr(self.options, 'c1_aux_ref_sample_ratio', 0.5)),
             'memory_has_points_ref': self.memory_contract_info['has_points_ref'],
             'memory_has_points_ref_norm': self.memory_contract_info['has_points_ref_norm'],
             'memory_has_scene_center_world': self.memory_contract_info['has_scene_center_world'],
@@ -1037,6 +1118,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'intrinsics': torch.empty((effective_size, 3, 3), dtype=torch.float32, device=buffer_device),
             'intrinsics_inv': torch.empty((effective_size, 3, 3), dtype=torch.float32, device=buffer_device),
             'gt_scene_coords_world': torch.empty((effective_size, 3), dtype=torch.float32, device=buffer_device),
+            'gt_scene_coords_valid': torch.empty((effective_size, 1), dtype=torch.bool, device=buffer_device),
         }
 
         self.regressor.eval()
@@ -1056,14 +1138,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             while buffer_idx < effective_size:
                 dataset_passes += 1
                 for batch in training_dataloader:
-                    image_BCHW, image_mask_B1HW, _, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, coords_B3HW, _ = batch
+                    image_BCHW, image_mask_B1HW, _, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, *_ = batch
+                    coords_B3HW = self._extract_gt_scene_coords_from_batch(batch, image_BCHW=image_BCHW)
 
                     image_BCHW = image_BCHW.to(self.device, non_blocking=True)
                     image_mask_B1HW = image_mask_B1HW.to(self.device, non_blocking=True)
                     gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True)
                     intrinsics_B33 = intrinsics_B33.to(self.device, non_blocking=True)
                     intrinsics_inv_B33 = intrinsics_inv_B33.to(self.device, non_blocking=True)
-                    coords_B3HW = coords_B3HW.to(self.device, non_blocking=True).float()
+                    if coords_B3HW is not None:
+                        coords_B3HW = coords_B3HW.to(self.device, non_blocking=True).float()
+                    else:
+                        self._warn_missing_aux_ref_coords_once()
 
                     if gt_pose_inv_B44.shape[1] == 4:
                         gt_pose_inv_B34 = gt_pose_inv_B44[:, :3, :]
@@ -1079,8 +1165,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     B, C, H, W = features_BCHW.shape
                     image_mask_B1HW = TF.resize(image_mask_B1HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
                     image_mask_B1HW = image_mask_B1HW.bool()
-                    if tuple(coords_B3HW.shape[-2:]) != (H, W):
+                    if coords_B3HW is None:
+                        coords_B3HW = torch.zeros((B, 3, H, W), dtype=torch.float32, device=self.device)
+                        coords_valid_B1HW = torch.zeros((B, 1, H, W), dtype=torch.bool, device=self.device)
+                    elif tuple(coords_B3HW.shape[-2:]) != (H, W):
+                        coords_valid_B1HW = self._scene_coords_valid_mask(coords_B3HW, size_hw=(H, W), device=self.device)
                         coords_B3HW = Fnn.interpolate(coords_B3HW, size=(H, W), mode="nearest")
+                    else:
+                        coords_valid_B1HW = self._scene_coords_valid_mask(coords_B3HW, size_hw=(H, W), device=self.device)
 
                     if image_mask_B1HW.sum() == 0:
                         continue
@@ -1100,6 +1192,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         'intrinsics': intrinsics,
                         'intrinsics_inv': intrinsics_inv,
                         'gt_scene_coords_world': normalize_shape(coords_B3HW),
+                        'gt_scene_coords_valid': normalize_shape(coords_valid_B1HW),
                     }
 
                     image_mask_B1HW = image_mask_B1HW.float()
@@ -1115,11 +1208,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         features_to_select = min(features_to_select, valid_count)
                     if features_to_select <= 0:
                         continue
-                    sample_idxs = torch.multinomial(
-                        image_mask_N1.view(-1),
+                    coord_valid_N1 = normalize_shape(coords_valid_B1HW)
+                    sample_idxs = self._sample_buffer_indices(
+                        image_mask_N1,
+                        coord_valid_N1,
                         features_to_select,
-                        replacement=use_replacement,
-                        generator=self.sampling_generator,
+                        use_replacement,
                     )
                     sampled_total += int(sample_idxs.numel())
                     sampled_duplicates += int(sample_idxs.numel() - torch.unique(sample_idxs).numel())
@@ -1475,6 +1569,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         invK_B33,
         image_mask_B1HW,
         gt_scene_coords_B3HW=None,
+        gt_scene_coords_valid_B1HW=None,
         s1_step=0,
     ):
         """Full E2E: head on (B,C,H,W), repro loss on spatial positions (optionally subsampled).
@@ -1558,9 +1653,27 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         loss = (loss_valid + loss_invalid) / N
         if gt_scene_coords_B3HW is not None:
             if tuple(gt_scene_coords_B3HW.shape[-2:]) != (H, W):
+                gt_scene_coords_valid_B1HW = self._scene_coords_valid_mask(
+                    gt_scene_coords_B3HW,
+                    size_hw=(H, W),
+                    device=fused_feats_BCHW.device,
+                )
                 gt_scene_coords_B3HW = Fnn.interpolate(gt_scene_coords_B3HW, size=(H, W), mode="nearest")
+            elif gt_scene_coords_valid_B1HW is None:
+                gt_scene_coords_valid_B1HW = self._scene_coords_valid_mask(
+                    gt_scene_coords_B3HW,
+                    size_hw=(H, W),
+                    device=fused_feats_BCHW.device,
+                )
             gt_scene_coords_N3 = gt_scene_coords_B3HW.permute(0, 2, 3, 1).reshape(N, 3)
-            loss = loss + (self._compute_c1_aux_ref_loss(pred_scene_B3HW, gt_scene_coords_N3) / N)
+            gt_scene_coords_valid_N1 = None
+            if gt_scene_coords_valid_B1HW is not None:
+                gt_scene_coords_valid_N1 = gt_scene_coords_valid_B1HW.permute(0, 2, 3, 1).reshape(N, 1)
+            loss = loss + self._compute_c1_aux_ref_loss(
+                pred_scene_B3HW,
+                gt_scene_coords_N3,
+                gt_scene_coords_valid_N1,
+            )
         fraction_valid = float(valid_flat.sum() / N)
         finite_l1 = repro_l1_b1[torch.isfinite(repro_l1_b1).flatten()]
         finite_l2 = repro_l2_b1[torch.isfinite(repro_l2_b1).flatten()]
@@ -1583,6 +1696,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         Ks_b33,
         invKs_b33,
         gt_scene_coords_world_b3=None,
+        gt_scene_coords_valid_b1=None,
     ):
         """Compute ace_depth reprojection loss from sampled fused features (same formula as TrainerACEDINOv2.training_step)."""
         channels = features_bC.shape[1]
@@ -1595,10 +1709,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             gt_inv_poses_b34,
             Ks_b33,
             invKs_b33,
+            gt_scene_coords_world_b3,
+            gt_scene_coords_valid_b1,
         )
         if batch_size is None:
             return None, None
-        target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33 = trimmed
+        target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
 
         features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
         pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(features_bCHW)
@@ -1641,7 +1757,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         loss_invalid = invalid_abs.masked_select(invalid_mask_b11).sum()
 
         loss = (loss_valid + loss_invalid) / batch_size
-        loss = loss + self._compute_c1_aux_ref_loss(pred_scene_coords_b3HW, gt_scene_coords_world_b3)
+        loss = loss + self._compute_c1_aux_ref_loss(
+            pred_scene_coords_b3HW,
+            gt_scene_coords_world_b3,
+            gt_scene_coords_valid_b1,
+        )
         fraction_valid = float(valid_mask_b1.sum() / batch_size)
         finite_l1 = reprojection_error_l1_b1[torch.isfinite(reprojection_error_l1_b1)]
         finite_l2 = reprojection_error_l2_b1[torch.isfinite(reprojection_error_l2_b1)]
@@ -2179,14 +2299,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 )
                 break
             batch = next(s1_iterator)
-            image_BCHW, image_mask_B1HW, _, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, gt_scene_coords_B3HW, _ = batch
+            image_BCHW, image_mask_B1HW, _, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, *_ = batch
+            gt_scene_coords_B3HW = self._extract_gt_scene_coords_from_batch(batch, image_BCHW=image_BCHW)
 
             image_BCHW = image_BCHW.to(self.device, non_blocking=True)
             image_mask_B1HW = image_mask_B1HW.to(self.device, non_blocking=True)
             gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True)
             intrinsics_B33 = intrinsics_B33.to(self.device, non_blocking=True)
             intrinsics_inv_B33 = intrinsics_inv_B33.to(self.device, non_blocking=True)
-            gt_scene_coords_B3HW = gt_scene_coords_B3HW.to(self.device, non_blocking=True).float()
+            if gt_scene_coords_B3HW is not None:
+                gt_scene_coords_B3HW = gt_scene_coords_B3HW.to(self.device, non_blocking=True).float()
+            else:
+                self._warn_missing_aux_ref_coords_once()
 
             if gt_pose_inv_B44.shape[1] == 4:
                 gt_pose_inv_B34 = gt_pose_inv_B44[:, :3, :]
@@ -2206,6 +2330,22 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 B, C, H, W = fused_feats.shape
                 image_mask_B1HW = TF.resize(image_mask_B1HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
                 image_mask_B1HW = image_mask_B1HW.bool()
+                if gt_scene_coords_B3HW is None:
+                    gt_scene_coords_B3HW = torch.zeros((B, 3, H, W), dtype=torch.float32, device=self.device)
+                    gt_scene_coords_valid_B1HW = torch.zeros((B, 1, H, W), dtype=torch.bool, device=self.device)
+                elif tuple(gt_scene_coords_B3HW.shape[-2:]) != (H, W):
+                    gt_scene_coords_valid_B1HW = self._scene_coords_valid_mask(
+                        gt_scene_coords_B3HW,
+                        size_hw=(H, W),
+                        device=self.device,
+                    )
+                    gt_scene_coords_B3HW = Fnn.interpolate(gt_scene_coords_B3HW, size=(H, W), mode="nearest")
+                else:
+                    gt_scene_coords_valid_B1HW = self._scene_coords_valid_mask(
+                        gt_scene_coords_B3HW,
+                        size_hw=(H, W),
+                        device=self.device,
+                    )
 
                 if image_mask_B1HW.sum() == 0:
                     skipped_mask += 1
@@ -2218,6 +2358,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     loss, s1_stats = self._s1_compute_loss_full_map(
                         fused_feats, gt_pose_inv_B34, intrinsics_B33, intrinsics_inv_B33, image_mask_B1HW,
                         gt_scene_coords_B3HW=gt_scene_coords_B3HW,
+                        gt_scene_coords_valid_B1HW=gt_scene_coords_valid_B1HW,
                         s1_step=s1_step,
                     )
                 else:
@@ -2235,13 +2376,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         'gt_poses_inv': gt_pose_inv,
                         'intrinsics': intrinsics,
                         'intrinsics_inv': intrinsics_inv,
-                        'gt_scene_coords_world': normalize_shape(
-                            Fnn.interpolate(gt_scene_coords_B3HW, size=(H, W), mode="nearest")
-                            if tuple(gt_scene_coords_B3HW.shape[-2:]) != (H, W) else gt_scene_coords_B3HW
-                        ),
+                        'gt_scene_coords_world': normalize_shape(gt_scene_coords_B3HW),
+                        'gt_scene_coords_valid': normalize_shape(gt_scene_coords_valid_B1HW),
                     }
 
                     image_mask_N1 = normalize_shape(image_mask_B1HW.float())
+                    coord_valid_N1 = normalize_shape(gt_scene_coords_valid_B1HW)
                     n_per_image = self.options.samples_per_image
 
                     if s1_loss_mode == 'sample_per_image':
@@ -2251,8 +2391,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                             n_sample = min(n_per_image, valid_flat.numel())
                             if n_sample < 16:
                                 continue
-                            perm = torch.randperm(valid_flat.numel(), device=valid_flat.device, generator=self.sampling_generator)
-                            idx_b = valid_flat[perm[:n_sample]]
+                            idx_b = self._sample_buffer_indices(
+                                image_mask_B1HW[b].flatten().float().view(-1, 1),
+                                gt_scene_coords_valid_B1HW[b].flatten().view(-1, 1),
+                                n_sample,
+                                True,
+                            )
                             global_idx = b * (H * W) + idx_b
                             per_image_indices.append(global_idx)
                         if len(per_image_indices) == 0:
@@ -2264,11 +2408,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         if features_to_select < 16:
                             skipped_sample += 1
                             continue
-                        sample_idxs = torch.multinomial(
-                            image_mask_N1.view(-1),
+                        sample_idxs = self._sample_buffer_indices(
+                            image_mask_N1,
+                            coord_valid_N1,
                             features_to_select,
-                            replacement=True,
-                            generator=self.sampling_generator,
+                            True,
                         )
 
                     for k in batch_data:
@@ -2281,6 +2425,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         batch_data['intrinsics'].contiguous(),
                         batch_data['intrinsics_inv'].contiguous(),
                         batch_data['gt_scene_coords_world'].contiguous(),
+                        batch_data['gt_scene_coords_valid'].contiguous(),
                     )
 
             if loss is None:
@@ -3183,6 +3328,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 _to_dev(buf['intrinsics'][random_batch_indices]),
                 _to_dev(buf['intrinsics_inv'][random_batch_indices]),
                 _to_dev(buf['gt_scene_coords_world'][random_batch_indices]),
+                _to_dev(buf['gt_scene_coords_valid'][random_batch_indices]),
             )
             if not bool(getattr(self, "_s2_update_applied_last", True)):
                 continue
@@ -3190,7 +3336,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self.global_s2_step += 1
             self.local_s2_step += 1
 
-    def training_step(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None):
+    def training_step(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None):
         """When LMC S2: use step_eff for ReproLoss and head-only optimizer/scheduler."""
         if not self.use_lmc or self.optimizer_head is None:
             return super().training_step(features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33)
@@ -3203,11 +3349,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             gt_inv_poses_b34,
             Ks_b33,
             invKs_b33,
+            gt_scene_coords_world_b3,
+            gt_scene_coords_valid_b1,
         )
         if batch_size is None:
             self._s2_update_applied_last = False
             return None
-        target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33 = trimmed
+        target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
         features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
 
         if self.repro_step_mode == "global_monotonic":
@@ -3274,7 +3422,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             delta_cam_b31 = delta_cam_b31.clamp(max=self._loss_invalid_max_delta)
         loss_invalid = delta_cam_b31.masked_select(invalid_mask_b11).sum()
         loss = (loss_valid + loss_invalid) / batch_size
-        loss = loss + self._compute_c1_aux_ref_loss(pred_scene_coords_b3HW, gt_scene_coords_world_b3)
+        loss = loss + self._compute_c1_aux_ref_loss(
+            pred_scene_coords_b3HW,
+            gt_scene_coords_world_b3,
+            gt_scene_coords_valid_b1,
+        )
 
         # Guard NaN/Inf: truly skip optimizer/scheduler updates to avoid consuming LR schedule.
         loss_is_finite = bool(torch.isfinite(loss).all().item())
@@ -3341,7 +3493,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             )
         return loss
 
-    def _training_step_ace_g(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None):
+    def _training_step_ace_g(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None):
         """ACE-G S2 training step: apply fusion on-the-fly then head.
 
         Key difference from training_step(): raw backbone features are fused
@@ -3355,11 +3507,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             gt_inv_poses_b34,
             Ks_b33,
             invKs_b33,
+            gt_scene_coords_world_b3,
+            gt_scene_coords_valid_b1,
         )
         if batch_size is None:
             self._s2_update_applied_last = False
             return None
-        target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33 = trimmed
+        target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
         features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
 
         # --- Same repro loss as training_step from here on ---
@@ -3426,7 +3580,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             delta_cam_b31 = delta_cam_b31.clamp(max=self._loss_invalid_max_delta)
         loss_invalid = delta_cam_b31.masked_select(invalid_mask_b11).sum()
         loss = (loss_valid + loss_invalid) / batch_size
-        loss = loss + self._compute_c1_aux_ref_loss(pred_scene_coords_b3HW, gt_scene_coords_world_b3)
+        loss = loss + self._compute_c1_aux_ref_loss(
+            pred_scene_coords_b3HW,
+            gt_scene_coords_world_b3,
+            gt_scene_coords_valid_b1,
+        )
 
         loss_is_finite = bool(torch.isfinite(loss).all().item())
         loss_for_log = float(loss.item()) if loss_is_finite else -1.0
