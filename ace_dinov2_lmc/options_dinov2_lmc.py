@@ -200,6 +200,42 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        '--buffer_sample_valid_coords',
+        type=_strtobool,
+        default=True,
+        help=(
+            '填充训练 buffer / sampled S1 时，若 batch 提供真实深度生成的有效 scene-coordinate patch，'
+            '优先从这些 patch 采样。默认 True；没有真实 coords 时自动回退到 image mask 随机采样。'
+        ),
+    )
+    parser.add_argument(
+        '--buffer_valid_coord_sample_ratio',
+        type=float,
+        default=1.0,
+        help=(
+            '每次采样预算中优先分配给有效深度/scene-coordinate patch 的比例。'
+            '1.0 表示尽量全部来自有效 patch，不足时再从 image mask 随机补齐。'
+        ),
+    )
+    parser.add_argument(
+        '--buffer_valid_coord_neighbor_radius',
+        type=int,
+        default=1,
+        help=(
+            '有效深度 patch 的采样邻域半径，单位是 DINO 输出 patch。'
+            '0 表示只采样有效 patch 本身；1 表示中心加一圈邻域。'
+        ),
+    )
+    parser.add_argument(
+        '--buffer_valid_coord_neighbor_mode',
+        choices=['none', 'cross', 'square'],
+        default='cross',
+        help=(
+            '有效深度 patch 的邻域形状。cross=上下左右邻域，'
+            'square=包含对角邻域，none=不扩展。'
+        ),
+    )
+    parser.add_argument(
         '--epochs',
         type=int,
         default=24,
@@ -469,9 +505,8 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.5,
         help=(
-            '已保留兼容但当前不再作为固定比例使用。'
-            '启用 --c1_aux_ref_loss_weight 时，采样会优先纳入当前 batch 内全部可用真实深度有效 patch；'
-            '若不足 samples_per_image/buffer 预算，再从常规 image mask 随机补齐。'
+            '兼容旧参数；新的采样控制请使用 --buffer_sample_valid_coords 和 '
+            '--buffer_valid_coord_sample_ratio。'
         ),
     )
     parser.add_argument(
@@ -731,6 +766,15 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         help=(
             'S2 阶段将训练 buffer 放在 CPU，每步只把当前 batch 搬到 GPU，避免 23GB 卡 OOM（与 map-anything 一致）。'
             '默认 True；设为 False 则 buffer 全程在 GPU（显存充足时可用）。'
+        ),
+    )
+    parser.add_argument(
+        '--buffer_on_cpu_final',
+        type=_strtobool,
+        default=True,
+        help=(
+            '最后一轮 S2 的 buffer_size_final buffer 强制放在 CPU，避免 3x final buffer 在 24GB 卡上 OOM。'
+            '默认 True；若确实要 final buffer 也留在 GPU，可显式设为 False。'
         ),
     )
     parser.add_argument(

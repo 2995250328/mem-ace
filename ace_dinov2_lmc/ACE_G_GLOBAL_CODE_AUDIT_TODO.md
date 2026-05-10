@@ -53,7 +53,7 @@ Why defer these:
 
 ### 1. Make global FPS deterministic or checkpoint the selected latent set
 
-Status: fixed in code on 2026-05-07.
+Status: done. Fixed in code on 2026-05-07 and tracked in `ace_g_global_refactor/steps/01_deterministic_fps.md`.
 
 Implemented first change:
 

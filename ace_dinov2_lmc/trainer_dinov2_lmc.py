@@ -327,14 +327,74 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             valid_B1HW = Fnn.interpolate(valid_B1HW.float(), size=size_hw, mode="nearest") > 0.5
         return valid_B1HW
 
+    def _expand_valid_coord_sampling_mask(self, coord_valid_B1HW, image_mask_B1HW=None):
+        """Expand valid-depth patches to nearby DINO patches for buffer sampling only."""
+        if coord_valid_B1HW is None:
+            return None
+        radius = int(getattr(self.options, "buffer_valid_coord_neighbor_radius", 1))
+        mode = str(getattr(self.options, "buffer_valid_coord_neighbor_mode", "cross") or "cross").lower()
+        valid = coord_valid_B1HW.bool()
+        if radius <= 0 or mode == "none" or valid.numel() == 0 or not bool(valid.any().item()):
+            expanded = valid
+        elif mode == "square":
+            kernel_size = radius * 2 + 1
+            expanded = Fnn.max_pool2d(
+                valid.float(),
+                kernel_size=kernel_size,
+                stride=1,
+                padding=radius,
+            ) > 0.5
+        elif mode == "cross":
+            offsets = []
+            for dy in range(-radius, radius + 1):
+                for dx in range(-radius, radius + 1):
+                    if abs(dy) + abs(dx) <= radius:
+                        offsets.append((dy, dx))
+            kernel = torch.zeros(
+                (1, 1, radius * 2 + 1, radius * 2 + 1),
+                dtype=valid.dtype if valid.is_floating_point() else torch.float32,
+                device=valid.device,
+            )
+            for dy, dx in offsets:
+                kernel[0, 0, dy + radius, dx + radius] = 1.0
+            expanded = Fnn.conv2d(valid.float(), kernel, padding=radius) > 0.5
+        else:
+            raise ValueError(
+                f"Unsupported buffer_valid_coord_neighbor_mode={mode!r}; expected none/cross/square."
+            )
+
+        if image_mask_B1HW is not None:
+            expanded = expanded & image_mask_B1HW.bool()
+
+        seed_count = int((valid & image_mask_B1HW.bool()).sum().item()) if image_mask_B1HW is not None else int(valid.sum().item())
+        expanded_count = int(expanded.sum().item())
+        self._buffer_sample_valid_coord_seed_available = (
+            int(getattr(self, "_buffer_sample_valid_coord_seed_available", 0)) + seed_count
+        )
+        self._buffer_sample_valid_coord_roi_available = (
+            int(getattr(self, "_buffer_sample_valid_coord_roi_available", 0)) + expanded_count
+        )
+        self._buffer_sample_valid_coord_neighbor_available = (
+            int(getattr(self, "_buffer_sample_valid_coord_neighbor_available", 0)) + max(0, expanded_count - seed_count)
+        )
+        return expanded
+
     def _sample_buffer_indices(self, image_mask_N1, coord_valid_N1, features_to_select, use_replacement):
         image_weights = image_mask_N1.view(-1).float()
         sample_generator = self._get_training_generator(image_weights.device)
         if features_to_select <= 0:
             return None
+        if float(image_weights.sum().item()) <= 0.0:
+            return None
+
+        prefer_valid_coords = bool(getattr(self.options, "buffer_sample_valid_coords", True))
         aux_weight = float(getattr(self.options, "c1_aux_ref_loss_weight", 0.0))
+        prefer_valid_coords = prefer_valid_coords or aux_weight > 0.0
         coord_weights = coord_valid_N1.view(-1).float() if coord_valid_N1 is not None else None
-        if aux_weight <= 0.0 or coord_weights is None or float(coord_weights.sum().item()) <= 0.0:
+        if not prefer_valid_coords or coord_weights is None or float(coord_weights.sum().item()) <= 0.0:
+            self._buffer_sample_random_selected = (
+                int(getattr(self, "_buffer_sample_random_selected", 0)) + int(features_to_select)
+            )
             return torch.multinomial(
                 image_weights,
                 features_to_select,
@@ -342,21 +402,46 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 generator=sample_generator,
             )
 
-        valid_coord_idx = torch.where(coord_weights > 0)[0]
-        n_aux = min(int(valid_coord_idx.numel()), features_to_select)
+        valid_coord_idx = torch.where((coord_weights > 0) & (image_weights > 0))[0]
+        if valid_coord_idx.numel() <= 0:
+            self._buffer_sample_random_selected = (
+                int(getattr(self, "_buffer_sample_random_selected", 0)) + int(features_to_select)
+            )
+            return torch.multinomial(
+                image_weights,
+                features_to_select,
+                replacement=use_replacement,
+                generator=sample_generator,
+            )
+
+        valid_ratio = float(getattr(self.options, "buffer_valid_coord_sample_ratio", 1.0))
+        valid_ratio = min(1.0, max(0.0, valid_ratio))
+        n_valid_target = features_to_select if valid_ratio >= 1.0 else int(math.ceil(features_to_select * valid_ratio))
+        n_aux = min(int(valid_coord_idx.numel()), features_to_select, max(0, n_valid_target))
         pieces = []
         if n_aux > 0:
             coord_generator = self._get_training_generator(valid_coord_idx.device)
             perm = torch.randperm(valid_coord_idx.numel(), device=valid_coord_idx.device, generator=coord_generator)
             pieces.append(valid_coord_idx[perm[:n_aux]])
+            self._buffer_sample_valid_coord_selected = int(getattr(self, "_buffer_sample_valid_coord_selected", 0)) + n_aux
+        self._buffer_sample_valid_coord_available = (
+            int(getattr(self, "_buffer_sample_valid_coord_available", 0)) + int(valid_coord_idx.numel())
+        )
         n_random = features_to_select - n_aux
         if n_random > 0:
+            random_weights = image_weights
+            if not use_replacement and n_aux > 0:
+                random_weights = image_weights.clone()
+                random_weights[pieces[0]] = 0.0
+            if float(random_weights.sum().item()) <= 0.0:
+                return pieces[0] if pieces else None
             pieces.append(torch.multinomial(
-                image_weights,
+                random_weights,
                 n_random,
                 replacement=use_replacement,
                 generator=sample_generator,
             ))
+            self._buffer_sample_random_selected = int(getattr(self, "_buffer_sample_random_selected", 0)) + n_random
         return torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0]
 
     def _infer_c1_aux_depth_dir(self, train_root: Path) -> Optional[Path]:
@@ -390,6 +475,49 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         return depth
 
     @staticmethod
+    def _sample_patch_depth_nearest_valid(depth: np.ndarray, stride: int, coords_h: int, coords_w: int):
+        """Return one representative valid depth pixel per patch, preferring the patch center."""
+        patch_depth = np.zeros((coords_h, coords_w), dtype=np.float64)
+        patch_px = np.zeros((coords_h, coords_w), dtype=np.float64)
+        patch_py = np.zeros((coords_h, coords_w), dtype=np.float64)
+        patch_valid = np.zeros((coords_h, coords_w), dtype=bool)
+
+        image_h, image_w = depth.shape
+        half = int(stride) // 2
+        for gy in range(coords_h):
+            cy = min(gy * stride + half, image_h - 1)
+            y0 = gy * stride
+            y1 = min((gy + 1) * stride, image_h)
+            for gx in range(coords_w):
+                cx = min(gx * stride + half, image_w - 1)
+                x0 = gx * stride
+                x1 = min((gx + 1) * stride, image_w)
+
+                center_depth = depth[cy, cx]
+                if np.isfinite(center_depth) and center_depth > 0.0 and center_depth <= 1000.0:
+                    patch_depth[gy, gx] = center_depth
+                    patch_px[gy, gx] = cx
+                    patch_py[gy, gx] = cy
+                    patch_valid[gy, gx] = True
+                    continue
+
+                window = depth[y0:y1, x0:x1]
+                valid = np.isfinite(window) & (window > 0.0) & (window <= 1000.0)
+                if not np.any(valid):
+                    continue
+                yy, xx = np.where(valid)
+                abs_y = yy + y0
+                abs_x = xx + x0
+                best = int(np.argmin((abs_y - cy) ** 2 + (abs_x - cx) ** 2))
+                py = int(abs_y[best])
+                px = int(abs_x[best])
+                patch_depth[gy, gx] = depth[py, px]
+                patch_px[gy, gx] = px
+                patch_py[gy, gx] = py
+                patch_valid[gy, gx] = True
+        return patch_depth, patch_px, patch_py, patch_valid
+
+    @staticmethod
     def _depth_to_patch_scene_coords(
         depth: np.ndarray,
         pose: torch.Tensor,
@@ -409,27 +537,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             )
 
         stride = int(Regressor.OUTPUT_SUBSAMPLE)
-        offset_x = int(stride / 2)
-        offset_y = int(stride / 2)
         coords_h = math.ceil(image_h / stride)
         coords_w = math.ceil(image_w / stride)
-        depth_patch = depth[offset_y::stride, offset_x::stride][:coords_h, :coords_w]
+        depth_patch, px, py, valid = TrainerACEDINOv2LMC._sample_patch_depth_nearest_valid(
+            depth,
+            stride,
+            coords_h,
+            coords_w,
+        )
 
         coords = torch.zeros((3, coords_h, coords_w), dtype=torch.float32)
-        if depth_patch.size == 0:
-            return coords
-
-        valid = np.isfinite(depth_patch) & (depth_patch > 0.0) & (depth_patch <= 1000.0)
         if not np.any(valid):
             return coords
-
-        yy, xx = np.meshgrid(
-            np.arange(depth_patch.shape[0], dtype=np.float64),
-            np.arange(depth_patch.shape[1], dtype=np.float64),
-            indexing="ij",
-        )
-        px = xx * stride + offset_x
-        py = yy * stride + offset_y
 
         if centre_point:
             fx = float(focal_length[0])
@@ -715,8 +834,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             aug_scale_max=aug_scale_max,
             aug_scale_min=aug_scale_min,
         )
+        aux_ref_required = float(getattr(self.options, "c1_aux_ref_loss_weight", 0.0)) > 0.0
+        valid_coord_sampling = bool(getattr(self.options, "buffer_sample_valid_coords", True))
         if (
-            float(getattr(self.options, "c1_aux_ref_loss_weight", 0.0)) > 0.0
+            (aux_ref_required or valid_coord_sampling)
             and getattr(self.options, "data_backend", "ace") == "ace"
             and hasattr(dataset, "init")
         ):
@@ -729,7 +850,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 dataset.coord_files = sorted(ace_depth_dir.iterdir())
             else:
                 depth_dir = self._infer_c1_aux_depth_dir(train_root)
-                dataset = self._attach_ace_aux_depth_dataset(dataset, train_root, depth_dir)
+                if aux_ref_required or depth_dir.exists():
+                    dataset = self._attach_ace_aux_depth_dataset(dataset, train_root, depth_dir)
+                elif not getattr(self, "_warned_missing_valid_coord_sampling_depth", False):
+                    _logger.warning(
+                        "[LMC] --buffer_sample_valid_coords=True but no aux depth dir found at %s; "
+                        "falling back to image-mask random sampling.",
+                        depth_dir,
+                    )
+                    self._warned_missing_valid_coord_sampling_depth = True
         return dataset
 
     def __init__(self, options):
@@ -1188,8 +1317,16 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     def _expected_training_buffer_feature_dtype(self):
         return torch.float16 if bool(getattr(self.options, "use_half", False)) else torch.float32
 
-    def _expected_training_buffer_device_type(self):
+    def _current_buffer_should_be_on_cpu(self):
         if bool(getattr(self.options, "buffer_on_cpu", True)):
+            return True
+        return bool(getattr(self, "_force_current_buffer_on_cpu", False))
+
+    def _expected_training_buffer_device_type(self):
+        current_buffer_on_cpu = getattr(self, "_current_training_buffer_on_cpu", None)
+        if current_buffer_on_cpu is None:
+            current_buffer_on_cpu = self._current_buffer_should_be_on_cpu()
+        if bool(current_buffer_on_cpu):
             return "cpu"
         return self.device.type
 
@@ -1478,10 +1615,16 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         )
 
         _logger.info("Starting creation of the training buffer.")
-        buffer_on_cpu = getattr(self.options, "buffer_on_cpu", False)
+        buffer_on_cpu = self._current_buffer_should_be_on_cpu()
+        self._current_training_buffer_on_cpu = buffer_on_cpu
         buffer_device = torch.device("cpu") if buffer_on_cpu else self.device
         if buffer_on_cpu:
-            _logger.info("Buffer will be allocated on CPU (buffer_on_cpu=True) to avoid GPU OOM.")
+            reason = (
+                "buffer_on_cpu=True"
+                if bool(getattr(self.options, "buffer_on_cpu", True))
+                else "buffer_on_cpu_final=True"
+            )
+            _logger.info("Buffer will be allocated on CPU (%s) to avoid GPU OOM.", reason)
 
         self.training_buffer = {
             'features': torch.empty(
@@ -1503,6 +1646,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             dataset_passes = 0
             sampled_total = 0
             sampled_duplicates = 0
+            self._buffer_sample_valid_coord_selected = 0
+            self._buffer_sample_valid_coord_available = 0
+            self._buffer_sample_valid_coord_seed_available = 0
+            self._buffer_sample_valid_coord_roi_available = 0
+            self._buffer_sample_valid_coord_neighbor_available = 0
+            self._buffer_sample_random_selected = 0
             pbar = tqdm(
                 total=effective_size,
                 unit="samples",
@@ -1549,6 +1698,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         coords_B3HW = Fnn.interpolate(coords_B3HW, size=(H, W), mode="nearest")
                     else:
                         coords_valid_B1HW = self._scene_coords_valid_mask(coords_B3HW, size_hw=(H, W), device=self.device)
+                    coord_sampling_B1HW = self._expand_valid_coord_sampling_mask(
+                        coords_valid_B1HW,
+                        image_mask_B1HW,
+                    )
 
                     if image_mask_B1HW.sum() == 0:
                         continue
@@ -1584,15 +1737,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         features_to_select = min(features_to_select, valid_count)
                     if features_to_select <= 0:
                         continue
-                    coord_valid_N1 = normalize_shape(coords_valid_B1HW)
+                    coord_valid_N1 = normalize_shape(coord_sampling_B1HW)
                     sample_idxs = self._sample_buffer_indices(
                         image_mask_N1,
                         coord_valid_N1,
                         features_to_select,
                         use_replacement,
                     )
+                    if sample_idxs is None or sample_idxs.numel() <= 0:
+                        continue
                     sampled_total += int(sample_idxs.numel())
                     sampled_duplicates += int(sample_idxs.numel() - torch.unique(sample_idxs).numel())
+                    features_to_select = int(sample_idxs.numel())
 
                     for k in batch_data:
                         batch_data[k] = batch_data[k][sample_idxs].to(buffer_device, non_blocking=True)
@@ -1621,6 +1777,26 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             sampled_duplicates,
             sampled_total,
         )
+        valid_selected = int(getattr(self, "_buffer_sample_valid_coord_selected", 0))
+        random_selected = int(getattr(self, "_buffer_sample_random_selected", 0))
+        if valid_selected > 0 or bool(getattr(self.options, "buffer_sample_valid_coords", True)):
+            seed_available = int(getattr(self, "_buffer_sample_valid_coord_seed_available", 0))
+            roi_available = int(getattr(self, "_buffer_sample_valid_coord_roi_available", 0))
+            neighbor_available = int(getattr(self, "_buffer_sample_valid_coord_neighbor_available", 0))
+            _logger.info(
+                "Buffer valid-depth sampling: enabled=%s, selected_valid=%d, selected_random=%d, "
+                "valid_ratio=%.4f, neighbor_radius=%d, neighbor_mode=%s, "
+                "seed_available=%d, roi_available=%d, neighbor_available=%d.",
+                bool(getattr(self.options, "buffer_sample_valid_coords", True)),
+                valid_selected,
+                random_selected,
+                valid_selected / max(valid_selected + random_selected, 1),
+                int(getattr(self.options, "buffer_valid_coord_neighbor_radius", 1)),
+                str(getattr(self.options, "buffer_valid_coord_neighbor_mode", "cross")),
+                seed_available,
+                roi_available,
+                neighbor_available,
+            )
         self.regressor.train()
 
     # ------------------------------------------------------------------
@@ -1805,6 +1981,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         # Temporarily override buffer size if requested (for final iteration)
         orig_buf_size = self.options.training_buffer_size
         target_buf_size = int(buffer_size_override if buffer_size_override is not None else orig_buf_size)
+        force_final_cpu = (
+            buffer_size_override is not None
+            and int(buffer_size_override) == int(self.buffer_size_final)
+            and bool(getattr(self.options, "buffer_on_cpu_final", True))
+        )
         if buffer_size_override is not None:
             self.options.training_buffer_size = buffer_size_override
 
@@ -1817,9 +1998,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return self._fuse_features(raw_feats, compressor_out)
 
         self.regressor.get_features = fused_get_features
+        orig_force_current_buffer_on_cpu = getattr(self, "_force_current_buffer_on_cpu", False)
+        self._force_current_buffer_on_cpu = force_final_cpu
         try:
             self._create_training_buffer_with_scene_coords()
         finally:
+            self._force_current_buffer_on_cpu = orig_force_current_buffer_on_cpu
             self.regressor.get_features = original_get_features
             self.options.training_buffer_size = orig_buf_size
             if comp_was_training:
@@ -1828,13 +2012,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 self.fusion.train()
 
         # LMC: keep buffer on CPU to avoid GPU OOM (map-anything style: only batch on GPU)
-        buffer_on_cpu = getattr(self.options, "buffer_on_cpu", True)
+        buffer_on_cpu = bool(getattr(self, "_current_training_buffer_on_cpu", self._current_buffer_should_be_on_cpu()))
         if buffer_on_cpu and self.training_buffer is not None:
             for k in list(self.training_buffer.keys()):
                 self.training_buffer[k] = self.training_buffer[k].cpu()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            _logger.info("[LMC] Buffer moved to CPU (buffer_on_cpu=True) to save GPU memory.")
+            _logger.info("[LMC] Buffer kept on CPU to save GPU memory.")
         if self.training_buffer is not None:
             self._validate_training_buffer_schema(
                 buffer_dict=self.training_buffer,
@@ -1857,25 +2041,33 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         """
         orig_buf_size = self.options.training_buffer_size
         target_buf_size = int(buffer_size_override if buffer_size_override is not None else orig_buf_size)
+        force_final_cpu = (
+            buffer_size_override is not None
+            and int(buffer_size_override) == int(self.buffer_size_final)
+            and bool(getattr(self.options, "buffer_on_cpu_final", True))
+        )
         if buffer_size_override is not None:
             self.options.training_buffer_size = buffer_size_override
 
+        orig_force_current_buffer_on_cpu = getattr(self, "_force_current_buffer_on_cpu", False)
+        self._force_current_buffer_on_cpu = force_final_cpu
         try:
             # Backbone should be in eval mode for deterministic feature extraction.
             self.regressor.eval()
             self._create_training_buffer_with_scene_coords()
         finally:
+            self._force_current_buffer_on_cpu = orig_force_current_buffer_on_cpu
             self.options.training_buffer_size = orig_buf_size
             self.regressor.train()
 
         # Move buffer to CPU to save GPU memory (same as LMC iterative path).
-        buffer_on_cpu = getattr(self.options, "buffer_on_cpu", True)
+        buffer_on_cpu = bool(getattr(self, "_current_training_buffer_on_cpu", self._current_buffer_should_be_on_cpu()))
         if buffer_on_cpu and self.training_buffer is not None:
             for k in list(self.training_buffer.keys()):
                 self.training_buffer[k] = self.training_buffer[k].cpu()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            _logger.info("[ACE-G] Buffer moved to CPU (raw backbone features, no fusion).")
+            _logger.info("[ACE-G] Buffer kept on CPU (raw backbone features, no fusion).")
         if self.training_buffer is not None:
             self._validate_training_buffer_schema(
                 buffer_dict=self.training_buffer,
@@ -2722,6 +2914,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         size_hw=(H, W),
                         device=self.device,
                     )
+                coord_sampling_B1HW = self._expand_valid_coord_sampling_mask(
+                    gt_scene_coords_valid_B1HW,
+                    image_mask_B1HW,
+                )
 
                 if image_mask_B1HW.sum() == 0:
                     skipped_mask += 1
@@ -2757,7 +2953,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     }
 
                     image_mask_N1 = normalize_shape(image_mask_B1HW.float())
-                    coord_valid_N1 = normalize_shape(gt_scene_coords_valid_B1HW)
+                    coord_valid_N1 = normalize_shape(coord_sampling_B1HW)
                     n_per_image = self.options.samples_per_image
 
                     if s1_loss_mode == 'sample_per_image':
@@ -2769,10 +2965,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                                 continue
                             idx_b = self._sample_buffer_indices(
                                 image_mask_B1HW[b].flatten().float().view(-1, 1),
-                                gt_scene_coords_valid_B1HW[b].flatten().view(-1, 1),
+                                coord_sampling_B1HW[b].flatten().view(-1, 1),
                                 n_sample,
                                 True,
                             )
+                            if idx_b is None or idx_b.numel() <= 0:
+                                continue
                             global_idx = b * (H * W) + idx_b
                             per_image_indices.append(global_idx)
                         if len(per_image_indices) == 0:
@@ -2790,6 +2988,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                             features_to_select,
                             True,
                         )
+                        if sample_idxs is None or sample_idxs.numel() <= 0:
+                            skipped_sample += 1
+                            continue
 
                     for k in batch_data:
                         batch_data[k] = batch_data[k][sample_idxs]

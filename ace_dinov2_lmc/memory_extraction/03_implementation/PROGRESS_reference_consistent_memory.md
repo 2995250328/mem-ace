@@ -1,6 +1,6 @@
 # Reference-Consistent Memory Progress
 
-Last updated: 2026-04-30
+Last updated: 2026-05-08
 
 This file records the current implementation state of
 `EXECUTION_PLAN_reference_consistent_memory.md` so a new conversation can
@@ -186,6 +186,26 @@ Definition of done for future turns touching this project:
   tracked separately in repository-root memo
   `C1_NORMALIZED_PRETRAINING_MEMO.md` so they do not mix with the current
   memory-extraction mainline.
+- 2026-05-08: Checked the existing 4090 exploratory paired re-evaluation for
+  `scene2a` C1 aux-ref (`--c1_aux_ref_loss_weight 0.1`) versus control. The
+  saved 5-seed eval summaries already exist. Aux-ref does not pass the
+  expansion check: mean `acc5=71.98` versus control `73.54`, with median
+  translation essentially tied/slightly worse (`3.4068 cm` versus
+  `3.4038 cm`). Do not expand this aux-ref setting to all scenes.
+- 2026-05-08: Added a 4090 full-baseline scheduler at
+  `memory_extraction/run_indoor6_full_baselines_4090.sh` for the 6-scene
+  matrix `c0_original`, `c0_p4`, and `c1_p4`. Training commands use
+  `buffer_on_cpu=True`, `buffer_on_cpu_final=True`, `training_buffer_size=2.56M`,
+  and `buffer_size_final=7.68M`. Trainer code now also has a
+  `--buffer_on_cpu_final` safeguard so final S2 buffers can be forced onto CPU
+  even if regular buffers are kept on GPU.
+- 2026-05-08: Added all-mode valid-depth patch sampling for buffer/sample-based
+  S1. New flags `--buffer_sample_valid_coords` and
+  `--buffer_valid_coord_sample_ratio` make C0/C1 and original/P4 variants
+  prefer patch-level scene coordinates generated from ACE depth or WAI aux
+  depth, falling back to image-mask random sampling when no valid depth exists.
+  The 4090 full-baseline scheduler enables this for all variants and passes
+  each scene's WAI `gt_depth` root into training.
 
 ## 1. Resume Checklist
 
@@ -920,34 +940,43 @@ Ordered next steps:
 1. Treat the repaired Phase 4 `scene2a` run as the current best single-memory
    `C0` baseline, and treat the completed `scene2a` single-memory `C1` run as
    evidence that `C1` works end-to-end but does not yet beat repaired `C0`.
-2. Formally close out `Q1b` in the handoff / progress layer: keep default
+2. Treat the existing 4090 `scene2a` aux-ref exploratory pair as negative for
+   expansion: aux-ref improved `acc25`/`acc10` but lost on `acc5`, so do not
+   launch an all-scene aux-ref sweep from this setting.
+3. For the requested 4090 full baseline, use
+   `memory_extraction/run_indoor6_full_baselines_4090.sh`. Start with
+   `DRY_RUN=true` to confirm the matrix, then run the default extraction +
+   training matrix on GPU 0/1.
+4. Formally close out `Q1b` in the handoff / progress layer: keep default
    single-memory policy on repaired `C0`; do not promote `C1` to default yet.
-3. Do not launch another unchanged single-memory run on `scene2a`, `scene3`,
+5. Do not launch another unchanged single-memory run on `scene2a`, `scene3`,
    or additional cross-scene same-recipe `C1` scenes. The current missing
    evidence is no longer “does single-memory `C1` run?”.
-4. `scene3 cluster-local C1` is now closed end-to-end:
+6. `scene3 cluster-local C1` is now closed end-to-end:
    - `C1` cluster-fallback extraction validated on `20260430_222156`
    - `cluster_01` and `cluster_02` both trained successfully
    - ensemble eval reached `acc25=97.78`, `acc5=68.57`,
      median `0.6657 deg / 3.3866 cm`
    - this is close to the older cluster-local `C0` ensemble but still
      slightly weaker overall
-5. Do not spend more GPU time on more same-shape `scene3` single-memory or
+7. Do not spend more GPU time on more same-shape `scene3` single-memory or
    repeated cluster-local `C1` reruns unless a deterministic-eval discrepancy
    needs to be resolved.
-6. Keep the future multi-scene training ideas separate from the current
+8. Keep the future multi-scene training ideas separate from the current
    memory-extraction mainline. Track weaker normalization (`alpha > 1`) and
    metric auxiliary loss only in
    `/home/xwh/project/ace_depth/ace_dinov2_lmc/C1_NORMALIZED_PRETRAINING_MEMO.md`
    as a separate research line.
-7. After `scene3 cluster-local C1`, the next optional mechanism study
+9. After `scene3 cluster-local C1`, the next optional mechanism study
    should be a strictly single-scene `scene2a` matrix, not a new cross-scene
    sweep. Keep it minimal:
    - `C1 points_ref_norm(alpha=2)`
-   - `C1 points_ref_norm + aux_ref_loss`
+   - a revised auxiliary signal only if it provides real supervision on
+     `indoor6_ace`; the existing aux-ref exploratory pair did not justify
+     expansion
    - one third run only if needed (`alpha=4`, tuned aux weight, or the
      combined variant)
-8. Treat these post-mainline mechanism studies as diagnosis of normalized-C1
+10. Treat these post-mainline mechanism studies as diagnosis of normalized-C1
    fine-precision behavior. Evaluate them primarily by:
    - `acc5`
    - median translation
@@ -980,8 +1009,9 @@ Not yet completed:
   acceptable as long as key judgments are rechecked when needed
 - for future cheap evals, key checkpoints should by default be evaluated
   `5` times and recorded as best-of over the saved `eval_summary_*.txt` files
+- existing 4090 `scene2a` aux-ref/control pair has 5 saved deterministic eval
+  summaries each; aux-ref did not beat control on `acc5`
 - the first `scene2a` weaker-normalization (`alpha > 1`) mechanism run
-- the first `scene2a` `aux_ref_loss` mechanism run
 - shared-model multi-memory training path
 - clustered package as a first-class training input interface
 

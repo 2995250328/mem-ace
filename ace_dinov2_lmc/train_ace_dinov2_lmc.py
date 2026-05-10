@@ -728,6 +728,13 @@ def _log_configuration_summary(args, output_layout, full_log_path):
             args.samples_per_image,
         )
         _logger.info(
+            "Buffer sample valid coords: enabled=%s, ratio=%.2f, neighbor_radius=%d, neighbor_mode=%s",
+            args.buffer_sample_valid_coords,
+            args.buffer_valid_coord_sample_ratio,
+            args.buffer_valid_coord_neighbor_radius,
+            args.buffer_valid_coord_neighbor_mode,
+        )
+        _logger.info(
             "S1 early-stop: enabled=%s, min_updates=%d, patience=%d, rel_improve=%.4f, ema_beta=%.2f",
             args.s1_early_stop,
             args.s1_early_stop_min_updates,
@@ -737,6 +744,7 @@ def _log_configuration_summary(args, output_layout, full_log_path):
         )
         _logger.info("Head grid    : sampled features are reshaped to 16xW; use batch_size multiple of 16 to avoid trimming.")
         _logger.info("Buffer on CPU: %s (S2 显存不足时保持 True)", args.buffer_on_cpu)
+        _logger.info("Final buffer on CPU: %s (buffer_size_final=%s)", args.buffer_on_cpu_final, args.buffer_size_final)
         _logger.info(
             "S1 data source: %s (s1_loss_mode=%s, refill_mode=%s)",
             "raw_buffer" if args.s1_use_buffer else "online_encoder",

@@ -1,0 +1,7 @@
+status=ok
+variant=c0_p4
+scene=scene6
+gpu=1
+contract_mode=C0
+memory_path=/home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/04_evaluation/memory_extract/scene6/40v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate4_prepair8_sor_gm_l2/20260508_104103/memory_bse.pt
+log=/home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/full_baseline_logs/4090_full_20260508_102826/logs/extract_c0_p4_scene6.log

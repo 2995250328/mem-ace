@@ -1,391 +1,280 @@
-# Handoff Prompt
+# Handoff Prompt: ACE-DINOv2-LMC C1 / Aux Depth / 4090 Migration
 
-请先从项目根目录进入：
+You are continuing work on `/home/xwh/project/ace_depth/ace_dinov2_lmc`. The user is moving most future experiments to a 4090 machine. Continue in Chinese unless the user asks otherwise. Be concise, but preserve exact paths and commands.
 
-`cd /home/xwh/project/ace_depth/ace_dinov2_lmc`
+## Read First
 
-先阅读这三个文档恢复上下文：
+Read these files before changing code or launching long runs:
 
-1. `memory_extraction/03_implementation/EXECUTION_PLAN_reference_consistent_memory.md`
-2. `memory_extraction/03_implementation/PROGRESS_reference_consistent_memory.md`
-3. `memory_extraction/03_implementation/HANDOFF_PROMPT.md`
+1. `/home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/03_implementation/PROGRESS_reference_consistent_memory.md`
+2. `/home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/03_implementation/KEY_RESULTS_reference_consistent_memory.md`
+3. `/home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/03_implementation/EXECUTION_PLAN_reference_consistent_memory.md`
+4. `/home/xwh/project/ace_depth/ace_dinov2_lmc/ACE_G_GLOBAL_CODE_AUDIT_TODO.md`
+5. `/home/xwh/project/ace_depth/ace_dinov2_lmc/trainer_dinov2_lmc.py`
+6. `/home/xwh/project/ace_depth/ace_dinov2_lmc/test_ace_dinov2_lmc.py`
+7. `/home/xwh/project/ace_depth/ace_dinov2_lmc/options_dinov2_lmc.py`
+8. `/home/xwh/project/ace_depth/ace_compressor.py`
 
-注意：
+Run commands from `/home/xwh/project/ace_depth`. Use `conda activate mapanything_new`; do not use `conda run`.
 
-- `IMPLEMENTATION_NOTES.md` 和 `IMPLEMENTATION_NOTES_zh.md` 主要是早期 BSE extraction 实现说明，不代表当前 Phase 3/4/5 的真实状态。
-- 当前真正需要跟进的是 reference-consistent memory、cluster fallback、query-time ensemble、以及后续 shared-model multi-memory 路线。
+## Mainline Summary
 
-## 当前总体状态
+The current workstream tests whether C1 reference-normalized coordinate learning can be improved enough to support larger multi-scene training. Historical baseline facts:
 
-我们已经完成并验证了这些部分：
+- Best validated scene2a single-memory C0 is repaired C0, not C1: best `acc5=76.65`, median translation about `3.015 cm`.
+- Earlier scene2a C1 works end-to-end but trails repaired C0: best `acc5=71.98`.
+- scene3 single-memory remains diagnostic/fallback; do not record it as successful single-forward policy.
+- scene3 cluster C1 ensemble is validated but still slightly weaker than C0 cluster ensemble.
 
-1. Phase 3 minimal reference gate 已落地。
-2. post-repair 不再只盯单个最差洞，而是平衡 top-K uncovered clusters；repair 结果会写入 `memory_policy_report.json`。
-3. Phase 4 第一版 offline cluster fallback 已实现并验证：
-   - `cluster_fallback_plan.json`
-   - `memory_bse.clustered.pt`
-   - `memory_bse.cluster_*.pt`
-4. per-cluster 单独训练/评估路径已打通。
-5. query-time dual-checkpoint ensemble 已实现并验证：
-   - 新脚本：`test_ace_dinov2_lmc_ensemble.py`
-   - 主入口：`test_ace_dinov2_lmc.py --ensemble_networks ...`
+## Recent Code Changes That Must Exist on the 4090 Machine
 
-但以下事情还没有完成：
+1. C1 aux depth/reference supervision:
+   - files: `trainer_dinov2_lmc.py`, `options_dinov2_lmc.py`, `memory_extraction/check_aux_depth_alignment.py`
+   - flags: `--c1_aux_ref_loss_weight`, `--c1_aux_depth_root`, `--c1_aux_depth_kind`
+   - off by default; old behavior is restored by omitting `--c1_aux_ref_loss_weight` or setting it to `0.0`.
+
+2. Correct aux depth alignment:
+   - Do not align ACE RGB and WAI depth by same filename.
+   - ACE export can renumber frames.
+   - Correct logic reads WAI `scene_meta.json`, matches ACE pose + calibration to WAI frame metadata, then uses that frame's `gt_depth`.
+   - Verified for scene2a: filename-only match was `4377/4890`; scene-meta pose/calibration match is `4890/4890`, `bad_intrinsics=0`, `missing_depth=0`.
+
+3. Deterministic GeoLMC FPS start:
+   - files: `/home/xwh/project/ace_depth/ace_compressor.py`, `options_dinov2_lmc.py`, `trainer_dinov2_lmc.py`, `test_ace_dinov2_lmc.py`
+   - flag: `--lmc_fps_start_policy`
+   - default: `farthest_from_center`
+   - rollback old behavior with `--lmc_fps_start_policy legacy_random`
+   - fixes the audit issue where training and inference could compress different latent coordinates due to random FPS start.
+
+4. LMC config persistence:
+   - checkpoints now include structure-affecting fields such as `num_fine`, `num_coarse`, `geo_sigma`, `pe_normalize_input`, `backbone_feature_dim`, and `lmc_fps_start_policy`.
+   - eval rebuilds `GeoLMC` from saved config.
 
-1. `C1` 还没有完成真正的 end-to-end 训练验证。
-2. 当前 cluster 验证仍是“两个独立 checkpoint + 后融合评测”，还不是“一个共享模型 + 多个 memory 文件”。
-3. `clustered package` 还没有作为训练输入被原生消费；现在训练仍然是每个 `cluster_XX.pt` 单独跑。
-4. query-time ensemble 现在是 independent prediction + DSAC inlier count selection，尚未有 learned router，也没有 shared-model multi-memory 版。
+Compile check that should pass:
+
+```bash
+cd /home/xwh/project/ace_depth/ace_dinov2_lmc
+PYTHONPYCACHEPREFIX=/tmp /home/xwh/miniforge3/envs/mapanything_new/bin/python -m py_compile \
+  /home/xwh/project/ace_depth/ace_compressor.py \
+  options_dinov2_lmc.py trainer_dinov2_lmc.py test_ace_dinov2_lmc.py \
+  memory_extraction/check_aux_depth_alignment.py
+```
 
-## 目前最可信的实验结论
+## Existing 4090 Paired Runs
 
-### scene2a
+Aux-ref exploratory run:
 
-`scene2a` 的 repaired Phase 4 C0 run 仍然是当前最稳定的 single-memory baseline。
+```text
+/home/xwh/project/ace_depth/ace_dinov2_lmc/04_evaluation/train_compare/memory_pooled_vs_asb_c1/indoor6_ace/scene2a/dino_ace_lmc_ace_g/20260508_000246_aceg_fS2cie_global_res518_buf2.6M_F7.7M_K64_it28_ep24_bs10240_spi_s1buf_sp384_onecycle_improved
+```
 
-关键 extraction：
+Control exploratory run:
 
-`/home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/04_evaluation/memory_extract/scene2a/40v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate4_prepair8_sor_gm_l2/20260423_103144`
-
-关键信息：
-
-- repair 执行了真实 swap：`3909 -> 4294`
-- selected reference = `2850`
-- coverage mean/p95/max = `0.6089 / 1.5291 / 2.3385`
-- probe translation mean/q90/max = `0.0641 / 0.0984 / 0.1385`
-
-当前最好训练结果：
-
-`/home/xwh/project/ace_depth/ace_dinov2_lmc/04_evaluation/train_compare/memory_pooled_vs_asb/indoor6_ace/scene2a/dino_ace_lmc_ace_g/scene2a_asb40_phase4_c0_20260422_122243_aceg_fS2cie_global_res518_buf2.6M_F7.7M_K64_it28_ep24_bs5120_spi_s1buf_sp384_onecycle_improved`
-
-结果：
-
-- `5cm/5deg = 76.65%`
-- `2cm/2deg = 26.07%`
-- median = `0.3266 deg / 3.015 cm`
-
-### scene3
-
-`scene3` 是当前关键场景。单一 memory 路线会稳定触发 `cluster_branch`。
-
-已经验证通过的 cluster fallback extraction：
-
-`/home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/04_evaluation/memory_extract/scene3/60v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate6_prepair12_cfb2_sor_gm_l2/20260425_130557`
-
-关键产物：
-
-- `cluster_fallback_plan.json`
-- `memory_bse.clustered.pt`
-- `memory_bse.cluster_01.pt`
-- `memory_bse.cluster_02.pt`
-
-已知事实：
-
-- policy decision = `cluster_branch`
-- 生成了两个 `cluster_local` memory
-- 两个 cluster 当前都标记为 `low_confidence=true`
-- failure reason = `disconnected_covis_graph`
-- 这表示代码路径是对的，但 scene3 的结构确实复杂
-
-## per-cluster 训练结果
-
-cluster01 run：
-
-`/home/xwh/project/ace_depth/ace_dinov2_lmc/04_evaluation/train_compare/memory_pooled_vs_asb/indoor6_ace/scene3/dino_ace_lmc_ace_g/20260425_162835_aceg_fS2cie_global_res518_buf2.6M_F7.7M_K64_it28_ep24_bs5120_spi_s1buf_sp384_onecycle_improved`
-
-best：
-
-- `5cm/5deg = 66.67%`
-- `10cm/5deg = 86.98%`
-- median = `0.7083 deg / 3.6337 cm`
-
-cluster02 run：
-
-`/home/xwh/project/ace_depth/ace_dinov2_lmc/04_evaluation/train_compare/memory_pooled_vs_asb/indoor6_ace/scene3/dino_ace_lmc_ace_g/20260425_162840_aceg_fS2cie_global_res518_buf2.6M_F7.7M_K64_it28_ep24_bs5120_spi_s1buf_sp384_onecycle_improved`
-
-best：
-
-- `5cm/5deg = 67.94%`
-- `10cm/5deg = 86.03%`
-- median = `0.6748 deg / 3.3586 cm`
-
-注意：
-
-- 单次 manual eval 会受到 DSAC 随机性影响。
-- 评测时没有 test augmentation；波动主要来自 DSAC hypotheses sampling 和 winner sampling。
-- 因此比较时尽量使用同一口径，优先考虑 `--hypotheses 256`。
-
-## 联合测评结果
-
-已经实现并验证 “逐帧双分支独立推理，按 DSAC inlier count 选最终 pose”。
-
-命令入口有两种：
-
-1. `test_ace_dinov2_lmc_ensemble.py`
-2. `test_ace_dinov2_lmc.py --ensemble_networks ...`
-
-最新联合评测结果：
-
-输出目录：
-
-`/home/xwh/project/ace_depth/ace_dinov2_lmc/04_evaluation/train_compare/memory_pooled_vs_asb/indoor6_ace/scene3/dino_ace_lmc_ace_g/cluster_ensemble_eval`
-
-指标：
-
-- `25cm/5deg = 99.05%`
-- `10cm/5deg = 92.06%`
-- `5cm/5deg = 68.89%`
-- `2cm/2deg = 29.84%`
-- median = `0.63 deg / 3.08 cm`
-
-选择分布：
-
-- `cluster01`: 106 frames
-- `cluster02`: 209 frames
-
-这说明：
-
-1. `sub memory` 不是伪改动，确实有互补性。
-2. scene3 上 “切分后独立训练，再聚合评测” 已经被验证有效。
-3. 当前 cluster 路线已经具备研究意义，不应再回退到“只看单一 fallback memory”。
-
-## 关于参考坐标系 gap 的最新判断
-
-当前最重要的概念结论：
-
-1. MapAnything 的 memory feature 是 reference-conditioned。
-2. 当前主训练大多还是 `C0`，监督点云在 `points_world`。
-3. 对 `sub memory` 路线来说，这之间存在真实的语义 gap。
-
-因此下一阶段主线应当是：
-
-1. `sub memory` 内部切到 `C1`
-2. 每个 cluster 的点云、监督目标、回归输出都在各自 `ref_i` 下定义
-3. 推理时每个 cluster 输出 `P_ref_i`
-4. 再通过 `T_ref_i_c2w_world` 恢复到 world 做 DSAC / 统计
-
-但要保留一个已经验证有效的原则：
-
-- `scene_center` 的定义继续沿用“相机中心均值”
-- 不改成点云质心
-
-更严格的实现建议：
-
-- 同时保存 `scene_center_world`
-- 同时保存 `scene_center_ref`
-
-这样在 `C1` 下才真正一致：
-
-- head / fusion 用 `scene_center_ref`
-- world 恢复和日志保留 `scene_center_world`
-
-## 关于 ACE Cambridge 路线的借鉴
-
-仓库根 README 已明确说明 ACE Poker / Cambridge 的 cluster 路线：
-
-- 先做 spatial clustering
-- 每个 cluster 单独训练 head
-- 最后 ensemble merge
-
-对我们有用的借鉴不是“必须多模型”，而是：
-
-- 先切子数据域，再在子数据域内构建 memory
-
-所以建议后续不要只在全场景 selected views 上做后处理式 cluster builder，而是显式引入：
-
-- `cluster manifest`
-- `sub-dataset view list`
-- 每个 cluster 内独立 reference 选择
-- 每个 cluster 内独立 `scene_center_world/ref`
-- 每个 cluster 内独立 `C1` memory contract
-
-## 当前任务判断
-
-基于现状，当前任务优先级应当重排为：
-
-1. 不再重复跑 `scene3` 的单一 fallback memory 训练。
-2. 不再把“两个独立 checkpoint + ensemble eval”当作最终形态。
-3. 当前最重要任务是把验证推进到：
-   - `sub-dataset split`
-   - `C1 reference-consistent sub memory`
-   - `single shared model + multiple memory files + post-hoc pose selection`
-
-换句话说，后续不该继续做“两个模型分别训练”的重复实验，而应该做：
-
-## 下一阶段目标
-
-### Goal A: Shared-model multi-memory prototype
-
-目标：
-
-- 一个共享的 backbone / compressor / fusion / regressor head
-- 多个 memory 文件作为外部条件输入
-- 同一套权重可以在不同 sub memory 上工作
-- 推理时 query backbone 只算一次
-- 对每个 memory 分支独立输出 pose
-- 最后按几何质量选 winner
-
-### Goal B: C1-first sub memory
-
-目标：
-
-- 每个 cluster memory 默认走 `C1`
-- supervision target = `points_ref` 或 `points_ref_norm`
-- eval 时恢复到 world
-
-### Goal C: 保持 independent ensemble，不做 cross-cluster feature fusion
-
-第一版明确不做：
-
-- cross-cluster feature fusion
-- pose averaging
-- learned routing
-
-第一版继续使用：
-
-- independent prediction
-- world-frame pose recovery
-- DSAC inlier count / geometry quality selection
-
-## 推荐的实际实现顺序
-
-1. extraction schema 升级
-   - 为 cluster memory 显式补充 `scene_center_world`
-   - 为 cluster memory 显式补充 `scene_center_ref`
-   - 确认 `C1` 下 cluster memory 的保存字段完整
-
-2. sub-dataset manifest
-   - 生成每个 cluster 的 view list / manifest
-   - 让 cluster construction 更接近 ACE Cambridge 的“先分域再训练”
-
-3. shared-model trainer prototype
-   - 一个 checkpoint
-   - 训练时 batch 绑定某一个 cluster memory
-   - 同一套权重轮流消费多个 memory
-
-4. shared-model query-time multi-memory eval
-   - query backbone 一次
-   - 多 memory 分支独立 forward
-   - 恢复到 world
-   - DSAC 选 winner
-
-5. router 作为最后一步
-   - 只有在 shared-model multi-memory 已成立之后，才考虑 learned router 或 pre-routing
-
-## 明确哪些任务还没完成
-
-以下任务仍然没有闭环：
-
-1. `Q1b`：同一 selected set 下真正验证 `C0 vs C1`
-2. `sub memory` 的 `C1` 正式 extraction + training + eval
-3. `shared-model multi-memory` 训练路径
-4. `clustered package` 作为训练输入的统一接口
-5. learned router / pre-routing
-6. 更稳定的 deterministic eval 或 DSAC eval mode 改造
-
-## 当前最合理的下一步
-
-如果继续从这里推进，优先做：
-
-1. 先把 `Q1b` 结论写死：
-   - `scene2a` 的 single-memory `C1` 已经 end-to-end 跑通
-   - 但当前 same-recipe 下仍然落后于 repaired `C0`
-   - 默认 single-memory policy 暂不切换到 `C1`
-2. `scene3 cluster-local C1` 已经闭环：
-   - `scene3` 的 `C1` cluster-fallback extraction 已完成
-   - `cluster_01` / `cluster_02` 两个训练已完成
-   - ensemble eval 已完成，结果接近旧 `C0` cluster ensemble，
-     但仍略弱一些
-3. 只有在这条 `scene3 cluster-local C1` 结果被正式记入结果文档之后，再考虑 shared-model
-   multi-memory
-
-而不是：
-
-1. 再重复跑更多单 cluster 训练
-2. 再刷同配置 single-memory baseline
-3. 提前做 learned router
-
-## 不要混入当前主线的未来研究线
-
-下面这条线先不要和当前 `memory_extraction` 主线混在一起：
-
-- 面向未来大规模多场景预训练的 `C1 + normalized target` 设计
-- 包括：
-  - weaker normalization / scaled normalized target
-  - metric auxiliary loss
-
-这部分已经单独记录在仓库根文档：
-
-- `/home/xwh/project/ace_depth/ace_dinov2_lmc/C1_NORMALIZED_PRETRAINING_MEMO.md`
-
-注意：
-
-- 该 memo 目前只是设计备忘录
-- 当前代码里还没有可直接运行的 `alpha` / weaker-normalization CLI 开关
-- 在 `scene3 cluster-local C1` 没闭环之前，不要把这条未来研究线并入当前实验矩阵
-
-## `scene3 cluster-local C1` 之后的最小机制验证矩阵
-
-如果 `scene3 cluster-local C1` 已闭环，而我们要继续回答
-“normalized-C1 为什么会掉高精度指标”，建议只做 `scene2a` 单场景小矩阵：
-
-1. `C1 points_ref_norm(alpha=2)`
-   - 保留 normalized target，只降低归一化强度
-2. `C1 points_ref_norm + aux_ref_loss`
-   - 主目标仍是 normalized `C1`
-   - 增加一个小权重 reference-frame metric supervision
-3. 第三个 run 只在前两个没有充分回答问题时再补：
-   - `alpha=4`
-   - 或调一个 aux 权重
-   - 或组合版 `alpha=2 + aux_ref_loss`
-
-判定标准固定：
-
-- 主看 `acc5` 和 median translation
-- 约束 `acc25` 不应明显恶化
-- 若评测开销可接受，关键 checkpoint 默认重复评 `5` 次
-- 继续按同一实验目录下全部 `*_eval_log.txt` 和 `eval_summary_*.txt`
-  的 best-of 口径统计；备注里应写明 `best of 5 eval repeats`
-
-不要把这个小矩阵扩成新的 cross-scene sweep，也不要在这一步就引入
-refinement head / residual branch / shared-model 联合研究。
-
-## 现在最推荐的下一步
-
-不要再继续刷 `scene3`。
-
-当前最推荐的下一步是：
-
-1. deterministic eval 保留为“需要严格横向复核时”的工具，而不是硬性默认：
-   - 必要时可加 `--eval_deterministic True`
-   - `--dsacstar_seed 1305`
-   - `--dsacstar_seed_per_frame True`
-   - 不开 deterministic 时，关键 checkpoint 默认重复评 `5` 次，再按
-     best-of 记结果
-2. 在 `scene2a` 上做第一个最小机制验证：
-   - `C1 points_ref_norm(alpha=2)`
-3. 只在 `alpha=2` 不能解释问题时，再做第二个：
-   - `C1 points_ref_norm + aux_ref_loss`
-
-也就是说，下一步不再是“多场景扩展”，而是
-“在 `scene2a` 单场景上用最小矩阵判断 fine-precision 掉点究竟来自
-归一化强度，还是需要额外 metric supervision”。
-
-## 当前已知关键文件
-
-核心代码：
-
-- `memory_extraction/run_memory_extraction.py`
-- `memory_extraction/extract_memory.sh`
-- `trainer_dinov2_lmc.py`
-- `test_ace_dinov2_lmc.py`
-- `test_ace_dinov2_lmc_ensemble.py`
-- `utils_lmc.py`
-
-关键文档：
-
-- `memory_extraction/03_implementation/EXECUTION_PLAN_reference_consistent_memory.md`
-- `memory_extraction/03_implementation/PROGRESS_reference_consistent_memory.md`
-- `memory_extraction/03_implementation/HANDOFF_PROMPT.md`
-
-请从这些文件恢复工作，而不是依赖旧的 `IMPLEMENTATION_NOTES*.md` 来判断当前阶段。
+```text
+/home/xwh/project/ace_depth/ace_dinov2_lmc/04_evaluation/train_compare/memory_pooled_vs_asb_c1/indoor6_ace/scene2a/dino_ace_lmc_ace_g/20260508_000323_aceg_fS2cie_global_res518_buf2.6M_F7.7M_K64_it28_ep24_bs10240_spi_s1buf_sp384_onecycle_improved
+```
+
+Interpretation:
+
+- These two 4090 runs can be compared to each other as exploratory paired ablation: `aux_ref=0.1` vs `aux_ref=0.0`.
+- Do not compare them strictly against old 3090 runs without labeling as `4090 exploratory`.
+- Both produced iter summaries and best checkpoints, but final `buffer_size_final=7.68M` hit OOM with `--buffer_on_cpu False`.
+- Future full runs should add `--buffer_size_final 2560000`, or use `--buffer_on_cpu True`.
+
+OOM cause:
+
+```text
+FINAL S2 buffer allocation on GPU
+buffer_size_final = 7680000
+buffer_on_cpu = False
+24GB card ran out of memory
+```
+
+Recommended fix:
+
+```bash
+--buffer_on_cpu False \
+--buffer_size_final 2560000 \
+--batch_size 10240
+```
+
+## First 4090 Task: Re-evaluate Existing Pair with Same 5 Seeds
+
+Run this before launching more training:
+
+```bash
+cd /home/xwh/project/ace_depth
+conda activate mapanything_new
+
+AUX_DIR="/home/xwh/project/ace_depth/ace_dinov2_lmc/04_evaluation/train_compare/memory_pooled_vs_asb_c1/indoor6_ace/scene2a/dino_ace_lmc_ace_g/20260508_000246_aceg_fS2cie_global_res518_buf2.6M_F7.7M_K64_it28_ep24_bs10240_spi_s1buf_sp384_onecycle_improved"
+CTRL_DIR="/home/xwh/project/ace_depth/ace_dinov2_lmc/04_evaluation/train_compare/memory_pooled_vs_asb_c1/indoor6_ace/scene2a/dino_ace_lmc_ace_g/20260508_000323_aceg_fS2cie_global_res518_buf2.6M_F7.7M_K64_it28_ep24_bs10240_spi_s1buf_sp384_onecycle_improved"
+
+AUX_CKPT="$AUX_DIR/best_K64_it28_scene2a_c1_auxref01_detfps_20260508_000244.pt"
+CTRL_CKPT="$CTRL_DIR/best_K64_it28_scene2a_c1_detfps_ctrl_20260508_000321.pt"
+
+for SEED in 1305 2026 4242 7777 9001; do
+  ACE_DATA_ROOT=/home/xwh/data \
+  python ace_dinov2_lmc/test_ace_dinov2_lmc.py \
+    /home/xwh/data/indoor6_ace/scene2a \
+    "$AUX_CKPT" \
+    --device cuda:0 \
+    --output_dir "$AUX_DIR" \
+    --session "auxref01_seed${SEED}" \
+    --hypotheses 256 \
+    --eval_deterministic True \
+    --dsacstar_seed "$SEED" &
+
+  ACE_DATA_ROOT=/home/xwh/data \
+  python ace_dinov2_lmc/test_ace_dinov2_lmc.py \
+    /home/xwh/data/indoor6_ace/scene2a \
+    "$CTRL_CKPT" \
+    --device cuda:1 \
+    --output_dir "$CTRL_DIR" \
+    --session "ctrl_seed${SEED}" \
+    --hypotheses 256 \
+    --eval_deterministic True \
+    --dsacstar_seed "$SEED" &
+
+  wait
+done
+```
+
+Summarize:
+
+```bash
+grep -H "accuracy_5cm5deg_pct\\|accuracy_10cm5deg_pct\\|accuracy_25cm5deg_pct\\|median" \
+  "$AUX_DIR"/eval_summary_scene2a_auxref01_seed*.txt \
+  "$CTRL_DIR"/eval_summary_scene2a_ctrl_seed*.txt
+```
+
+Acceptance check:
+
+- If `aux_ref=0.1` clearly beats control across repeated evals, rerun the paired experiment fully with `--buffer_size_final 2560000`.
+- If gain is small or negative, do not expand aux-ref to all scenes yet.
+
+## Clean Paired 4090 Training Commands
+
+Run a clean scene2a pair if strict results are needed.
+
+Aux-ref:
+
+```bash
+cd /home/xwh/project/ace_depth
+conda activate mapanything_new
+TS=$(date +%Y%m%d_%H%M%S)
+
+ACE_DATA_ROOT=/home/xwh/data \
+python ace_dinov2_lmc/train_ace_dinov2_lmc.py \
+  /home/xwh/data/indoor6_ace/scene2a \
+  "scene2a_c1_auxref01_detfps_bf2p6_${TS}.pt" \
+  --train_preset memory_compare_ace_g_v1 \
+  --data_backend ace \
+  --device cuda:0 \
+  --post_train_eval_device cuda:0 \
+  --use_lmc True \
+  --memory_path /home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/04_evaluation/memory_extract/scene2a/40v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate4_prepair8_sor_gm_l2/20260507_195231/memory_bse.pt \
+  --lmc_mode global \
+  --lmc_fps_start_policy farthest_from_center \
+  --experiment_subdir memory_pooled_vs_asb_c1 \
+  --c1_aux_ref_loss_weight 0.1 \
+  --c1_aux_depth_root /home/xwh/data/mapanything-dataset/wai_data/indoor6/scene2a_train \
+  --c1_aux_depth_kind gt_depth \
+  --buffer_on_cpu False \
+  --buffer_size_final 2560000 \
+  --batch_size 10240 \
+  --post_train_eval_seeds 1305 2026 4242 7777 9001 \
+  --post_train_hypotheses 256
+```
+
+Control:
+
+```bash
+cd /home/xwh/project/ace_depth
+conda activate mapanything_new
+TS=$(date +%Y%m%d_%H%M%S)
+
+ACE_DATA_ROOT=/home/xwh/data \
+python ace_dinov2_lmc/train_ace_dinov2_lmc.py \
+  /home/xwh/data/indoor6_ace/scene2a \
+  "scene2a_c1_detfps_ctrl_bf2p6_${TS}.pt" \
+  --train_preset memory_compare_ace_g_v1 \
+  --data_backend ace \
+  --device cuda:1 \
+  --post_train_eval_device cuda:1 \
+  --use_lmc True \
+  --memory_path /home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/04_evaluation/memory_extract/scene2a/40v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate4_prepair8_sor_gm_l2/20260507_195231/memory_bse.pt \
+  --lmc_mode global \
+  --lmc_fps_start_policy farthest_from_center \
+  --experiment_subdir memory_pooled_vs_asb_c1 \
+  --c1_aux_ref_loss_weight 0.0 \
+  --buffer_on_cpu False \
+  --buffer_size_final 2560000 \
+  --batch_size 10240 \
+  --post_train_eval_seeds 1305 2026 4242 7777 9001 \
+  --post_train_hypotheses 256
+```
+
+## If Doing Full All-Scene Retraining on 4090
+
+Do not immediately launch a large matrix. Recommended escalation:
+
+1. scene2a paired control vs aux-ref.
+2. If aux-ref helps, run one cross-scene validation pair, preferably scene4a because previous C1 was strong.
+3. Only after both pass, run all available single-memory C1 scenes.
+4. Keep cluster experiments separate from single-memory comparisons.
+
+Suggested future full-matrix defaults:
+
+- single-memory scenes: `scene1`, `scene2a`, `scene4a`, `scene5`, `scene6`
+- keep scene3 single-memory diagnostic unless using cluster fallback
+- compare `aux_ref=0.1` vs `aux_ref=0.0` only where clean C1 memory exists
+- always use:
+  - `--lmc_fps_start_policy farthest_from_center`
+  - `--buffer_size_final 2560000`
+  - `--post_train_eval_seeds 1305 2026 4242 7777 9001`
+  - `--post_train_hypotheses 256`
+
+## Required Aux-Depth Data Check Per Scene
+
+Before any aux-ref run:
+
+```bash
+cd /home/xwh/project/ace_depth/ace_dinov2_lmc
+conda activate mapanything_new
+
+/home/xwh/miniforge3/envs/mapanything_new/bin/python \
+  memory_extraction/check_aux_depth_alignment.py \
+  --ace-train-root /home/xwh/data/indoor6_ace/scene2a/train \
+  --wai-scene-root /home/xwh/data/mapanything-dataset/wai_data/indoor6/scene2a_train \
+  --depth-kind gt_depth
+```
+
+Pass condition:
+
+```text
+scene_meta_alignment:
+  status=complete
+  matched=<all ACE RGB frames>
+  bad_intrinsics=0
+  missing_depth=0
+```
+
+Do not trust filename-only `matched`; ACE may renumber frames.
+
+## Cautions
+
+- 4090 and 3090 results can be compared only as exploratory cross-hardware context. Strict ablations must be same hardware, same code, same memory, same evaluation seeds.
+- Do not overwrite older 3090 tables with 4090 values unless clearly labeled.
+- If evaluation is cheap, use 5 repeated eval passes.
+- If `--buffer_on_cpu False`, never leave default final buffer expansion on 24GB cards unless you know memory is sufficient.
+- Old checkpoints do not store old random FPS latent coordinates. After deterministic FPS code changes, old checkpoint eval may not exactly reproduce original compression unless config explicitly carries the old policy.
+
+## Update After New Runs
+
+After new code or experiments, update:
+
+1. `/home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/03_implementation/PROGRESS_reference_consistent_memory.md`
+2. `/home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/03_implementation/KEY_RESULTS_reference_consistent_memory.md`
+3. `/home/xwh/project/ace_depth/ace_dinov2_lmc/memory_extraction/03_implementation/EXECUTION_PLAN_reference_consistent_memory.md` if the matrix/plan changes.
+
+Keep 4090 exploratory results labeled separately until a clean paired rerun is complete.
