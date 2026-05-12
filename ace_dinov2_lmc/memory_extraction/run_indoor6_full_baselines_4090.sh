@@ -27,6 +27,8 @@ ACE_ROOT="${ACE_ROOT:-${DATA_ROOT}/indoor6_ace}"
 
 SCENES_STR="${SCENES_STR:-scene1 scene2a scene3 scene4a scene5 scene6}"
 VARIANTS_STR="${VARIANTS_STR:-c0_original c0_p4 c1_p4}"
+EXTRACT_JOBS_STR="${EXTRACT_JOBS_STR:-}"
+TRAIN_JOBS_STR="${TRAIN_JOBS_STR:-}"
 GPUS_STR="${GPUS_STR:-0 1}"
 
 DO_EXTRACT="${DO_EXTRACT:-true}"
@@ -42,10 +44,14 @@ EXPERIMENT_SUBDIR="${EXPERIMENT_SUBDIR:-indoor6_full_baselines_4090}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-10240}"
 TRAINING_BUFFER_SIZE="${TRAINING_BUFFER_SIZE:-2560000}"
 BUFFER_SIZE_FINAL="${BUFFER_SIZE_FINAL:-7680000}"
-BUFFER_ON_CPU="${BUFFER_ON_CPU:-false}"
+# 24GB cards are fragile when the S2 training buffer is reallocated many times.
+# Keep the main buffer on CPU by default and move only per-step batches to GPU.
+BUFFER_ON_CPU="${BUFFER_ON_CPU:-true}"
 BUFFER_ON_CPU_FINAL="${BUFFER_ON_CPU_FINAL:-true}"
 POST_TRAIN_SEEDS_STR="${POST_TRAIN_SEEDS_STR:-1305 2026 4242 7777 9001}"
 POST_TRAIN_HYPOTHESES="${POST_TRAIN_HYPOTHESES:-256}"
+EVAL_EACH_ITERATION="${EVAL_EACH_ITERATION:-true}"
+EVAL_AFTER_TRAIN="${EVAL_AFTER_TRAIN:-true}"
 
 RUN_ROOT="${RUN_ROOT:-${EXTRACT_DIR}/full_baseline_logs/$(date +%Y%m%d_%H%M%S)}"
 LOG_ROOT="${RUN_ROOT}/logs"
@@ -57,6 +63,8 @@ mkdir -p "$LOG_ROOT" "$RESULT_ROOT"
 
 read -r -a SCENES <<< "$SCENES_STR"
 read -r -a VARIANTS <<< "$VARIANTS_STR"
+read -r -a EXTRACT_JOBS <<< "$EXTRACT_JOBS_STR"
+read -r -a TRAIN_JOBS <<< "$TRAIN_JOBS_STR"
 read -r -a GPUS <<< "$GPUS_STR"
 read -r -a POST_TRAIN_SEEDS <<< "$POST_TRAIN_SEEDS_STR"
 
@@ -123,6 +131,15 @@ append_memory_manifest() {
   awk -F '\t' -v v="$variant" -v s="$scene" '$1 != v || $2 != s' "$MEMORY_MANIFEST" > "$tmp"
   printf '%s\t%s\t%s\n' "$variant" "$scene" "$memory_path" >> "$tmp"
   mv "$tmp" "$MEMORY_MANIFEST"
+}
+
+train_result_is_ok() {
+  local result_file="$1"
+  [ -f "$result_file" ] || return 1
+  local status best_file
+  status="$(awk -F '=' '$1 == "status" {print $2}' "$result_file" | tail -n 1)"
+  best_file="$(awk -F '=' '$1 == "best_file" {print $2}' "$result_file" | tail -n 1)"
+  [ "$status" = "ok" ] && [ -n "$best_file" ] && [ -f "$best_file" ]
 }
 
 start_live_log_tail() {
@@ -281,11 +298,16 @@ run_train_job() {
     echo "ERROR: missing memory for ${variant}/${scene}: ${memory_path}" >&2
     return 1
   fi
+  if bool_true "$RESUME_EXISTING" && train_result_is_ok "$result_file"; then
+    log "[skip train] ${variant}/${scene}: existing successful result marker: ${result_file}"
+    return 0
+  fi
 
   log "[train start] gpu=${gpu} variant=${variant} scene=${scene}"
   log "[train log] ${log_file}"
 
   ACE_DATA_ROOT="$DATA_ROOT" \
+  PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
   python "${REPO_ROOT}/train_ace_dinov2_lmc.py" \
     "${ACE_ROOT}/${scene}" \
     "$output_name" \
@@ -310,6 +332,8 @@ run_train_job() {
     --c1_aux_depth_root "${WAI_ROOT}/${scene}_train" \
     --c1_aux_depth_kind gt_depth \
     --batch_size "$TRAIN_BATCH_SIZE" \
+    --eval_each_iteration "$EVAL_EACH_ITERATION" \
+    --eval_after_train "$EVAL_AFTER_TRAIN" \
     --post_train_eval_seeds "${POST_TRAIN_SEEDS[@]}" \
     --post_train_hypotheses "$POST_TRAIN_HYPOTHESES" \
     > "$log_file" 2>&1
@@ -387,6 +411,65 @@ run_matrix_phase() {
   fi
 }
 
+run_job_list_phase() {
+  local phase="$1"
+  local -n phase_jobs="$2"
+  local pids=()
+  local labels=()
+  local log_files=()
+  local tail_pids=()
+  local heartbeat_pids=()
+  local gpu_index=0
+
+  for job_spec in "${phase_jobs[@]}"; do
+    local scene="${job_spec%%:*}"
+    local variant="${job_spec#*:}"
+    if [ -z "$scene" ] || [ -z "$variant" ] || [ "$scene" = "$job_spec" ]; then
+      echo "ERROR: invalid ${phase} job spec '${job_spec}'. Use scene:variant." >&2
+      return 1
+    fi
+
+    local gpu="${GPUS[$gpu_index]}"
+    local label="${phase}:${variant}:${scene}:gpu${gpu}"
+    local log_file="${LOG_ROOT}/${phase}_${variant}_${scene}.log"
+
+    if [ "$phase" = "extract" ]; then
+      run_extract_job "$gpu" "$variant" "$scene" &
+    else
+      local memory_path
+      memory_path="$(find_manifest_memory "$variant" "$scene")"
+      if [ -z "$memory_path" ]; then
+        echo "ERROR: no memory manifest entry for ${variant}/${scene}; run extraction first." >&2
+        return 1
+      fi
+      run_train_job "$gpu" "$variant" "$scene" "$memory_path" &
+    fi
+
+    local job_pid="$!"
+    pids+=("$job_pid")
+    labels+=("$label")
+    log_files+=("$log_file")
+    start_live_log_tail "$label" "$log_file"
+    tail_pids+=("$STARTED_MONITOR_PID")
+    start_heartbeat "$label" "$job_pid" "$log_file"
+    heartbeat_pids+=("$STARTED_MONITOR_PID")
+    gpu_index=$(((gpu_index + 1) % ${#GPUS[@]}))
+
+    if [ "${#pids[@]}" -ge "${#GPUS[@]}" ]; then
+      wait_phase_batch pids labels log_files tail_pids heartbeat_pids
+      pids=()
+      labels=()
+      log_files=()
+      tail_pids=()
+      heartbeat_pids=()
+    fi
+  done
+
+  if [ "${#pids[@]}" -gt 0 ]; then
+    wait_phase_batch pids labels log_files tail_pids heartbeat_pids
+  fi
+}
+
 wait_phase_batch() {
   local -n _pids="$1"
   local -n _labels="$2"
@@ -421,12 +504,15 @@ log "Full Indoor6 4090 baseline matrix"
 log "Run root: ${RUN_ROOT}"
 log "Scenes: ${SCENES[*]}"
 log "Variants: ${VARIANTS[*]}"
+log "Extract job list: ${EXTRACT_JOBS_STR:-<matrix>}"
+log "Train job list: ${TRAIN_JOBS_STR:-<matrix>}"
 log "GPUs: ${GPUS[*]}"
 log "Do extract: ${DO_EXTRACT}; do train: ${DO_TRAIN}"
 log "Dry run: ${DRY_RUN}"
 log "Live logs: ${LIVE_LOGS} (tail=${LIVE_TAIL_LINES}, heartbeat=${HEARTBEAT_INTERVAL}s)"
 log "Train preset: ${TRAIN_PRESET}"
 log "Buffers: training=${TRAINING_BUFFER_SIZE}, final=${BUFFER_SIZE_FINAL}, CPU=${BUFFER_ON_CPU}, final_CPU=${BUFFER_ON_CPU_FINAL}"
+log "Eval controls: each_iter=${EVAL_EACH_ITERATION}, after_train=${EVAL_AFTER_TRAIN}"
 log "Sampling: prefer valid depth/scene-coordinate patches for all variants (neighbor=cross,radius=1)"
 log "Aux ref loss: disabled (--c1_aux_ref_loss_weight 0.0)"
 
@@ -435,30 +521,65 @@ cd "$ROOT_DIR"
 if bool_true "$DRY_RUN"; then
   echo
   echo "Planned extraction/training matrix:"
-  for variant in "${VARIANTS[@]}"; do
-    for scene in "${SCENES[@]}"; do
-      printf '  %s\t%s\tcontract=%s\tgate=%s\trepair=%s\n' \
-        "$variant" \
-        "$scene" \
-        "$(variant_contract_mode "$variant")" \
-        "$(variant_gate_enabled "$variant")" \
-        "$(variant_repair_enabled "$variant")"
+  if [ "${#EXTRACT_JOBS[@]}" -gt 0 ] || [ "${#TRAIN_JOBS[@]}" -gt 0 ]; then
+    for job_spec in "${EXTRACT_JOBS[@]}"; do
+      local_scene="${job_spec%%:*}"
+      local_variant="${job_spec#*:}"
+      printf '  extract\t%s\t%s\tcontract=%s\tgate=%s\trepair=%s\n' \
+        "$local_variant" \
+        "$local_scene" \
+        "$(variant_contract_mode "$local_variant")" \
+        "$(variant_gate_enabled "$local_variant")" \
+        "$(variant_repair_enabled "$local_variant")"
     done
-  done
+    for job_spec in "${TRAIN_JOBS[@]}"; do
+      local_scene="${job_spec%%:*}"
+      local_variant="${job_spec#*:}"
+      printf '  train\t%s\t%s\tcontract=%s\tgate=%s\trepair=%s\n' \
+        "$local_variant" \
+        "$local_scene" \
+        "$(variant_contract_mode "$local_variant")" \
+        "$(variant_gate_enabled "$local_variant")" \
+        "$(variant_repair_enabled "$local_variant")"
+    done
+  else
+    for variant in "${VARIANTS[@]}"; do
+      for scene in "${SCENES[@]}"; do
+        printf '  %s\t%s\tcontract=%s\tgate=%s\trepair=%s\n' \
+          "$variant" \
+          "$scene" \
+          "$(variant_contract_mode "$variant")" \
+          "$(variant_gate_enabled "$variant")" \
+          "$(variant_repair_enabled "$variant")"
+      done
+    done
+  fi
   echo
   echo "No extraction or training launched because DRY_RUN=true."
   exit 0
 fi
 
 if bool_true "$DO_EXTRACT"; then
-  run_matrix_phase extract
+  if [ "${#EXTRACT_JOBS[@]}" -gt 0 ]; then
+    run_job_list_phase extract EXTRACT_JOBS
+  else
+    run_matrix_phase extract
+  fi
 else
   log "Skipping extraction; using MEMORY_MANIFEST=${MEMORY_MANIFEST}"
 fi
 
 if bool_true "$DO_TRAIN"; then
-  : > "$TRAIN_MANIFEST"
-  run_matrix_phase train
+  if ! bool_true "$RESUME_EXISTING" || [ ! -f "$TRAIN_MANIFEST" ]; then
+    : > "$TRAIN_MANIFEST"
+  else
+    touch "$TRAIN_MANIFEST"
+  fi
+  if [ "${#TRAIN_JOBS[@]}" -gt 0 ]; then
+    run_job_list_phase train TRAIN_JOBS
+  else
+    run_matrix_phase train
+  fi
 else
   log "Skipping training."
 fi

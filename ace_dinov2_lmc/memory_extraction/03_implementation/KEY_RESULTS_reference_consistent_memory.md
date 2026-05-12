@@ -31,8 +31,6 @@ default is best-of over `5` eval repeats whenever evaluation is cheap enough.
 | scene3_c1_20260426_122510 | diagnostic single-memory C1 same recipe | 98.10 | 0.6379 | 3.4885 | 68.89 | scanned `*_eval_log.txt` + `eval_summary_*.txt`; acc25 + median trans: iter 28; median rot: iter 23; acc5: iter 25 | validated diagnostic |
 | scene1_c1_20260428_101453 | cross-scene single-memory C1 same recipe | 97.00 | 0.5614 | 3.3743 | 70.84 | scanned `*_eval_log.txt` + `eval_summary_*.txt`; acc25: iter 25/28; median rot/trans + acc5: iter 28 | validated |
 | scene4a_c1_20260428_101453 | cross-scene single-memory C1 same recipe | 100.00 | 0.6420 | 2.8059 | 75.32 | scanned `*_eval_log.txt` + `eval_summary_*.txt`; acc25: iter 13; median rot: iter 24; median trans: iter 10; acc5: iter 26 | validated |
-| scene2a_c1_auxref01_4090_20260508 | 4090 exploratory aux-ref paired eval | 99.61 | 0.3469 | 3.3428 | 72.37 | 5 saved deterministic eval summaries; best values across seeds | exploratory negative |
-| scene2a_c1_ctrl_4090_20260508 | 4090 exploratory control paired eval | 99.22 | 0.3629 | 3.3501 | 73.93 | 5 saved deterministic eval summaries; best values across seeds | exploratory control |
 | scene3_cluster01_20260425_162835 | cluster-local single run | 97.46 | 0.6768 | 3.6337 | 66.67 | scanned `*_eval_log.txt` + `eval_summary_*.txt`; acc25 + median trans + acc5: iter 28; median rot: iter 18 | validated |
 | scene3_cluster02_20260425_162840 | cluster-local single run | 96.19 | 0.6748 | 3.3586 | 67.94 | scanned `*_eval_log.txt` + `eval_summary_*.txt`; acc25: iter 16; median rot/trans + acc5: iter 28 | validated |
 | scene3_cluster_ensemble_eval | query-time cluster ensemble | 99.05 | 0.6327 | 3.0805 | 68.89 | scanned ensemble `eval_summary_*.txt` | validated |
@@ -40,6 +38,53 @@ default is best-of over `5` eval repeats whenever evaluation is cheap enough.
 | scene3_c1_cluster02_20260501_213200 | cluster-local C1 single run | 96.19 | 0.6588 | 3.4461 | 67.30 | scanned `*_eval_log.txt` + `eval_summary_*.txt`; post-train eval | validated |
 | scene3_c1_cluster_ensemble_eval | query-time cluster-local C1 ensemble | 97.78 | 0.6657 | 3.3866 | 68.57 | scanned ensemble `eval_summary_*.txt` | validated |
 | shared_model_multi_memory | one shared checkpoint over multiple memories | - | - | - | - | not implemented yet | pending |
+
+## 0.1a Local Complete Rollup for 4090 Handoff
+
+This table is a handoff-oriented rollup of the current local result tree. It
+uses the same metric policy as the main table: for each experiment directory,
+scan that directory's `*_eval_log.txt` and `eval_summary_*.txt`, then report
+the best value for each metric. The 4090 rows are marked exploratory because
+they should not be mixed into strict ablations against older 3090 results.
+
+| Experiment | Scope | HW / Status | Best acc25 | Best acc10 | Best acc5 | Best acc2 | Best Median Rot (deg) | Best Median Trans (cm) | Metric Sources |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| scene2a_phase0_c0_rerun | single-memory C0 baseline rerun | 3090 validated | 100.00 | 91.05 | 73.15 | 24.51 | 0.3456 | 3.3740 | scanned 57 entries; acc25: iter 6; acc10: iter 16; acc5/trans: iter 28; acc2: iter 18; rot: post_train |
+| scene2a_phase4_c0_20260422_122243 | repaired single-memory C0 | 3090 validated | 99.61 | 91.44 | 76.65 | 26.46 | 0.3212 | 3.0150 | scanned 57 entries; acc25: iter 3; acc10: iter 16; acc5/trans: iter 27; acc2: iter 26; rot: iter 28 |
+| scene2a_c1_20260426_113134 | single-memory C1 same recipe | 3090 validated | 99.61 | 91.05 | 71.98 | 23.35 | 0.3444 | 3.4055 | scanned 58 entries; acc25: iter 4; acc10: iter 11; acc5/rot: iter 26; acc2: iter 9; trans: iter 10 |
+| scene2a_c1_alpha2_20260502_183531 | C1 normalized target scaled by alpha=2 | 3090 exploratory | 99.61 | 91.83 | 73.54 | 25.68 | 0.3424 | 3.1096 | scanned 62 entries; acc25: iter 7; acc10/acc5/rot: iter 24; acc2: iter 21; trans: post_train seed9999 |
+| scene2a_c1_alpha1_ctrl_20260502_184405 | C1 alpha=1 same-date control | 3090 exploratory | 99.61 | 91.44 | 75.49 | 24.90 | 0.3407 | 3.1607 | scanned 62 entries; acc25: iter 5; acc10: iter 22; acc5: iter 28; acc2: iter 25; rot: post_train seed9999; trans: post_train seed1305 |
+| scene2a_c1_auxref01_detfps_20260508_000246 | C1 + deterministic FPS + depth-derived aux_ref=0.1 | 4090 exploratory; interrupted before final post-train by FINAL buffer OOM | 100.00 | 91.44 | 71.60 | 23.35 | 0.3540 | 3.2366 | scanned 55 entries; acc25: iter 15; acc10: iter 19; acc5/rot: iter 12; acc2/trans: iter 14 |
+| scene2a_c1_detfps_ctrl_20260508_000323 | C1 + deterministic FPS control, aux_ref=0 | 4090 exploratory; interrupted before final post-train by FINAL buffer OOM | 100.00 | 91.83 | 73.93 | 27.24 | 0.3580 | 3.1805 | scanned 55 entries; acc25: iter 19; acc10: iter 12; acc5: iter 11; acc2/trans: iter 22; rot: iter 14 |
+| scene1_c1_20260428_101453 | cross-scene single-memory C1 same recipe | 3090 validated | 97.00 | 89.86 | 70.84 | 26.78 | 0.5546 | 3.3743 | scanned 58 entries; acc25: iter 25; acc10/acc5/acc2: iter 28; rot: post_train; trans: iter 28 |
+| scene1_c1_cluster_pair_20260430_121243 | cluster-local C1 pair saved under one run directory | 3090 partial cluster diagnostic | 95.87 | 88.24 | 68.46 | 24.03 | 0.5822 | 3.4611 | scanned 47 entries; acc25: cluster02 iter 15; acc10/acc2/rot: cluster01 iter 16/13/16; acc5/trans: cluster02 iter 13/12 |
+| scene4a_c1_20260428_101453 | cross-scene single-memory C1 same recipe | 3090 validated | 100.00 | 96.20 | 75.32 | 38.61 | 0.6420 | 2.8059 | scanned 56 entries; acc25: iter 13; acc10: iter 28; acc5: iter 26; acc2: iter 21; rot: iter 24; trans: iter 10 |
+| scene5_c1_20260429_184410 | cross-scene single-memory C1 same recipe | 3090 partial/validated from local summaries | 98.11 | 87.03 | 61.56 | 15.80 | 0.6706 | 4.3124 | scanned 55 entries; acc25: iter 24; acc10: iter 21; acc5/rot: iter 25; acc2: iter 18; trans: iter 23 |
+| scene6_c1_20260429_184410 | cross-scene single-memory C1 same recipe | 3090 validated from local summaries | 90.40 | 84.21 | 67.49 | 32.20 | 0.6256 | 3.3777 | scanned 58 entries; acc25/acc2: iter 28; acc10/acc5: post_train; rot: iter 25; trans: iter 15 |
+| scene3_fallback60_phase4_c0_20260423_111442 | diagnostic 60-view fallback single-memory C0 | 3090 diagnostic | 97.14 | 88.57 | 69.52 | 22.22 | 0.6379 | 3.3900 | scanned 57 entries; acc25: post_train; acc10/acc5/rot/trans: iter 28; acc2: iter 27 |
+| scene3_c1_20260426_122510 | diagnostic single-memory C1 same recipe | 3090 diagnostic | 98.10 | 89.52 | 68.89 | 25.40 | 0.6379 | 3.4885 | scanned 56 entries; acc25/acc10/acc2/trans: iter 28; acc5: iter 25; rot: iter 23 |
+| scene3_c1_cluster_local_cuda0_20260430_223717 | cluster-local C1 trial, cuda:0 naming retained as saved | 3090 diagnostic | 96.19 | 86.35 | 63.81 | 22.22 | 0.7050 | 3.7481 | scanned 58 entries; acc25: iter 15; acc10/trans: post_train; acc5: iter 17; acc2: iter 18; rot: iter 11 |
+| scene3_c1_cluster_local_cuda1_20260430_223723 | cluster-local C1 trial, cuda:1 naming retained as saved | 3090 diagnostic | 97.14 | 88.57 | 68.25 | 26.03 | 0.6634 | 3.5084 | scanned 58 entries; acc25: iter 23; acc10: iter 27; acc5/trans: iter 26; acc2: iter 28; rot: iter 25 |
+| scene3_cluster01_c0_20260425_162835 | cluster-local C0 run | 3090 validated | 97.46 | 87.30 | 66.67 | 25.40 | 0.6768 | 3.6255 | scanned 58 entries; acc25/acc5: iter 28; acc10: iter 23; acc2/trans: post_train/manual; rot: iter 18 |
+| scene3_cluster02_c0_20260425_162840 | cluster-local C0 run | 3090 validated | 97.14 | 88.57 | 67.94 | 23.49 | 0.6748 | 3.3586 | scanned 57 entries; acc25/acc10: post_train/manual; acc5/rot/trans: iter 28; acc2: iter 20 |
+| scene3_cluster_ensemble_eval | query-time C0 cluster ensemble | 3090 validated | 99.05 | 92.06 | 68.89 | 29.84 | 0.6327 | 3.0805 | scanned ensemble `eval_summary_*.txt` |
+| scene3_c1_cluster01_20260501_213155 | cluster-local C1 run / ensemble host | 3090 validated | 97.78 | 89.21 | 70.16 | 25.40 | 0.6487 | 3.2640 | scanned 59 entries; acc25/acc10/acc5/acc2/trans: `scene3_ensemble`; rot: iter 21 |
+| scene3_c1_cluster02_20260501_213200 | cluster-local C1 run | 3090 validated | 96.83 | 87.62 | 67.94 | 24.44 | 0.6517 | 3.3525 | scanned 58 entries; acc25: iter 9; acc10/acc5: iter 25; acc2/rot/trans: iter 28 |
+
+Immediate interpretation for the 4090 handoff:
+
+- The `alpha=2` idea did not beat the same-date `alpha=1` control on `acc5`
+  (`73.54` vs `75.49`), so do not expand alpha-scaling before a stronger
+  reason appears.
+- The current 4090 aux-ref run also did not beat its paired control on the
+  best-of scan (`acc5 71.60` vs `73.93`, `acc2 23.35` vs `27.24`). It remains
+  exploratory because both runs were interrupted before final post-train
+  aggregation.
+- Before full all-scene retraining, run the 5-seed evaluation pair recorded in
+  `HANDOFF_PROMPT.md`; only expand aux-ref if that paired repeated eval shows
+  a clear win.
+- If rerunning on 4090, use `--buffer_size_final 2560000` with
+  `--buffer_on_cpu False` to avoid the observed FINAL-buffer OOM.
 
 ## 0.1 Milestone Table
 
@@ -55,7 +100,6 @@ This table tracks non-metric milestones and supporting artifacts.
 | scene3 | Single-memory C1 diagnostic | `20260426_123243` | `C1` train/eval path runs end-to-end; remains diagnostic, not a policy success case | validated diagnostic |
 | scene1 | Single-memory C1 cross-scene | `20260428_101456` | same-recipe `C1` run validated; best `acc5=70.84` | validated |
 | scene4a | Single-memory C1 cross-scene | `20260428_101456` | same-recipe `C1` run validated; best `acc5=75.32` | validated |
-| scene2a | 4090 exploratory aux-ref pair | `20260508_000246` vs `20260508_000323` | 5-seed eval: aux-ref mean `acc5=71.98` vs control `73.54`; do not expand aux-ref setting | exploratory negative |
 | scene3 | Phase 4 cluster fallback extraction | `20260425_130557` | built `memory_bse.clustered.pt` + two `cluster_local` memories | validated |
 | scene3 | Cluster ensemble eval | `cluster_ensemble_eval` | `2cm/2deg=29.84`, selection `106/209` | validated |
 | scene3 | Cluster-local C1 extraction | `20260430_222156` | both `cluster_01/02` packages carry full `C1` ref-space + recovery metadata | validated |
@@ -210,35 +254,6 @@ block, not only the checkpoint tagged `BEST`.
 | median rotation | `0.3212 deg` | `scene2a_asb40_phase4_c0_20260422_122243_...`, iter `28` |
 | median translation | `3.0150 cm` | `scene2a_asb40_phase4_c0_20260422_122243_...` |
 | `acc5` | `76.6537` | `scene2a_asb40_phase4_c0_20260422_122243_...`, iter `27` |
-
-### 1.8 4090 exploratory aux-ref paired re-evaluation
-
-Aux-ref run:
-
-- `/home/xwh/project/ace_depth/ace_dinov2_lmc/04_evaluation/train_compare/memory_pooled_vs_asb_c1/indoor6_ace/scene2a/dino_ace_lmc_ace_g/20260508_000246_aceg_fS2cie_global_res518_buf2.6M_F7.7M_K64_it28_ep24_bs10240_spi_s1buf_sp384_onecycle_improved`
-- checkpoint: `best_K64_it28_scene2a_c1_auxref01_detfps_20260508_000244.pt`
-- config: `--c1_aux_ref_loss_weight 0.1`, `--lmc_fps_start_policy farthest_from_center`, `buffer_size_final=7680000`, `buffer_on_cpu=false`
-
-Control run:
-
-- `/home/xwh/project/ace_depth/ace_dinov2_lmc/04_evaluation/train_compare/memory_pooled_vs_asb_c1/indoor6_ace/scene2a/dino_ace_lmc_ace_g/20260508_000323_aceg_fS2cie_global_res518_buf2.6M_F7.7M_K64_it28_ep24_bs10240_spi_s1buf_sp384_onecycle_improved`
-- checkpoint: `best_K64_it28_scene2a_c1_detfps_ctrl_20260508_000321.pt`
-- config: `--c1_aux_ref_loss_weight 0.0`, `--lmc_fps_start_policy farthest_from_center`, `buffer_size_final=7680000`, `buffer_on_cpu=false`
-
-5-seed deterministic eval summary:
-
-| Group | Mean Median Rot | Mean Median Trans | Mean acc25 | Mean acc10 | Mean acc5 |
-| --- | --- | --- | --- | --- | --- |
-| aux-ref `0.1` | `0.3561 deg` | `3.4068 cm` | `99.61` | `89.57` | `71.98` |
-| control `0.0` | `0.3660 deg` | `3.4038 cm` | `99.22` | `88.64` | `73.54` |
-
-Conclusion:
-
-- Aux-ref improves coarse metrics (`acc25`, `acc10`) and median rotation in
-  this exploratory 4090 pair, but loses clearly on `acc5` and does not improve
-  median translation.
-- This does not pass the expansion check. Do not run an all-scene aux-ref sweep
-  from this setting.
 
 ## 2. scene3_train
 
@@ -556,8 +571,6 @@ ensemble result it uses the final saved ensemble summary.
      `scene3`, `scene1`, and `scene4a`
    - the main remaining question is no longer "does C1 run", but "how do we
      recover fine precision while keeping normalized-C1 as the scalable path"
-   - the 4090 exploratory aux-ref setting did not recover fine precision on
-     `scene2a`; it should not be expanded without a revised auxiliary signal
 
 ## 4. Next Empty Slots To Fill
 
@@ -567,5 +580,4 @@ Add the next validated results here when they happen:
 - cluster-local C1 versus cluster-local C0 comparison summary for `scene3`
 - first shared-model multi-memory training result
 - first `scene2a` mechanism run with weaker normalization (`alpha > 1`)
-- first revised `scene2a` auxiliary-supervision mechanism that gives real
-  fine-precision supervision
+- first `scene2a` mechanism run with `aux_ref_loss`
