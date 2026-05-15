@@ -286,6 +286,7 @@ def run_evaluation_lmc(opt):
             num_attn_layers=lmc_config.get('num_attn_layers', 2),
             pe_normalize_input=lmc_config.get('pe_normalize_input', False),
             fps_start_policy=lmc_config.get('lmc_fps_start_policy', 'farthest_from_center'),
+            key_slice_idx=lmc_config.get('lmc_key_slice_idx', None),
         ).to(device)
         compressor.load_state_dict(checkpoint['compressor_state_dict'])
         compressor.eval()

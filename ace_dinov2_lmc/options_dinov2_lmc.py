@@ -607,6 +607,15 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         help='估计 memory 可见性时随机采样的点数上限。',
     )
     parser.add_argument(
+        '--lmc_key_slice_idx',
+        type=int,
+        default=None,
+        help=(
+            'GeoLMC key projection 使用的 pooled_features slice（zero-based）。'
+            'None 表示兼容旧行为：多层 memory 默认 slice 2，单层 memory 使用完整 feature。'
+        ),
+    )
+    parser.add_argument(
         '--num_latent_tokens',
         type=int,
         default=64,

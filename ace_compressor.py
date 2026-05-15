@@ -264,7 +264,8 @@ class GeoLMC(nn.Module):
                  scale_token_dim=None,
                  num_attn_layers=2,
                  pe_normalize_input=False,
-                 fps_start_policy="farthest_from_center"):
+                 fps_start_policy="farthest_from_center",
+                 key_slice_idx=None):
         super().__init__()
 
         self.mode = mode
@@ -274,6 +275,7 @@ class GeoLMC(nn.Module):
         self.num_layers = num_layers
         self.use_scale_token = use_scale_token
         self.fps_start_policy = fps_start_policy
+        self.key_slice_idx = self._resolve_key_slice_idx(key_slice_idx)
 
         # --- Input Projection ---
         self.total_input_dim = input_dim * num_layers
@@ -323,16 +325,30 @@ class GeoLMC(nn.Module):
 
     # -- helpers --
 
-    def _get_layer_slice(self, features, layer_idx):
+    def _resolve_key_slice_idx(self, key_slice_idx):
+        if self.num_layers <= 1:
+            if key_slice_idx not in (None, 0):
+                raise ValueError(
+                    f"key_slice_idx must be 0/None for num_layers={self.num_layers}, got {key_slice_idx}."
+                )
+            return 0
+        if key_slice_idx is None:
+            # Legacy-compatible default: previous _get_layer_slice(..., 1)
+            # selected slice 2 for multi-layer MapAnything memory.
+            return min(2, self.num_layers - 1)
+        key_slice_idx = int(key_slice_idx)
+        if key_slice_idx < 0 or key_slice_idx >= self.num_layers:
+            raise ValueError(
+                f"key_slice_idx={key_slice_idx} out of range for num_layers={self.num_layers}."
+            )
+        return key_slice_idx
+
+    def _get_layer_slice(self, features, slice_idx):
         if self.num_layers <= 1:
             return features  # single-layer: return as-is
         C = features.shape[-1] // self.num_layers
-        start = (layer_idx + 1) * C
-        end = (layer_idx + 2) * C
-        if end > features.shape[-1]:
-            # Fallback: use last available slice
-            start = features.shape[-1] - C
-            end = features.shape[-1]
+        start = slice_idx * C
+        end = start + C
         return features[:, :, start:end]
 
     def _inject_scale(self, x, memory_dict):
@@ -363,7 +379,7 @@ class GeoLMC(nn.Module):
         pooled_features = memory_dict["pooled_features"]
         scene_center = memory_dict["scene_center"]
 
-        raw_key_feats = self._get_layer_slice(pooled_features, 1)
+        raw_key_feats = self._get_layer_slice(pooled_features, self.key_slice_idx)
         k_base = self.k_proj(raw_key_feats)
         v = self.v_proj(pooled_features)
 

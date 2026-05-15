@@ -19,20 +19,23 @@ implementation notes in one file per step under `steps/`.
    - Deterministic global FPS start policy.
    - Detail: `steps/01_deterministic_fps.md`
 
-2. `[todo]` Make global compressor key-layer selection explicit.
+2. `[done]` Make global compressor key-layer selection explicit.
    - Replace implicit `_get_layer_slice(..., 1)` semantics with an explicit
      config field and checkpoint metadata.
    - Keep current actual behavior as the compatibility default until ablation
      says otherwise.
+   - Detail: `steps/02_low_risk_contract.md`
 
-3. `[todo]` Save and report all structure-affecting LMC metadata.
+3. `[done]` Save and report low-risk structure-affecting LMC metadata.
    - Record requested/effective LMC mode, memory layer metadata, selected key
      slice, and future geometry/fusion mode fields.
    - Keep test-time reconstruction driven by checkpoint config.
+   - Detail: `steps/02_low_risk_contract.md`
 
-4. `[todo]` Make S2 compressor freezing explicit.
+4. `[done]` Make S2 compressor freezing explicit.
    - Add a clear trainability boundary for S1/S2.
    - Prevent future live-compressor S2 edits from silently creating gradients.
+   - Detail: `steps/02_low_risk_contract.md`
 
 5. `[todo]` Unify reprojection and invalid-loss behavior.
    - Consolidate S1 full-map, S1 sampled, S2, and S2-G loss paths around one

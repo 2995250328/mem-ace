@@ -1104,6 +1104,33 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 pooled_features_dim, num_layers, feature_dim)
         _logger.info("[LMC] feature_dim (per layer)=%d", feature_dim)
 
+        lmc_key_slice_idx = getattr(options, 'lmc_key_slice_idx', None)
+        if num_layers <= 1:
+            resolved_key_slice_idx = 0
+        elif lmc_key_slice_idx is None:
+            resolved_key_slice_idx = min(2, num_layers - 1)
+        else:
+            resolved_key_slice_idx = int(lmc_key_slice_idx)
+        if resolved_key_slice_idx < 0 or resolved_key_slice_idx >= num_layers:
+            raise ValueError(
+                f"[LMC] lmc_key_slice_idx={resolved_key_slice_idx} out of range for num_layers={num_layers}."
+            )
+        key_layer_label = None
+        if isinstance(layers_idx, (list, tuple)) and len(layers_idx) > resolved_key_slice_idx:
+            key_layer_label = layers_idx[resolved_key_slice_idx]
+        _logger.info(
+            "[LMC] Mode contract: requested=%s effective=%s auto_by_visibility=%s",
+            requested_lmc_mode,
+            lmc_mode,
+            auto_mode,
+        )
+        _logger.info(
+            "[LMC] Key layer: key_slice_idx=%d key_layer_label=%s layers_idx=%s",
+            resolved_key_slice_idx,
+            key_layer_label,
+            layers_idx if layers_idx else "n/a",
+        )
+
         scale_token_dim = 1024
         if bank_data.get("all_scale_tokens") is not None:
             st = bank_data["all_scale_tokens"]
@@ -1150,6 +1177,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.lmc_config = {
             'use_lmc': True,
             'lmc_mode': lmc_mode,
+            'requested_lmc_mode': requested_lmc_mode,
+            'effective_lmc_mode': lmc_mode,
             'num_latent_tokens': num_latent_tokens,
             'num_fine': num_fine,
             'num_coarse': num_coarse,
@@ -1157,6 +1186,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'use_scale_token': use_scale_token,
             'compress_dim': feature_dim,
             'num_layers': num_layers,
+            'layers_idx': self._tensor_to_config_value(layers_idx),
+            'lmc_key_slice_idx': resolved_key_slice_idx,
+            'lmc_key_layer_label': self._tensor_to_config_value(key_layer_label),
             'geo_sigma': geo_sigma,
             'pe_normalize_input': pe_normalize_input,
             'lmc_fps_start_policy': lmc_fps_start_policy,
@@ -1204,6 +1236,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             num_attn_layers=num_attn_layers,
             pe_normalize_input=pe_normalize_input,
             fps_start_policy=lmc_fps_start_policy,
+            key_slice_idx=resolved_key_slice_idx,
         ).to(self.device)
 
         # --- Build fusion (query=backbone 1024, memory=compressor output feature_dim) ---
@@ -1917,11 +1950,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
     def _compress_memory(self):
         """Run GeoLMC on the loaded memory_dict. Returns compressor output."""
+        was_training = self.compressor.training
         self.compressor.eval()
         with torch.no_grad():
             out = self.compressor(self.memory_dict)
-        self.compressor.train()
+        self.compressor.train(was_training)
         return out
+
+    def _set_compressor_trainable(self, trainable: bool):
+        """Explicit S1/S2 compressor trainability boundary."""
+        for param in self.compressor.parameters():
+            param.requires_grad_(trainable)
+        _logger.info("[LMC] Compressor trainable=%s", trainable)
 
     # ------------------------------------------------------------------
     # Fuse features with memory
@@ -2534,6 +2574,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
     def _train_compressor_steps_from_buffer(self, iteration_idx, n_steps):
         """Stage 1 buffer mode: train compressor/fusion/head from raw feature buffer."""
+        self._set_compressor_trainable(True)
         self.compressor.train()
         self.fusion.train()
         self.regressor.heads.train()
@@ -2786,6 +2827,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 raise ValueError("S1 buffer mode does not support s1_loss_mode='full_map'.")
             return self._train_compressor_steps_from_buffer(iteration_idx, n_steps)
 
+        self._set_compressor_trainable(True)
         self.compressor.train()
         self.fusion.train()
         self.regressor.heads.train()
@@ -3585,6 +3627,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self._maybe_reset_head(it)
 
             # --- Stage 2 ---
+            self._set_compressor_trainable(False)
             buf_size = self.buffer_size_final if is_last else None
             _logger.info(f"[S2] Filling buffer"
                          f" (size={'FINAL ' + str(self.buffer_size_final) if is_last else 'default'})")
@@ -3753,6 +3796,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
             # --- Stage 2: ACE-G specific ---
             # 1. Compress memory once, cache for training step
+            self._set_compressor_trainable(False)
             self._s2_compressor_out = self._compress_memory()
 
             # 2. Set fusion mode for S2
