@@ -234,16 +234,23 @@ ablations:
      architecture.
    - Detail: `steps/07_loss_contract.md`
 
+7. `[done]` Non-architecture hygiene and fail-fast checks.
+   - Problem: a few engineering hazards remained before architecture ablation:
+     hidden head-grid trimming, delayed memory feature-dim errors, and preset
+     choices drifting from preset definitions.
+   - Scope: no loss, fusion, compressor, or head-architecture behavior change.
+   - Detail: `steps/08_non_arch_hygiene.md`
+
 ### Priority 3 - Add Observability Before New Losses
 
-7. `[todo]` Add diagnostic-only compressor/fusion observability.
+8. `[todo]` Add diagnostic-only compressor/fusion observability.
    - Problem: token usage and fusion behavior are invisible.
    - Track: attention entropy, effective token count, avg max attention, token
      usage, gate values, raw/fused feature norms, PE scale.
    - No new loss and no behavior change when disabled.
    - Detail: `steps/05_geomatch_near_term.md`
 
-8. `[designing]` Add compressor geometry contract and ablations.
+9. `[designing]` Add compressor geometry contract and ablations.
    - Problem: key layer and geometry scale may be hidden bottlenecks.
    - First ablations: layer 12 baseline, layer 18, layer 6, final, learned
      scalar mix.
@@ -566,7 +573,40 @@ Detail:
 
 - `steps/07_loss_contract.md`
 
-### 9. Diagnostic-Only Observability
+### 9. Non-Architecture Hygiene And Fail-Fast Checks
+
+Status: `[done]`
+
+Problem:
+
+- Head-grid packing for sampled rows was named as trimming rather than the
+  actual fake-grid contract.
+- Tail trimming was only warned once and had no cumulative stage statistics.
+- LMC memory feature-dim mismatch was a warning even though it leads to later
+  shape errors.
+- `memory_compare_ace_g_v2` existed in preset defaults but was not accepted by
+  `--train_preset`.
+
+Decision:
+
+- Preserve current training math and normal experiment behavior.
+- Promote only invalid memory shape contracts to immediate failure.
+- Expose the already-defined preset without changing older preset defaults.
+- Record this change in `steps/08_non_arch_hygiene.md`; future code/config
+  changes must update the refactor docs before being considered complete.
+
+Verification:
+
+- `python -m py_compile options_dinov2_lmc.py trainer_dinov2_lmc.py train_ace_dinov2_lmc.py test_ace_dinov2_lmc.py /home/xwh/project/ace_depth/ace_compressor.py`
+- CLI parser accepts `--train_preset memory_compare_ace_g_v2`.
+- Synthetic fail-fast check confirms non-divisible memory feature dimensions
+  raise `ValueError` with config context.
+
+Detail:
+
+- `steps/08_non_arch_hygiene.md`
+
+### 10. Diagnostic-Only Observability
 
 Status: `[todo]`
 
@@ -608,7 +648,7 @@ Detail:
 
 - `steps/05_geomatch_near_term.md`
 
-### 10. Compressor Geometry Contract And Ablations
+### 11. Compressor Geometry Contract And Ablations
 
 Status: `[designing]`
 
@@ -644,7 +684,7 @@ Detail:
 
 - `steps/06_compressor_geometry_contract.md`
 
-### 11. GeoMatch Fusion v1
+### 12. GeoMatch Fusion v1
 
 Status: `[todo]`
 
@@ -675,7 +715,7 @@ Detail:
 
 - `steps/05_geomatch_near_term.md`
 
-### 12. Conditional Usage Regularization
+### 13. Conditional Usage Regularization
 
 Status: `[todo]`
 
@@ -704,7 +744,7 @@ Detail:
 
 - `steps/05_geomatch_near_term.md`
 
-### 13. Fusion Residual Gate
+### 14. Fusion Residual Gate
 
 Status: `[todo]`
 
@@ -728,7 +768,7 @@ Detail:
 
 - `steps/05_geomatch_near_term.md`
 
-### 14. Anchor-Assisted Residual Branch
+### 15. Anchor-Assisted Residual Branch
 
 Status: `[designing]`
 

@@ -357,12 +357,18 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--train_preset',
         type=str,
         default='none',
-        choices=['none', 'memory_compare_ace_g_v1', 'ace_g_indoor6_4090_global_fixedzero_v1'],
+        choices=[
+            'none',
+            'memory_compare_ace_g_v1',
+            'memory_compare_ace_g_v2',
+            'ace_g_indoor6_4090_global_fixedzero_v1',
+        ],
         help=(
             '训练预设。none=不改动 parser 默认值；'
             'memory_compare_ace_g_v1=当前 memory compare/ACE-G 常用配置，'
             '会自动补齐 use_lmc、ace_g、strict preflight、scene/head 容差、'
             'BSE world-point 路径、S1 buffer 训练，以及 train_compare 输出目录；'
+            'memory_compare_ace_g_v2=deterministic-eval/composite 指标版本；'
             'ace_g_indoor6_4090_global_fixedzero_v1=indoor6/4090 true-global fixed-zero ACE-G 配方。'
         ),
     )

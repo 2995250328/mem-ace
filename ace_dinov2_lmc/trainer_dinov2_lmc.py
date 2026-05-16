@@ -1097,11 +1097,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             num_layers = 4
             _logger.info("[LMC] No layers_idx, using default num_layers=%d", num_layers)
 
-        feature_dim = pooled_features_dim // num_layers
-        if feature_dim * num_layers != pooled_features_dim:
-            _logger.warning(
-                "[LMC] pooled_features_dim=%d not divisible by num_layers=%d; using feature_dim=%d",
-                pooled_features_dim, num_layers, feature_dim)
+        feature_dim = self._resolve_lmc_feature_dim(
+            pooled_features_dim,
+            num_layers,
+            layers_idx,
+            memory_path,
+        )
         _logger.info("[LMC] feature_dim (per layer)=%d", feature_dim)
 
         lmc_key_slice_idx = getattr(options, 'lmc_key_slice_idx', None)
@@ -1388,28 +1389,61 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "ema_beta": min(0.999, max(0.0, float(getattr(self.options, "s1_early_stop_ema_beta", 0.90)))),
         }
 
-    def _trim_batch_for_head_grid(self, stage_tag, features_bC, *aligned_tensors):
-        """Reshape sampled points into the fixed 16 x W head grid, trimming tail samples if needed."""
+    @staticmethod
+    def _resolve_lmc_feature_dim(pooled_features_dim, num_layers, layers_idx, memory_path):
+        feature_dim = int(pooled_features_dim) // int(num_layers)
+        if feature_dim * int(num_layers) != int(pooled_features_dim):
+            raise ValueError(
+                "[LMC] pooled_features_dim is not divisible by num_layers; "
+                f"pooled_features_dim={pooled_features_dim}, num_layers={num_layers}, "
+                f"layers_idx={layers_idx if layers_idx else 'n/a'}, memory_path={memory_path}"
+            )
+        return feature_dim
+
+    def _pack_feature_rows_for_head(self, stage_tag, features_bC, *aligned_tensors, grid_h=16):
+        """Pack sampled feature rows into the fixed H x W grid expected by the 1x1 ACE head."""
         batch_size = int(features_bC.shape[0])
-        h, w = 16, batch_size // 16
+        h = int(grid_h)
+        if h <= 0:
+            raise ValueError(f"grid_h must be positive, got {grid_h}.")
+        w = batch_size // h
         trimmed_batch = h * w
         if trimmed_batch <= 0:
-            return None, None, None, (None,) * len(aligned_tensors)
+            return None, None, None, None, (None,) * len(aligned_tensors)
         if trimmed_batch != batch_size:
+            trim_count = batch_size - trimmed_batch
+            if not hasattr(self, "_head_grid_trim_stats"):
+                self._head_grid_trim_stats = {}
+            stats = self._head_grid_trim_stats.setdefault(
+                stage_tag,
+                {"trim_events": 0, "trimmed_rows": 0},
+            )
+            stats["trim_events"] += 1
+            stats["trimmed_rows"] += int(trim_count)
             if not hasattr(self, "_logged_grid_trim_stages"):
                 self._logged_grid_trim_stages = set()
             if stage_tag not in self._logged_grid_trim_stages:
                 _logger.warning(
-                    "[%s] batch_size=%d is not divisible by 16; trimming tail samples to %d (=16x%d).",
+                    "[%s] batch_size=%d is not divisible by %d; trimming %d tail samples to %d (=%dx%d). "
+                    "cumulative_trim_events=%d cumulative_trimmed_rows=%d",
                     stage_tag,
                     batch_size,
+                    h,
+                    trim_count,
                     trimmed_batch,
+                    h,
                     w,
+                    stats["trim_events"],
+                    stats["trimmed_rows"],
                 )
                 self._logged_grid_trim_stages.add(stage_tag)
             features_bC = features_bC[:trimmed_batch]
             aligned_tensors = tuple(t[:trimmed_batch] for t in aligned_tensors)
         return features_bC, trimmed_batch, h, w, aligned_tensors
+
+    def _trim_batch_for_head_grid(self, stage_tag, features_bC, *aligned_tensors):
+        """Compatibility wrapper for older call sites; prefer _pack_feature_rows_for_head."""
+        return self._pack_feature_rows_for_head(stage_tag, features_bC, *aligned_tensors)
 
     def _validate_training_buffer_schema(self, buffer_dict, schema_name, expected_size=None):
         schema = self.BUFFER_SCHEMA_SPECS.get(schema_name)
@@ -2419,7 +2453,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         channels = features_bC.shape[1]
 
         # Keep same head input reshaping logic as ace_depth training_step.
-        features_bC, batch_size, h, w, trimmed = self._trim_batch_for_head_grid(
+        features_bC, batch_size, h, w, trimmed = self._pack_feature_rows_for_head(
             "S1",
             features_bC,
             target_px_b2,
@@ -2750,7 +2784,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             invKs_b33 = _to_dev(buf['intrinsics_inv'])
 
             channels = raw_features_bC.shape[1]
-            raw_features_bC, batch_size, h, w, trimmed = self._trim_batch_for_head_grid(
+            raw_features_bC, batch_size, h, w, trimmed = self._pack_feature_rows_for_head(
                 "S1-Buffer",
                 raw_features_bC,
                 target_px_b2,
@@ -4045,7 +4079,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return super().training_step(features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33)
 
         channels = features_bC.shape[1]
-        features_bC, batch_size, h, w, trimmed = self._trim_batch_for_head_grid(
+        features_bC, batch_size, h, w, trimmed = self._pack_feature_rows_for_head(
             "S2",
             features_bC,
             target_px_b2,
@@ -4171,7 +4205,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         with compressed memory per-batch, rather than being pre-fused in buffer.
         """
         channels = features_bC.shape[1]
-        features_bC, batch_size, h, w, trimmed = self._trim_batch_for_head_grid(
+        features_bC, batch_size, h, w, trimmed = self._pack_feature_rows_for_head(
             "S2-G",
             features_bC,
             target_px_b2,

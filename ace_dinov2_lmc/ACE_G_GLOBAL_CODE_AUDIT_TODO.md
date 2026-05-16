@@ -266,6 +266,10 @@ Recommended first change: add small helpers such as `_set_compressor_trainable(T
 
 ### 9. Reduce the fake `1 x C x 16 x W` head-packing leakage
 
+Status: addressed for current non-architecture hygiene. The sampled-row packer
+is now named `_pack_feature_rows_for_head(...)`, the old helper remains as a
+compatibility wrapper, and per-stage trim counts are accumulated.
+
 Location:
 
 - `trainer_dinov2_lmc.py:674`
@@ -285,6 +289,10 @@ Recommended first change: add a clearly named helper, for example `_pack_feature
 
 ### 10. Promote feature-dimension mismatch from warning to error
 
+Status: addressed. Non-divisible `pooled_features_dim / num_layers` now raises
+`ValueError` immediately with `pooled_features_dim`, `num_layers`,
+`layers_idx`, and `memory_path`.
+
 Location:
 
 - `trainer_dinov2_lmc.py:451`
@@ -295,6 +303,9 @@ If `pooled_features_dim` is not divisible by `num_layers`, the trainer only logs
 Recommended first change: raise `ValueError` immediately with `pooled_features_dim`, `num_layers`, `layers_idx`, and `memory_path`.
 
 ### 11. Clean up preset/config drift
+
+Status: addressed conservatively. `memory_compare_ace_g_v2` is now accepted by
+`--train_preset`; existing preset defaults were not changed.
 
 Locations:
 
