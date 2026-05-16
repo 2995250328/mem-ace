@@ -241,16 +241,23 @@ ablations:
    - Scope: no loss, fusion, compressor, or head-architecture behavior change.
    - Detail: `steps/08_non_arch_hygiene.md`
 
+8. `[done]` Module train/eval mode restoration contract.
+   - Problem: helper functions temporarily switched modules to eval/train mode
+     and could restore a broader state than the caller originally had.
+   - Scope: compressor memory compression, fused-buffer construction, ACE-G raw
+     buffer construction, and exact regressor/encoder/heads mode restoration.
+   - Detail: `steps/09_module_mode_contract.md`
+
 ### Priority 3 - Add Observability Before New Losses
 
-8. `[todo]` Add diagnostic-only compressor/fusion observability.
+9. `[todo]` Add diagnostic-only compressor/fusion observability.
    - Problem: token usage and fusion behavior are invisible.
    - Track: attention entropy, effective token count, avg max attention, token
      usage, gate values, raw/fused feature norms, PE scale.
    - No new loss and no behavior change when disabled.
    - Detail: `steps/05_geomatch_near_term.md`
 
-9. `[designing]` Add compressor geometry contract and ablations.
+10. `[designing]` Add compressor geometry contract and ablations.
    - Problem: key layer and geometry scale may be hidden bottlenecks.
    - First ablations: layer 12 baseline, layer 18, layer 6, final, learned
      scalar mix.
@@ -259,19 +266,19 @@ ablations:
 
 ### Priority 4 - Controlled Architecture Ablations
 
-9. `[todo]` GeoMatch Fusion v1.
+11. `[todo]` GeoMatch Fusion v1.
    - Problem: geometry does not affect query-memory matching logits.
    - Ablation: `value_only` vs `gated_key_value`.
    - Preserve old value geometry behavior as closely as possible.
    - Detail: `steps/05_geomatch_near_term.md`
 
-10. `[todo]` Usage regularization only if diagnostics justify it.
+12. `[todo]` Usage regularization only if diagnostics justify it.
     - Problem: possible token collapse.
     - Add only after measuring token usage.
     - Start with S1-only `lambda_usage` ablations.
     - Detail: `steps/05_geomatch_near_term.md`
 
-11. `[todo]` Fusion residual gate as a lower-priority ablation.
+13. `[todo]` Fusion residual gate as a lower-priority ablation.
     - Problem: `LayerNorm(query_feats + attention_out)` may allow fusion to
       heavily reparameterize raw features.
     - Candidate: `query_feats + residual_gate * attention_out`.
@@ -280,12 +287,12 @@ ablations:
 
 ### Priority 5 - Medium/Long-Term Research
 
-12. `[designing]` Anchor-assisted residual branch as auxiliary only.
+14. `[designing]` Anchor-assisted residual branch as auxiliary only.
     - Keep ACE head as primary output.
     - Add anchor-relative branch only after GeoMatch and diagnostics are stable.
     - Detail: `steps/05_geomatch_near_term.md`
 
-13. `[deferred]` Larger research changes.
+15. `[deferred]` Larger research changes.
     - Full normalized-coordinate target training.
     - Reference-frame memory coordinate contract.
     - DSD/local/deformable compressor.
@@ -606,7 +613,40 @@ Detail:
 
 - `steps/08_non_arch_hygiene.md`
 
-### 10. Diagnostic-Only Observability
+### 10. Module Train/Eval Mode Restoration Contract
+
+Status: `[done]`
+
+Problem:
+
+- Some helper functions temporarily switched modules to eval mode for
+  deterministic feature extraction, then restored with broad calls such as
+  `regressor.train()`.
+- That can accidentally turn a previously eval-only child module, especially
+  the frozen DINO encoder, back to train mode.
+- `_compress_memory()` did not restore the compressor mode through a
+  `finally` block if compression failed.
+
+Decision:
+
+- Add small helpers to capture and restore exact module `.training` flags.
+- Use them around compressor memory compression, fused-buffer construction, and
+  ACE-G raw-buffer construction.
+- Preserve output math, optimizer membership, loss contracts, and trainability
+  boundaries.
+
+Verification:
+
+- `python -m py_compile trainer_dinov2_lmc.py`
+- Synthetic smoke check captures/restores mixed parent/child module modes.
+- Existing full sanity run remains the metric-level check; no new baseline
+  training is required for this state-restoration-only change.
+
+Detail:
+
+- `steps/09_module_mode_contract.md`
+
+### 11. Diagnostic-Only Observability
 
 Status: `[todo]`
 
@@ -648,7 +688,7 @@ Detail:
 
 - `steps/05_geomatch_near_term.md`
 
-### 11. Compressor Geometry Contract And Ablations
+### 12. Compressor Geometry Contract And Ablations
 
 Status: `[designing]`
 
@@ -684,7 +724,7 @@ Detail:
 
 - `steps/06_compressor_geometry_contract.md`
 
-### 12. GeoMatch Fusion v1
+### 13. GeoMatch Fusion v1
 
 Status: `[todo]`
 
@@ -715,7 +755,7 @@ Detail:
 
 - `steps/05_geomatch_near_term.md`
 
-### 13. Conditional Usage Regularization
+### 14. Conditional Usage Regularization
 
 Status: `[todo]`
 
@@ -744,7 +784,7 @@ Detail:
 
 - `steps/05_geomatch_near_term.md`
 
-### 14. Fusion Residual Gate
+### 15. Fusion Residual Gate
 
 Status: `[todo]`
 
@@ -768,7 +808,7 @@ Detail:
 
 - `steps/05_geomatch_near_term.md`
 
-### 15. Anchor-Assisted Residual Branch
+### 16. Anchor-Assisted Residual Branch
 
 Status: `[designing]`
 

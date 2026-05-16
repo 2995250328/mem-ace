@@ -92,6 +92,27 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return [TrainerACEDINOv2LMC._tensor_to_config_value(v) for v in value]
         return value
 
+    @staticmethod
+    def _capture_module_training_modes(*modules):
+        """Capture exact train/eval flags for modules that may be toggled temporarily."""
+        snapshot = []
+        seen = set()
+        for module in modules:
+            if module is None:
+                continue
+            module_id = id(module)
+            if module_id in seen:
+                continue
+            seen.add(module_id)
+            snapshot.append((module, bool(module.training)))
+        return snapshot
+
+    @staticmethod
+    def _restore_module_training_modes(snapshot):
+        """Restore module train/eval flags captured by _capture_module_training_modes."""
+        for module, was_training in snapshot:
+            module.train(was_training)
+
     def _get_training_generator(self, device: Optional[torch.device] = None) -> torch.Generator:
         """Return the training RNG that matches the target tensor device."""
         target_device = torch.device(device) if device is not None else self.device
@@ -1723,6 +1744,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'gt_scene_coords_valid': torch.empty((effective_size, 1), dtype=torch.bool, device=buffer_device),
         }
 
+        regressor_mode_snapshot = self._capture_module_training_modes(
+            self.regressor,
+            getattr(self.regressor, "encoder", None),
+            getattr(self.regressor, "heads", None),
+        )
         self.regressor.eval()
         with torch.no_grad():
             buffer_idx = 0
@@ -1880,7 +1906,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 roi_available,
                 neighbor_available,
             )
-        self.regressor.train()
+        self._restore_module_training_modes(regressor_mode_snapshot)
 
     # ------------------------------------------------------------------
     # Optimizer rebuild (includes compressor + fusion + head)
@@ -2142,12 +2168,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
     def _compress_memory(self):
         """Run GeoLMC on the loaded memory_dict. Returns compressor output."""
-        was_training = self.compressor.training
+        mode_snapshot = self._capture_module_training_modes(self.compressor)
         self.compressor.eval()
-        with torch.no_grad():
-            out = self.compressor(self.memory_dict)
-        self.compressor.train(was_training)
-        return out
+        try:
+            with torch.no_grad():
+                return self.compressor(self.memory_dict)
+        finally:
+            self._restore_module_training_modes(mode_snapshot)
 
     def _set_compressor_trainable(self, trainable: bool):
         """Explicit S1/S2 compressor trainability boundary."""
@@ -2201,14 +2228,19 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if not self.use_lmc:
             return super().create_training_buffer()
 
-        # S2 buffer collection should be deterministic: disable dropout etc.
-        comp_was_training = self.compressor.training
-        fusion_was_training = self.fusion.training
-        self.compressor.eval()
-        self.fusion.eval()
-
         # Compress memory once for this buffer fill
         compressor_out = self._compress_memory()
+
+        # S2 buffer collection should be deterministic: disable dropout etc.
+        mode_snapshot = self._capture_module_training_modes(
+            self.compressor,
+            self.fusion,
+            self.regressor,
+            getattr(self.regressor, "encoder", None),
+            getattr(self.regressor, "heads", None),
+        )
+        self.compressor.eval()
+        self.fusion.eval()
 
         # Temporarily override buffer size if requested (for final iteration)
         orig_buf_size = self.options.training_buffer_size
@@ -2238,10 +2270,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self._force_current_buffer_on_cpu = orig_force_current_buffer_on_cpu
             self.regressor.get_features = original_get_features
             self.options.training_buffer_size = orig_buf_size
-            if comp_was_training:
-                self.compressor.train()
-            if fusion_was_training:
-                self.fusion.train()
+            self._restore_module_training_modes(mode_snapshot)
 
         # LMC: keep buffer on CPU to avoid GPU OOM (map-anything style: only batch on GPU)
         buffer_on_cpu = bool(getattr(self, "_current_training_buffer_on_cpu", self._current_buffer_should_be_on_cpu()))
@@ -2283,6 +2312,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         orig_force_current_buffer_on_cpu = getattr(self, "_force_current_buffer_on_cpu", False)
         self._force_current_buffer_on_cpu = force_final_cpu
+        mode_snapshot = self._capture_module_training_modes(
+            self.regressor,
+            getattr(self.regressor, "encoder", None),
+            getattr(self.regressor, "heads", None),
+        )
         try:
             # Backbone should be in eval mode for deterministic feature extraction.
             self.regressor.eval()
@@ -2290,7 +2324,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         finally:
             self._force_current_buffer_on_cpu = orig_force_current_buffer_on_cpu
             self.options.training_buffer_size = orig_buf_size
-            self.regressor.train()
+            self._restore_module_training_modes(mode_snapshot)
 
         # Move buffer to CPU to save GPU memory (same as LMC iterative path).
         buffer_on_cpu = bool(getattr(self, "_current_training_buffer_on_cpu", self._current_buffer_should_be_on_cpu()))

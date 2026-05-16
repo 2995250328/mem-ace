@@ -233,6 +233,12 @@ Status: addressed for the default path. `lmc_auto_mode_by_visibility` defaults t
 
 ### 7. Restore module training modes instead of forcing them
 
+Status: addressed. Helper-level module mode restoration now uses exact
+train/eval snapshots for compressor memory compression, fused-buffer
+construction, ACE-G raw-buffer construction, and the normal scene-coordinate
+buffer completion path. Details are tracked in
+`ace_g_global_refactor/steps/09_module_mode_contract.md`.
+
 Locations:
 
 - `trainer_dinov2_lmc.py:1021`
