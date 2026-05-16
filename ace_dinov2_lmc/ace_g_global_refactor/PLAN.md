@@ -42,23 +42,29 @@ implementation notes in one file per step under `steps/`.
      shared contract.
    - Preserve existing behavior unless a difference is intentionally changed.
 
-6. `[todo]` Make S1 sampled loss time-axis explicit.
+6. `[done]` Make S1 sampled loss time-axis explicit.
    - Expose/log whether sampled S1 uses fixed-zero, per-iteration, or monotonic
      ReproLoss scheduling.
+   - Detail: `steps/03_s1_sampled_loss_step_mode.md`
 
 7. `[todo]` Add compressor and fusion observability.
    - Log key layer metadata, latent token count, PE coordinate scale, distance
      bias scale, and fusion attention diagnostics.
 
-8. `[todo]` Add GeoMatch Fusion v1 as a controlled ablation.
+8. `[done]` Make requested LMC mode authoritative by default.
+   - Disable visibility-based automatic fallback unless explicitly requested.
+   - Keep requested/effective mode metadata in logs and checkpoints.
+   - Detail: `steps/04_lmc_mode_authority.md`
+
+9. `[todo]` Add GeoMatch Fusion v1 as a controlled ablation.
    - Keep current value-only fusion as baseline.
    - Add gated geometry injection into both key and value paths.
 
-9. `[todo]` Consider usage regularization only after diagnostics.
+10. `[todo]` Consider usage regularization only after diagnostics.
    - Add token usage loss only if attention metrics show collapse.
    - Start with S1-only ablations.
 
-10. `[deferred]` Larger research changes.
+11. `[deferred]` Larger research changes.
     - Anchor residual branch as primary path.
     - Full normalized-coordinate target training.
     - DSD/local/deformable compressor.

@@ -222,14 +222,14 @@ Location:
 - `trainer_dinov2_lmc.py:417`
 - `options_dinov2_lmc.py:498`
 
-`lmc_auto_mode_by_visibility=True` can silently change requested `global` into `local` or `hierarchical`. That may be useful generally, but it is dangerous for ACE-G global comparisons.
+`lmc_auto_mode_by_visibility=True` can silently change requested `global` into `local` or `hierarchical`. That may be useful generally, but it is dangerous for ACE-G global comparisons. The default is now `False`, so the requested `lmc_mode` is honored unless fallback is explicitly enabled.
 
 Why this is rough:
 
 - A command line that says `--lmc_mode global` may produce a non-global checkpoint.
 - Experiment paths and summaries can be misread if only the requested mode is inspected.
 
-Recommended first change: for ACE-G global experiment presets, set `lmc_auto_mode_by_visibility=False`, or require a loud metadata field such as `requested_lmc_mode` and `effective_lmc_mode` in every checkpoint and log.
+Status: addressed for the default path. `lmc_auto_mode_by_visibility` defaults to `False`, and checkpoints/logs record both `requested_lmc_mode` and `effective_lmc_mode`. Fallback remains available only as an explicit opt-in.
 
 ### 7. Restore module training modes instead of forcing them
 

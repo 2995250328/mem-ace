@@ -357,12 +357,13 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--train_preset',
         type=str,
         default='none',
-        choices=['none', 'memory_compare_ace_g_v1'],
+        choices=['none', 'memory_compare_ace_g_v1', 'ace_g_indoor6_4090_global_fixedzero_v1'],
         help=(
             '训练预设。none=不改动 parser 默认值；'
             'memory_compare_ace_g_v1=当前 memory compare/ACE-G 常用配置，'
             '会自动补齐 use_lmc、ace_g、strict preflight、scene/head 容差、'
-            'BSE world-point 路径、S1 buffer 训练，以及 train_compare 输出目录。'
+            'BSE world-point 路径、S1 buffer 训练，以及 train_compare 输出目录；'
+            'ace_g_indoor6_4090_global_fixedzero_v1=indoor6/4090 true-global fixed-zero ACE-G 配方。'
         ),
     )
     parser.add_argument(
@@ -581,10 +582,11 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--lmc_auto_mode_by_visibility',
         type=_strtobool,
-        default=True,
+        default=False,
         help=(
             '当 memory 在多视角下前方可见性不足时，自动将 lmc_mode 从 global '
-            '回退到 lmc_visibility_fallback_mode（默认 local）。'
+            '回退到 lmc_visibility_fallback_mode（默认 local）。默认关闭，'
+            '保证命令行指定的 lmc_mode 就是实际训练模式。'
         ),
     )
     parser.add_argument(
@@ -732,6 +734,18 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
             'full_map=整图 E2E 不采样; '
             'sample_per_image=每张图固定采样数(类 S2); '
             'sample_pooled=当前方式(从整批有效点中随机采样).'
+        ),
+    )
+    parser.add_argument(
+        '--s1_loss_step_mode',
+        type=str,
+        default=None,
+        choices=['fixed_zero', 'per_iter', 'global_monotonic'],
+        help=(
+            'S1 sampled loss 的 ReproLoss step 选择。'
+            'None 表示兼容旧行为：普通 profile 使用 fixed_zero，mapany_flow_v1 使用 global_monotonic。'
+            'fixed_zero=始终使用 step 0；per_iter=按当前 LMC iteration 内 S1 update 递增；'
+            'global_monotonic=使用全局 monotonic step。'
         ),
     )
     parser.add_argument(

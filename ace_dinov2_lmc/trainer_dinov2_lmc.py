@@ -1063,7 +1063,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 vis_stats["num_points_sampled"],
                 vis_stats["num_poses"],
             )
-        auto_mode = bool(getattr(options, "lmc_auto_mode_by_visibility", True))
+        auto_mode = bool(getattr(options, "lmc_auto_mode_by_visibility", False))
         fallback_mode = str(getattr(options, "lmc_visibility_fallback_mode", "local"))
         vis_thr = float(getattr(options, "lmc_visibility_front_ratio_threshold", 0.85))
         if (
@@ -1173,6 +1173,19 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         pe_normalize_input = bool(getattr(options, 'pe_normalize_input', False))
         lmc_fps_start_policy = str(getattr(options, 'lmc_fps_start_policy', 'farthest_from_center'))
+        requested_s1_loss_step_mode = getattr(options, 's1_loss_step_mode', None)
+        lmc_profile_for_s1_step = str(getattr(options, 'lmc_profile', 'legacy'))
+        if requested_s1_loss_step_mode is None:
+            s1_loss_step_mode = 'global_monotonic' if lmc_profile_for_s1_step == 'mapany_flow_v1' else 'fixed_zero'
+        else:
+            s1_loss_step_mode = str(requested_s1_loss_step_mode)
+        if s1_loss_step_mode not in ('fixed_zero', 'per_iter', 'global_monotonic'):
+            raise ValueError(f"Unsupported s1_loss_step_mode={s1_loss_step_mode!r}")
+        _logger.info(
+            "[S1] sampled loss step mode: requested=%s resolved=%s",
+            requested_s1_loss_step_mode if requested_s1_loss_step_mode is not None else "legacy_default",
+            s1_loss_step_mode,
+        )
 
         self.lmc_config = {
             'use_lmc': True,
@@ -1192,6 +1205,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'geo_sigma': geo_sigma,
             'pe_normalize_input': pe_normalize_input,
             'lmc_fps_start_policy': lmc_fps_start_policy,
+            's1_loss_step_mode': s1_loss_step_mode,
+            'requested_s1_loss_step_mode': requested_s1_loss_step_mode,
             'backbone_feature_dim': backbone_feature_dim,
             'scale_token_dim': scale_token_dim,
             'memory_path': str(memory_path),
@@ -1272,6 +1287,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.s2_polish_fusion_lr_ratio = max(0.0, float(getattr(options, 's2_polish_fusion_lr_ratio', 0.005)))
         self.lmc_profile = str(getattr(options, 'lmc_profile', 'legacy'))
         self.mapany_flow_profile = (self.lmc_profile == 'mapany_flow_v1')
+        self.s1_loss_step_mode = s1_loss_step_mode
         self.s1_use_buffer = bool(getattr(options, 's1_use_buffer', False))
         self.s1_buffer_refill_mode = str(getattr(options, 's1_buffer_refill_mode', 'full'))
         if self.s1_use_buffer and str(getattr(options, 's1_loss_mode', 'full_map')) == 'full_map':
@@ -1863,6 +1879,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         """Monotonic repro-loss step used by mapany_flow_v1 profile."""
         return min(int(self.iteration), self.repro_loss.total_iterations - 1)
 
+    def _resolve_s1_sampled_loss_step(self, s1_step=0):
+        """Resolve ReproLoss step for sampled S1 loss without changing legacy defaults."""
+        mode = getattr(self, 's1_loss_step_mode', 'fixed_zero')
+        if mode == 'fixed_zero':
+            return 0
+        if mode == 'per_iter':
+            return min(max(int(s1_step), 0), self.repro_loss.total_iterations - 1)
+        if mode == 'global_monotonic':
+            return self._monotonic_repro_step()
+        raise ValueError(f"Unsupported s1_loss_step_mode={mode!r}")
+
     # ------------------------------------------------------------------
     # Head reset
     # ------------------------------------------------------------------
@@ -2305,6 +2332,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         invKs_b33,
         gt_scene_coords_world_b3=None,
         gt_scene_coords_valid_b1=None,
+        s1_step=0,
     ):
         """Compute ace_depth reprojection loss from sampled fused features (same formula as TrainerACEDINOv2.training_step)."""
         channels = features_bC.shape[1]
@@ -2350,8 +2378,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         valid_mask_b1 = ~invalid_mask_b1
 
         valid_reprojection_error_b1 = reprojection_error_l1_b1[valid_mask_b1]
-        # legacy: use early schedule(0); mapany_flow_v1: use monotonic global step.
-        iter_for_loss = self._monotonic_repro_step() if self.mapany_flow_profile else 0
+        iter_for_loss = self._resolve_s1_sampled_loss_step(s1_step)
         if valid_reprojection_error_b1.numel() > 0:
             loss_valid = self.repro_loss.compute(valid_reprojection_error_b1, iter_for_loss)
         else:
@@ -2622,9 +2649,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         _s1_loss_last = None
 
         _logger.info(
-            "  [S1-Buffer] source=raw_buffer, target_updates=%d, s1_loss_mode=%s",
+            "  [S1-Buffer] source=raw_buffer, target_updates=%d, s1_loss_mode=%s, s1_loss_step_mode=%s",
             n_steps,
             getattr(self.options, 's1_loss_mode', 'sample_per_image'),
+            self.s1_loss_step_mode,
         )
         if s1_early_stop_cfg["enabled"]:
             _logger.info(
@@ -2696,6 +2724,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 gt_inv_poses_b34.contiguous(),
                 Ks_b33.contiguous(),
                 invKs_b33.contiguous(),
+                s1_step=update_step,
             )
 
             if loss is None:
@@ -2853,8 +2882,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         s1_bs = max(1, getattr(self.options, 's1_batch_size', 8))
         _logger.info("  [S1] source=online_encoder")
         _logger.info(
-            "  [S1] loss_mode=%s, dataloader batch=%d, target_updates=%d (strict update-count mode)",
+            "  [S1] loss_mode=%s, loss_step_mode=%s, dataloader batch=%d, target_updates=%d (strict update-count mode)",
             s1_loss_mode,
+            self.s1_loss_step_mode,
             s1_bs,
             n_steps,
         )
@@ -3045,6 +3075,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         batch_data['intrinsics_inv'].contiguous(),
                         batch_data['gt_scene_coords_world'].contiguous(),
                         batch_data['gt_scene_coords_valid'].contiguous(),
+                        s1_step=update_step,
                     )
 
             if loss is None:
