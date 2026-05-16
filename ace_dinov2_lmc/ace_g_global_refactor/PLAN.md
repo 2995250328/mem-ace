@@ -225,13 +225,14 @@ ablations:
 
 ### Priority 2 - Clean Shared Supervision Contract
 
-6. `[todo]` Unify reprojection and invalid-loss behavior.
+6. `[done]` Unify reprojection and invalid-loss behavior.
    - Problem: duplicated loss implementations can hide behavior differences.
    - Scope: S1 sampled, S1 full-map, S2, and S2-G.
    - Constraint: preserve current behavior first; only refactor into a shared
      helper with tests/smoke checks.
    - Priority reason: it reduces risk before changing fusion/compressor
      architecture.
+   - Detail: `steps/07_loss_contract.md`
 
 ### Priority 3 - Add Observability Before New Losses
 
@@ -530,7 +531,7 @@ Detail:
 
 ### 8. Unified Reprojection / Invalid Loss Contract
 
-Status: `[todo]`
+Status: `[done]`
 
 Problem:
 
@@ -553,13 +554,17 @@ Recommended direction:
 
 Verification:
 
-- Run lightweight helper checks on synthetic data.
-- Run a short smoke command or compile check.
-- Logs should identify which loss contract/mode is active.
+- Synthetic parity checks compare the shared helper against copied old S1 and
+  S2 formulas.
+- `python -m py_compile trainer_dinov2_lmc.py`
 
 Priority:
 
 - Highest code-cleanup priority after current true-global comparisons.
+
+Detail:
+
+- `steps/07_loss_contract.md`
 
 ### 9. Diagnostic-Only Observability
 

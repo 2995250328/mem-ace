@@ -1890,6 +1890,137 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return self._monotonic_repro_step()
         raise ValueError(f"Unsupported s1_loss_step_mode={mode!r}")
 
+    def _compute_reprojection_invalid_loss_contract(
+        self,
+        pred_scene_coords_N31,
+        target_px_N2,
+        gt_inv_poses_N34,
+        Ks_N33,
+        invKs_N33,
+        *,
+        step_eff,
+        normalizer,
+        include_mask_N=None,
+        apply_nuclear_mask=False,
+        valid_subsample_max=0,
+        invalid_max_delta=None,
+        invalid_posinf=1e4,
+        invalid_neginf=1e4,
+    ):
+        """Shared ACE reprojection + invalid proxy loss.
+
+        This helper intentionally preserves existing stage-specific policy at
+        the call site: S1/S2 step selection, S1 full-map masks, and S2 invalid
+        clamping are still explicit arguments rather than hidden defaults.
+        """
+        n_points = int(pred_scene_coords_N31.shape[0])
+        pred_scene_coords_N41 = to_homogeneous(pred_scene_coords_N31)
+        pred_cam_coords_N31 = torch.bmm(gt_inv_poses_N34, pred_scene_coords_N41)
+        pred_px_N31 = torch.bmm(Ks_N33, pred_cam_coords_N31)
+        pred_px_N31[:, 2].clamp_(min=self.options.depth_min)
+        pred_px_N21 = pred_px_N31[:, :2] / pred_px_N31[:, 2, None]
+
+        reprojection_error_N2 = pred_px_N21.squeeze() - target_px_N2
+        reprojection_error_l1_N1 = torch.norm(reprojection_error_N2, dim=1, keepdim=True, p=1)
+        reprojection_error_l2_N1 = torch.norm(reprojection_error_N2, dim=1, keepdim=True, p=2)
+
+        finite_repro_N = torch.isfinite(reprojection_error_l1_N1).flatten()
+        finite_cam_N = torch.isfinite(pred_cam_coords_N31).all(dim=1).flatten()
+        invalid_min_depth_N = (pred_cam_coords_N31[:, 2] < self.options.depth_min).flatten()
+        invalid_repro_N = (reprojection_error_l1_N1 > self.options.repro_loss_hard_clamp).flatten()
+        invalid_max_depth_N = (pred_cam_coords_N31[:, 2] > self.options.depth_max).flatten()
+        invalid_nonfinite_N = ~(finite_repro_N & finite_cam_N)
+        base_invalid_mask_N = (
+            invalid_min_depth_N
+            | invalid_repro_N
+            | invalid_max_depth_N
+            | invalid_nonfinite_N
+        ).flatten()
+
+        if include_mask_N is None:
+            include_mask_N = torch.ones(n_points, device=pred_scene_coords_N31.device, dtype=torch.bool)
+        else:
+            include_mask_N = include_mask_N.reshape(-1).to(device=pred_scene_coords_N31.device, dtype=torch.bool)
+
+        if apply_nuclear_mask:
+            repro_flat_N = reprojection_error_l1_N1.flatten()
+            coords_max_N = torch.abs(pred_scene_coords_N31).view(n_points, -1).max(dim=1)[0]
+            nuclear_mask_N = (
+                (repro_flat_N > self.SANITY_PIXEL_ERR)
+                | (coords_max_N > self.SANITY_COORD_VAL)
+                | (~torch.isfinite(repro_flat_N))
+                | (~torch.isfinite(pred_cam_coords_N31).all(dim=1).flatten())
+            ).flatten()
+        else:
+            nuclear_mask_N = torch.zeros(n_points, device=pred_scene_coords_N31.device, dtype=torch.bool)
+
+        valid_mask_N = include_mask_N & (~base_invalid_mask_N) & (~nuclear_mask_N)
+        invalid_mask_N = include_mask_N & base_invalid_mask_N & (~nuclear_mask_N)
+
+        max_points = int(valid_subsample_max)
+        if max_points > 0 and valid_mask_N.sum() > max_points:
+            valid_idx = torch.where(valid_mask_N)[0]
+            perm = torch.randperm(
+                valid_idx.numel(),
+                device=valid_idx.device,
+                generator=getattr(self, "sampling_generator", None),
+            )
+            valid_reprojection_error = reprojection_error_l1_N1[valid_idx[perm[:max_points]]]
+        else:
+            valid_reprojection_error = reprojection_error_l1_N1[valid_mask_N]
+
+        if valid_reprojection_error.numel() > 0:
+            loss_valid = self.repro_loss.compute(valid_reprojection_error, int(step_eff))
+            if not isinstance(loss_valid, torch.Tensor):
+                loss_valid = torch.tensor(
+                    loss_valid,
+                    device=pred_scene_coords_N31.device,
+                    dtype=pred_scene_coords_N31.dtype,
+                )
+        else:
+            loss_valid = torch.zeros(
+                (),
+                device=pred_scene_coords_N31.device,
+                dtype=pred_scene_coords_N31.dtype,
+            )
+
+        pixel_grid_crop_N31 = to_homogeneous(target_px_N2.unsqueeze(2))
+        target_camera_coords_N31 = self.options.depth_target * torch.bmm(invKs_N33, pixel_grid_crop_N31)
+        invalid_mask_N11 = invalid_mask_N.reshape(n_points, 1, 1)
+        delta_cam_N31 = torch.abs(target_camera_coords_N31 - pred_cam_coords_N31)
+        delta_cam_N31 = torch.nan_to_num(
+            delta_cam_N31,
+            nan=0.0,
+            posinf=invalid_posinf,
+            neginf=invalid_neginf,
+        )
+        if invalid_max_delta is not None and float(invalid_max_delta) > 0:
+            delta_cam_N31 = delta_cam_N31.clamp(max=float(invalid_max_delta))
+        loss_invalid = delta_cam_N31.masked_select(invalid_mask_N11).sum()
+        loss = (loss_valid + loss_invalid) / normalizer
+
+        finite_l1 = reprojection_error_l1_N1[torch.isfinite(reprojection_error_l1_N1)]
+        finite_l2 = reprojection_error_l2_N1[torch.isfinite(reprojection_error_l2_N1)]
+        stats = {
+            "fraction_valid": float(valid_mask_N.sum() / normalizer),
+            "pxerr_l1": float(finite_l1.mean().item()) if finite_l1.numel() > 0 else float("nan"),
+            "pxerr_l2": float(finite_l2.mean().item()) if finite_l2.numel() > 0 else float("nan"),
+            "valid_pxerr_l1": (
+                float(valid_reprojection_error.mean().item())
+                if valid_reprojection_error.numel() > 0
+                else float("nan")
+            ),
+            "nonfinite_ratio": float(invalid_nonfinite_N.float().mean().item()),
+            "nuclear_cnt": int(nuclear_mask_N.sum().item()),
+        }
+        return {
+            "loss": loss,
+            "stats": stats,
+            "reprojection_error_l1": reprojection_error_l1_N1,
+            "valid_mask": valid_mask_N,
+            "invalid_mask": invalid_mask_N,
+        }
+
     # ------------------------------------------------------------------
     # Head reset
     # ------------------------------------------------------------------
@@ -2222,70 +2353,31 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         pred_scene_B3HW = self.regressor.get_scene_coordinates(fused_feats_BCHW)
         pred_scene_B3HW = self._recover_pred_scene_to_training_world(pred_scene_B3HW)
         pred_scene_N31 = pred_scene_B3HW.permute(0, 2, 3, 1).reshape(N, 3).unsqueeze(-1).float()
-        pred_scene_N41 = to_homogeneous(pred_scene_N31)
 
         gt_pose_inv_N34 = gt_pose_inv_B34.unsqueeze(1).unsqueeze(1).expand(B, H, W, 3, 4).reshape(N, 3, 4)
         K_N33 = K_B33.unsqueeze(1).unsqueeze(1).expand(B, H, W, 3, 3).reshape(N, 3, 3)
         invK_N33 = invK_B33.unsqueeze(1).unsqueeze(1).expand(B, H, W, 3, 3).reshape(N, 3, 3)
 
-        pred_cam_N31 = torch.bmm(gt_pose_inv_N34, pred_scene_N41)
-        pred_px_N31 = torch.bmm(K_N33, pred_cam_N31)
-        pred_px_N31[:, 2].clamp_(min=self.options.depth_min)
-        pred_px_N21 = pred_px_N31[:, :2] / pred_px_N31[:, 2, None]
-
         pixel_grid_B2HW = self.pixel_grid_2HW[:, :H, :W].clone().unsqueeze(0).expand(B, 2, H, W)
         target_px_N2 = pixel_grid_B2HW.permute(0, 2, 3, 1).reshape(N, 2)
 
-        repro_b2 = pred_px_N21.squeeze() - target_px_N2
-        repro_l1_b1 = torch.norm(repro_b2, dim=1, keepdim=True, p=1)
-        repro_l2_b1 = torch.norm(repro_b2, dim=1, keepdim=True, p=2)
-
-        # Nuclear mask (extreme outliers): exclude from both repro and invalid loss (align with loss_utils.py)
-        repro_flat = repro_l1_b1.flatten()
-        coords_max = torch.abs(pred_scene_N31).view(N, -1).max(dim=1)[0]
-        nuclear_mask = (
-            (repro_flat > self.SANITY_PIXEL_ERR)
-            | (coords_max > self.SANITY_COORD_VAL)
-            | (~torch.isfinite(repro_flat))
-            | (~torch.isfinite(pred_cam_N31).all(dim=1).flatten())
-        ).flatten()
-
-        # Base invalid: depth / repro threshold / nonfinite (same as before)
-        finite_repro = torch.isfinite(repro_l1_b1).flatten()
-        finite_cam = torch.isfinite(pred_cam_N31).all(dim=1).flatten()
-        invalid_min_depth = (pred_cam_N31[:, 2] < self.options.depth_min).flatten()
-        invalid_repro = (repro_l1_b1 > self.options.repro_loss_hard_clamp).flatten()
-        invalid_max_depth = (pred_cam_N31[:, 2] > self.options.depth_max).flatten()
-        invalid_nonfinite = ~(finite_repro & finite_cam)
-        base_invalid_mask = (invalid_min_depth | invalid_repro | invalid_max_depth | invalid_nonfinite).flatten()
-
-        # Valid = inside image_mask, not base_invalid, not nuclear (align with map-anything buffer)
-        valid_flat = mask_flat & (~base_invalid_mask) & (~nuclear_mask)
-        invalid_mask = mask_flat & base_invalid_mask & (~nuclear_mask)
-
-        # Optional subsampling: cap number of valid points for repro loss (reduce hard-point dominance)
-        max_points = int(getattr(self.options, "s1_full_map_max_points", 0))
-        if max_points > 0 and valid_flat.sum() > max_points:
-            valid_idx = torch.where(valid_flat)[0]
-            perm = torch.randperm(valid_idx.numel(), device=valid_idx.device, generator=getattr(self, "sampling_generator", None))
-            chosen = valid_idx[perm[:max_points]]
-            valid_repro_err = repro_l1_b1[chosen]
-        else:
-            valid_repro_err = repro_l1_b1[valid_flat]
-        if valid_repro_err.numel() > 0:
-            loss_step = self._monotonic_repro_step() if self.mapany_flow_profile else int(s1_step)
-            loss_valid = self.repro_loss.compute(valid_repro_err, loss_step)
-        else:
-            loss_valid = torch.zeros((), device=fused_feats_BCHW.device, dtype=fused_feats_BCHW.dtype)
-
-        pixel_grid_crop_N31 = to_homogeneous(target_px_N2.unsqueeze(2))
-        target_cam_N31 = self.options.depth_target * torch.bmm(invK_N33, pixel_grid_crop_N31)
-        invalid_abs = torch.abs(target_cam_N31 - pred_cam_N31)
-        invalid_abs = torch.nan_to_num(invalid_abs, nan=0.0, posinf=1e4, neginf=1e4)
-        # Index by invalid_mask instead of expand to (N,3,1) to save GPU memory (avoids 6+ GiB for large N)
-        loss_invalid = invalid_abs[invalid_mask].sum()
-
-        loss = (loss_valid + loss_invalid) / N
+        loss_step = self._monotonic_repro_step() if self.mapany_flow_profile else int(s1_step)
+        contract = self._compute_reprojection_invalid_loss_contract(
+            pred_scene_N31,
+            target_px_N2,
+            gt_pose_inv_N34,
+            K_N33,
+            invK_N33,
+            step_eff=loss_step,
+            normalizer=N,
+            include_mask_N=mask_flat,
+            apply_nuclear_mask=True,
+            valid_subsample_max=int(getattr(self.options, "s1_full_map_max_points", 0)),
+            invalid_max_delta=None,
+            invalid_posinf=1e4,
+            invalid_neginf=1e4,
+        )
+        loss = contract["loss"]
         if gt_scene_coords_B3HW is not None:
             if tuple(gt_scene_coords_B3HW.shape[-2:]) != (H, W):
                 gt_scene_coords_valid_B1HW = self._scene_coords_valid_mask(
@@ -2309,18 +2401,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 gt_scene_coords_N3,
                 gt_scene_coords_valid_N1,
             )
-        fraction_valid = float(valid_flat.sum() / N)
-        finite_l1 = repro_l1_b1[torch.isfinite(repro_l1_b1).flatten()]
-        finite_l2 = repro_l2_b1[torch.isfinite(repro_l2_b1).flatten()]
-        nuclear_cnt = int(nuclear_mask.sum().item())
-        stats = {
-            "fraction_valid": fraction_valid,
-            "pxerr_l1": float(finite_l1.mean().item()) if finite_l1.numel() > 0 else float("nan"),
-            "pxerr_l2": float(finite_l2.mean().item()) if finite_l2.numel() > 0 else float("nan"),
-            "valid_pxerr_l1": float(valid_repro_err.mean().item()) if valid_repro_err.numel() > 0 else float("nan"),
-            "nonfinite_ratio": float(invalid_nonfinite.float().mean().item()),
-            "nuclear_cnt": nuclear_cnt,
-        }
+        stats = contract["stats"]
         return loss, stats
 
     def _s1_compute_loss_from_features(
@@ -2357,56 +2438,26 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         pred_scene_coords_b3HW = self._recover_pred_scene_to_training_world(pred_scene_coords_b3HW)
 
         pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
-        pred_scene_coords_b41 = to_homogeneous(pred_scene_coords_b31)
-        pred_cam_coords_b31 = torch.bmm(gt_inv_poses_b34, pred_scene_coords_b41)
-        pred_px_b31 = torch.bmm(Ks_b33, pred_cam_coords_b31)
-        pred_px_b31[:, 2].clamp_(min=self.options.depth_min)
-        pred_px_b21 = pred_px_b31[:, :2] / pred_px_b31[:, 2, None]
-
-        reprojection_error_b2 = pred_px_b21.squeeze() - target_px_b2
-        reprojection_error_l1_b1 = torch.norm(reprojection_error_b2, dim=1, keepdim=True, p=1)
-        reprojection_error_l2_b1 = torch.norm(reprojection_error_b2, dim=1, keepdim=True, p=2)
-
-        finite_repro_b1 = torch.isfinite(reprojection_error_l1_b1)
-        # Keep mask shape as (N, 1), matching reprojection_error_l1_b1.
-        finite_cam_b1 = torch.isfinite(pred_cam_coords_b31).all(dim=1).all(dim=1, keepdim=True)
-        invalid_min_depth_b1 = pred_cam_coords_b31[:, 2] < self.options.depth_min
-        invalid_repro_b1 = reprojection_error_l1_b1 > self.options.repro_loss_hard_clamp
-        invalid_max_depth_b1 = pred_cam_coords_b31[:, 2] > self.options.depth_max
-        invalid_nonfinite_b1 = ~(finite_repro_b1 & finite_cam_b1)
-        invalid_mask_b1 = invalid_min_depth_b1 | invalid_repro_b1 | invalid_max_depth_b1 | invalid_nonfinite_b1
-        valid_mask_b1 = ~invalid_mask_b1
-
-        valid_reprojection_error_b1 = reprojection_error_l1_b1[valid_mask_b1]
         iter_for_loss = self._resolve_s1_sampled_loss_step(s1_step)
-        if valid_reprojection_error_b1.numel() > 0:
-            loss_valid = self.repro_loss.compute(valid_reprojection_error_b1, iter_for_loss)
-        else:
-            loss_valid = torch.zeros((), device=features_bC.device, dtype=features_bC.dtype)
-
-        pixel_grid_crop_b31 = to_homogeneous(target_px_b2.unsqueeze(2))
-        target_camera_coords_b31 = self.options.depth_target * torch.bmm(invKs_b33, pixel_grid_crop_b31)
-        invalid_mask_b11 = invalid_mask_b1.unsqueeze(2)
-        invalid_abs = torch.abs(target_camera_coords_b31 - pred_cam_coords_b31)
-        invalid_abs = torch.nan_to_num(invalid_abs, nan=0.0, posinf=1e4, neginf=1e4)
-        loss_invalid = invalid_abs.masked_select(invalid_mask_b11).sum()
-
-        loss = (loss_valid + loss_invalid) / batch_size
+        contract = self._compute_reprojection_invalid_loss_contract(
+            pred_scene_coords_b31,
+            target_px_b2,
+            gt_inv_poses_b34,
+            Ks_b33,
+            invKs_b33,
+            step_eff=iter_for_loss,
+            normalizer=batch_size,
+            invalid_max_delta=None,
+            invalid_posinf=1e4,
+            invalid_neginf=1e4,
+        )
+        loss = contract["loss"]
         loss = loss + self._compute_c1_aux_ref_loss(
             pred_scene_coords_b3HW,
             gt_scene_coords_world_b3,
             gt_scene_coords_valid_b1,
         )
-        fraction_valid = float(valid_mask_b1.sum() / batch_size)
-        finite_l1 = reprojection_error_l1_b1[torch.isfinite(reprojection_error_l1_b1)]
-        finite_l2 = reprojection_error_l2_b1[torch.isfinite(reprojection_error_l2_b1)]
-        stats = {
-            "fraction_valid": fraction_valid,
-            "pxerr_l1": float(finite_l1.mean().item()) if finite_l1.numel() > 0 else float("nan"),
-            "pxerr_l2": float(finite_l2.mean().item()) if finite_l2.numel() > 0 else float("nan"),
-            "valid_pxerr_l1": float(valid_reprojection_error_b1.mean().item()) if valid_reprojection_error_b1.numel() > 0 else float("nan"),
-            "nonfinite_ratio": float(invalid_nonfinite_b1.float().mean().item()),
-        }
+        stats = contract["stats"]
         return loss, stats
 
     def _build_s1_dataloader(self):
@@ -4027,58 +4078,26 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         pred_scene_coords_b3HW = self._recover_pred_scene_to_training_world(pred_scene_coords_b3HW)
 
         pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
-        pred_scene_coords_b41 = to_homogeneous(pred_scene_coords_b31)
-        pred_cam_coords_b31 = torch.bmm(gt_inv_poses_b34, pred_scene_coords_b41)
-        pred_px_b31 = torch.bmm(Ks_b33, pred_cam_coords_b31)
-        pred_px_b31[:, 2].clamp_(min=self.options.depth_min)
-        pred_px_b21 = pred_px_b31[:, :2] / pred_px_b31[:, 2, None]
-
-        reprojection_error_b2 = pred_px_b21.squeeze() - target_px_b2
-        reprojection_error_b1 = torch.norm(reprojection_error_b2, dim=1, keepdim=True, p=1)
-
-        invalid_min_depth_b1 = (pred_cam_coords_b31[:, 2] < self.options.depth_min).squeeze(-1)
-        invalid_repro_b1 = (reprojection_error_b1 > self.options.repro_loss_hard_clamp).squeeze(-1)
-        invalid_max_depth_b1 = (pred_cam_coords_b31[:, 2] > self.options.depth_max).squeeze(-1)
-        finite_repro_b1 = torch.isfinite(reprojection_error_b1).squeeze(-1)
-        finite_cam_b1 = torch.isfinite(pred_cam_coords_b31).all(dim=1).squeeze(-1)
-        invalid_mask_b1 = invalid_min_depth_b1 | invalid_repro_b1 | invalid_max_depth_b1 | (~finite_repro_b1) | (~finite_cam_b1)
-        # Ensure strict 1D mask (B,) to avoid accidental broadcast to (B,B)
-        n_batch = int(reprojection_error_b1.shape[0])
-        invalid_mask_b1 = invalid_mask_b1.reshape(-1)
-        if invalid_mask_b1.numel() != n_batch:
-            _logger.warning(
-                "[S2] invalid_mask_b1 numel mismatch: got=%d expected=%d; slicing to expected length.",
-                int(invalid_mask_b1.numel()), n_batch,
-            )
-            invalid_mask_b1 = invalid_mask_b1[:n_batch]
-        valid_mask_b1 = ~invalid_mask_b1
-
-        valid_reprojection_error_b1 = reprojection_error_b1[valid_mask_b1]
-        if valid_reprojection_error_b1.numel() > 0:
-            loss_valid = self.repro_loss.compute(valid_reprojection_error_b1, int(step_eff))
-            if not isinstance(loss_valid, torch.Tensor):
-                loss_valid = torch.tensor(loss_valid, device=features_bC.device, dtype=features_bC.dtype)
-        else:
-            loss_valid = torch.zeros((), device=features_bC.device, dtype=features_bC.dtype)
-
-        pixel_grid_crop_b31 = to_homogeneous(target_px_b2.unsqueeze(2))
-        target_camera_coords_b31 = self.options.depth_target * torch.bmm(invKs_b33, pixel_grid_crop_b31)
-        # Match (B, 3, 1) camera-coordinate tensor shape via broadcastable mask.
-        invalid_mask_b11 = invalid_mask_b1.reshape(n_batch, 1, 1)
-        # FIX: per-component clamp to prevent catastrophic loss_invalid explosion when predictions diverge.
-        # Without clamp, camera-space L1 deltas can reach millions of meters (vs. typical ~0.1m target scale),
-        # causing loss ~650K+ that overwhelms loss_valid and produces destructive gradients leading to NaN.
-        delta_cam_b31 = torch.abs(target_camera_coords_b31 - pred_cam_coords_b31)
-        delta_cam_b31 = torch.nan_to_num(delta_cam_b31, nan=0.0, posinf=0.0, neginf=0.0)
-        if self._loss_invalid_max_delta > 0:
-            delta_cam_b31 = delta_cam_b31.clamp(max=self._loss_invalid_max_delta)
-        loss_invalid = delta_cam_b31.masked_select(invalid_mask_b11).sum()
-        loss = (loss_valid + loss_invalid) / batch_size
+        contract = self._compute_reprojection_invalid_loss_contract(
+            pred_scene_coords_b31,
+            target_px_b2,
+            gt_inv_poses_b34,
+            Ks_b33,
+            invKs_b33,
+            step_eff=step_eff,
+            normalizer=batch_size,
+            invalid_max_delta=self._loss_invalid_max_delta,
+            invalid_posinf=0.0,
+            invalid_neginf=0.0,
+        )
+        loss = contract["loss"]
         loss = loss + self._compute_c1_aux_ref_loss(
             pred_scene_coords_b3HW,
             gt_scene_coords_world_b3,
             gt_scene_coords_valid_b1,
         )
+        reprojection_error_b1 = contract["reprojection_error_l1"]
+        valid_mask_b1 = contract["valid_mask"]
 
         # Guard NaN/Inf: truly skip optimizer/scheduler updates to avoid consuming LR schedule.
         loss_is_finite = bool(torch.isfinite(loss).all().item())
@@ -4193,50 +4212,26 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         pred_scene_coords_b3HW = self._recover_pred_scene_to_training_world(pred_scene_coords_b3HW)
 
         pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
-        pred_scene_coords_b41 = to_homogeneous(pred_scene_coords_b31)
-        pred_cam_coords_b31 = torch.bmm(gt_inv_poses_b34, pred_scene_coords_b41)
-        pred_px_b31 = torch.bmm(Ks_b33, pred_cam_coords_b31)
-        pred_px_b31[:, 2].clamp_(min=self.options.depth_min)
-        pred_px_b21 = pred_px_b31[:, :2] / pred_px_b31[:, 2, None]
-
-        reprojection_error_b2 = pred_px_b21.squeeze() - target_px_b2
-        reprojection_error_b1 = torch.norm(reprojection_error_b2, dim=1, keepdim=True, p=1)
-
-        invalid_min_depth_b1 = (pred_cam_coords_b31[:, 2] < self.options.depth_min).squeeze(-1)
-        invalid_repro_b1 = (reprojection_error_b1 > self.options.repro_loss_hard_clamp).squeeze(-1)
-        invalid_max_depth_b1 = (pred_cam_coords_b31[:, 2] > self.options.depth_max).squeeze(-1)
-        finite_repro_b1 = torch.isfinite(reprojection_error_b1).squeeze(-1)
-        finite_cam_b1 = torch.isfinite(pred_cam_coords_b31).all(dim=1).squeeze(-1)
-        invalid_mask_b1 = invalid_min_depth_b1 | invalid_repro_b1 | invalid_max_depth_b1 | (~finite_repro_b1) | (~finite_cam_b1)
-        n_batch = int(reprojection_error_b1.shape[0])
-        invalid_mask_b1 = invalid_mask_b1.reshape(-1)
-        if invalid_mask_b1.numel() != n_batch:
-            invalid_mask_b1 = invalid_mask_b1[:n_batch]
-        valid_mask_b1 = ~invalid_mask_b1
-
-        valid_reprojection_error_b1 = reprojection_error_b1[valid_mask_b1]
-        if valid_reprojection_error_b1.numel() > 0:
-            loss_valid = self.repro_loss.compute(valid_reprojection_error_b1, int(step_eff))
-            if not isinstance(loss_valid, torch.Tensor):
-                loss_valid = torch.tensor(loss_valid, device=features_bC.device, dtype=features_bC.dtype)
-        else:
-            loss_valid = torch.zeros((), device=features_bC.device, dtype=features_bC.dtype)
-
-        pixel_grid_crop_b31 = to_homogeneous(target_px_b2.unsqueeze(2))
-        target_camera_coords_b31 = self.options.depth_target * torch.bmm(invKs_b33, pixel_grid_crop_b31)
-        invalid_mask_b11 = invalid_mask_b1.reshape(n_batch, 1, 1)
-        # FIX: per-component clamp to prevent catastrophic loss_invalid explosion.
-        delta_cam_b31 = torch.abs(target_camera_coords_b31 - pred_cam_coords_b31)
-        delta_cam_b31 = torch.nan_to_num(delta_cam_b31, nan=0.0, posinf=0.0, neginf=0.0)
-        if self._loss_invalid_max_delta > 0:
-            delta_cam_b31 = delta_cam_b31.clamp(max=self._loss_invalid_max_delta)
-        loss_invalid = delta_cam_b31.masked_select(invalid_mask_b11).sum()
-        loss = (loss_valid + loss_invalid) / batch_size
+        contract = self._compute_reprojection_invalid_loss_contract(
+            pred_scene_coords_b31,
+            target_px_b2,
+            gt_inv_poses_b34,
+            Ks_b33,
+            invKs_b33,
+            step_eff=step_eff,
+            normalizer=batch_size,
+            invalid_max_delta=self._loss_invalid_max_delta,
+            invalid_posinf=0.0,
+            invalid_neginf=0.0,
+        )
+        loss = contract["loss"]
         loss = loss + self._compute_c1_aux_ref_loss(
             pred_scene_coords_b3HW,
             gt_scene_coords_world_b3,
             gt_scene_coords_valid_b1,
         )
+        reprojection_error_b1 = contract["reprojection_error_l1"]
+        valid_mask_b1 = contract["valid_mask"]
 
         loss_is_finite = bool(torch.isfinite(loss).all().item())
         loss_for_log = float(loss.item()) if loss_is_finite else -1.0
