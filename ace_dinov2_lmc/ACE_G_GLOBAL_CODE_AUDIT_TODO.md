@@ -31,7 +31,7 @@ The historical GeoMatch document is useful, but it mixes near-term fixes with lo
 Keep for the near-term roadmap:
 
 - GeoMatch Fusion v1: inject memory coordinate PE into fusion `key` as well as `value`, controlled by learnable gates.
-- Attention diagnostics: return/log fusion attention so token usage, entropy, effective token count, and gate values are inspectable.
+- Attention diagnostics: return/log fusion attention so token usage, entropy, effective token count, and gate values are inspectable. The diagnostic-only scalar logging path is implemented behind `--lmc_log_runtime_stats`; GeoMatch gates are still future work.
 - Conditional usage loss: only consider a small token-usage regularizer after diagnostics show token collapse.
 - Scene-scale contract: use a stable `scene_scale` for PE and distance-bias normalization before attempting full normalized-coordinate training.
 
@@ -323,6 +323,10 @@ Locations:
 Recommended first change: either expose v2 in `choices` or remove the dead preset until it is ready.
 
 ### 12. Add GeoMatch Fusion v1 as a controlled ablation, not a replacement architecture
+
+Status: architecture change still pending. The non-structural attention/runtime
+diagnostics and experiment-semantics summaries are addressed in
+`ace_g_global_refactor/steps/10_runtime_observability_and_semantics.md`.
 
 Locations:
 

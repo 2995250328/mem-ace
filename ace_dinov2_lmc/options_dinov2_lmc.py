@@ -636,6 +636,24 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         help='GeoLMC 注意力层数。层数越大表达更强，耗时更高。',
     )
     parser.add_argument(
+        '--lmc_log_runtime_stats',
+        type=_strtobool,
+        default=False,
+        help='是否记录 LMC runtime 诊断标量（attention/token usage/norm/geometry stats）。默认 False，不改变训练输出。',
+    )
+    parser.add_argument(
+        '--lmc_runtime_stats_interval',
+        type=int,
+        default=100,
+        help='LMC runtime stats 的 fusion 调用日志间隔。仅在 --lmc_log_runtime_stats True 时生效。',
+    )
+    parser.add_argument(
+        '--lmc_runtime_stats_max_pixels',
+        type=int,
+        default=4096,
+        help='计算 attention/token stats 时最多抽样的 query pixel/token 数。仅保存标量，不保存 attention tensor。',
+    )
+    parser.add_argument(
         '--s1_batch_size',
         type=int,
         default=28,

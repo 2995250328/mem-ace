@@ -909,6 +909,24 @@ def run_post_train_eval(args, trainer):
             )
         _logger.info("=====================================================")
         # 写入 run_dir 便于与 training_full_log 一起查看
+        semantic_fields = {}
+        try:
+            checkpoint = torch.load(args.output_map, map_location='cpu')
+            lmc_config = checkpoint.get('lmc_config', {}) if isinstance(checkpoint, dict) else {}
+            semantic_fields = {
+                "requested_lmc_mode": lmc_config.get("requested_lmc_mode"),
+                "effective_lmc_mode": lmc_config.get("effective_lmc_mode", lmc_config.get("lmc_mode")),
+                "lmc_auto_mode_by_visibility": lmc_config.get("lmc_auto_mode_by_visibility"),
+                "lmc_flow": lmc_config.get("lmc_flow"),
+                "lmc_key_slice_idx": lmc_config.get("lmc_key_slice_idx"),
+                "lmc_key_layer_label": lmc_config.get("lmc_key_layer_label"),
+                "layers_idx": lmc_config.get("layers_idx"),
+                "lmc_fps_start_policy": lmc_config.get("lmc_fps_start_policy"),
+                "s1_loss_step_mode": lmc_config.get("s1_loss_step_mode"),
+                "ace_g_fusion_in_s2": lmc_config.get("ace_g_fusion_in_s2"),
+            }
+        except Exception as e:
+            _logger.warning("Could not read LMC semantics from checkpoint for post-train eval summary: %s", e)
         eval_log_path = args.run_dir / "post_train_eval.txt"
         with open(eval_log_path, "w", encoding="utf-8") as f:
             f.write(f"eval_deterministic\t{bool(getattr(args, 'eval_deterministic', False))}\n")
@@ -924,6 +942,10 @@ def run_post_train_eval(args, trainer):
             f.write(f"accuracy_1cm1deg_pct\t{result['pct1']:.2f}\n")
             f.write(f"avg_time_per_frame_ms\t{result['avg_time'] * 1000:.2f}\n")
             f.write(f"total_frames\t{result['total_frames']}\n")
+            for key, value in semantic_fields.items():
+                if isinstance(value, (list, tuple)):
+                    value = ",".join(str(v) for v in value)
+                f.write(f"{key}\t{value}\n")
         if len(seed_results) > 1:
             raw_eval_path = args.run_dir / "post_train_eval_seed_runs.txt"
             with open(raw_eval_path, "w", encoding="utf-8") as f:

@@ -531,6 +531,23 @@ def run_evaluation_lmc(opt):
         f"avg_time_per_frame_ms\t{avg_time * 1000:.2f}",
         f"total_frames\t{total_frames}",
     ]
+    if is_lmc and lmc_config is not None:
+        semantic_fields = {
+            "requested_lmc_mode": lmc_config.get("requested_lmc_mode"),
+            "effective_lmc_mode": lmc_config.get("effective_lmc_mode", lmc_config.get("lmc_mode")),
+            "lmc_auto_mode_by_visibility": lmc_config.get("lmc_auto_mode_by_visibility"),
+            "lmc_flow": lmc_config.get("lmc_flow"),
+            "lmc_key_slice_idx": lmc_config.get("lmc_key_slice_idx"),
+            "lmc_key_layer_label": lmc_config.get("lmc_key_layer_label"),
+            "layers_idx": lmc_config.get("layers_idx"),
+            "lmc_fps_start_policy": lmc_config.get("lmc_fps_start_policy"),
+            "s1_loss_step_mode": lmc_config.get("s1_loss_step_mode"),
+            "ace_g_fusion_in_s2": lmc_config.get("ace_g_fusion_in_s2"),
+        }
+        for key, value in semantic_fields.items():
+            if isinstance(value, (list, tuple)):
+                value = ",".join(str(v) for v in value)
+            summary_lines.append(f"{key}\t{value}")
     eval_summary_file.write_text("\n".join(summary_lines) + "\n")
     _logger.info("Eval summary written to: %s", eval_summary_file)
 

@@ -113,6 +113,23 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         for module, was_training in snapshot:
             module.train(was_training)
 
+    @staticmethod
+    def _count_trainable_params(module):
+        if module is None:
+            return 0
+        return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+    @staticmethod
+    def _optimizer_contains_module_params(optimizer, module):
+        if optimizer is None or module is None:
+            return False
+        module_param_ids = {id(p) for p in module.parameters()}
+        for group in optimizer.param_groups:
+            for param in group.get("params", []):
+                if id(param) in module_param_ids:
+                    return True
+        return False
+
     def _get_training_generator(self, device: Optional[torch.device] = None) -> torch.Generator:
         """Return the training RNG that matches the target tensor device."""
         target_device = torch.device(device) if device is not None else self.device
@@ -1208,12 +1225,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             requested_s1_loss_step_mode if requested_s1_loss_step_mode is not None else "legacy_default",
             s1_loss_step_mode,
         )
+        self.lmc_log_runtime_stats = bool(getattr(options, 'lmc_log_runtime_stats', False))
+        self.lmc_runtime_stats_interval = max(1, int(getattr(options, 'lmc_runtime_stats_interval', 100)))
+        self.lmc_runtime_stats_max_pixels = max(1, int(getattr(options, 'lmc_runtime_stats_max_pixels', 4096)))
+        self._lmc_runtime_stats_calls = 0
 
         self.lmc_config = {
             'use_lmc': True,
+            'lmc_flow': str(getattr(options, 'lmc_flow', 'iterative')),
             'lmc_mode': lmc_mode,
             'requested_lmc_mode': requested_lmc_mode,
             'effective_lmc_mode': lmc_mode,
+            'lmc_auto_mode_by_visibility': bool(getattr(options, 'lmc_auto_mode_by_visibility', False)),
             'num_latent_tokens': num_latent_tokens,
             'num_fine': num_fine,
             'num_coarse': num_coarse,
@@ -1229,6 +1252,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'lmc_fps_start_policy': lmc_fps_start_policy,
             's1_loss_step_mode': s1_loss_step_mode,
             'requested_s1_loss_step_mode': requested_s1_loss_step_mode,
+            'lmc_log_runtime_stats': self.lmc_log_runtime_stats,
+            'lmc_runtime_stats_interval': self.lmc_runtime_stats_interval,
+            'lmc_runtime_stats_max_pixels': self.lmc_runtime_stats_max_pixels,
+            'ace_g_fusion_in_s2': bool(getattr(options, 'ace_g_fusion_in_s2', False)),
             'backbone_feature_dim': backbone_feature_dim,
             'scale_token_dim': scale_token_dim,
             'memory_path': str(memory_path),
@@ -2172,7 +2199,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.compressor.eval()
         try:
             with torch.no_grad():
-                return self.compressor(self.memory_dict)
+                out = self.compressor(self.memory_dict)
+            self._log_compressor_runtime_stats(out, "Compress")
+            return out
         finally:
             self._restore_module_training_modes(mode_snapshot)
 
@@ -2182,11 +2211,131 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             param.requires_grad_(trainable)
         _logger.info("[LMC] Compressor trainable=%s", trainable)
 
+    def _log_stage_trainability(self, stage_tag: str):
+        """Log trainable parameter counts for stage-contract debugging."""
+        if not self.use_lmc:
+            return
+        _logger.info(
+            "[%s] trainable params: compressor=%d fusion=%d head=%d encoder=%d",
+            stage_tag,
+            self._count_trainable_params(getattr(self, "compressor", None)),
+            self._count_trainable_params(getattr(self, "fusion", None)),
+            self._count_trainable_params(getattr(self.regressor, "heads", None)),
+            self._count_trainable_params(getattr(self.regressor, "encoder", None)),
+        )
+
+    def _validate_s2_compressor_contract(self):
+        """S2-G must not train compressor parameters."""
+        if not self.use_lmc or self.lmc_flow != 'ace_g':
+            return
+        leaked = [name for name, param in self.compressor.named_parameters() if param.requires_grad]
+        if leaked:
+            preview = ", ".join(leaked[:5])
+            raise RuntimeError(
+                f"[S2-G] Compressor must be frozen during S2, but {len(leaked)} params require grad: {preview}"
+            )
+        if self._optimizer_contains_module_params(getattr(self, "optimizer_head", None), self.compressor):
+            raise RuntimeError("[S2-G] optimizer_head unexpectedly contains compressor parameters.")
+
+    def _lmc_semantics_for_logs(self):
+        if not self.use_lmc:
+            return {}
+        keys = [
+            "requested_lmc_mode",
+            "effective_lmc_mode",
+            "lmc_mode",
+            "layers_idx",
+            "lmc_key_slice_idx",
+            "lmc_key_layer_label",
+            "lmc_fps_start_policy",
+            "s1_loss_step_mode",
+            "requested_s1_loss_step_mode",
+            "lmc_log_runtime_stats",
+            "lmc_runtime_stats_interval",
+            "lmc_runtime_stats_max_pixels",
+        ]
+        meta = {key: self._tensor_to_config_value(self.lmc_config.get(key)) for key in keys}
+        meta["lmc_flow"] = str(getattr(self.options, "lmc_flow", "iterative"))
+        meta["lmc_auto_mode_by_visibility"] = bool(getattr(self.options, "lmc_auto_mode_by_visibility", False))
+        meta["ace_g_fusion_in_s2"] = bool(getattr(self.options, "ace_g_fusion_in_s2", False))
+        return meta
+
+    def _should_log_runtime_stats(self):
+        if not bool(getattr(self, "lmc_log_runtime_stats", False)):
+            return False
+        self._lmc_runtime_stats_calls += 1
+        return self._lmc_runtime_stats_calls == 1 or (
+            self._lmc_runtime_stats_calls % self.lmc_runtime_stats_interval == 0
+        )
+
+    def _log_fusion_runtime_stats(self, stage_tag: str, stats: Dict[str, Any]):
+        if not stats:
+            return
+        top5 = stats.get("token_usage_top5", [])
+        top5_str = ",".join(f"{float(v):.4f}" for v in top5)
+        _logger.info(
+            "[LMC-Runtime][%s] call=%d entropy_mean=%.4f p10=%.4f p50=%.4f p90=%.4f "
+            "effective_tokens=%.2f avg_max=%.4f usage_min=%.5f usage_max=%.5f top5=[%s] "
+            "raw_norm=%.4f attn_out_norm=%.4f fused_norm=%.4f queries=%d tokens=%d",
+            stage_tag,
+            int(getattr(self, "_lmc_runtime_stats_calls", 0)),
+            float(stats.get("attn_entropy_mean", 0.0)),
+            float(stats.get("attn_entropy_p10", 0.0)),
+            float(stats.get("attn_entropy_p50", 0.0)),
+            float(stats.get("attn_entropy_p90", 0.0)),
+            float(stats.get("effective_token_count", 0.0)),
+            float(stats.get("avg_max_attention", 0.0)),
+            float(stats.get("token_usage_min", 0.0)),
+            float(stats.get("token_usage_max", 0.0)),
+            top5_str,
+            float(stats.get("raw_feature_norm", 0.0)),
+            float(stats.get("attention_out_norm", 0.0)),
+            float(stats.get("fused_feature_norm", 0.0)),
+            int(stats.get("num_queries_used", 0)),
+            int(stats.get("num_tokens", 0)),
+        )
+
+    def _log_compressor_runtime_stats(self, compressor_out, stage_tag: str):
+        if not bool(getattr(self, "lmc_log_runtime_stats", False)):
+            return
+        with torch.no_grad():
+            if isinstance(compressor_out, dict):
+                latent_p = compressor_out.get("p_coarse", compressor_out.get("p_fine"))
+            else:
+                _, latent_p = compressor_out
+            if latent_p is None:
+                return
+            latent_p = latent_p.detach().float()
+            scene_center = self.memory_dict["scene_center"].to(device=latent_p.device, dtype=latent_p.dtype)
+            if scene_center.ndim == 1:
+                scene_center = scene_center.unsqueeze(0)
+            if scene_center.shape[0] == 1 and latent_p.shape[0] > 1:
+                scene_center = scene_center.expand(latent_p.shape[0], -1)
+            centered = latent_p - scene_center.unsqueeze(1)
+            radius = torch.linalg.norm(centered, dim=-1)
+            pooled_points = self.memory_dict["pooled_points"].to(device=latent_p.device, dtype=latent_p.dtype)
+            dist_log = torch.log(torch.cdist(latent_p, pooled_points, p=2).pow(2) + 1e-6)
+            _logger.info(
+                "[LMC-Runtime][%s] compressor K_eff=%d key_slice=%s key_layer=%s "
+                "latent_radius_mean=%.4f latent_radius_std=%.4f coord_std=%.4f "
+                "dist_log_min=%.4f dist_log_max=%.4f dist_log_std=%.4f",
+                stage_tag,
+                int(latent_p.shape[1]),
+                str(self.lmc_config.get("lmc_key_slice_idx")),
+                str(self.lmc_config.get("lmc_key_layer_label")),
+                float(radius.mean().item()),
+                float(radius.std(unbiased=False).item()),
+                float(centered.std(unbiased=False).item()),
+                float(dist_log.min().item()),
+                float(dist_log.max().item()),
+                float(dist_log.std(unbiased=False).item()),
+            )
+
     # ------------------------------------------------------------------
     # Fuse features with memory
     # ------------------------------------------------------------------
 
-    def _fuse_features(self, features_BCHW, compressor_out):
+    def _fuse_features(self, features_BCHW, compressor_out, stage_tag="Fusion"):
         """Fuse encoder features with compressed memory tokens.
 
         features_BCHW: (B, C, H, W) from DINOv2 encoder
@@ -2214,7 +2363,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 compressor_out = (latent_z, latent_p)
 
         query = features_BCHW.permute(0, 2, 3, 1).reshape(B, H * W, C)
-        fused = self.fusion(query, compressor_out, scene_center)
+        collect_stats = self._should_log_runtime_stats()
+        fused = self.fusion(
+            query,
+            compressor_out,
+            scene_center,
+            return_stats=collect_stats,
+            stats_max_pixels=self.lmc_runtime_stats_max_pixels,
+        )
+        if collect_stats:
+            fused, stats = fused
+            self._log_fusion_runtime_stats(stage_tag, stats)
         return fused.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
     # ------------------------------------------------------------------
@@ -2259,7 +2418,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         def fused_get_features(images):
             raw_feats = original_get_features(images)
-            return self._fuse_features(raw_feats, compressor_out)
+            return self._fuse_features(raw_feats, compressor_out, stage_tag="S2-Buffer")
 
         self.regressor.get_features = fused_get_features
         orig_force_current_buffer_on_cpu = getattr(self, "_force_current_buffer_on_cpu", False)
@@ -2725,6 +2884,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.fusion.train()
         self.regressor.heads.train()
         self.regressor.encoder.eval()
+        self._log_stage_trainability("S1-Buffer")
 
         if self.training_buffer is None or 'features' not in self.training_buffer:
             raise RuntimeError("[S1-Buffer] training_buffer is empty; call _prepare_s1_buffer_for_iteration first.")
@@ -2834,7 +2994,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             with autocast("cuda", enabled=self.options.use_half):
                 comp_out = self.compressor(self.memory_dict)
                 raw_features_bCHW = raw_features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
-                fused_bCHW = self._fuse_features(raw_features_bCHW, comp_out)
+                fused_bCHW = self._fuse_features(raw_features_bCHW, comp_out, stage_tag="S1-Buffer")
             fused_features_bC = fused_bCHW.permute(0, 2, 3, 1).reshape(-1, channels)
 
             loss, s1_stats = self._s1_compute_loss_from_features(
@@ -2982,6 +3142,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         # Backbone remains frozen / inference-only in S1.
         self.regressor.encoder.eval()
+        self._log_stage_trainability("S1")
 
         # From iter 1 onward use a lower S1 LR to avoid destabilizing the already-trained compressor/fusion.
         s1_lr_scale_later = float(getattr(self.options, 's1_lr_scale_later', 0.4))
@@ -3084,7 +3245,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     raw_feats = self.regressor.get_features(image_BCHW)
 
                 comp_out = self.compressor(self.memory_dict)
-                fused_feats = self._fuse_features(raw_feats, comp_out)
+                fused_feats = self._fuse_features(raw_feats, comp_out, stage_tag="S1-Online")
 
                 B, C, H, W = fused_feats.shape
                 image_mask_B1HW = TF.resize(image_mask_B1HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
@@ -3390,6 +3551,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             )
         else:
             self.optimizer_head = optim.AdamW(self.regressor.heads.parameters(), lr=head_lr)
+        self._validate_s2_compressor_contract()
 
         warmup_ratio = (self.s2_lr_warmup_steps / self.steps_per_s2_phase) if self.s2_lr_warmup_steps else 0.1
         warmup_ratio = min(0.5, max(0.0, warmup_ratio))
@@ -3607,6 +3769,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "best_score": float(best_score),
             "best_checkpoint_path": str(self.options.output_map),
         }
+        meta.update(self._lmc_semantics_for_logs())
         if eval_result:
             meta["pct25_5"] = float(eval_result.get("pct25_5", 0.0))
             meta["pct10_5"] = float(eval_result.get("pct10_5", 0.0))
@@ -3947,6 +4110,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             # --- Stage 2: ACE-G specific ---
             # 1. Compress memory once, cache for training step
             self._set_compressor_trainable(False)
+            self._log_stage_trainability("S2-G")
+            self._validate_s2_compressor_contract()
             self._s2_compressor_out = self._compress_memory()
 
             # 2. Set fusion mode for S2
@@ -4271,11 +4436,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             ace_g_fusion_in_s2 = getattr(self.options, 'ace_g_fusion_in_s2', False)
             if ace_g_fusion_in_s2:
                 # R2 path: fusion is trainable with slow LR
-                fused_bCHW = self._fuse_features(features_bCHW, self._s2_compressor_out)
+                fused_bCHW = self._fuse_features(features_bCHW, self._s2_compressor_out, stage_tag="S2-G")
             else:
                 # R1 path: fusion frozen (default)
                 with torch.no_grad():
-                    fused_bCHW = self._fuse_features(features_bCHW, self._s2_compressor_out)
+                    fused_bCHW = self._fuse_features(features_bCHW, self._s2_compressor_out, stage_tag="S2-G")
             pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(fused_bCHW)
         pred_scene_coords_b3HW = self._recover_pred_scene_to_training_world(pred_scene_coords_b3HW)
 

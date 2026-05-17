@@ -38,7 +38,7 @@ Status:
 
 - Mostly fixed. See steps 01, 02, 03, and 04.
 
-### P1 - Loss Contracts Are Still Partly Duplicated
+### P1 - Loss Contracts Were Partly Duplicated
 
 Symptoms:
 
@@ -55,7 +55,7 @@ Risk:
 
 Status:
 
-- Still open. This is the highest-priority cleanup after current global runs.
+- Fixed for the current compatibility-preserving path. See step 07.
 
 ### P2 - Compressor Geometry Is Hard To Interpret
 
@@ -97,7 +97,7 @@ Status:
 
 - Planned as a controlled GeoMatch Fusion v1 ablation. See step 05.
 
-### P4 - Token Usage Is Not Observable
+### P4 - Token Usage Needed Observability
 
 Symptoms:
 
@@ -113,7 +113,8 @@ Risk:
 
 Status:
 
-- Planned before usage regularization. See step 05.
+- Diagnostic-only runtime observability is implemented behind an explicit flag.
+  See step 10.
 
 ### P5 - Future Multi-Scene LMC Needs A New System Contract
 
@@ -250,12 +251,13 @@ ablations:
 
 ### Priority 3 - Add Observability Before New Losses
 
-9. `[todo]` Add diagnostic-only compressor/fusion observability.
+9. `[done]` Add diagnostic-only compressor/fusion observability and runtime semantics.
    - Problem: token usage and fusion behavior are invisible.
    - Track: attention entropy, effective token count, avg max attention, token
-     usage, gate values, raw/fused feature norms, PE scale.
+     usage, raw/fused feature norms, compressor geometry stats, and experiment
+     semantics in summaries.
    - No new loss and no behavior change when disabled.
-   - Detail: `steps/05_geomatch_near_term.md`
+   - Detail: `steps/10_runtime_observability_and_semantics.md`
 
 10. `[designing]` Add compressor geometry contract and ablations.
    - Problem: key layer and geometry scale may be hidden bottlenecks.
@@ -646,9 +648,9 @@ Detail:
 
 - `steps/09_module_mode_contract.md`
 
-### 11. Diagnostic-Only Observability
+### 11. Runtime Observability And Experiment Semantics
 
-Status: `[todo]`
+Status: `[done]`
 
 Problem:
 
@@ -665,8 +667,10 @@ Why this matters:
 Recommended direction:
 
 - Add optional diagnostics that are off by default.
-- First implementation should not add loss and should not change outputs when
-  disabled.
+- Save requested/effective experiment semantics in eval and best-checkpoint
+  summaries.
+- Add S1/S2-G trainability and optimizer contract guards.
+- Do not add loss and do not change outputs when diagnostics are disabled.
 
 Metrics:
 
@@ -683,10 +687,12 @@ Verification:
 
 - Diagnostics can be enabled for selected runs.
 - Normal runs remain unchanged when diagnostics are disabled.
+- Eval summaries include requested/effective mode, key slice, FPS policy, S1
+  step mode, and ACE-G fusion mode.
 
 Detail:
 
-- `steps/05_geomatch_near_term.md`
+- `steps/10_runtime_observability_and_semantics.md`
 
 ### 12. Compressor Geometry Contract And Ablations
 
