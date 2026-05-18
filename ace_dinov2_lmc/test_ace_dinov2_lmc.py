@@ -44,6 +44,14 @@ DATA_ROOT = Path(os.environ.get("ACE_DATA_ROOT", "/home/xwh/data"))
 _WARNED_DSACSTAR_SEEDING = False
 
 
+def _torch_load_trusted_checkpoint(path, *, map_location='cpu'):
+    """Load a local project checkpoint while making pickle semantics explicit."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def _normalize_device_for_visible_cuda(device_str):
     """Map a physical cuda:N request to logical cuda:0 after CUDA_VISIBLE_DEVICES narrowing."""
     device_str = str(device_str or "cuda:0")
@@ -191,6 +199,42 @@ def _is_lmc_checkpoint(checkpoint):
     return isinstance(checkpoint, dict) and 'lmc_config' in checkpoint
 
 
+def _log_fusion_runtime_stats(stage_tag: str, call_idx: int, stats: Dict[str, Any]):
+    if not stats:
+        return
+    top5 = stats.get("token_usage_top5", [])
+    top5_str = ",".join(f"{float(v):.4f}" for v in top5)
+    _logger.info(
+        "[LMC-EvalRuntime][%s] call=%d entropy_mean=%.4f p10=%.4f p50=%.4f p90=%.4f "
+        "effective_tokens=%.2f avg_max=%.4f usage_min=%.5f usage_max=%.5f top5=[%s] "
+        "raw_norm=%.4f attn_out_norm=%.4f fused_norm=%.4f queries=%d tokens=%d "
+        "fusion_mode=%s scene_scale=%.6f key_geo_scale=%.6f p_norm_std=%.4f "
+        "p_norm_absmax=%.4f p_norm_finite=%s",
+        stage_tag,
+        int(call_idx),
+        float(stats.get("attn_entropy_mean", 0.0)),
+        float(stats.get("attn_entropy_p10", 0.0)),
+        float(stats.get("attn_entropy_p50", 0.0)),
+        float(stats.get("attn_entropy_p90", 0.0)),
+        float(stats.get("effective_token_count", 0.0)),
+        float(stats.get("avg_max_attention", 0.0)),
+        float(stats.get("token_usage_min", 0.0)),
+        float(stats.get("token_usage_max", 0.0)),
+        top5_str,
+        float(stats.get("raw_feature_norm", 0.0)),
+        float(stats.get("attention_out_norm", 0.0)),
+        float(stats.get("fused_feature_norm", 0.0)),
+        int(stats.get("num_queries_used", 0)),
+        int(stats.get("num_tokens", 0)),
+        str(stats.get("fusion_geometry_mode", "n/a")),
+        float(stats.get("fusion_scene_scale", 0.0)),
+        float(stats.get("key_geo_scale", 0.0)),
+        float(stats.get("memory_p_norm_std", 0.0)),
+        float(stats.get("memory_p_norm_absmax", 0.0)),
+        str(stats.get("memory_p_norm_finite", "n/a")),
+    )
+
+
 def run_evaluation_lmc(opt):
     """Run evaluation. Auto-detects LMC vs vanilla checkpoint.
 
@@ -210,6 +254,9 @@ def run_evaluation_lmc(opt):
     dsacstar_seed = int(getattr(opt, 'dsacstar_seed', 1305))
     dsacstar_seed_per_frame = bool(getattr(opt, 'dsacstar_seed_per_frame', True))
     eval_num_workers = int(getattr(opt, 'eval_num_workers', 6))
+    lmc_log_runtime_stats = bool(getattr(opt, 'lmc_log_runtime_stats', False))
+    lmc_runtime_stats_interval = max(1, int(getattr(opt, 'lmc_runtime_stats_interval', 100)))
+    lmc_runtime_stats_max_pixels = max(1, int(getattr(opt, 'lmc_runtime_stats_max_pixels', 4096)))
 
     if eval_deterministic:
         _configure_eval_determinism(dsacstar_seed)
@@ -229,7 +276,7 @@ def run_evaluation_lmc(opt):
                  torch.cuda.device_count() if torch.cuda.is_available() else 0)
 
     # Load checkpoint
-    checkpoint = torch.load(head_network_path, map_location='cpu')
+    checkpoint = _torch_load_trusted_checkpoint(head_network_path, map_location='cpu')
     is_lmc = _is_lmc_checkpoint(checkpoint)
 
     if is_lmc:
@@ -285,6 +332,14 @@ def run_evaluation_lmc(opt):
             scale_token_dim=lmc_config.get('scale_token_dim', 1024),
             num_attn_layers=lmc_config.get('num_attn_layers', 2),
             pe_normalize_input=lmc_config.get('pe_normalize_input', False),
+            pe_scale_mode=lmc_config.get(
+                'lmc_compressor_pe_scale_mode',
+                'std' if lmc_config.get('pe_normalize_input', False) else 'raw',
+            ),
+            pe_scene_scale=lmc_config.get(
+                'lmc_compressor_pe_scene_scale',
+                lmc_config.get('lmc_fusion_scene_scale', 1.0),
+            ),
             fps_start_policy=lmc_config.get('lmc_fps_start_policy', 'farthest_from_center'),
             key_slice_idx=lmc_config.get('lmc_key_slice_idx', None),
         ).to(device)
@@ -296,6 +351,9 @@ def run_evaluation_lmc(opt):
             mode=lmc_config.get('lmc_mode', 'global'),
             query_feature_dim=backbone_feature_dim,
             memory_feature_dim=compress_dim,
+            fusion_geometry_mode=lmc_config.get('lmc_fusion_geometry_mode', 'value_only_raw'),
+            fusion_scene_scale=lmc_config.get('lmc_fusion_scene_scale', 1.0),
+            fusion_key_geo_init=lmc_config.get('lmc_fusion_key_geo_init', 0.0),
         ).to(device)
         fusion.load_state_dict(checkpoint['fusion_state_dict'])
         fusion.eval()
@@ -374,6 +432,7 @@ def run_evaluation_lmc(opt):
     rErrs, tErrs = [], []
     pct25_5 = pct10_5 = pct5 = pct2 = pct1 = 0
     frame_idx = 0
+    lmc_runtime_stats_calls = 0
 
     with torch.no_grad():
         for image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames in testset_loader:
@@ -404,7 +463,21 @@ def run_evaluation_lmc(opt):
                     else:
                         compressor_out_batch = compressor_out_cached
                     query = features.permute(0, 2, 3, 1).reshape(B, H * W, C)
-                    fused = fusion(query, compressor_out_batch, sc)
+                    lmc_runtime_stats_calls += 1
+                    collect_stats = lmc_log_runtime_stats and (
+                        lmc_runtime_stats_calls == 1
+                        or lmc_runtime_stats_calls % lmc_runtime_stats_interval == 0
+                    )
+                    fused = fusion(
+                        query,
+                        compressor_out_batch,
+                        sc,
+                        return_stats=collect_stats,
+                        stats_max_pixels=lmc_runtime_stats_max_pixels,
+                    )
+                    if collect_stats:
+                        fused, stats = fused
+                        _log_fusion_runtime_stats("EvalFusion", lmc_runtime_stats_calls, stats)
                     features = fused.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
                 scene_coordinates_B3HW = network.get_scene_coordinates(features)
@@ -541,8 +614,17 @@ def run_evaluation_lmc(opt):
             "lmc_key_layer_label": lmc_config.get("lmc_key_layer_label"),
             "layers_idx": lmc_config.get("layers_idx"),
             "lmc_fps_start_policy": lmc_config.get("lmc_fps_start_policy"),
+            "lmc_compressor_pe_scale_mode": lmc_config.get("lmc_compressor_pe_scale_mode"),
+            "lmc_compressor_pe_scene_scale": lmc_config.get("lmc_compressor_pe_scene_scale"),
             "s1_loss_step_mode": lmc_config.get("s1_loss_step_mode"),
             "ace_g_fusion_in_s2": lmc_config.get("ace_g_fusion_in_s2"),
+            "lmc_fusion_geometry_mode": lmc_config.get("lmc_fusion_geometry_mode"),
+            "lmc_fusion_key_geo_init": lmc_config.get("lmc_fusion_key_geo_init"),
+            "lmc_fusion_scene_scale": lmc_config.get("lmc_fusion_scene_scale"),
+            "lmc_fusion_scene_scale_source": lmc_config.get("lmc_fusion_scene_scale_source"),
+            "lmc_log_runtime_stats": lmc_log_runtime_stats,
+            "lmc_runtime_stats_interval": lmc_runtime_stats_interval,
+            "lmc_runtime_stats_max_pixels": lmc_runtime_stats_max_pixels,
         }
         for key, value in semantic_fields.items():
             if isinstance(value, (list, tuple)):
@@ -590,6 +672,12 @@ if __name__ == '__main__':
     parser.add_argument('--eval_num_workers', type=int, default=6)
     parser.add_argument('--log_per_frame', type=_strtobool, default=False,
                         help='Print each frame’s rErr (deg) and tErr (cm) after evaluation.')
+    parser.add_argument('--lmc_log_runtime_stats', type=_strtobool, default=False,
+                        help='Log diagnostic-only LMC fusion attention/runtime stats during eval.')
+    parser.add_argument('--lmc_runtime_stats_interval', type=int, default=100,
+                        help='Fusion call interval for LMC runtime stats when enabled.')
+    parser.add_argument('--lmc_runtime_stats_max_pixels', type=int, default=4096,
+                        help='Maximum query pixels sampled for LMC runtime attention stats.')
 
     opt = parser.parse_args()
     if opt.ensemble_networks:

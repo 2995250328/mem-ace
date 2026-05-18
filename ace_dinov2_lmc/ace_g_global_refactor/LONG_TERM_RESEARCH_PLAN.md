@@ -8,7 +8,8 @@ Near-term, compatibility-focused work remains in `PLAN.md` and `steps/`.
 ## Guiding Rule
 
 Do not implement these before the true-global ACE-G baseline, attention
-diagnostics, and GeoMatch Fusion v1 ablations are understood.
+diagnostics, and Progressive Geometry Injection / GeoKey v0 ablations are
+understood.
 
 Each item below changes multiple contracts at once and should get its own
 experiment family, output directory, and checkpoint metadata.
@@ -19,7 +20,7 @@ The long-term items are not independent. The intended dependency is:
 
 ```text
 single-scene true-global baseline
-  -> diagnostics and GeoMatch v1
+  -> diagnostics and Progressive Geometry Injection / GeoKey v0
   -> explicit coordinate-frame metadata
   -> reference-frame memory contract
   -> normalized coordinate contract
@@ -84,6 +85,9 @@ Goal:
   coordinates.
 - Convert point clouds into the selected reference coordinate frame so features
   and 3D points are represented in the same frame.
+- Use the recorded camera/reference pose transforms explicitly for this
+  conversion; do not leave memory features in a reference-frame convention while
+  memory points stay silently in world coordinates.
 - At inference/evaluation time, predict or assemble coordinates in reference
   space, then convert back to world coordinates for DSAC / PnP.
 
@@ -190,6 +194,9 @@ Proposed direction:
 
 - Cluster reference frames or spatial regions into sub-datasets.
 - Build one sub-memory per cluster.
+- Treat the clustering step as an isolation mechanism for memory construction:
+  each clustered sub-dataset can produce its own sub-memory instead of forcing
+  unrelated regions into one FPS memory.
 - Keep a single model, but let it consume routed sub-memories.
 - Each sub-memory may need its own reference transform and possibly its own
   local scene-center-like metadata, while the global scene-center policy remains

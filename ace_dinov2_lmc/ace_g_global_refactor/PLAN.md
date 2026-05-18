@@ -2,6 +2,10 @@
 
 Scope: `--lmc_flow ace_g` with effective `lmc_mode=global`.
 
+Maintenance rule: `PLAN.md` is the source-of-truth plan. Any structural
+change to this file must be mirrored in `PLAN_CN.md` as the synchronized
+Chinese translation. Do not maintain a separate `ROADMAP_CN.md`.
+
 This file is the high-level tracker, priority map, and onboarding summary for
 new agents. It should be detailed enough to understand the problem and intended
 solution without immediately reading source code. Concrete implementation notes
@@ -63,6 +67,10 @@ Symptoms:
 
 - Key feature selection was implicit; it is now explicit, but not yet ablated.
 - Current default is effectively slice 2 / layer 12.
+- The current multi-layer memory contract is conservative: key uses one selected
+  layer, while value keeps all-layer concatenation. It is not yet decided
+  whether a later LMC should use a DPT-style fused memory feature or explicit
+  multi-level compression/fusion.
 - PE and distance bias use raw scene coordinates, so geometry frequency/scale
   differs across scenes.
 - Distance bias currently uses a scalar `log(dist_sq)` style signal.
@@ -95,7 +103,9 @@ Risk:
 
 Status:
 
-- Planned as a controlled GeoMatch Fusion v1 ablation. See step 05.
+- Implemented as Progressive Geometry Injection / GeoKey v0. The first fusion
+  change is a falsifiable memory-side geometry probe, not full GeoMatch. A0/A1/A2
+  experiments are pending. See step 05.
 
 ### P4 - Token Usage Needed Observability
 
@@ -170,13 +180,24 @@ avoid mixing a baseline cleanup with larger research changes.
 These items are relevant after the current true-global baseline comparison,
 but should be added as controlled ablations with diagnostic logs:
 
-- Diagnostic-only fusion/token observability.
-- GeoMatch Fusion v1: geometry into fusion key logits while preserving the
-  current value-only path as the exact baseline.
+- Diagnostic-only fusion/token observability is already implemented and remains
+  the required explanation layer for new fusion ablations.
+- Progressive Geometry Injection / GeoKey v0 is implemented behind explicit
+  fusion flags: first test scene-scale-normalized value geometry, then add
+  memory geometry into fusion keys with a zero-init scalar gate. This does not
+  use query 3D coordinates and should not be treated as full GeoMatch.
+- Detached token-routing prior is now preferred before any coordinate-based
+  coarse GeoMatch. It predicts a distribution over memory tokens and can remain
+  multi-modal, instead of forcing a pre-fusion raw feature into a single 3D
+  coordinate.
 - Compressor key-layer ablations, starting from the current layer 12 baseline.
+- Memory feature hierarchy ablations after the basic key-layer result: current
+  selected-layer key/all-layer value, key scalar mix, DPT-style fused memory
+  feature, or explicit multi-level compressor/fusion.
 - Compressor/fusion geometry scale diagnostics and a shared scene-scale
   encoding contract for PE and distance bias.
-- Shared reprojection/invalid-loss helper, preserving current behavior first.
+- Shared reprojection/invalid-loss helper is done for the current
+  compatibility-preserving path.
 
 ### Long-Term System Work
 
@@ -263,15 +284,23 @@ ablations:
    - Problem: key layer and geometry scale may be hidden bottlenecks.
    - First ablations: layer 12 baseline, layer 18, layer 6, final, learned
      scalar mix.
+   - Later ablations should decide whether memory layers stay as selected-key /
+     all-layer-value, collapse through a DPT-style feature neck, or remain
+     explicit through multi-level compression/fusion.
    - Scene-scale contract comes before PE/distance-bias redesign.
    - Detail: `steps/06_compressor_geometry_contract.md`
 
 ### Priority 4 - Controlled Architecture Ablations
 
-11. `[todo]` GeoMatch Fusion v1.
+11. `[done]` Progressive Geometry Injection / GeoKey v0.
    - Problem: geometry does not affect query-memory matching logits.
-   - Ablation: `value_only` vs `gated_key_value`.
-   - Preserve old value geometry behavior as closely as possible.
+   - Implemented ablation modes: A0 current value-only raw PE, A1 value-only
+     normalized PE, A2 normalized PE plus memory-side GeoKey.
+   - Treat A1/A2 as probes. No result here can by itself prove or disprove full
+     query-memory GeoMatch.
+   - Hard constraints: keep A0 exactly compatible, initialize the GeoKey scalar
+     gate at zero, fix `lmc_key_slice_idx=2` for the first run, and record the
+     scene-scale source/value in logs and checkpoint metadata.
    - Detail: `steps/05_geomatch_near_term.md`
 
 12. `[todo]` Usage regularization only if diagnostics justify it.
@@ -289,12 +318,27 @@ ablations:
 
 ### Priority 5 - Medium/Long-Term Research
 
-14. `[designing]` Anchor-assisted residual branch as auxiliary only.
+14. `[designing]` Detached token-routing prior before coordinate GeoMatch.
     - Keep ACE head as primary output.
-    - Add anchor-relative branch only after GeoMatch and diagnostics are stable.
+    - Prefer predicting a detached memory-token distribution
+      `r(token | query)` and adding `g * log(r + eps)` as a weak residual logit
+      prior before adding any coarse-coordinate distance bias.
+    - This is safer than a single coarse 3D point because it can keep ambiguous
+      or repeated-texture patches multi-modal.
+    - Only attempt after A0/A1/A2 and attention diagnostics are understood.
     - Detail: `steps/05_geomatch_near_term.md`
 
-15. `[deferred]` Larger research changes.
+15. `[designing]` Confidence-gated coarse-coordinate GeoMatch as a later weak prior.
+    - Do not treat detached coarse coordinates as the default next step after
+      GeoKey. A bad coarse coordinate can pull attention into the wrong memory
+      region and make refinement unrecoverable.
+    - If implemented, it must be a fallback-safe residual: zero/warmup global
+      gate, per-query confidence, normalized coordinates, nearby reward rather
+      than far-token punishment, and image feature logits remain the main path.
+    - Anchor-relative branch remains auxiliary only.
+    - Detail: `steps/05_geomatch_near_term.md`
+
+16. `[deferred]` Larger research changes.
     - Full normalized-coordinate target training.
     - Reference-frame memory coordinate contract.
     - DSD/local/deformable compressor.
@@ -661,8 +705,8 @@ Problem:
 Why this matters:
 
 - Usage loss is risky unless collapse is proven.
-- GeoMatch Fusion improvements should be explainable by routing/token behavior,
-  not only pose metrics.
+- Progressive Geometry Injection improvements should be explainable by
+  routing/token behavior, not only pose metrics.
 
 Recommended direction:
 
@@ -681,7 +725,7 @@ Metrics:
 - raw feature norm
 - attention output norm
 - fused feature norm
-- geometry gate/scale values when GeoMatch is enabled
+- geometry gate/scale values when GeoKey is enabled
 
 Verification:
 
@@ -701,6 +745,8 @@ Status: `[designing]`
 Problem:
 
 - Key layer is explicit but not yet ablated.
+- Multi-layer memory usage is not yet settled beyond the current
+  selected-layer key plus all-layer-concat value contract.
 - PE and distance bias still use raw scene coordinates.
 - Distance-bias geometry is narrow: mostly scalar distance/log-distance.
 
@@ -716,13 +762,18 @@ Recommended direction:
 - Start with key-layer ablations:
   layer 12, layer 18, layer 6, final, learned scalar mix.
 - Then define scene-scale policy.
+- After key-layer and scene-scale basics, test memory feature hierarchy
+  variants:
+  current selected-layer key/all-layer value, key scalar mix, DPT-style fused
+  memory feature, and explicit multi-level compressor/fusion.
 - Only after scene-scale contract, test PE and distance-bias variants.
 
 Do not mix:
 
 - key-layer ablation
-- GeoMatch Fusion v1
+- Progressive Geometry Injection / GeoKey v0
 - scene-scale PE changes
+- DPT-style or explicit multi-level memory feature fusion
 
 Each should be its own ablation.
 
@@ -730,32 +781,50 @@ Detail:
 
 - `steps/06_compressor_geometry_contract.md`
 
-### 13. GeoMatch Fusion v1
+### 13. Progressive Geometry Injection / GeoKey v0
 
-Status: `[todo]`
+Status: `[done]`
 
 Problem:
 
 - Current fusion geometry only affects values, not query-memory matching logits.
+- Query-side 3D coordinates are not reliable before fusion, so the first
+  geometry-logit change must not depend on query geometry.
 
 Recommended direction:
 
-- Keep `value_only` as exact baseline.
-- Add `gated_key_value` as controlled ablation.
-- Key geometry starts near zero.
-- Value geometry should preserve old behavior as closely as possible.
+- A0: keep current value-only raw centered PE as the exact baseline.
+- A1: value-only with explicit scene-scale-normalized memory geometry.
+- A2: A1 plus memory-side GeoKey:
+  `k_input = memory_z + key_geo_scale * pe_mem`.
+- Fix `lmc_key_slice_idx=2` for the first A0/A1/A2 comparison so key-layer
+  ablations do not contaminate fusion geometry results.
+- Use scene scale from stable memory metadata or a precomputed memory-point
+  statistic, not from per-forward latent coordinates that may later move.
 
 Important compatibility note:
 
 - Current value path is equivalent to `value_geo_scale=1.0`.
 - A sigmoid gate initialized at zero gives `0.5`, which is not exactly old
-  behavior.
+  behavior. Prefer a direct scalar parameter initialized to `0.0` for GeoKey so
+  A2 starts exactly as A1.
+- A1/A2 are probes. A2 over A1 supports memory-side geometry in keys; A2 flat
+  against A1 does not disprove later query-side priors, but it also does not
+  justify jumping directly to coordinate-distance bias.
+- Implemented CLI:
+  `--lmc_fusion_geometry_mode {value_only_raw,value_only_norm,geokey_norm}`,
+  `--lmc_fusion_key_geo_init`,
+  `--lmc_fusion_scene_scale_source {memory_points_p95,fixed}`, and
+  `--lmc_fusion_scene_scale_value`.
 
 Verification:
 
 - Old checkpoints load.
-- Logs/checkpoints identify fusion geometry mode.
-- Compare against true-global value-only baseline.
+- Logs/checkpoints identify fusion geometry mode, scene-scale source/value, and
+  learned key geometry scale.
+- A0 reconstructs the current baseline exactly.
+- Compare A1/A2 against the true-global `forceglobal_s1_periter` value-only
+  baseline and inspect routing diagnostics, not only pose metrics.
 
 Detail:
 
@@ -803,7 +872,7 @@ Problem:
 Recommended direction:
 
 - Consider `query_feats + residual_gate * attention_out`.
-- Lower priority than diagnostics and GeoMatch key geometry.
+- Lower priority than diagnostics and GeoKey geometry.
 
 Verification:
 
@@ -814,18 +883,76 @@ Detail:
 
 - `steps/05_geomatch_near_term.md`
 
-### 16. Anchor-Assisted Residual Branch
+### 16. Detached Token-Routing Prior
 
 Status: `[designing]`
 
 Problem:
 
-- Absolute coordinate regression may be harder than anchor-relative residual
-  prediction.
+- Full query-memory geometry bias wants query-side information, but pre-fusion
+  query 3D from raw features is not reliable.
+- A single coarse coordinate can be structurally wrong in repeated texture,
+  weak texture, or room/region aliasing cases.
+- If that wrong coordinate is used as a distance bias, it can reward the wrong
+  memory region and suppress recovery by the refined head.
+
+Recommended direction:
+
+- Prefer a detached token-routing prior before coordinate-based GeoMatch.
+- Predict a distribution over memory tokens:
+  `r_ik = P(memory token k | query i)`.
+- Add it to fusion logits only as a weak residual prior:
+  `logits = image_logits + g * log(r_ik + eps)`.
+- Initialize `g=0` and cap or warm it up until diagnostics show the prior is
+  useful.
+- Keep the ACE head as the primary output.
+
+Why this comes before coarse coordinates:
+
+- A distribution can remain multi-modal, which is important for ambiguous
+  patches.
+- It does not require choosing one possibly wrong 3D point before fusion.
+- It is closer to a coarse matching prior than to hard coordinate refinement.
+
+Verification:
+
+- Compare against A1/A2 with attention diagnostics enabled.
+- Check whether routing entropy, top-token maps, and pose metrics improve
+  together.
+- Reject or keep diagnostic-only if it merely sharpens wrong attention.
+
+Detail:
+
+- `steps/05_geomatch_near_term.md`
+
+### 17. Confidence-Gated Coarse-Coordinate GeoMatch / Anchor-Assisted Branches
+
+Status: `[designing]`
+
+Problem:
+
+- Coordinate-based GeoMatch needs query-side 3D, but pre-fusion query 3D is not
+  reliable.
+- Absolute coordinate regression may also be harder than anchor-relative
+  residual prediction.
 
 Recommended direction:
 
 - Keep ACE head as the primary output.
+- Only consider detached coarse query-coordinate bias after A1/A2 diagnostics
+  and the token-routing prior clarify whether memory-side geometry and routing
+  are useful.
+- Treat coarse-coordinate GeoMatch as a confidence-gated weak prior, not as a
+  hard coarse-to-fine refinement assumption.
+- Use a zero-init or warmup global gate, detach the coarse coordinate, normalize
+  by the same scene-scale contract as A1/A2, and keep image feature logits as
+  the dominant matching path.
+- Prefer nearby reward, such as `alpha * exp(-d^2 / tau)`, over a global
+  negative-distance penalty that suppresses all far tokens.
+- Add per-query confidence before applying the bias. Inference-compatible first
+  choices are coarse-to-memory nearest distance and/or a predicted uncertainty;
+  training-only reprojection validity may be useful for diagnostics but cannot
+  be the inference gate.
 - Add anchor-relative branch only as auxiliary.
 - Start with small loss weights such as `0.05` or `0.1`.
 
@@ -833,6 +960,8 @@ Do not do yet:
 
 - Do not replace ACE head.
 - Do not make anchor-only the primary path until auxiliary branch proves useful.
+- Do not let coarse coordinates dominate attention logits.
+- Do not add a hard distance penalty without a fallback to image logits.
 
 Detail:
 

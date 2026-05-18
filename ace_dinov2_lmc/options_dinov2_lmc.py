@@ -569,6 +569,16 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        '--lmc_compressor_pe_scale_mode',
+        type=str,
+        default=None,
+        choices=['raw', 'std', 'scene_scale'],
+        help=(
+            'Compressor Fourier PE 输入坐标尺度策略。None 表示兼容旧行为：'
+            '--pe_normalize_input False -> raw，True -> std；scene_scale 使用与 fusion 相同的 scene_scale。'
+        ),
+    )
+    parser.add_argument(
         '--lmc_mode',
         type=str,
         default='global',
@@ -652,6 +662,36 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=int,
         default=4096,
         help='计算 attention/token stats 时最多抽样的 query pixel/token 数。仅保存标量，不保存 attention tensor。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_geometry_mode',
+        type=str,
+        default='value_only_raw',
+        choices=['value_only_raw', 'value_only_norm', 'geokey_norm'],
+        help=(
+            'Fusion geometry 注入模式。value_only_raw=旧行为，raw centered memory_p 只进 value；'
+            'value_only_norm=scene-scale normalized memory_p 只进 value；'
+            'geokey_norm=normalized memory_p 同时以零初始化 scalar gate 进入 key。'
+        ),
+    )
+    parser.add_argument(
+        '--lmc_fusion_key_geo_init',
+        type=float,
+        default=0.0,
+        help='geokey_norm 中 key geometry scalar gate 的初始值。默认 0.0，使 A2 初始严格等价 A1。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_scene_scale_source',
+        type=str,
+        default='memory_points_p95',
+        choices=['memory_points_p95', 'fixed'],
+        help='Fusion geometry normalization 的 scene_scale 来源。memory_points_p95=P95(||pooled_points-scene_center||)；fixed=使用显式 value。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_scene_scale_value',
+        type=float,
+        default=None,
+        help='当 --lmc_fusion_scene_scale_source fixed 时使用的正数 scene_scale。',
     )
     parser.add_argument(
         '--s1_batch_size',

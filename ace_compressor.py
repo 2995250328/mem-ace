@@ -20,9 +20,23 @@ class FourierPositionEncoding(nn.Module):
     """3D Positional Encoding using Random Fourier Features."""
 
     def __init__(self, input_dim=3, hidden_dim=256, output_dim=1024,
-                 num_frequencies=10, sigma=1.0, normalize_input=False):
+                 num_frequencies=10, sigma=1.0, normalize_input=False,
+                 scale_mode=None, scene_scale=1.0):
         super().__init__()
+        if scale_mode is None:
+            scale_mode = "std" if normalize_input else "raw"
+        if scale_mode not in ("raw", "std", "scene_scale"):
+            raise ValueError(f"Unsupported PE scale_mode={scale_mode!r}.")
         self.normalize_input = normalize_input
+        self.scale_mode = scale_mode
+        scene_scale = float(scene_scale)
+        if (not torch.isfinite(torch.tensor(scene_scale)).item()) or scene_scale <= 0.0:
+            raise ValueError(f"scene_scale must be finite and > 0, got {scene_scale!r}")
+        self.register_buffer(
+            "scene_scale",
+            torch.tensor(scene_scale, dtype=torch.float32),
+            persistent=False,
+        )
         self.register_buffer(
             "B_gauss", torch.randn(input_dim, num_frequencies) * sigma)
         self.mlp = nn.Sequential(
@@ -32,8 +46,11 @@ class FourierPositionEncoding(nn.Module):
         )
 
     def forward(self, coords):
-        if self.normalize_input:
+        if self.scale_mode == "std":
             coords = coords / (coords.std(dim=1, keepdim=True).clamp(min=1e-6))
+        elif self.scale_mode == "scene_scale":
+            scale = self.scene_scale.to(device=coords.device, dtype=coords.dtype)
+            coords = coords / scale.clamp(min=1e-6)
         projected = torch.matmul(coords, self.B_gauss)
         fourier = torch.cat([torch.sin(2 * math.pi * projected),
                              torch.cos(2 * math.pi * projected)], dim=-1)
@@ -264,6 +281,8 @@ class GeoLMC(nn.Module):
                  scale_token_dim=None,
                  num_attn_layers=2,
                  pe_normalize_input=False,
+                 pe_scale_mode=None,
+                 pe_scene_scale=1.0,
                  fps_start_policy="farthest_from_center",
                  key_slice_idx=None):
         super().__init__()
@@ -276,11 +295,20 @@ class GeoLMC(nn.Module):
         self.use_scale_token = use_scale_token
         self.fps_start_policy = fps_start_policy
         self.key_slice_idx = self._resolve_key_slice_idx(key_slice_idx)
+        self.pe_scale_mode = pe_scale_mode if pe_scale_mode is not None else (
+            "std" if pe_normalize_input else "raw"
+        )
+        self.pe_scene_scale = float(pe_scene_scale)
 
         # --- Input Projection ---
         self.total_input_dim = input_dim * num_layers
         self.pe_encoder = FourierPositionEncoding(
-            input_dim=3, output_dim=compress_dim, normalize_input=pe_normalize_input)
+            input_dim=3,
+            output_dim=compress_dim,
+            normalize_input=pe_normalize_input,
+            scale_mode=self.pe_scale_mode,
+            scene_scale=self.pe_scene_scale,
+        )
         self.k_proj = nn.Linear(input_dim, compress_dim)
         self.v_proj = nn.Sequential(
             nn.Linear(self.total_input_dim, compress_dim * 2),
@@ -455,8 +483,12 @@ class GeoLMC(nn.Module):
         # One-time PE diagnostic log
         if not hasattr(self, '_pe_logged'):
             _logger.info(
-                "[PE] input range: %.3f~%.3f, output range: %.3f~%.3f",
+                "[PE] scale_mode=%s scene_scale=%.6f input range: %.3f~%.3f, "
+                "input_std=%.4f, output range: %.3f~%.3f",
+                self.pe_scale_mode,
+                self.pe_scene_scale,
                 float(norm_coords.min()), float(norm_coords.max()),
+                float(norm_coords.std(unbiased=False)),
                 float(q.min()), float(q.max()),
             )
             self._pe_logged = True

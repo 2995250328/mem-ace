@@ -94,7 +94,7 @@ Additional checks:
 ## Non-Goals
 
 - No compressor/fusion attention diagnostics in this step.
-- No GeoMatch Fusion v1.
+- No Progressive Geometry Injection / GeoKey v0.
 - No usage loss.
 - No coordinate normalization contract change.
 - No sub-memory or multi-scene routing change.

@@ -92,6 +92,36 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return [TrainerACEDINOv2LMC._tensor_to_config_value(v) for v in value]
         return value
 
+    def _resolve_lmc_geometry_scene_scale(self, needs_scene_scale: bool):
+        """Resolve the fixed scene scale used by PE/fusion geometry normalization."""
+        source = str(getattr(self.options, "lmc_fusion_scene_scale_source", "memory_points_p95"))
+        if not needs_scene_scale:
+            return 1.0, "unused_raw_geometry"
+
+        if source == "fixed":
+            value = getattr(self.options, "lmc_fusion_scene_scale_value", None)
+            if value is None:
+                raise ValueError("[LMC-Geometry] fixed scene scale requires --lmc_fusion_scene_scale_value.")
+            scale = float(value)
+        elif source == "memory_points_p95":
+            pooled_points = self.memory_dict["pooled_points"].detach().float()
+            scene_center = self.memory_dict["scene_center"].detach().float()
+            if scene_center.ndim == 1:
+                scene_center = scene_center.unsqueeze(0)
+            if scene_center.ndim == 2:
+                scene_center = scene_center.unsqueeze(1)
+            centered = pooled_points - scene_center
+            radius = torch.linalg.norm(centered, dim=-1).flatten()
+            if radius.numel() == 0:
+                raise ValueError("[LMC-Geometry] Cannot compute scene_scale from empty pooled_points.")
+            scale = float(torch.quantile(radius, 0.95).item())
+        else:
+            raise ValueError(f"[LMC-Geometry] Unsupported lmc_fusion_scene_scale_source={source!r}")
+
+        if (not torch.isfinite(torch.tensor(scale)).item()) or scale <= 1e-6:
+            raise ValueError(f"[LMC-Geometry] Invalid scene_scale={scale!r} from source={source!r}")
+        return scale, source
+
     @staticmethod
     def _capture_module_training_modes(*modules):
         """Capture exact train/eval flags for modules that may be toggled temporarily."""
@@ -1211,6 +1241,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             )
 
         pe_normalize_input = bool(getattr(options, 'pe_normalize_input', False))
+        requested_compressor_pe_scale_mode = getattr(options, 'lmc_compressor_pe_scale_mode', None)
+        if requested_compressor_pe_scale_mode is None:
+            compressor_pe_scale_mode = 'std' if pe_normalize_input else 'raw'
+        else:
+            compressor_pe_scale_mode = str(requested_compressor_pe_scale_mode)
+        if compressor_pe_scale_mode not in ('raw', 'std', 'scene_scale'):
+            raise ValueError(f"Unsupported lmc_compressor_pe_scale_mode={compressor_pe_scale_mode!r}")
         lmc_fps_start_policy = str(getattr(options, 'lmc_fps_start_policy', 'farthest_from_center'))
         requested_s1_loss_step_mode = getattr(options, 's1_loss_step_mode', None)
         lmc_profile_for_s1_step = str(getattr(options, 'lmc_profile', 'legacy'))
@@ -1229,6 +1266,25 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.lmc_runtime_stats_interval = max(1, int(getattr(options, 'lmc_runtime_stats_interval', 100)))
         self.lmc_runtime_stats_max_pixels = max(1, int(getattr(options, 'lmc_runtime_stats_max_pixels', 4096)))
         self._lmc_runtime_stats_calls = 0
+        lmc_fusion_geometry_mode = str(getattr(options, 'lmc_fusion_geometry_mode', 'value_only_raw'))
+        if lmc_fusion_geometry_mode not in ('value_only_raw', 'value_only_norm', 'geokey_norm'):
+            raise ValueError(f"Unsupported lmc_fusion_geometry_mode={lmc_fusion_geometry_mode!r}")
+        lmc_fusion_key_geo_init = float(getattr(options, 'lmc_fusion_key_geo_init', 0.0))
+        needs_scene_scale = (
+            lmc_fusion_geometry_mode != 'value_only_raw'
+            or compressor_pe_scale_mode == 'scene_scale'
+        )
+        lmc_geometry_scene_scale, lmc_geometry_scene_scale_source = self._resolve_lmc_geometry_scene_scale(
+            needs_scene_scale
+        )
+        _logger.info(
+            "[LMC-Geometry] fusion_mode=%s compressor_pe_scale=%s scene_scale=%.6f source=%s key_geo_init=%.6f",
+            lmc_fusion_geometry_mode,
+            compressor_pe_scale_mode,
+            lmc_geometry_scene_scale,
+            lmc_geometry_scene_scale_source,
+            lmc_fusion_key_geo_init,
+        )
 
         self.lmc_config = {
             'use_lmc': True,
@@ -1249,12 +1305,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'lmc_key_layer_label': self._tensor_to_config_value(key_layer_label),
             'geo_sigma': geo_sigma,
             'pe_normalize_input': pe_normalize_input,
+            'lmc_compressor_pe_scale_mode': compressor_pe_scale_mode,
+            'lmc_compressor_pe_scene_scale': lmc_geometry_scene_scale,
             'lmc_fps_start_policy': lmc_fps_start_policy,
             's1_loss_step_mode': s1_loss_step_mode,
             'requested_s1_loss_step_mode': requested_s1_loss_step_mode,
             'lmc_log_runtime_stats': self.lmc_log_runtime_stats,
             'lmc_runtime_stats_interval': self.lmc_runtime_stats_interval,
             'lmc_runtime_stats_max_pixels': self.lmc_runtime_stats_max_pixels,
+            'lmc_fusion_geometry_mode': lmc_fusion_geometry_mode,
+            'lmc_fusion_key_geo_init': lmc_fusion_key_geo_init,
+            'lmc_fusion_scene_scale': lmc_geometry_scene_scale,
+            'lmc_fusion_scene_scale_source': lmc_geometry_scene_scale_source,
             'ace_g_fusion_in_s2': bool(getattr(options, 'ace_g_fusion_in_s2', False)),
             'backbone_feature_dim': backbone_feature_dim,
             'scale_token_dim': scale_token_dim,
@@ -1299,6 +1361,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             scale_token_dim=scale_token_dim,
             num_attn_layers=num_attn_layers,
             pe_normalize_input=pe_normalize_input,
+            pe_scale_mode=compressor_pe_scale_mode,
+            pe_scene_scale=lmc_geometry_scene_scale,
             fps_start_policy=lmc_fps_start_policy,
             key_slice_idx=resolved_key_slice_idx,
         ).to(self.device)
@@ -1309,6 +1373,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             mode=lmc_mode,
             query_feature_dim=backbone_feature_dim,
             memory_feature_dim=feature_dim,
+            fusion_geometry_mode=lmc_fusion_geometry_mode,
+            fusion_scene_scale=lmc_geometry_scene_scale,
+            fusion_key_geo_init=lmc_fusion_key_geo_init,
         ).to(self.device)
 
         # --- LMC training params ---
@@ -2248,11 +2315,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "lmc_key_slice_idx",
             "lmc_key_layer_label",
             "lmc_fps_start_policy",
+            "pe_normalize_input",
+            "lmc_compressor_pe_scale_mode",
+            "lmc_compressor_pe_scene_scale",
             "s1_loss_step_mode",
             "requested_s1_loss_step_mode",
             "lmc_log_runtime_stats",
             "lmc_runtime_stats_interval",
             "lmc_runtime_stats_max_pixels",
+            "lmc_fusion_geometry_mode",
+            "lmc_fusion_key_geo_init",
+            "lmc_fusion_scene_scale",
+            "lmc_fusion_scene_scale_source",
         ]
         meta = {key: self._tensor_to_config_value(self.lmc_config.get(key)) for key in keys}
         meta["lmc_flow"] = str(getattr(self.options, "lmc_flow", "iterative"))
@@ -2276,7 +2350,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         _logger.info(
             "[LMC-Runtime][%s] call=%d entropy_mean=%.4f p10=%.4f p50=%.4f p90=%.4f "
             "effective_tokens=%.2f avg_max=%.4f usage_min=%.5f usage_max=%.5f top5=[%s] "
-            "raw_norm=%.4f attn_out_norm=%.4f fused_norm=%.4f queries=%d tokens=%d",
+            "raw_norm=%.4f attn_out_norm=%.4f fused_norm=%.4f queries=%d tokens=%d "
+            "fusion_mode=%s scene_scale=%.6f key_geo_scale=%.6f p_norm_std=%.4f "
+            "p_norm_absmax=%.4f p_norm_finite=%s",
             stage_tag,
             int(getattr(self, "_lmc_runtime_stats_calls", 0)),
             float(stats.get("attn_entropy_mean", 0.0)),
@@ -2293,6 +2369,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             float(stats.get("fused_feature_norm", 0.0)),
             int(stats.get("num_queries_used", 0)),
             int(stats.get("num_tokens", 0)),
+            str(stats.get("fusion_geometry_mode", "n/a")),
+            float(stats.get("fusion_scene_scale", 0.0)),
+            float(stats.get("key_geo_scale", 0.0)),
+            float(stats.get("memory_p_norm_std", 0.0)),
+            float(stats.get("memory_p_norm_absmax", 0.0)),
+            str(stats.get("memory_p_norm_finite", "n/a")),
         )
 
     def _log_compressor_runtime_stats(self, compressor_out, stage_tag: str):
@@ -2313,19 +2395,26 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 scene_center = scene_center.expand(latent_p.shape[0], -1)
             centered = latent_p - scene_center.unsqueeze(1)
             radius = torch.linalg.norm(centered, dim=-1)
+            scene_scale = float(self.lmc_config.get("lmc_compressor_pe_scene_scale", 1.0) or 1.0)
+            centered_scaled = centered / max(scene_scale, 1e-6)
             pooled_points = self.memory_dict["pooled_points"].to(device=latent_p.device, dtype=latent_p.dtype)
             dist_log = torch.log(torch.cdist(latent_p, pooled_points, p=2).pow(2) + 1e-6)
             _logger.info(
                 "[LMC-Runtime][%s] compressor K_eff=%d key_slice=%s key_layer=%s "
-                "latent_radius_mean=%.4f latent_radius_std=%.4f coord_std=%.4f "
+                "pe_scale_mode=%s scene_scale=%.6f latent_radius_mean=%.4f latent_radius_std=%.4f "
+                "coord_std=%.4f coord_scaled_std=%.4f coord_scaled_absmax=%.4f "
                 "dist_log_min=%.4f dist_log_max=%.4f dist_log_std=%.4f",
                 stage_tag,
                 int(latent_p.shape[1]),
                 str(self.lmc_config.get("lmc_key_slice_idx")),
                 str(self.lmc_config.get("lmc_key_layer_label")),
+                str(self.lmc_config.get("lmc_compressor_pe_scale_mode", "raw")),
+                scene_scale,
                 float(radius.mean().item()),
                 float(radius.std(unbiased=False).item()),
                 float(centered.std(unbiased=False).item()),
+                float(centered_scaled.std(unbiased=False).item()),
+                float(centered_scaled.abs().max().item()),
                 float(dist_log.min().item()),
                 float(dist_log.max().item()),
                 float(dist_log.std(unbiased=False).item()),

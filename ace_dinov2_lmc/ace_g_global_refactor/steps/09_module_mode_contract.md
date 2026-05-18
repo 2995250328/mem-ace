@@ -119,7 +119,7 @@ Additional smoke checks:
 
 ## Non-Goals
 
-- No GeoMatch Fusion v1.
+- No Progressive Geometry Injection / GeoKey v0.
 - No fusion/token observability.
 - No usage regularization.
 - No coordinate normalization contract change.

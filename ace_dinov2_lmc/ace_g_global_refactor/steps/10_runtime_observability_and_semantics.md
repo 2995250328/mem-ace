@@ -116,7 +116,7 @@ Additional smoke checks:
 
 ## Non-Goals
 
-- No GeoMatch Fusion v1.
+- No Progressive Geometry Injection / GeoKey v0.
 - No key-layer ablation.
 - No scene-scale PE or distance-bias normalization.
 - No usage regularization.

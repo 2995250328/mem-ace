@@ -5,7 +5,8 @@ Status: designing
 ## Purpose
 
 This step tracks compressor-side ideas from `silu/修改.md` that are useful but
-should not be mixed into the first GeoMatch Fusion change.
+should not be mixed into the first Progressive Geometry Injection / GeoKey v0
+change.
 
 This step is still a near-term ACE-G architecture item. It only concerns the
 geometry encodings consumed by the current compressor/fusion modules. It is not
@@ -23,6 +24,11 @@ The compressor already has meaningful geometry:
 
 The problem is not that the compressor has no geometry. The problem is that
 some geometry choices are still hard to interpret or scene-scale dependent.
+The current multi-layer memory contract is also conservative: key selection is
+single-layer, while value keeps the all-layer concatenation. Whether the LMC
+should first collapse memory layers into one DPT-style fused feature, or keep
+explicit multi-level features through compression/fusion, is a separate design
+question that should not be silently folded into key-layer ablations.
 
 ## Problems
 
@@ -64,7 +70,57 @@ Rationale:
 - Parameter and compute growth are limited.
 - Value still preserves full memory content.
 
-### 2. PE And Distance Bias Need A Scene-Scale Contract
+### 2. Multi-Layer Memory Feature Fusion Is Not Yet Decided
+
+Current compatibility behavior:
+
+```text
+key feature   = one selected layer slice
+value feature = concat(all_layers)
+fusion input  = compressed memory_z, not explicit per-layer memory tokens
+```
+
+Open design question:
+
+- Should memory layers be fused into one feature before LMC, similar in spirit
+  to a DPT-style neck?
+- Or should the LMC keep multi-level memory features explicit, with compression
+  and/or fusion operating over multiple layer levels?
+
+Candidate ablations, after key-layer and scene-scale basics are understood:
+
+```text
+B0: current contract
+    key = selected single layer
+    value = concat(all_layers)
+
+B1: key learned scalar mix only
+    key = sum_l softmax(w_l) * feat_l
+    value = concat(all_layers)
+
+B2: DPT-style fused memory feature
+    memory_fused = neck(feat_0, feat_6, feat_12, feat_18, feat_final)
+    key/value consume memory_fused
+
+B3: multi-level compressor/fusion
+    keep per-layer memory features explicit
+    compress or attend per level, then merge with a controlled gate/weight
+```
+
+Constraints:
+
+- Do not make B2/B3 the first ablation. They change feature hierarchy and model
+  capacity at the same time.
+- Do not combine B2/B3 with GeoKey, usage loss, or scene-scale PE changes in the
+  same first experiment.
+- If a DPT-style neck is introduced, log the neck type, output dimension, input
+  layers, and whether the value path still sees all original layers.
+- If multi-level fusion is introduced, log per-level usage/gates so a gain can
+  be attributed to level routing rather than parameter count.
+- Keep the current B0 contract as the compatibility baseline for old
+  checkpoints and first key-layer ablations.
+
+### 3. PE And Distance Bias Need A Scene-Scale Contract
 
 Current behavior:
 
@@ -118,7 +174,7 @@ Metadata that must be logged when this becomes code:
 - whether distance bias uses raw or scale-normalized distances
 - whether fusion PE and compressor PE share the same scale policy
 
-### 3. Fourier PE Ablations Should Wait For Scene-Scale Contract
+### 4. Fourier PE Ablations Should Wait For Scene-Scale Contract
 
 Candidate PE variants:
 
@@ -131,7 +187,7 @@ Candidate PE variants:
 These are lower priority than scene-scale normalization, because without a
 shared scale policy the PE ablation is hard to interpret.
 
-### 4. Global Distance Bias Is Currently Too Narrow
+### 5. Global Distance Bias Is Currently Too Narrow
 
 Current simplified form:
 
@@ -175,7 +231,9 @@ Order within this step:
 2. Run key-layer ablations.
 3. Define and log scene-scale policy.
 4. Apply scene-scale to PE/distance bias as a controlled ablation.
-5. Only then test PE variants or richer distance-bias basis.
+5. Only then test DPT-style fused memory features or explicit multi-level
+   compressor/fusion.
+6. Only then test PE variants or richer distance-bias basis.
 
 ## Non-Goals
 
@@ -185,12 +243,16 @@ Order within this step:
 - Do not switch to full normalized-coordinate target training.
 - Do not convert memory points into reference-frame coordinates here.
 - Do not introduce multi-scene batching or sub-memory routing here.
-- Do not combine key-layer ablation with GeoMatch Fusion v1 in the same first
-  experiment.
+- Do not combine key-layer ablation with Progressive Geometry Injection /
+  GeoKey v0 in the same first experiment.
+- Do not introduce DPT-style feature fusion or explicit multi-level fusion in
+  the same experiment as the first key-layer, scene-scale, or GeoKey ablations.
 
 ## Success Criteria
 
 - Key-layer ablations are interpretable from checkpoint config and logs.
 - Scene-scale policy is recorded in checkpoint metadata.
 - PE/distance-bias ablations use the same scale policy in compressor and fusion.
+- Multi-layer feature ablations state whether the model uses selected-layer key,
+  learned scalar mix, DPT-style fused feature, or explicit multi-level fusion.
 - Any gain can be attributed to one changed variable.

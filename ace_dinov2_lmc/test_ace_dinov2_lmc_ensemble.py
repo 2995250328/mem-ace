@@ -43,6 +43,14 @@ _logger = logging.getLogger(__name__)
 DATA_ROOT = Path(os.environ.get("ACE_DATA_ROOT", "/home/xwh/data"))
 
 
+def _torch_load_trusted_checkpoint(path, *, map_location="cpu"):
+    """Load a local project checkpoint while making pickle semantics explicit."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 def _to_tensor(value: Any, *, dtype=torch.float32):
     if value is None:
         return None
@@ -181,7 +189,7 @@ def _load_bundle(
     dinov2_path: Path,
     device: torch.device,
 ) -> EvalBundle:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = _torch_load_trusted_checkpoint(checkpoint_path, map_location="cpu")
     is_lmc = _is_lmc_checkpoint(checkpoint)
 
     if is_lmc:
@@ -223,6 +231,17 @@ def _load_bundle(
             use_scale_token=lmc_config.get("use_scale_token", True),
             scale_token_dim=lmc_config.get("scale_token_dim", 1024),
             num_attn_layers=lmc_config.get("num_attn_layers", 2),
+            pe_normalize_input=lmc_config.get("pe_normalize_input", False),
+            pe_scale_mode=lmc_config.get(
+                "lmc_compressor_pe_scale_mode",
+                "std" if lmc_config.get("pe_normalize_input", False) else "raw",
+            ),
+            pe_scene_scale=lmc_config.get(
+                "lmc_compressor_pe_scene_scale",
+                lmc_config.get("lmc_fusion_scene_scale", 1.0),
+            ),
+            fps_start_policy=lmc_config.get("lmc_fps_start_policy", "farthest_from_center"),
+            key_slice_idx=lmc_config.get("lmc_key_slice_idx", None),
         ).to(device)
         compressor.load_state_dict(checkpoint["compressor_state_dict"])
         compressor.eval()
@@ -232,6 +251,9 @@ def _load_bundle(
             mode=lmc_config.get("lmc_mode", "global"),
             query_feature_dim=backbone_feature_dim,
             memory_feature_dim=compress_dim,
+            fusion_geometry_mode=lmc_config.get("lmc_fusion_geometry_mode", "value_only_raw"),
+            fusion_scene_scale=lmc_config.get("lmc_fusion_scene_scale", 1.0),
+            fusion_key_geo_init=lmc_config.get("lmc_fusion_key_geo_init", 0.0),
         ).to(device)
         fusion.load_state_dict(checkpoint["fusion_state_dict"])
         fusion.eval()

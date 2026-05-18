@@ -57,6 +57,15 @@ print("train_ace_dinov2_lmc: ready, configuring logging.", flush=True)
 logging.basicConfig(level=logging.INFO)
 _logger = logging.getLogger(__name__)
 
+
+def _torch_load_trusted_checkpoint(path, *, map_location='cpu'):
+    """Load a local project checkpoint while making pickle semantics explicit."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
 TRAIN_PRESET_DEFAULTS = {
     "memory_compare_ace_g_v1": {
         "use_lmc": True,
@@ -809,6 +818,7 @@ def _log_configuration_summary(args, output_layout, full_log_path):
                 args.ace_g_cross_iter_eval,
             )
         _logger.info("PE normalize : %s", getattr(args, 'pe_normalize_input', False))
+        _logger.info("Compressor PE scale: %s", getattr(args, 'lmc_compressor_pe_scale_mode', None))
 
     _logger.info(
         "Eval policy  : each_iter=%s, keep_best_only=%s, best_metric=%s",
@@ -911,7 +921,7 @@ def run_post_train_eval(args, trainer):
         # 写入 run_dir 便于与 training_full_log 一起查看
         semantic_fields = {}
         try:
-            checkpoint = torch.load(args.output_map, map_location='cpu')
+            checkpoint = _torch_load_trusted_checkpoint(args.output_map, map_location='cpu')
             lmc_config = checkpoint.get('lmc_config', {}) if isinstance(checkpoint, dict) else {}
             semantic_fields = {
                 "requested_lmc_mode": lmc_config.get("requested_lmc_mode"),
@@ -922,8 +932,14 @@ def run_post_train_eval(args, trainer):
                 "lmc_key_layer_label": lmc_config.get("lmc_key_layer_label"),
                 "layers_idx": lmc_config.get("layers_idx"),
                 "lmc_fps_start_policy": lmc_config.get("lmc_fps_start_policy"),
+                "lmc_compressor_pe_scale_mode": lmc_config.get("lmc_compressor_pe_scale_mode"),
+                "lmc_compressor_pe_scene_scale": lmc_config.get("lmc_compressor_pe_scene_scale"),
                 "s1_loss_step_mode": lmc_config.get("s1_loss_step_mode"),
                 "ace_g_fusion_in_s2": lmc_config.get("ace_g_fusion_in_s2"),
+                "lmc_fusion_geometry_mode": lmc_config.get("lmc_fusion_geometry_mode"),
+                "lmc_fusion_key_geo_init": lmc_config.get("lmc_fusion_key_geo_init"),
+                "lmc_fusion_scene_scale": lmc_config.get("lmc_fusion_scene_scale"),
+                "lmc_fusion_scene_scale_source": lmc_config.get("lmc_fusion_scene_scale_source"),
             }
         except Exception as e:
             _logger.warning("Could not read LMC semantics from checkpoint for post-train eval summary: %s", e)
