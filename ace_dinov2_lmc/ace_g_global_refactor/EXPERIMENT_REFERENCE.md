@@ -67,16 +67,17 @@ Aggregation: completed post-train summaries in the combined note.
 | B0-4090 | `4090_baseline_20260509` | local fallback | fixed_zero default | 75.49 | 93.39 | 29.96 | 6.23 | 2.8986 | 0.2992 | 101.75 | Legacy local fallback control |
 | ELPI-4090 | `4090_s1_periter` | local fallback | per_iter | 80.16 | 94.94 | 28.40 | 7.39 | 2.8205 | 0.2892 | 136.83 | Per-iter useful, but not true global |
 | FGFZ-4090 | `4090_forceglobal_fixedzero` | true global | fixed_zero | 76.65 | 94.94 | 26.46 | 6.61 | 3.0464 | 0.3204 | 107.99 | Negative/mixed control |
+| FGPI-4090 | `4090_forceglobal_s1_periter` | true global | per_iter | 83.66 | 95.33 | 34.24 | 6.23 | 2.6233 | 0.2831 | 168.31 | Clean 4090 true-global per-iter reference |
 
-Known missing cell:
-- `4090_forceglobal_s1_periter` with `lmc_auto_mode_by_visibility=False`,
-  same memory as the 4090 triplet. This is the clean local true-global
-  per-iter confirmation cell.
+FGPI-4090 source:
+- `04_evaluation/train_compare/indoor6_full_baselines_4090_forceglobal_s1_periter/.../20260517_112300_...`
+- Aggregation: 5-run post-train median over seeds `1305,2026,4242,7777,9001`.
 
 Do not rerun unchanged:
 - `B0-4090`
 - `ELPI-4090`
 - `FGFZ-4090`
+- `FGPI-4090`
 
 ### Fusion Geometry A0/A1/A2
 
@@ -168,7 +169,8 @@ These are not completed results yet.
 | --- | --- | --- | --- | --- |
 | CPE-A1-scene2a | Test compressor PE scene-scale on top of A1-style fusion | `--lmc_fusion_geometry_mode value_only_norm --lmc_fusion_scene_scale_source memory_points_p95 --lmc_compressor_pe_scale_mode scene_scale` | High | New run, not a repeat of A1 |
 | CPE-A1-diag | Same as above with runtime diagnostics | add `--lmc_log_runtime_stats True --lmc_runtime_stats_interval 20 --lmc_runtime_stats_max_pixels 4096` | High | Run one diagnostic job; no need to block all other jobs |
-| FGPI-4090-clean | Fill missing local 4090 true-global per-iter cell | `--lmc_auto_mode_by_visibility False --s1_loss_step_mode per_iter --lmc_key_slice_idx 2` | Medium | Only needed to close the local 4090 matrix |
+| B1-scalar-mix-scene2a | Test multi-layer key learned scalar mix while keeping value as all-layer concat | `--lmc_key_feature_mode scalar_mix --lmc_key_slice_idx 2` | High | New structural run; do not combine with CPE in the first pass |
+| B1-scalar-mix-diag | Same as B1 with runtime diagnostics | add `--lmc_log_runtime_stats True --lmc_runtime_stats_interval 20 --lmc_runtime_stats_max_pixels 4096` | High | Use to inspect `lmc_key_mix_weights` and token usage |
 | Cross-scene CPE | Check whether CPE effect generalizes | same CPE flags on selected non-scene2a scenes | Medium | Launch after scene2a CPE has a useful signal |
 
 ## Duplicate-Prevention Rules

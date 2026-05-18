@@ -242,6 +242,7 @@ def _load_bundle(
             ),
             fps_start_policy=lmc_config.get("lmc_fps_start_policy", "farthest_from_center"),
             key_slice_idx=lmc_config.get("lmc_key_slice_idx", None),
+            key_feature_mode=lmc_config.get("lmc_key_feature_mode", "slice"),
         ).to(device)
         compressor.load_state_dict(checkpoint["compressor_state_dict"])
         compressor.eval()

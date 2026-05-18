@@ -342,6 +342,7 @@ def run_evaluation_lmc(opt):
             ),
             fps_start_policy=lmc_config.get('lmc_fps_start_policy', 'farthest_from_center'),
             key_slice_idx=lmc_config.get('lmc_key_slice_idx', None),
+            key_feature_mode=lmc_config.get('lmc_key_feature_mode', 'slice'),
         ).to(device)
         compressor.load_state_dict(checkpoint['compressor_state_dict'])
         compressor.eval()
@@ -612,6 +613,8 @@ def run_evaluation_lmc(opt):
             "lmc_flow": lmc_config.get("lmc_flow"),
             "lmc_key_slice_idx": lmc_config.get("lmc_key_slice_idx"),
             "lmc_key_layer_label": lmc_config.get("lmc_key_layer_label"),
+            "lmc_key_feature_mode": lmc_config.get("lmc_key_feature_mode"),
+            "lmc_key_mix_weights": lmc_config.get("lmc_key_mix_weights"),
             "layers_idx": lmc_config.get("layers_idx"),
             "lmc_fps_start_policy": lmc_config.get("lmc_fps_start_policy"),
             "lmc_compressor_pe_scale_mode": lmc_config.get("lmc_compressor_pe_scale_mode"),

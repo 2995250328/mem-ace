@@ -634,6 +634,15 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        '--lmc_key_feature_mode',
+        choices=['slice', 'scalar_mix'],
+        default='slice',
+        help=(
+            'GeoLMC key feature 来源。slice 使用单层 feature；'
+            'scalar_mix 对多层 pooled_features 做可学习 softmax 加权，value path 保持 concat(all_layers)。'
+        ),
+    )
+    parser.add_argument(
         '--num_latent_tokens',
         type=int,
         default=64,

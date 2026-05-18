@@ -96,6 +96,7 @@ TRAIN_PRESET_DEFAULTS = {
         "lmc_auto_mode_by_visibility": False,
         "lmc_fps_start_policy": "farthest_from_center",
         "lmc_key_slice_idx": 2,
+        "lmc_key_feature_mode": "slice",
         "s1_loss_step_mode": "fixed_zero",
         "lmc_memory_preflight_strict": True,
         "lmc_scene_center_max_distance": 4.0,
@@ -819,6 +820,7 @@ def _log_configuration_summary(args, output_layout, full_log_path):
             )
         _logger.info("PE normalize : %s", getattr(args, 'pe_normalize_input', False))
         _logger.info("Compressor PE scale: %s", getattr(args, 'lmc_compressor_pe_scale_mode', None))
+        _logger.info("LMC key feature mode: %s", getattr(args, 'lmc_key_feature_mode', 'slice'))
 
     _logger.info(
         "Eval policy  : each_iter=%s, keep_best_only=%s, best_metric=%s",
@@ -930,6 +932,8 @@ def run_post_train_eval(args, trainer):
                 "lmc_flow": lmc_config.get("lmc_flow"),
                 "lmc_key_slice_idx": lmc_config.get("lmc_key_slice_idx"),
                 "lmc_key_layer_label": lmc_config.get("lmc_key_layer_label"),
+                "lmc_key_feature_mode": lmc_config.get("lmc_key_feature_mode"),
+                "lmc_key_mix_weights": lmc_config.get("lmc_key_mix_weights"),
                 "layers_idx": lmc_config.get("layers_idx"),
                 "lmc_fps_start_policy": lmc_config.get("lmc_fps_start_policy"),
                 "lmc_compressor_pe_scale_mode": lmc_config.get("lmc_compressor_pe_scale_mode"),

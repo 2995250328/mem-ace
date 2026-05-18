@@ -284,7 +284,8 @@ class GeoLMC(nn.Module):
                  pe_scale_mode=None,
                  pe_scene_scale=1.0,
                  fps_start_policy="farthest_from_center",
-                 key_slice_idx=None):
+                 key_slice_idx=None,
+                 key_feature_mode="slice"):
         super().__init__()
 
         self.mode = mode
@@ -295,6 +296,9 @@ class GeoLMC(nn.Module):
         self.use_scale_token = use_scale_token
         self.fps_start_policy = fps_start_policy
         self.key_slice_idx = self._resolve_key_slice_idx(key_slice_idx)
+        self.key_feature_mode = str(key_feature_mode)
+        if self.key_feature_mode not in ("slice", "scalar_mix"):
+            raise ValueError(f"Unsupported key_feature_mode={key_feature_mode!r}.")
         self.pe_scale_mode = pe_scale_mode if pe_scale_mode is not None else (
             "std" if pe_normalize_input else "raw"
         )
@@ -310,6 +314,10 @@ class GeoLMC(nn.Module):
             scene_scale=self.pe_scene_scale,
         )
         self.k_proj = nn.Linear(input_dim, compress_dim)
+        if self.key_feature_mode == "scalar_mix":
+            key_mix_logits = torch.full((num_layers,), -4.0)
+            key_mix_logits[self.key_slice_idx] = 4.0
+            self.key_mix_logits = nn.Parameter(key_mix_logits)
         self.v_proj = nn.Sequential(
             nn.Linear(self.total_input_dim, compress_dim * 2),
             nn.GELU(),
@@ -379,6 +387,18 @@ class GeoLMC(nn.Module):
         end = start + C
         return features[:, :, start:end]
 
+    def _get_key_features(self, features):
+        if self.key_feature_mode == "slice":
+            return self._get_layer_slice(features, self.key_slice_idx)
+        B, N, total_c = features.shape
+        C = total_c // self.num_layers
+        per_layer = features.reshape(B, N, self.num_layers, C)
+        weights = torch.softmax(self.key_mix_logits, dim=0).to(
+            device=features.device,
+            dtype=features.dtype,
+        )
+        return torch.sum(per_layer * weights.view(1, 1, self.num_layers, 1), dim=2)
+
     def _inject_scale(self, x, memory_dict):
         if self.use_scale_token and "all_scale_tokens" in memory_dict:
             scales = memory_dict["all_scale_tokens"]
@@ -407,7 +427,7 @@ class GeoLMC(nn.Module):
         pooled_features = memory_dict["pooled_features"]
         scene_center = memory_dict["scene_center"]
 
-        raw_key_feats = self._get_layer_slice(pooled_features, self.key_slice_idx)
+        raw_key_feats = self._get_key_features(pooled_features)
         k_base = self.k_proj(raw_key_feats)
         v = self.v_proj(pooled_features)
 

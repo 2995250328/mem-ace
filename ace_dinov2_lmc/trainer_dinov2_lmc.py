@@ -1187,6 +1187,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         key_layer_label = None
         if isinstance(layers_idx, (list, tuple)) and len(layers_idx) > resolved_key_slice_idx:
             key_layer_label = layers_idx[resolved_key_slice_idx]
+        lmc_key_feature_mode = str(getattr(options, 'lmc_key_feature_mode', 'slice'))
+        if lmc_key_feature_mode not in ('slice', 'scalar_mix'):
+            raise ValueError(f"Unsupported lmc_key_feature_mode={lmc_key_feature_mode!r}")
         _logger.info(
             "[LMC] Mode contract: requested=%s effective=%s auto_by_visibility=%s",
             requested_lmc_mode,
@@ -1194,7 +1197,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             auto_mode,
         )
         _logger.info(
-            "[LMC] Key layer: key_slice_idx=%d key_layer_label=%s layers_idx=%s",
+            "[LMC] Key feature: mode=%s key_slice_idx=%d key_layer_label=%s layers_idx=%s",
+            lmc_key_feature_mode,
             resolved_key_slice_idx,
             key_layer_label,
             layers_idx if layers_idx else "n/a",
@@ -1303,6 +1307,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'layers_idx': self._tensor_to_config_value(layers_idx),
             'lmc_key_slice_idx': resolved_key_slice_idx,
             'lmc_key_layer_label': self._tensor_to_config_value(key_layer_label),
+            'lmc_key_feature_mode': lmc_key_feature_mode,
             'geo_sigma': geo_sigma,
             'pe_normalize_input': pe_normalize_input,
             'lmc_compressor_pe_scale_mode': compressor_pe_scale_mode,
@@ -1365,6 +1370,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             pe_scene_scale=lmc_geometry_scene_scale,
             fps_start_policy=lmc_fps_start_policy,
             key_slice_idx=resolved_key_slice_idx,
+            key_feature_mode=lmc_key_feature_mode,
         ).to(self.device)
 
         # --- Build fusion (query=backbone 1024, memory=compressor output feature_dim) ---
@@ -2314,6 +2320,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "layers_idx",
             "lmc_key_slice_idx",
             "lmc_key_layer_label",
+            "lmc_key_feature_mode",
+            "lmc_key_mix_weights",
             "lmc_fps_start_policy",
             "pe_normalize_input",
             "lmc_compressor_pe_scale_mode",
@@ -2328,6 +2336,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "lmc_fusion_scene_scale",
             "lmc_fusion_scene_scale_source",
         ]
+        key_mix_logits = getattr(getattr(self, "compressor", None), "key_mix_logits", None)
+        if key_mix_logits is not None:
+            weights = torch.softmax(key_mix_logits.detach().float().cpu(), dim=0)
+            self.lmc_config["lmc_key_mix_weights"] = weights.tolist()
         meta = {key: self._tensor_to_config_value(self.lmc_config.get(key)) for key in keys}
         meta["lmc_flow"] = str(getattr(self.options, "lmc_flow", "iterative"))
         meta["lmc_auto_mode_by_visibility"] = bool(getattr(self.options, "lmc_auto_mode_by_visibility", False))
@@ -2399,15 +2411,23 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             centered_scaled = centered / max(scene_scale, 1e-6)
             pooled_points = self.memory_dict["pooled_points"].to(device=latent_p.device, dtype=latent_p.dtype)
             dist_log = torch.log(torch.cdist(latent_p, pooled_points, p=2).pow(2) + 1e-6)
+            key_mix_logits = getattr(self.compressor, "key_mix_logits", None)
+            key_mix = "n/a"
+            if key_mix_logits is not None:
+                key_mix_weights = torch.softmax(key_mix_logits.detach().float().cpu(), dim=0)
+                key_mix = "[" + ",".join(f"{float(w):.3f}" for w in key_mix_weights) + "]"
+                self.lmc_config["lmc_key_mix_weights"] = key_mix_weights.tolist()
             _logger.info(
-                "[LMC-Runtime][%s] compressor K_eff=%d key_slice=%s key_layer=%s "
-                "pe_scale_mode=%s scene_scale=%.6f latent_radius_mean=%.4f latent_radius_std=%.4f "
+                "[LMC-Runtime][%s] compressor K_eff=%d key_mode=%s key_slice=%s key_layer=%s "
+                "key_mix=%s pe_scale_mode=%s scene_scale=%.6f latent_radius_mean=%.4f latent_radius_std=%.4f "
                 "coord_std=%.4f coord_scaled_std=%.4f coord_scaled_absmax=%.4f "
                 "dist_log_min=%.4f dist_log_max=%.4f dist_log_std=%.4f",
                 stage_tag,
                 int(latent_p.shape[1]),
+                str(self.lmc_config.get("lmc_key_feature_mode", "slice")),
                 str(self.lmc_config.get("lmc_key_slice_idx")),
                 str(self.lmc_config.get("lmc_key_layer_label")),
+                key_mix,
                 str(self.lmc_config.get("lmc_compressor_pe_scale_mode", "raw")),
                 scene_scale,
                 float(radius.mean().item()),
@@ -4636,7 +4656,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'compressor_state_dict': self.compressor.state_dict(),
             'fusion_state_dict': self.fusion.state_dict(),
             'mean_cam_center': self.dataset.mean_cam_center,
-            'lmc_config': self.lmc_config,
+            'lmc_config': self._lmc_config_for_checkpoint(),
         }
         torch.save(checkpoint, output_path)
         _logger.info(f"Saved LMC checkpoint to: {output_path}")
+
+    def _lmc_config_for_checkpoint(self):
+        config = dict(self.lmc_config)
+        key_mix_logits = getattr(self.compressor, "key_mix_logits", None)
+        if key_mix_logits is not None:
+            weights = torch.softmax(key_mix_logits.detach().float().cpu(), dim=0)
+            config["lmc_key_mix_weights"] = weights.tolist()
+        return config
