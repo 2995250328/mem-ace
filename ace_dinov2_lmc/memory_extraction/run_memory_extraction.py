@@ -3744,13 +3744,15 @@ def detect_dataset_type(dataset_path: str) -> str:
     Auto-detect dataset type from path.
 
     Returns:
-        "7scenes" or "indoor6" or "custom"
+        "7scenes", "indoor6", "rio10", or "custom"
     """
     path_lower = dataset_path.lower()
     if "7scenes" in path_lower or "7-scenes" in path_lower:
         return "7scenes"
     elif "indoor6" in path_lower or "indoor-6" in path_lower:
         return "indoor6"
+    elif "rio10" in path_lower or "rio-10" in path_lower:
+        return "rio10"
     return "custom"
 
 
@@ -3803,6 +3805,7 @@ def load_dataset(
 
     from mapanything.datasets.wai.seven_scenes import SevenScenesWAI  # pyright: ignore[reportMissingImports]
     from mapanything.datasets.wai.indoor6 import Indoor6WAI  # pyright: ignore[reportMissingImports]
+    from mapanything.datasets.wai.rio10 import Rio10WAI  # pyright: ignore[reportMissingImports]
 
     # Determine dataset_metadata_dir
     metadata_dir = os.environ.get(
@@ -3836,6 +3839,17 @@ def load_dataset(
         )
     if dataset_type == "indoor6":
         return Indoor6WAI(
+            ROOT=dataset_path,
+            dataset_metadata_dir=metadata_dir,
+            split='train',
+            sample_specific_scene=True,
+            specific_scene_name=scene_name,
+            sequential_view_mode=True,
+            num_views=n_views,
+            **base_kwargs,
+        )
+    if dataset_type == "rio10":
+        return Rio10WAI(
             ROOT=dataset_path,
             dataset_metadata_dir=metadata_dir,
             split='train',
@@ -7934,21 +7948,29 @@ def convert_ace_tuple_to_dict(
     except Exception:
         target_hw = None
     if filename and isinstance(filename, str):
-        # Replace /rgb/ with /depth/ in the path
-        depth_path = filename.replace("/rgb/", "/depth/")
-        # Replace .color.png → .depth.png (or just strip extension and add .depth.png)
-        base, ext = os.path.splitext(depth_path)
+        depth_base = filename.replace("/rgb/", "/depth/")
+        base, ext = os.path.splitext(depth_base)
+        candidates = []
         if base.endswith(".color"):
-            base = base[:-6]  # strip ".color"
-        depth_path = base + ".depth" + ext
+            no_color = base[:-6]
+            candidates.extend([
+                no_color + ".depth" + ext,
+                no_color + ".depth.png",
+                no_color + ".rendered.depth.png",
+            ])
+        candidates.extend([
+            depth_base,
+            base + ".depth.png",
+            base + ".rendered.depth.png",
+        ])
 
-        if not os.path.exists(depth_path):
-            # Try just replacing /rgb/ without renaming the suffix
-            alt_path = filename.replace("/rgb/", "/depth/")
-            if os.path.exists(alt_path):
-                depth_path = alt_path
+        depth_path = None
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                depth_path = candidate
+                break
 
-        if os.path.exists(depth_path):
+        if depth_path is not None and os.path.exists(depth_path):
             from skimage import io as skio
 
             depth_np = skio.imread(depth_path).astype(np.float64) / 1000.0  # mm -> meters
@@ -7971,7 +7993,7 @@ def convert_ace_tuple_to_dict(
             else:
                 depth = torch.from_numpy(depth_np).float()
         else:
-            print(f"[Warning] Depth file not found (tried {depth_path})")
+            print(f"[Warning] Depth file not found (tried {candidates})")
 
     result = {
         "img": image,                        # [3, H, W] tensor (ImageNet normalized)
@@ -8195,7 +8217,7 @@ def parse_args() -> ExtractionConfig:
         '--dataset_type',
         type=str,
         default='auto',
-        choices=['auto', '7scenes', 'indoor6', 'custom'],
+        choices=['auto', '7scenes', 'indoor6', 'rio10', 'custom'],
         help='数据集类型；auto 时根据路径启发式检测。',
     )
     parser.add_argument(

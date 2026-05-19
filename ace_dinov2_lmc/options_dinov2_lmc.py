@@ -643,6 +643,122 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        '--lmc_feature_hierarchy_mode',
+        choices=['selected_key_concat_value', 'levelwise_latent_merge'],
+        default='selected_key_concat_value',
+        help=(
+            '多层 memory feature 的压缩路径。selected_key_concat_value 保持旧行为；'
+            'levelwise_latent_merge 对每层独立投影/压缩后用全局 level gate 合并。'
+        ),
+    )
+    parser.add_argument(
+        '--lmc_level_merge_mode',
+        choices=['softmax_gate'],
+        default='softmax_gate',
+        help='levelwise_latent_merge 的层级合并方式。当前 B3-lite 仅支持 softmax_gate。',
+    )
+    parser.add_argument(
+        '--lmc_level_merge_init',
+        choices=['uniform'],
+        default='uniform',
+        help='levelwise_latent_merge 的 gate 初始化。uniform 表示各层初始等权。',
+    )
+    parser.add_argument(
+        '--lmc_level_proj_shared',
+        type=_strtobool,
+        default=False,
+        help='levelwise_latent_merge 是否在各 feature level 间共享输入投影。默认 False。',
+    )
+    parser.add_argument(
+        '--lmc_level_cross_attn_shared',
+        type=_strtobool,
+        default=True,
+        help='levelwise_latent_merge 是否在各 feature level 间共享 cross-attention。默认 True。',
+    )
+    parser.add_argument(
+        '--lmc_level_gate_entropy_weight',
+        type=float,
+        default=0.0,
+        help='预留的 level gate entropy 正则权重。B3-lite 首版保持 0.0。',
+    )
+    parser.add_argument(
+        '--lmc_level_token_gate',
+        type=_strtobool,
+        default=False,
+        help='预留的 token-wise level gate 开关。B3-lite 首版保持 False。',
+    )
+    parser.add_argument(
+        '--lmc_geo_bias_mode',
+        type=str,
+        default='legacy',
+        choices=['legacy', 'rbf_residual'],
+        help='GeoLMC attention logits 的几何 bias 路径。legacy 保持旧行为；rbf_residual 叠加零初始化的多尺度 RBF 残差。',
+    )
+    parser.add_argument(
+        '--lmc_geo_bias_rbf_scales',
+        type=float,
+        nargs='+',
+        default=[0.25, 0.5, 1.0, 2.0, 4.0],
+        help='rbf_residual 中使用的距离尺度列表（米）。',
+    )
+    parser.add_argument(
+        '--lmc_geo_bias_rbf_alpha_init',
+        type=float,
+        default=0.0,
+        help='rbf_residual 残差门控 alpha 的初始值。默认 0.0，保护旧初始化。',
+    )
+    parser.add_argument(
+        '--lmc_geo_bias_rbf_learn_weights',
+        type=_strtobool,
+        default=True,
+        help='rbf_residual 是否学习多尺度 RBF 混合权重。默认 True。',
+    )
+    parser.add_argument(
+        '--lmc_geo_bias_rbf_per_head',
+        type=_strtobool,
+        default=False,
+        help='rbf_residual 是否为每个 attention head 学习独立的 RBF 混合权重。默认 False。',
+    )
+    parser.add_argument(
+        '--lmc_pos_encoding_mode',
+        type=str,
+        default='fourier_legacy',
+        choices=['fourier_legacy', 'fourier_v2'],
+        help='Compressor 坐标位置编码模式。fourier_legacy 保持旧行为；fourier_v2 在旧分支上叠加归一化 Fourier 残差。',
+    )
+    parser.add_argument(
+        '--lmc_pos_fourier_v2_scales',
+        type=float,
+        nargs='+',
+        default=[1.0, 2.0, 4.0, 8.0, 16.0],
+        help='fourier_v2 使用的固定 Fourier 频率尺度列表。',
+    )
+    parser.add_argument(
+        '--lmc_pos_fourier_coord_norm',
+        type=str,
+        default='scene_radius',
+        choices=['scene_radius'],
+        help='fourier_v2 的坐标归一化方式。当前仅支持 scene_radius。',
+    )
+    parser.add_argument(
+        '--lmc_pos_fourier_radius',
+        type=float,
+        default=4.0,
+        help='fourier_v2 的固定坐标归一化半径。',
+    )
+    parser.add_argument(
+        '--lmc_pos_fourier_learnable_scale',
+        type=_strtobool,
+        default=False,
+        help='fourier_v2 是否学习 Fourier 频率尺度。默认 False。',
+    )
+    parser.add_argument(
+        '--lmc_pos_fourier_residual_gate_init',
+        type=float,
+        default=0.0,
+        help='fourier_v2 残差门控的初始值。默认 0.0，保护旧初始化。',
+    )
+    parser.add_argument(
         '--num_latent_tokens',
         type=int,
         default=64,

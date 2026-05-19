@@ -343,9 +343,30 @@ def run_evaluation_lmc(opt):
             fps_start_policy=lmc_config.get('lmc_fps_start_policy', 'farthest_from_center'),
             key_slice_idx=lmc_config.get('lmc_key_slice_idx', None),
             key_feature_mode=lmc_config.get('lmc_key_feature_mode', 'slice'),
+            feature_hierarchy_mode=lmc_config.get(
+                'lmc_feature_hierarchy_mode', 'selected_key_concat_value'
+            ),
+            level_merge_mode=lmc_config.get('lmc_level_merge_mode', 'softmax_gate'),
+            level_merge_init=lmc_config.get('lmc_level_merge_init', 'uniform'),
+            level_proj_shared=lmc_config.get('lmc_level_proj_shared', False),
+            level_cross_attn_shared=lmc_config.get('lmc_level_cross_attn_shared', True),
+            level_gate_entropy_weight=lmc_config.get('lmc_level_gate_entropy_weight', 0.0),
+            level_token_gate=lmc_config.get('lmc_level_token_gate', False),
+            geo_bias_mode=lmc_config.get('geo_bias_mode', 'legacy'),
+            geo_bias_rbf_scales=lmc_config.get('geo_bias_rbf_scales', [0.25, 0.5, 1.0, 2.0, 4.0]),
+            geo_bias_rbf_alpha_init=lmc_config.get('geo_bias_rbf_alpha_init', 0.0),
+            geo_bias_rbf_learn_weights=lmc_config.get('geo_bias_rbf_learn_weights', True),
+            geo_bias_rbf_per_head=lmc_config.get('geo_bias_rbf_per_head', False),
+            pos_encoding_mode=lmc_config.get('pos_encoding_mode', 'fourier_legacy'),
+            pos_fourier_v2_scales=lmc_config.get('pos_fourier_v2_scales', [1.0, 2.0, 4.0, 8.0, 16.0]),
+            pos_fourier_coord_norm=lmc_config.get('pos_fourier_coord_norm', 'scene_radius'),
+            pos_fourier_radius=lmc_config.get('pos_fourier_radius', 4.0),
+            pos_fourier_learnable_scale=lmc_config.get('pos_fourier_learnable_scale', False),
+            pos_fourier_residual_gate_init=lmc_config.get('pos_fourier_residual_gate_init', 0.0),
         ).to(device)
         compressor.load_state_dict(checkpoint['compressor_state_dict'])
         compressor.eval()
+        compressor.collect_runtime_stats = lmc_log_runtime_stats
 
         fusion = LMCFeatureFusion(
             feature_dim=backbone_feature_dim,
@@ -395,6 +416,19 @@ def run_evaluation_lmc(opt):
         # Compress memory once; reuse the same latent for all test frames (no per-frame compression).
         with torch.no_grad():
             compressor_out_cached = compressor(memory_dict)
+        level_stats = getattr(compressor, "last_levelwise_runtime_stats", None)
+        if isinstance(level_stats, dict):
+            lmc_config["lmc_level_merge_weights"] = level_stats.get("lmc_level_merge_weights")
+            lmc_config["lmc_level_gate_entropy"] = level_stats.get("lmc_level_gate_entropy")
+            if lmc_log_runtime_stats:
+                _logger.info(
+                    "[LMC-Runtime][EvalCompress] level_merge_weights=%s level_gate_entropy=%.4f "
+                    "per_level_latent_norm_mean=%s per_level_attention_entropy_mean=%s",
+                    level_stats.get("final_level_merge_weights"),
+                    float(level_stats.get("final_level_gate_entropy", 0.0)),
+                    level_stats.get("per_level_latent_norm_mean", []),
+                    level_stats.get("per_level_attention_entropy_mean", []),
+                )
         _logger.info("[LMC] Memory compressed once (cached for all test frames)")
 
     # Dataset
@@ -615,6 +649,31 @@ def run_evaluation_lmc(opt):
             "lmc_key_layer_label": lmc_config.get("lmc_key_layer_label"),
             "lmc_key_feature_mode": lmc_config.get("lmc_key_feature_mode"),
             "lmc_key_mix_weights": lmc_config.get("lmc_key_mix_weights"),
+            "lmc_feature_hierarchy_mode": lmc_config.get(
+                "lmc_feature_hierarchy_mode", "selected_key_concat_value"
+            ),
+            "lmc_level_merge_mode": lmc_config.get("lmc_level_merge_mode", "softmax_gate"),
+            "lmc_level_merge_init": lmc_config.get("lmc_level_merge_init", "uniform"),
+            "lmc_level_proj_shared": lmc_config.get("lmc_level_proj_shared", False),
+            "lmc_level_cross_attn_shared": lmc_config.get("lmc_level_cross_attn_shared", True),
+            "lmc_level_gate_entropy_weight": lmc_config.get("lmc_level_gate_entropy_weight", 0.0),
+            "lmc_level_token_gate": lmc_config.get("lmc_level_token_gate", False),
+            "lmc_level_merge_weights": lmc_config.get("lmc_level_merge_weights"),
+            "lmc_level_gate_entropy": lmc_config.get("lmc_level_gate_entropy"),
+            "geo_bias_mode": lmc_config.get("geo_bias_mode", "legacy"),
+            "geo_bias_rbf_scales": lmc_config.get("geo_bias_rbf_scales"),
+            "geo_bias_rbf_alpha_init": lmc_config.get("geo_bias_rbf_alpha_init", 0.0),
+            "geo_bias_rbf_learn_weights": lmc_config.get("geo_bias_rbf_learn_weights", True),
+            "geo_bias_rbf_per_head": lmc_config.get("geo_bias_rbf_per_head", False),
+            "final_geo_bias_rbf_alpha": lmc_config.get("final_geo_bias_rbf_alpha"),
+            "final_geo_bias_rbf_weights": lmc_config.get("final_geo_bias_rbf_weights"),
+            "pos_encoding_mode": lmc_config.get("pos_encoding_mode", "fourier_legacy"),
+            "pos_fourier_v2_scales": lmc_config.get("pos_fourier_v2_scales"),
+            "pos_fourier_coord_norm": lmc_config.get("pos_fourier_coord_norm", "scene_radius"),
+            "pos_fourier_radius": lmc_config.get("pos_fourier_radius", 4.0),
+            "pos_fourier_learnable_scale": lmc_config.get("pos_fourier_learnable_scale", False),
+            "pos_fourier_residual_gate_init": lmc_config.get("pos_fourier_residual_gate_init", 0.0),
+            "final_pos_fourier_residual_gate": lmc_config.get("final_pos_fourier_residual_gate"),
             "layers_idx": lmc_config.get("layers_idx"),
             "lmc_fps_start_policy": lmc_config.get("lmc_fps_start_policy"),
             "lmc_compressor_pe_scale_mode": lmc_config.get("lmc_compressor_pe_scale_mode"),

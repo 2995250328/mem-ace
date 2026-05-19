@@ -1190,6 +1190,54 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         lmc_key_feature_mode = str(getattr(options, 'lmc_key_feature_mode', 'slice'))
         if lmc_key_feature_mode not in ('slice', 'scalar_mix'):
             raise ValueError(f"Unsupported lmc_key_feature_mode={lmc_key_feature_mode!r}")
+        lmc_feature_hierarchy_mode = str(
+            getattr(options, 'lmc_feature_hierarchy_mode', 'selected_key_concat_value')
+        )
+        if lmc_feature_hierarchy_mode not in ('selected_key_concat_value', 'levelwise_latent_merge'):
+            raise ValueError(f"Unsupported lmc_feature_hierarchy_mode={lmc_feature_hierarchy_mode!r}")
+        lmc_level_merge_mode = str(getattr(options, 'lmc_level_merge_mode', 'softmax_gate'))
+        lmc_level_merge_init = str(getattr(options, 'lmc_level_merge_init', 'uniform'))
+        lmc_level_proj_shared = bool(getattr(options, 'lmc_level_proj_shared', False))
+        lmc_level_cross_attn_shared = bool(getattr(options, 'lmc_level_cross_attn_shared', True))
+        lmc_level_gate_entropy_weight = float(getattr(options, 'lmc_level_gate_entropy_weight', 0.0))
+        lmc_level_token_gate = bool(getattr(options, 'lmc_level_token_gate', False))
+        lmc_geo_bias_mode = str(getattr(options, 'lmc_geo_bias_mode', 'legacy'))
+        if lmc_geo_bias_mode not in ('legacy', 'rbf_residual'):
+            raise ValueError(f"Unsupported lmc_geo_bias_mode={lmc_geo_bias_mode!r}")
+        lmc_geo_bias_rbf_scales = [float(v) for v in getattr(options, 'lmc_geo_bias_rbf_scales', [0.25, 0.5, 1.0, 2.0, 4.0])]
+        if len(lmc_geo_bias_rbf_scales) == 0 or any(v <= 0.0 for v in lmc_geo_bias_rbf_scales):
+            raise ValueError(f"Invalid lmc_geo_bias_rbf_scales={lmc_geo_bias_rbf_scales!r}")
+        lmc_geo_bias_rbf_alpha_init = float(getattr(options, 'lmc_geo_bias_rbf_alpha_init', 0.0))
+        lmc_geo_bias_rbf_learn_weights = bool(getattr(options, 'lmc_geo_bias_rbf_learn_weights', True))
+        lmc_geo_bias_rbf_per_head = bool(getattr(options, 'lmc_geo_bias_rbf_per_head', False))
+        lmc_pos_encoding_mode = str(getattr(options, 'lmc_pos_encoding_mode', 'fourier_legacy'))
+        if lmc_pos_encoding_mode not in ('fourier_legacy', 'fourier_v2'):
+            raise ValueError(f"Unsupported lmc_pos_encoding_mode={lmc_pos_encoding_mode!r}")
+        lmc_pos_fourier_v2_scales = [float(v) for v in getattr(options, 'lmc_pos_fourier_v2_scales', [1.0, 2.0, 4.0, 8.0, 16.0])]
+        if len(lmc_pos_fourier_v2_scales) == 0 or any(v <= 0.0 for v in lmc_pos_fourier_v2_scales):
+            raise ValueError(f"Invalid lmc_pos_fourier_v2_scales={lmc_pos_fourier_v2_scales!r}")
+        lmc_pos_fourier_coord_norm = str(getattr(options, 'lmc_pos_fourier_coord_norm', 'scene_radius'))
+        if lmc_pos_fourier_coord_norm != 'scene_radius':
+            raise ValueError(f"Unsupported lmc_pos_fourier_coord_norm={lmc_pos_fourier_coord_norm!r}")
+        lmc_pos_fourier_radius = float(getattr(options, 'lmc_pos_fourier_radius', 4.0))
+        if lmc_pos_fourier_radius <= 0.0:
+            raise ValueError(f"lmc_pos_fourier_radius must be > 0, got {lmc_pos_fourier_radius!r}")
+        lmc_pos_fourier_learnable_scale = bool(getattr(options, 'lmc_pos_fourier_learnable_scale', False))
+        lmc_pos_fourier_residual_gate_init = float(getattr(options, 'lmc_pos_fourier_residual_gate_init', 0.0))
+        if lmc_feature_hierarchy_mode == 'levelwise_latent_merge':
+            if lmc_mode not in ('global', 'local'):
+                raise ValueError(
+                    "levelwise_latent_merge currently supports only global/local LMC modes, "
+                    f"got {lmc_mode!r}."
+                )
+            if lmc_level_merge_mode != 'softmax_gate':
+                raise ValueError(f"Unsupported lmc_level_merge_mode={lmc_level_merge_mode!r}")
+            if lmc_level_merge_init != 'uniform':
+                raise ValueError(f"Unsupported lmc_level_merge_init={lmc_level_merge_init!r}")
+            if lmc_level_gate_entropy_weight != 0.0:
+                raise ValueError("lmc_level_gate_entropy_weight must be 0.0 for B3-lite.")
+            if lmc_level_token_gate:
+                raise ValueError("lmc_level_token_gate must be False for B3-lite.")
         _logger.info(
             "[LMC] Mode contract: requested=%s effective=%s auto_by_visibility=%s",
             requested_lmc_mode,
@@ -1202,6 +1250,19 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             resolved_key_slice_idx,
             key_layer_label,
             layers_idx if layers_idx else "n/a",
+        )
+        _logger.info(
+            "[LMC] Feature hierarchy: mode=%s merge=%s init=%s proj_shared=%s cross_attn_shared=%s",
+            lmc_feature_hierarchy_mode,
+            lmc_level_merge_mode,
+            lmc_level_merge_init,
+            lmc_level_proj_shared,
+            lmc_level_cross_attn_shared,
+        )
+        _logger.info(
+            "[LMC] Geo/PE: geo_bias_mode=%s pos_encoding_mode=%s",
+            lmc_geo_bias_mode,
+            lmc_pos_encoding_mode,
         )
 
         scale_token_dim = 1024
@@ -1308,6 +1369,29 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'lmc_key_slice_idx': resolved_key_slice_idx,
             'lmc_key_layer_label': self._tensor_to_config_value(key_layer_label),
             'lmc_key_feature_mode': lmc_key_feature_mode,
+            'lmc_feature_hierarchy_mode': lmc_feature_hierarchy_mode,
+            'lmc_level_merge_mode': lmc_level_merge_mode,
+            'lmc_level_merge_init': lmc_level_merge_init,
+            'lmc_level_proj_shared': lmc_level_proj_shared,
+            'lmc_level_cross_attn_shared': lmc_level_cross_attn_shared,
+            'lmc_level_gate_entropy_weight': lmc_level_gate_entropy_weight,
+            'lmc_level_token_gate': lmc_level_token_gate,
+            'lmc_level_merge_weights': None,
+            'lmc_level_gate_entropy': None,
+            'geo_bias_mode': lmc_geo_bias_mode,
+            'geo_bias_rbf_scales': lmc_geo_bias_rbf_scales,
+            'geo_bias_rbf_alpha_init': lmc_geo_bias_rbf_alpha_init,
+            'geo_bias_rbf_learn_weights': lmc_geo_bias_rbf_learn_weights,
+            'geo_bias_rbf_per_head': lmc_geo_bias_rbf_per_head,
+            'final_geo_bias_rbf_alpha': None,
+            'final_geo_bias_rbf_weights': None,
+            'pos_encoding_mode': lmc_pos_encoding_mode,
+            'pos_fourier_v2_scales': lmc_pos_fourier_v2_scales,
+            'pos_fourier_coord_norm': lmc_pos_fourier_coord_norm,
+            'pos_fourier_radius': lmc_pos_fourier_radius,
+            'pos_fourier_learnable_scale': lmc_pos_fourier_learnable_scale,
+            'pos_fourier_residual_gate_init': lmc_pos_fourier_residual_gate_init,
+            'final_pos_fourier_residual_gate': None,
             'geo_sigma': geo_sigma,
             'pe_normalize_input': pe_normalize_input,
             'lmc_compressor_pe_scale_mode': compressor_pe_scale_mode,
@@ -1371,7 +1455,26 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             fps_start_policy=lmc_fps_start_policy,
             key_slice_idx=resolved_key_slice_idx,
             key_feature_mode=lmc_key_feature_mode,
+            feature_hierarchy_mode=lmc_feature_hierarchy_mode,
+            level_merge_mode=lmc_level_merge_mode,
+            level_merge_init=lmc_level_merge_init,
+            level_proj_shared=lmc_level_proj_shared,
+            level_cross_attn_shared=lmc_level_cross_attn_shared,
+            level_gate_entropy_weight=lmc_level_gate_entropy_weight,
+            level_token_gate=lmc_level_token_gate,
+            geo_bias_mode=lmc_geo_bias_mode,
+            geo_bias_rbf_scales=lmc_geo_bias_rbf_scales,
+            geo_bias_rbf_alpha_init=lmc_geo_bias_rbf_alpha_init,
+            geo_bias_rbf_learn_weights=lmc_geo_bias_rbf_learn_weights,
+            geo_bias_rbf_per_head=lmc_geo_bias_rbf_per_head,
+            pos_encoding_mode=lmc_pos_encoding_mode,
+            pos_fourier_v2_scales=lmc_pos_fourier_v2_scales,
+            pos_fourier_coord_norm=lmc_pos_fourier_coord_norm,
+            pos_fourier_radius=lmc_pos_fourier_radius,
+            pos_fourier_learnable_scale=lmc_pos_fourier_learnable_scale,
+            pos_fourier_residual_gate_init=lmc_pos_fourier_residual_gate_init,
         ).to(self.device)
+        self.compressor.collect_runtime_stats = self.lmc_log_runtime_stats
 
         # --- Build fusion (query=backbone 1024, memory=compressor output feature_dim) ---
         self.fusion = LMCFeatureFusion(
@@ -2322,6 +2425,29 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "lmc_key_layer_label",
             "lmc_key_feature_mode",
             "lmc_key_mix_weights",
+            "lmc_feature_hierarchy_mode",
+            "lmc_level_merge_mode",
+            "lmc_level_merge_init",
+            "lmc_level_proj_shared",
+            "lmc_level_cross_attn_shared",
+            "lmc_level_gate_entropy_weight",
+            "lmc_level_token_gate",
+            "lmc_level_merge_weights",
+            "lmc_level_gate_entropy",
+            "geo_bias_mode",
+            "geo_bias_rbf_scales",
+            "geo_bias_rbf_alpha_init",
+            "geo_bias_rbf_learn_weights",
+            "geo_bias_rbf_per_head",
+            "final_geo_bias_rbf_alpha",
+            "final_geo_bias_rbf_weights",
+            "pos_encoding_mode",
+            "pos_fourier_v2_scales",
+            "pos_fourier_coord_norm",
+            "pos_fourier_radius",
+            "pos_fourier_learnable_scale",
+            "pos_fourier_residual_gate_init",
+            "final_pos_fourier_residual_gate",
             "lmc_fps_start_policy",
             "pe_normalize_input",
             "lmc_compressor_pe_scale_mode",
@@ -2340,6 +2466,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if key_mix_logits is not None:
             weights = torch.softmax(key_mix_logits.detach().float().cpu(), dim=0)
             self.lmc_config["lmc_key_mix_weights"] = weights.tolist()
+        level_stats = getattr(getattr(self, "compressor", None), "last_levelwise_runtime_stats", None)
+        if isinstance(level_stats, dict):
+            self.lmc_config["lmc_level_merge_weights"] = level_stats.get("lmc_level_merge_weights")
+            self.lmc_config["lmc_level_gate_entropy"] = level_stats.get("lmc_level_gate_entropy")
+        geo_bias_stats = getattr(getattr(self, "compressor", None), "last_geo_bias_runtime_stats", None)
+        if isinstance(geo_bias_stats, dict):
+            self.lmc_config["final_geo_bias_rbf_alpha"] = geo_bias_stats.get("final_geo_bias_rbf_alpha")
+            self.lmc_config["final_geo_bias_rbf_weights"] = geo_bias_stats.get("final_geo_bias_rbf_weights")
+        pos_gate = getattr(getattr(getattr(self, "compressor", None), "pe_encoder", None), "residual_gate", None)
+        if pos_gate is not None:
+            self.lmc_config["final_pos_fourier_residual_gate"] = float(pos_gate.detach().float().cpu().item())
         meta = {key: self._tensor_to_config_value(self.lmc_config.get(key)) for key in keys}
         meta["lmc_flow"] = str(getattr(self.options, "lmc_flow", "iterative"))
         meta["lmc_auto_mode_by_visibility"] = bool(getattr(self.options, "lmc_auto_mode_by_visibility", False))
@@ -2417,6 +2554,38 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 key_mix_weights = torch.softmax(key_mix_logits.detach().float().cpu(), dim=0)
                 key_mix = "[" + ",".join(f"{float(w):.3f}" for w in key_mix_weights) + "]"
                 self.lmc_config["lmc_key_mix_weights"] = key_mix_weights.tolist()
+            level_stats = getattr(self.compressor, "last_levelwise_runtime_stats", None)
+            if isinstance(level_stats, dict):
+                weights = level_stats.get("final_level_merge_weights") or []
+                weights_str = "[" + ",".join(f"{float(w):.3f}" for w in weights) + "]"
+                self.lmc_config["lmc_level_merge_weights"] = level_stats.get("lmc_level_merge_weights")
+                self.lmc_config["lmc_level_gate_entropy"] = level_stats.get("lmc_level_gate_entropy")
+                _logger.info(
+                    "[LMC-Runtime][%s] level_merge_weights=%s level_gate_entropy=%.4f "
+                    "per_level_latent_norm_mean=%s per_level_latent_norm_std=%s "
+                    "per_level_attention_entropy_mean=%s per_level_effective_memory_token_count=%s",
+                    stage_tag,
+                    weights_str,
+                    float(level_stats.get("final_level_gate_entropy", 0.0)),
+                    level_stats.get("per_level_latent_norm_mean", []),
+                    level_stats.get("per_level_latent_norm_std", []),
+                    level_stats.get("per_level_attention_entropy_mean", []),
+                    level_stats.get("per_level_effective_memory_token_count", []),
+                )
+            geo_bias_stats = getattr(self.compressor, "last_geo_bias_runtime_stats", None)
+            if isinstance(geo_bias_stats, dict):
+                self.lmc_config["final_geo_bias_rbf_alpha"] = geo_bias_stats.get("final_geo_bias_rbf_alpha")
+                self.lmc_config["final_geo_bias_rbf_weights"] = geo_bias_stats.get("final_geo_bias_rbf_weights")
+                _logger.info(
+                    "[LMC-Runtime][%s] geo_bias_mode=%s rbf_alpha=%s rbf_weights=%s",
+                    stage_tag,
+                    str(self.lmc_config.get("geo_bias_mode", "legacy")),
+                    str(geo_bias_stats.get("final_geo_bias_rbf_alpha")),
+                    str(geo_bias_stats.get("final_geo_bias_rbf_weights")),
+                )
+            pos_gate = getattr(getattr(self.compressor, "pe_encoder", None), "residual_gate", None)
+            if pos_gate is not None:
+                self.lmc_config["final_pos_fourier_residual_gate"] = float(pos_gate.detach().float().cpu().item())
             _logger.info(
                 "[LMC-Runtime][%s] compressor K_eff=%d key_mode=%s key_slice=%s key_layer=%s "
                 "key_mix=%s pe_scale_mode=%s scene_scale=%.6f latent_radius_mean=%.4f latent_radius_std=%.4f "
@@ -4667,4 +4836,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if key_mix_logits is not None:
             weights = torch.softmax(key_mix_logits.detach().float().cpu(), dim=0)
             config["lmc_key_mix_weights"] = weights.tolist()
+        level_stats = getattr(self.compressor, "last_levelwise_runtime_stats", None)
+        if isinstance(level_stats, dict):
+            config["lmc_level_merge_weights"] = level_stats.get("lmc_level_merge_weights")
+            config["lmc_level_gate_entropy"] = level_stats.get("lmc_level_gate_entropy")
+        geo_bias_stats = getattr(self.compressor, "last_geo_bias_runtime_stats", None)
+        if isinstance(geo_bias_stats, dict):
+            config["final_geo_bias_rbf_alpha"] = geo_bias_stats.get("final_geo_bias_rbf_alpha")
+            config["final_geo_bias_rbf_weights"] = geo_bias_stats.get("final_geo_bias_rbf_weights")
+        pos_gate = getattr(getattr(self.compressor, "pe_encoder", None), "residual_gate", None)
+        if pos_gate is not None:
+            config["final_pos_fourier_residual_gate"] = float(pos_gate.detach().float().cpu().item())
         return config

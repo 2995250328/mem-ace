@@ -23,6 +23,8 @@ Metric convention:
 | `s1_loss_step_mode=per_iter` is useful | Accepted | 3090 true-global and 4090 effective-local both improve the useful operating point | Do not go back to `fixed_zero` as default |
 | A1 `value_only_norm` is a weak positive/mixed signal | Diagnostic only | Slightly improves `pct2`, attention is sharper, but no clear `pct5` win over accepted key2 baseline | Do not promote to default yet |
 | A2 `geokey_norm` is negative as default | Rejected as default | Clear metric drop vs A1/A0 | Do not rerun A2 unchanged |
+| CPE scene-scale on top of A1 | Rejected as default | `pct5=81.32`, `pct2=30.74`, below clean FGPI-4090 and worse high-precision than A1 | Do not rerun CPE-A1 unchanged |
+| B1 sharp-init key scalar mix | Rejected current form | `pct5=79.77`; diagnostic repeat `pct5=76.65`; mix stays almost entirely on layer 12 | Do not rerun B1 unchanged |
 | C1 / aux-ref / alpha scaling did not beat controls on `scene2a` | Negative or inconclusive | Historical C1, alpha=2, and aux-ref results trail paired controls on `acc5` | Do not expand before a stronger paired win |
 
 ## Recent Scene2a C0_P4 Baseline/Fusion Matrix
@@ -123,9 +125,38 @@ Do not rerun unchanged:
   the whole A0/A1/A2 matrix.
 
 Next related run:
-- CPE: A1-style fusion with compressor PE scene-scale, not a repeat of A1.
-  Use `--lmc_fusion_geometry_mode value_only_norm`
-  and `--lmc_compressor_pe_scale_mode scene_scale`.
+- Do not continue CPE/B1 unchanged. The next run should test a different
+  primary mechanism.
+
+### CPE / B1 2026-05-18
+
+Source note:
+- `ace_g_global_refactor/COMPARE_CPE_B1_scene2a_20260518.md`
+
+Shared setup:
+- Scene / variant: `scene2a/c0_p4`
+- Memory: `memory_extraction/04_evaluation/memory_extract/scene2a/40v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate4_prepair8_sor_gm_l2/20260508_103423/memory_bse.pt`
+- `lmc_mode=global`
+- `lmc_auto_mode_by_visibility=False`
+- `lmc_key_slice_idx=2`
+- `s1_loss_step_mode=per_iter`
+- `batch_size=10240`
+- Eval: 5-run post-train median, seeds `1305,2026,4242,7777,9001`,
+  `post_train_hypotheses=256`
+
+| ID | Main change | pct5 | pct10_5 | pct2 | pct1 | med_t | med_r | avg ms | Decision |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| CPE-A1 | `value_only_norm` + compressor PE `scene_scale` | 81.32 | 93.77 | 30.74 | 5.84 | 2.6946 | 0.2781 | 104.76 | Reject as default |
+| B1 | `lmc_key_feature_mode=scalar_mix`, value concat unchanged | 79.77 | 94.55 | 31.91 | 7.00 | 2.8101 | 0.2877 | 102.52 | Reject current form |
+| B1-diag | same as B1 + runtime diagnostics | 76.65 | 94.55 | 32.68 | 6.23 | 2.7682 | 0.3028 | 106.29 | Diagnostic complete |
+
+Diagnostic notes:
+- CPE gives a small `pct5` gain over A1 but is still below clean FGPI-4090 and
+  hurts `pct2`.
+- B1 scalar mix final weights stay effectively on layer 12:
+  `0.00034,0.00034,0.99862,0.00034,0.00034`.
+- Current B1 sharp-init scalar mix should not be expanded. Any future key-mix
+  work must be a new mechanism, not a rerun.
 
 ## Historical Memory / C0 / C1 Results
 
@@ -167,11 +198,7 @@ These are not completed results yet.
 
 | ID | Purpose | Key flags | Priority | Notes |
 | --- | --- | --- | --- | --- |
-| CPE-A1-scene2a | Test compressor PE scene-scale on top of A1-style fusion | `--lmc_fusion_geometry_mode value_only_norm --lmc_fusion_scene_scale_source memory_points_p95 --lmc_compressor_pe_scale_mode scene_scale` | High | New run, not a repeat of A1 |
-| CPE-A1-diag | Same as above with runtime diagnostics | add `--lmc_log_runtime_stats True --lmc_runtime_stats_interval 20 --lmc_runtime_stats_max_pixels 4096` | High | Run one diagnostic job; no need to block all other jobs |
-| B1-scalar-mix-scene2a | Test multi-layer key learned scalar mix while keeping value as all-layer concat | `--lmc_key_feature_mode scalar_mix --lmc_key_slice_idx 2` | High | New structural run; do not combine with CPE in the first pass |
-| B1-scalar-mix-diag | Same as B1 with runtime diagnostics | add `--lmc_log_runtime_stats True --lmc_runtime_stats_interval 20 --lmc_runtime_stats_max_pixels 4096` | High | Use to inspect `lmc_key_mix_weights` and token usage |
-| Cross-scene CPE | Check whether CPE effect generalizes | same CPE flags on selected non-scene2a scenes | Medium | Launch after scene2a CPE has a useful signal |
+| Cross-scene CPE | Check whether CPE effect generalizes | same CPE flags on selected non-scene2a scenes | Paused | Do not launch from current scene2a signal |
 
 ## Duplicate-Prevention Rules
 
@@ -180,9 +207,13 @@ These are not completed results yet.
 3. Do not expand `geokey_norm` until there is a new mechanism, not just the
    same flag set.
 4. Do not expand C1 aux-ref or alpha-scaling before a paired repeated-eval win.
-5. New experiments should change exactly one primary mechanism when possible:
+5. Do not rerun `CPE-A1` unchanged on `scene2a/c0_p4`; it is complete and
+   negative/mixed.
+6. Do not rerun current sharp-init `B1 scalar_mix` unchanged. A future key-mix
+   run must be a new mechanism such as softer init or explicit per-layer keys.
+7. New experiments should change exactly one primary mechanism when possible:
    fusion geometry, compressor PE scaling, S1 step mode, or auto-global mode.
-6. Every new completed run should append:
+8. Every new completed run should append:
    - exact command or `run_command.txt` path,
    - scene / variant / memory path,
    - checkpoint path,

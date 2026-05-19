@@ -12,29 +12,75 @@ import torch.nn.functional as F
 _logger = logging.getLogger(__name__)
 
 
+def _summarize_attention_scalars(attn):
+    """Return scalar-only attention diagnostics."""
+    with torch.no_grad():
+        attn_eval = attn.detach().float()
+        eps = 1e-8
+        entropy = -(attn_eval * (attn_eval + eps).log()).sum(dim=-1)
+        usage = attn_eval.mean(dim=(0, 1, 2))
+        usage = usage / usage.sum().clamp(min=eps)
+        usage_entropy = -(usage * (usage + eps).log()).sum()
+        max_attn = attn_eval.max(dim=-1).values
+        return {
+            "attn_entropy_mean": float(entropy.mean().item()),
+            "effective_token_count": float(torch.exp(usage_entropy).item()),
+            "avg_max_attention": float(max_attn.mean().item()),
+        }
+
+
 # ---------------------------------------------------------------------------
 # 1. Base Components
 # ---------------------------------------------------------------------------
 
 class FourierPositionEncoding(nn.Module):
-    """3D Positional Encoding using Random Fourier Features."""
+    """3D positional encoding with legacy and residual-v2 modes."""
 
     def __init__(self, input_dim=3, hidden_dim=256, output_dim=1024,
                  num_frequencies=10, sigma=1.0, normalize_input=False,
-                 scale_mode=None, scene_scale=1.0):
+                 scale_mode=None, scene_scale=1.0,
+                 mode="fourier_legacy",
+                 fourier_v2_scales=None,
+                 coord_norm="scene_radius",
+                 radius=4.0,
+                 learnable_scale=False,
+                 residual_gate_init=0.0):
         super().__init__()
         if scale_mode is None:
             scale_mode = "std" if normalize_input else "raw"
         if scale_mode not in ("raw", "std", "scene_scale"):
             raise ValueError(f"Unsupported PE scale_mode={scale_mode!r}.")
+        mode = str(mode)
+        if mode not in ("fourier_legacy", "fourier_v2"):
+            raise ValueError(f"Unsupported PE mode={mode!r}.")
+        coord_norm = str(coord_norm)
+        if coord_norm not in ("scene_radius",):
+            raise ValueError(f"Unsupported coord_norm={coord_norm!r}.")
+        radius = float(radius)
+        if (not torch.isfinite(torch.tensor(radius)).item()) or radius <= 0.0:
+            raise ValueError(f"radius must be finite and > 0, got {radius!r}")
+        if fourier_v2_scales is None:
+            fourier_v2_scales = [1.0, 2.0, 4.0, 8.0, 16.0]
+        fourier_v2_scales = [float(v) for v in fourier_v2_scales]
+        if len(fourier_v2_scales) == 0 or any(v <= 0.0 for v in fourier_v2_scales):
+            raise ValueError(f"Invalid fourier_v2_scales={fourier_v2_scales!r}")
+
         self.normalize_input = normalize_input
         self.scale_mode = scale_mode
+        self.mode = mode
+        self.coord_norm = coord_norm
+        self.learnable_scale = bool(learnable_scale)
         scene_scale = float(scene_scale)
         if (not torch.isfinite(torch.tensor(scene_scale)).item()) or scene_scale <= 0.0:
             raise ValueError(f"scene_scale must be finite and > 0, got {scene_scale!r}")
         self.register_buffer(
             "scene_scale",
             torch.tensor(scene_scale, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "v2_radius",
+            torch.tensor(radius, dtype=torch.float32),
             persistent=False,
         )
         self.register_buffer(
@@ -45,7 +91,25 @@ class FourierPositionEncoding(nn.Module):
             nn.Linear(hidden_dim, output_dim),
         )
 
-    def forward(self, coords):
+        scales_tensor = torch.tensor(fourier_v2_scales, dtype=torch.float32)
+        if self.learnable_scale:
+            self.v2_scales = nn.Parameter(scales_tensor)
+        else:
+            self.register_buffer("v2_scales", scales_tensor, persistent=False)
+        self.residual_gate = None
+        self.v2_mlp = None
+        if self.mode == "fourier_v2":
+            self.residual_gate = nn.Parameter(
+                torch.tensor(float(residual_gate_init), dtype=torch.float32)
+            )
+            fourier_dim = input_dim * scales_tensor.numel() * 2
+            self.v2_mlp = nn.Sequential(
+                nn.Linear(fourier_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, output_dim),
+            )
+
+    def _encode_legacy(self, coords):
         if self.scale_mode == "std":
             coords = coords / (coords.std(dim=1, keepdim=True).clamp(min=1e-6))
         elif self.scale_mode == "scene_scale":
@@ -55,6 +119,24 @@ class FourierPositionEncoding(nn.Module):
         fourier = torch.cat([torch.sin(2 * math.pi * projected),
                              torch.cos(2 * math.pi * projected)], dim=-1)
         return self.mlp(fourier)
+
+    def _encode_v2_residual(self, coords):
+        if self.coord_norm == "scene_radius":
+            radius = self.v2_radius.to(device=coords.device, dtype=coords.dtype)
+            coords = coords / radius.clamp(min=1e-6)
+        scales = self.v2_scales.to(device=coords.device, dtype=coords.dtype)
+        projected = coords.unsqueeze(-1) * scales.view(1, 1, 1, -1)
+        fourier = torch.cat([torch.sin(2 * math.pi * projected),
+                             torch.cos(2 * math.pi * projected)], dim=-1)
+        fourier = fourier.reshape(coords.shape[0], coords.shape[1], -1)
+        return self.v2_mlp(fourier)
+
+    def forward(self, coords):
+        legacy = self._encode_legacy(coords)
+        if self.mode == "fourier_legacy":
+            return legacy
+        gate = self.residual_gate.to(device=coords.device, dtype=coords.dtype)
+        return legacy + gate * self._encode_v2_residual(coords)
 
 
 def farthest_point_sampling(points, K, start_policy="farthest_from_center", scene_center=None, generator=None):
@@ -126,6 +208,70 @@ class AdaptiveGeometricBias(nn.Module):
         return bias.unsqueeze(1)
 
 
+class ResidualRBFDistanceBias(nn.Module):
+    """Residual multi-scale RBF bias added to attention logits."""
+
+    def __init__(self, num_heads, mode="legacy", scales=None,
+                 alpha_init=0.0, learn_weights=True, per_head=False):
+        super().__init__()
+        self.num_heads = int(num_heads)
+        self.mode = str(mode)
+        if self.mode not in ("legacy", "rbf_residual"):
+            raise ValueError(f"Unsupported geo_bias_mode={mode!r}.")
+        if scales is None:
+            scales = [0.25, 0.5, 1.0, 2.0, 4.0]
+        scales = [float(v) for v in scales]
+        if len(scales) == 0 or any(v <= 0.0 for v in scales):
+            raise ValueError(f"Invalid RBF scales={scales!r}.")
+        self.learn_weights = bool(learn_weights)
+        self.per_head = bool(per_head)
+        self.register_buffer(
+            "rbf_scales",
+            torch.tensor(scales, dtype=torch.float32),
+            persistent=False,
+        )
+        self.alpha = None
+        self.weight_logits = None
+        if self.mode == "rbf_residual":
+            self.alpha = nn.Parameter(torch.tensor(float(alpha_init), dtype=torch.float32))
+            shape = (self.num_heads if self.per_head else 1, len(scales))
+            weight_logits = torch.zeros(shape, dtype=torch.float32)
+            if self.learn_weights:
+                self.weight_logits = nn.Parameter(weight_logits)
+            else:
+                self.register_buffer("weight_logits", weight_logits, persistent=False)
+
+    def forward(self, dist_sq):
+        if self.mode != "rbf_residual" or dist_sq is None:
+            return None
+        scales = self.rbf_scales.to(device=dist_sq.device, dtype=dist_sq.dtype)
+        denom = 2.0 * scales.pow(2).view(1, 1, 1, 1, -1).clamp(min=1e-6)
+        basis = torch.exp(-dist_sq.unsqueeze(1).unsqueeze(-1) / denom)
+        weights = torch.softmax(
+            self.weight_logits.to(device=dist_sq.device, dtype=dist_sq.dtype),
+            dim=-1,
+        )
+        if self.per_head:
+            basis = basis.expand(-1, self.num_heads, -1, -1, -1)
+            weights = weights.view(1, self.num_heads, 1, 1, -1)
+        else:
+            weights = weights.view(1, 1, 1, 1, -1)
+        alpha = self.alpha.to(device=dist_sq.device, dtype=dist_sq.dtype).view(1, 1, 1, 1)
+        return alpha * (basis * weights).sum(dim=-1)
+
+    def summary(self):
+        if self.mode != "rbf_residual":
+            return None
+        weights = torch.softmax(self.weight_logits.detach().float().cpu(), dim=-1)
+        weights_out = weights.tolist()
+        if not self.per_head and len(weights_out) == 1:
+            weights_out = weights_out[0]
+        return {
+            "final_geo_bias_rbf_alpha": float(self.alpha.detach().float().cpu().item()),
+            "final_geo_bias_rbf_weights": weights_out,
+        }
+
+
 # ---------------------------------------------------------------------------
 # 3. Attention Modules
 # ---------------------------------------------------------------------------
@@ -134,7 +280,12 @@ class DecoupledCrossAttention(nn.Module):
     """Standard Cross Attention that accepts a pre-computed attn_bias."""
 
     def __init__(self, dim, num_heads=8, qkv_bias=False,
-                 attn_drop=0., proj_drop=0.):
+                 attn_drop=0., proj_drop=0.,
+                 geo_bias_mode="legacy",
+                 geo_bias_rbf_scales=None,
+                 geo_bias_rbf_alpha_init=0.0,
+                 geo_bias_rbf_learn_weights=True,
+                 geo_bias_rbf_per_head=False):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -142,11 +293,21 @@ class DecoupledCrossAttention(nn.Module):
         self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.rbf_bias = ResidualRBFDistanceBias(
+            num_heads=num_heads,
+            mode=geo_bias_mode,
+            scales=geo_bias_rbf_scales,
+            alpha_init=geo_bias_rbf_alpha_init,
+            learn_weights=geo_bias_rbf_learn_weights,
+            per_head=geo_bias_rbf_per_head,
+        )
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.collect_runtime_stats = False
+        self.last_runtime_stats = None
 
-    def forward(self, query, key, value, attn_bias=None):
+    def forward(self, query, key, value, attn_bias=None, dist_sq=None):
         B, N_q, C = query.shape
         N_k = key.shape[1]
         q = self.q_proj(query).reshape(B, N_q, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
@@ -155,7 +316,14 @@ class DecoupledCrossAttention(nn.Module):
         attn = (q @ k.transpose(-2, -1)) * self.scale
         if attn_bias is not None:
             attn = attn + attn_bias
+        rbf_bias = self.rbf_bias(dist_sq)
+        if rbf_bias is not None:
+            attn = attn + rbf_bias
         attn = attn.softmax(dim=-1)
+        self.last_runtime_stats = (
+            _summarize_attention_scalars(attn)
+            if self.collect_runtime_stats else None
+        )
         attn = self.attn_drop(attn)
         x = (attn @ v).transpose(1, 2).reshape(B, N_q, C)
         x = self.proj(x)
@@ -167,7 +335,12 @@ class GlobalSoftAttention(nn.Module):
     """Attention that learns a Soft Bias via MLP from dist_sq."""
 
     def __init__(self, dim, num_heads=8, qkv_bias=False,
-                 attn_drop=0., proj_drop=0.):
+                 attn_drop=0., proj_drop=0.,
+                 geo_bias_mode="legacy",
+                 geo_bias_rbf_scales=None,
+                 geo_bias_rbf_alpha_init=0.0,
+                 geo_bias_rbf_learn_weights=True,
+                 geo_bias_rbf_per_head=False):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -177,9 +350,19 @@ class GlobalSoftAttention(nn.Module):
         self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.geo_bias_mlp = nn.Sequential(
             nn.Linear(1, 32), nn.ReLU(), nn.Linear(32, num_heads))
+        self.rbf_bias = ResidualRBFDistanceBias(
+            num_heads=num_heads,
+            mode=geo_bias_mode,
+            scales=geo_bias_rbf_scales,
+            alpha_init=geo_bias_rbf_alpha_init,
+            learn_weights=geo_bias_rbf_learn_weights,
+            per_head=geo_bias_rbf_per_head,
+        )
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.collect_runtime_stats = False
+        self.last_runtime_stats = None
 
     def forward(self, query, key, value, dist_sq=None):
         B, N_q, C = query.shape
@@ -192,7 +375,14 @@ class GlobalSoftAttention(nn.Module):
             d_log = torch.log(dist_sq.unsqueeze(-1) + 1e-6)
             geo_bias = self.geo_bias_mlp(d_log).permute(0, 3, 1, 2)
             attn = attn + geo_bias
+        rbf_bias = self.rbf_bias(dist_sq)
+        if rbf_bias is not None:
+            attn = attn + rbf_bias
         attn = attn.softmax(dim=-1)
+        self.last_runtime_stats = (
+            _summarize_attention_scalars(attn)
+            if self.collect_runtime_stats else None
+        )
         attn = self.attn_drop(attn)
         x = (attn @ v).transpose(1, 2).reshape(B, N_q, C)
         x = self.proj(x)
@@ -207,13 +397,25 @@ class GlobalSoftAttention(nn.Module):
 class GeoAttentionBlock(nn.Module):
     """Transformer Block for Geometric Modes (global / local / fine)."""
 
-    def __init__(self, dim, mode, num_heads=8, geo_sigma=0.5):
+    def __init__(self, dim, mode, num_heads=8, geo_sigma=0.5,
+                 geo_bias_mode="legacy",
+                 geo_bias_rbf_scales=None,
+                 geo_bias_rbf_alpha_init=0.0,
+                 geo_bias_rbf_learn_weights=True,
+                 geo_bias_rbf_per_head=False):
         super().__init__()
         self.mode = mode
+        attn_kwargs = dict(
+            geo_bias_mode=geo_bias_mode,
+            geo_bias_rbf_scales=geo_bias_rbf_scales,
+            geo_bias_rbf_alpha_init=geo_bias_rbf_alpha_init,
+            geo_bias_rbf_learn_weights=geo_bias_rbf_learn_weights,
+            geo_bias_rbf_per_head=geo_bias_rbf_per_head,
+        )
         if mode == 'global':
-            self.attn = GlobalSoftAttention(dim, num_heads=num_heads)
+            self.attn = GlobalSoftAttention(dim, num_heads=num_heads, **attn_kwargs)
         else:
-            self.attn = DecoupledCrossAttention(dim, num_heads=num_heads)
+            self.attn = DecoupledCrossAttention(dim, num_heads=num_heads, **attn_kwargs)
         if mode == 'fine':
             self.fine_bias_gen = AdaptiveGeometricBias(dim, base_sigma=geo_sigma)
         self.norm1 = nn.LayerNorm(dim)
@@ -224,13 +426,19 @@ class GeoAttentionBlock(nn.Module):
     def forward(self, q, k, v, geometry_info=None):
         residual = q
         q_norm = self.norm1(q)
+        if isinstance(geometry_info, dict):
+            dist_sq = geometry_info.get("dist_sq")
+            attn_bias = geometry_info.get("attn_bias")
+        else:
+            dist_sq = geometry_info
+            attn_bias = geometry_info
         if self.mode == 'global':
-            q = residual + self.attn(q_norm, k, v, dist_sq=geometry_info)
+            q = residual + self.attn(q_norm, k, v, dist_sq=dist_sq)
         elif self.mode == 'local':
-            q = residual + self.attn(q_norm, k, v, attn_bias=geometry_info)
+            q = residual + self.attn(q_norm, k, v, attn_bias=attn_bias, dist_sq=dist_sq)
         elif self.mode == 'fine':
-            bias = self.fine_bias_gen(q_norm, geometry_info)
-            q = residual + self.attn(q_norm, k, v, attn_bias=bias)
+            bias = self.fine_bias_gen(q_norm, dist_sq)
+            q = residual + self.attn(q_norm, k, v, attn_bias=bias, dist_sq=dist_sq)
         q = q + self.mlp(self.norm2(q))
         return q
 
@@ -285,7 +493,25 @@ class GeoLMC(nn.Module):
                  pe_scene_scale=1.0,
                  fps_start_policy="farthest_from_center",
                  key_slice_idx=None,
-                 key_feature_mode="slice"):
+                 key_feature_mode="slice",
+                 feature_hierarchy_mode="selected_key_concat_value",
+                 level_merge_mode="softmax_gate",
+                 level_merge_init="uniform",
+                 level_proj_shared=False,
+                 level_cross_attn_shared=True,
+                 level_gate_entropy_weight=0.0,
+                 level_token_gate=False,
+                 geo_bias_mode="legacy",
+                 geo_bias_rbf_scales=(0.25, 0.5, 1.0, 2.0, 4.0),
+                 geo_bias_rbf_alpha_init=0.0,
+                 geo_bias_rbf_learn_weights=True,
+                 geo_bias_rbf_per_head=False,
+                 pos_encoding_mode="fourier_legacy",
+                 pos_fourier_v2_scales=(1.0, 2.0, 4.0, 8.0, 16.0),
+                 pos_fourier_coord_norm="scene_radius",
+                 pos_fourier_radius=4.0,
+                 pos_fourier_learnable_scale=False,
+                 pos_fourier_residual_gate_init=0.0):
         super().__init__()
 
         self.mode = mode
@@ -299,10 +525,57 @@ class GeoLMC(nn.Module):
         self.key_feature_mode = str(key_feature_mode)
         if self.key_feature_mode not in ("slice", "scalar_mix"):
             raise ValueError(f"Unsupported key_feature_mode={key_feature_mode!r}.")
+        self.feature_hierarchy_mode = str(feature_hierarchy_mode)
+        if self.feature_hierarchy_mode not in ("selected_key_concat_value", "levelwise_latent_merge"):
+            raise ValueError(f"Unsupported feature_hierarchy_mode={feature_hierarchy_mode!r}.")
+        self.level_merge_mode = str(level_merge_mode)
+        if self.level_merge_mode != "softmax_gate":
+            raise ValueError(f"Unsupported level_merge_mode={level_merge_mode!r}.")
+        self.level_merge_init = str(level_merge_init)
+        if self.level_merge_init != "uniform":
+            raise ValueError(f"Unsupported level_merge_init={level_merge_init!r}.")
+        self.level_proj_shared = bool(level_proj_shared)
+        self.level_cross_attn_shared = bool(level_cross_attn_shared)
+        self.level_gate_entropy_weight = float(level_gate_entropy_weight)
+        self.level_token_gate = bool(level_token_gate)
+        if self.feature_hierarchy_mode == "levelwise_latent_merge":
+            if self.mode not in ("global", "local"):
+                raise ValueError(
+                    "levelwise_latent_merge currently supports only global/local GeoLMC modes, "
+                    f"got mode={self.mode!r}."
+                )
+            if self.level_token_gate:
+                raise ValueError("level_token_gate is reserved for a future ablation; use False for B3-lite.")
+            if self.level_gate_entropy_weight != 0.0:
+                raise ValueError("level_gate_entropy_weight is reserved for a future ablation; use 0.0 for B3-lite.")
+        self.geo_bias_mode = str(geo_bias_mode)
+        if self.geo_bias_mode not in ("legacy", "rbf_residual"):
+            raise ValueError(f"Unsupported geo_bias_mode={geo_bias_mode!r}.")
+        self.geo_bias_rbf_scales = [float(v) for v in geo_bias_rbf_scales]
+        if len(self.geo_bias_rbf_scales) == 0 or any(v <= 0.0 for v in self.geo_bias_rbf_scales):
+            raise ValueError(f"Invalid geo_bias_rbf_scales={self.geo_bias_rbf_scales!r}.")
+        self.geo_bias_rbf_alpha_init = float(geo_bias_rbf_alpha_init)
+        self.geo_bias_rbf_learn_weights = bool(geo_bias_rbf_learn_weights)
+        self.geo_bias_rbf_per_head = bool(geo_bias_rbf_per_head)
+        self.pos_encoding_mode = str(pos_encoding_mode)
+        if self.pos_encoding_mode not in ("fourier_legacy", "fourier_v2"):
+            raise ValueError(f"Unsupported pos_encoding_mode={pos_encoding_mode!r}.")
+        self.pos_fourier_v2_scales = [float(v) for v in pos_fourier_v2_scales]
+        if len(self.pos_fourier_v2_scales) == 0 or any(v <= 0.0 for v in self.pos_fourier_v2_scales):
+            raise ValueError(f"Invalid pos_fourier_v2_scales={self.pos_fourier_v2_scales!r}.")
+        self.pos_fourier_coord_norm = str(pos_fourier_coord_norm)
+        if self.pos_fourier_coord_norm not in ("scene_radius",):
+            raise ValueError(f"Unsupported pos_fourier_coord_norm={pos_fourier_coord_norm!r}.")
+        self.pos_fourier_radius = float(pos_fourier_radius)
+        if self.pos_fourier_radius <= 0.0:
+            raise ValueError(f"pos_fourier_radius must be > 0, got {self.pos_fourier_radius!r}.")
+        self.pos_fourier_learnable_scale = bool(pos_fourier_learnable_scale)
+        self.pos_fourier_residual_gate_init = float(pos_fourier_residual_gate_init)
         self.pe_scale_mode = pe_scale_mode if pe_scale_mode is not None else (
             "std" if pe_normalize_input else "raw"
         )
         self.pe_scene_scale = float(pe_scene_scale)
+        self.last_geo_bias_runtime_stats = None
 
         # --- Input Projection ---
         self.total_input_dim = input_dim * num_layers
@@ -312,17 +585,42 @@ class GeoLMC(nn.Module):
             normalize_input=pe_normalize_input,
             scale_mode=self.pe_scale_mode,
             scene_scale=self.pe_scene_scale,
+            mode=self.pos_encoding_mode,
+            fourier_v2_scales=self.pos_fourier_v2_scales,
+            coord_norm=self.pos_fourier_coord_norm,
+            radius=self.pos_fourier_radius,
+            learnable_scale=self.pos_fourier_learnable_scale,
+            residual_gate_init=self.pos_fourier_residual_gate_init,
         )
-        self.k_proj = nn.Linear(input_dim, compress_dim)
-        if self.key_feature_mode == "scalar_mix":
-            key_mix_logits = torch.full((num_layers,), -4.0)
-            key_mix_logits[self.key_slice_idx] = 4.0
-            self.key_mix_logits = nn.Parameter(key_mix_logits)
-        self.v_proj = nn.Sequential(
-            nn.Linear(self.total_input_dim, compress_dim * 2),
-            nn.GELU(),
-            nn.Linear(compress_dim * 2, compress_dim),
-        )
+        if self.feature_hierarchy_mode == "levelwise_latent_merge":
+            self.level_latent_tokens = nn.Parameter(
+                torch.zeros(1, num_latent_tokens, compress_dim)
+            )
+            if self.level_proj_shared:
+                self.level_proj = nn.Sequential(
+                    nn.Linear(input_dim, compress_dim),
+                    nn.LayerNorm(compress_dim),
+                )
+            else:
+                self.level_proj = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Linear(input_dim, compress_dim),
+                        nn.LayerNorm(compress_dim),
+                    )
+                    for _ in range(num_layers)
+                ])
+            self.level_logits = nn.Parameter(torch.zeros(num_layers))
+        else:
+            self.k_proj = nn.Linear(input_dim, compress_dim)
+            if self.key_feature_mode == "scalar_mix":
+                key_mix_logits = torch.full((num_layers,), -4.0)
+                key_mix_logits[self.key_slice_idx] = 4.0
+                self.key_mix_logits = nn.Parameter(key_mix_logits)
+            self.v_proj = nn.Sequential(
+                nn.Linear(self.total_input_dim, compress_dim * 2),
+                nn.GELU(),
+                nn.Linear(compress_dim * 2, compress_dim),
+            )
 
         if use_scale_token:
             s_dim = scale_token_dim if scale_token_dim is not None else input_dim
@@ -343,21 +641,62 @@ class GeoLMC(nn.Module):
 
         elif mode == 'hierarchical':
             self.coarse_layers = nn.ModuleList([
-                GeoAttentionBlock(compress_dim, mode='global', num_heads=8)
+                GeoAttentionBlock(compress_dim, mode='global', num_heads=8,
+                                  geo_bias_mode=self.geo_bias_mode,
+                                  geo_bias_rbf_scales=self.geo_bias_rbf_scales,
+                                  geo_bias_rbf_alpha_init=self.geo_bias_rbf_alpha_init,
+                                  geo_bias_rbf_learn_weights=self.geo_bias_rbf_learn_weights,
+                                  geo_bias_rbf_per_head=self.geo_bias_rbf_per_head)
                 for _ in range(num_attn_layers)])
             self.fine_layers = nn.ModuleList([
                 GeoAttentionBlock(compress_dim, mode='fine', num_heads=8,
-                                  geo_sigma=geo_sigma)
+                                  geo_sigma=geo_sigma,
+                                  geo_bias_mode=self.geo_bias_mode,
+                                  geo_bias_rbf_scales=self.geo_bias_rbf_scales,
+                                  geo_bias_rbf_alpha_init=self.geo_bias_rbf_alpha_init,
+                                  geo_bias_rbf_learn_weights=self.geo_bias_rbf_learn_weights,
+                                  geo_bias_rbf_per_head=self.geo_bias_rbf_per_head)
                 for _ in range(num_attn_layers)])
 
         else:  # global / local
             if mode == 'local':
                 self.local_bias_gen = LocalGeometricBias(
                     sigma=geo_sigma, hard_cutoff_sigma=3.0)
-            self.layers = nn.ModuleList([
-                GeoAttentionBlock(compress_dim, mode=mode, num_heads=8,
-                                  geo_sigma=geo_sigma)
-                for _ in range(num_attn_layers)])
+            if self.feature_hierarchy_mode == "levelwise_latent_merge":
+                if self.level_cross_attn_shared:
+                    self.level_layers = nn.ModuleList([
+                        GeoAttentionBlock(compress_dim, mode=mode, num_heads=8,
+                                          geo_sigma=geo_sigma,
+                                          geo_bias_mode=self.geo_bias_mode,
+                                          geo_bias_rbf_scales=self.geo_bias_rbf_scales,
+                                          geo_bias_rbf_alpha_init=self.geo_bias_rbf_alpha_init,
+                                          geo_bias_rbf_learn_weights=self.geo_bias_rbf_learn_weights,
+                                          geo_bias_rbf_per_head=self.geo_bias_rbf_per_head)
+                        for _ in range(num_attn_layers)])
+                else:
+                    self.level_layers = nn.ModuleList([
+                        nn.ModuleList([
+                            GeoAttentionBlock(compress_dim, mode=mode, num_heads=8,
+                                              geo_sigma=geo_sigma,
+                                              geo_bias_mode=self.geo_bias_mode,
+                                              geo_bias_rbf_scales=self.geo_bias_rbf_scales,
+                                              geo_bias_rbf_alpha_init=self.geo_bias_rbf_alpha_init,
+                                              geo_bias_rbf_learn_weights=self.geo_bias_rbf_learn_weights,
+                                              geo_bias_rbf_per_head=self.geo_bias_rbf_per_head)
+                            for _ in range(num_attn_layers)
+                        ])
+                        for _ in range(num_layers)
+                    ])
+            else:
+                self.layers = nn.ModuleList([
+                    GeoAttentionBlock(compress_dim, mode=mode, num_heads=8,
+                                      geo_sigma=geo_sigma,
+                                      geo_bias_mode=self.geo_bias_mode,
+                                      geo_bias_rbf_scales=self.geo_bias_rbf_scales,
+                                      geo_bias_rbf_alpha_init=self.geo_bias_rbf_alpha_init,
+                                      geo_bias_rbf_learn_weights=self.geo_bias_rbf_learn_weights,
+                                      geo_bias_rbf_per_head=self.geo_bias_rbf_per_head)
+                    for _ in range(num_attn_layers)])
 
     # -- helpers --
 
@@ -387,6 +726,81 @@ class GeoLMC(nn.Module):
         end = start + C
         return features[:, :, start:end]
 
+    def _get_per_layer_features(self, features):
+        if self.num_layers <= 1:
+            return features.unsqueeze(2)
+        B, N, total_c = features.shape
+        if total_c % self.num_layers != 0:
+            raise ValueError(
+                f"pooled_features last dim {total_c} is not divisible by num_layers={self.num_layers}."
+            )
+        C = total_c // self.num_layers
+        return features.reshape(B, N, self.num_layers, C)
+
+    def _project_level_features(self, level_features, level_idx):
+        if self.level_proj_shared:
+            return self.level_proj(level_features)
+        return self.level_proj[level_idx](level_features)
+
+    def _set_cross_attention_stats(self, layers, enabled):
+        for layer in layers:
+            attn = getattr(layer, "attn", None)
+            if attn is not None:
+                attn.collect_runtime_stats = bool(enabled)
+                attn.last_runtime_stats = None
+
+    def _iter_attention_modules(self):
+        if self.mode == 'hierarchical':
+            for layer in self.coarse_layers:
+                yield getattr(layer, 'attn', None)
+            for layer in self.fine_layers:
+                yield getattr(layer, 'attn', None)
+        elif self.mode == 'learned':
+            return
+        elif self.feature_hierarchy_mode == "levelwise_latent_merge":
+            if self.level_cross_attn_shared:
+                for layer in self.level_layers:
+                    yield getattr(layer, 'attn', None)
+            else:
+                for layer_group in self.level_layers:
+                    for layer in layer_group:
+                        yield getattr(layer, 'attn', None)
+        else:
+            for layer in self.layers:
+                yield getattr(layer, 'attn', None)
+
+    def _update_geo_bias_runtime_stats(self):
+        summaries = []
+        for idx, attn in enumerate(self._iter_attention_modules() or []):
+            if attn is None:
+                continue
+            rbf_bias = getattr(attn, 'rbf_bias', None)
+            if rbf_bias is None:
+                continue
+            summary = rbf_bias.summary()
+            if summary is not None:
+                summaries.append({"layer": idx, **summary})
+        if not summaries:
+            self.last_geo_bias_runtime_stats = None
+            return
+        if len(summaries) == 1:
+            summary = summaries[0]
+            self.last_geo_bias_runtime_stats = {
+                "final_geo_bias_rbf_alpha": summary["final_geo_bias_rbf_alpha"],
+                "final_geo_bias_rbf_weights": summary["final_geo_bias_rbf_weights"],
+            }
+            return
+        self.last_geo_bias_runtime_stats = {
+            "final_geo_bias_rbf_alpha": [item["final_geo_bias_rbf_alpha"] for item in summaries],
+            "final_geo_bias_rbf_weights": [item["final_geo_bias_rbf_weights"] for item in summaries],
+        }
+
+    def _build_local_geometry_info(self, dist_sq):
+        return {
+            "dist_sq": dist_sq,
+            "attn_bias": self.local_bias_gen(dist_sq),
+        }
+
     def _get_key_features(self, features):
         if self.key_feature_mode == "slice":
             return self._get_layer_slice(features, self.key_slice_idx)
@@ -408,6 +822,102 @@ class GeoLMC(nn.Module):
                 x = x + scale_emb
         return x
 
+    def _sample_latent_coords(self, pooled_points, scene_center, K_curr):
+        if pooled_points.shape[1] > K_curr:
+            fps_idx = farthest_point_sampling(
+                pooled_points,
+                K_curr,
+                start_policy=self.fps_start_policy,
+                scene_center=scene_center,
+            )
+            return torch.gather(
+                pooled_points, 1,
+                fps_idx.unsqueeze(-1).expand(-1, -1, 3))
+        return pooled_points[:, :K_curr, :]
+
+    def _forward_levelwise_latent_merge(self, memory_dict):
+        pooled_points = memory_dict["pooled_points"]
+        pooled_features = memory_dict["pooled_features"]
+        scene_center = memory_dict["scene_center"]
+
+        latent_coords = self._sample_latent_coords(pooled_points, scene_center, self.K)
+        centered_latent = latent_coords - scene_center.unsqueeze(1)
+        centered_points = pooled_points - scene_center.unsqueeze(1)
+        q_seed = self.pe_encoder(centered_latent) + self.level_latent_tokens.to(
+            device=pooled_points.device,
+            dtype=pooled_features.dtype,
+        )
+        k_pos = self.pe_encoder(centered_points)
+
+        if not hasattr(self, '_pe_logged'):
+            _logger.info(
+                "[PE] scale_mode=%s scene_scale=%.6f input range: %.3f~%.3f, "
+                "input_std=%.4f, output range: %.3f~%.3f",
+                self.pe_scale_mode,
+                self.pe_scene_scale,
+                float(centered_latent.min()), float(centered_latent.max()),
+                float(centered_latent.std(unbiased=False)),
+                float(q_seed.min()), float(q_seed.max()),
+            )
+            self._pe_logged = True
+
+        dist_sq = torch.cdist(latent_coords, pooled_points, p=2) ** 2
+        if self.mode == 'local':
+            geometry_info = self._build_local_geometry_info(dist_sq)
+        else:
+            geometry_info = dist_sq
+
+        collect_stats = bool(getattr(self, "collect_runtime_stats", False))
+        per_layer = self._get_per_layer_features(pooled_features)
+        z_levels = []
+        level_norm_mean = []
+        level_norm_std = []
+        attn_entropy_mean = []
+        effective_token_count = []
+
+        for level_idx in range(self.num_layers):
+            level_features = per_layer[:, :, level_idx, :]
+            projected = self._project_level_features(level_features, level_idx)
+            k = projected + k_pos
+            q = q_seed
+            layers = self.level_layers if self.level_cross_attn_shared else self.level_layers[level_idx]
+            self._set_cross_attention_stats(layers, collect_stats)
+            last_attn_stats = None
+            for layer in layers:
+                q = layer(q, k, projected, geometry_info=geometry_info)
+                attn = getattr(layer, "attn", None)
+                if attn is not None and attn.last_runtime_stats is not None:
+                    last_attn_stats = attn.last_runtime_stats
+            z_levels.append(q)
+            if collect_stats:
+                norms = q.detach().float().norm(dim=-1)
+                level_norm_mean.append(float(norms.mean().item()))
+                level_norm_std.append(float(norms.std(unbiased=False).item()))
+                if last_attn_stats is not None:
+                    attn_entropy_mean.append(float(last_attn_stats["attn_entropy_mean"]))
+                    effective_token_count.append(float(last_attn_stats["effective_token_count"]))
+
+        z_all = torch.stack(z_levels, dim=1)
+        gate = torch.softmax(self.level_logits, dim=0).to(device=z_all.device, dtype=z_all.dtype)
+        merged = torch.sum(z_all * gate.view(1, self.num_layers, 1, 1), dim=1)
+        x = self._inject_scale(merged, memory_dict)
+
+        with torch.no_grad():
+            gate_float = gate.detach().float().cpu()
+            gate_entropy = -(gate_float * (gate_float + 1e-8).log()).sum()
+            self.last_levelwise_runtime_stats = {
+                "per_level_latent_norm_mean": level_norm_mean,
+                "per_level_latent_norm_std": level_norm_std,
+                "per_level_attention_entropy_mean": attn_entropy_mean,
+                "per_level_effective_memory_token_count": effective_token_count,
+                "final_level_merge_weights": gate_float.tolist(),
+                "final_level_gate_entropy": float(gate_entropy.item()),
+                "lmc_level_merge_weights": gate_float.tolist(),
+                "lmc_level_gate_entropy": float(gate_entropy.item()),
+            }
+        self._update_geo_bias_runtime_stats()
+        return x, latent_coords
+
     # -- forward --
 
     def forward(self, memory_dict):
@@ -427,6 +937,9 @@ class GeoLMC(nn.Module):
         pooled_features = memory_dict["pooled_features"]
         scene_center = memory_dict["scene_center"]
 
+        if self.feature_hierarchy_mode == "levelwise_latent_merge":
+            return self._forward_levelwise_latent_merge(memory_dict)
+
         raw_key_feats = self._get_key_features(pooled_features)
         k_base = self.k_proj(raw_key_feats)
         v = self.v_proj(pooled_features)
@@ -441,6 +954,7 @@ class GeoLMC(nn.Module):
                 q = layer(q, k, v)
             q = self._inject_scale(q, memory_dict)
             pred_coords = self.coord_head(q) + scene_center.unsqueeze(1)
+            self._update_geo_bias_runtime_stats()
             return q, pred_coords
 
         # --- Hierarchical ---
@@ -479,23 +993,12 @@ class GeoLMC(nn.Module):
                 q_fine = layer(q_fine, k_base, v, geometry_info=dist_fine)
             z_fine = self._inject_scale(q_fine, memory_dict)
 
+            self._update_geo_bias_runtime_stats()
             return {"z_coarse": z_coarse, "p_coarse": coords_coarse,
                     "z_fine": z_fine, "p_fine": coords_fine}
 
         # --- Single Level (global / local) ---
-        K_curr = self.K
-        if pooled_points.shape[1] > K_curr:
-            fps_idx = farthest_point_sampling(
-                pooled_points,
-                K_curr,
-                start_policy=self.fps_start_policy,
-                scene_center=scene_center,
-            )
-            latent_coords = torch.gather(
-                pooled_points, 1,
-                fps_idx.unsqueeze(-1).expand(-1, -1, 3))
-        else:
-            latent_coords = pooled_points[:, :K_curr, :]
+        latent_coords = self._sample_latent_coords(pooled_points, scene_center, self.K)
 
         norm_coords = latent_coords - scene_center.unsqueeze(1)
         q = self.pe_encoder(norm_coords)
@@ -515,7 +1018,7 @@ class GeoLMC(nn.Module):
 
         dist_sq = torch.cdist(latent_coords, pooled_points, p=2) ** 2
         if self.mode == 'local':
-            geometry_info = self.local_bias_gen(dist_sq)
+            geometry_info = self._build_local_geometry_info(dist_sq)
         else:
             geometry_info = dist_sq
 
@@ -523,4 +1026,5 @@ class GeoLMC(nn.Module):
             q = layer(q, k_base, v, geometry_info=geometry_info)
 
         x = self._inject_scale(q, memory_dict)
+        self._update_geo_bias_runtime_stats()
         return x, latent_coords
