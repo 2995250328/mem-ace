@@ -1202,7 +1202,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         lmc_level_gate_entropy_weight = float(getattr(options, 'lmc_level_gate_entropy_weight', 0.0))
         lmc_level_token_gate = bool(getattr(options, 'lmc_level_token_gate', False))
         lmc_geo_bias_mode = str(getattr(options, 'lmc_geo_bias_mode', 'legacy'))
-        if lmc_geo_bias_mode not in ('legacy', 'rbf_residual'):
+        if lmc_geo_bias_mode not in ('legacy', 'rbf_residual', 'crpb'):
             raise ValueError(f"Unsupported lmc_geo_bias_mode={lmc_geo_bias_mode!r}")
         lmc_geo_bias_rbf_scales = [float(v) for v in getattr(options, 'lmc_geo_bias_rbf_scales', [0.25, 0.5, 1.0, 2.0, 4.0])]
         if len(lmc_geo_bias_rbf_scales) == 0 or any(v <= 0.0 for v in lmc_geo_bias_rbf_scales):
@@ -1211,7 +1211,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         lmc_geo_bias_rbf_learn_weights = bool(getattr(options, 'lmc_geo_bias_rbf_learn_weights', True))
         lmc_geo_bias_rbf_per_head = bool(getattr(options, 'lmc_geo_bias_rbf_per_head', False))
         lmc_pos_encoding_mode = str(getattr(options, 'lmc_pos_encoding_mode', 'fourier_legacy'))
-        if lmc_pos_encoding_mode not in ('fourier_legacy', 'fourier_v2'):
+        if lmc_pos_encoding_mode not in ('fourier_legacy', 'fourier_v2', 'point_rope'):
             raise ValueError(f"Unsupported lmc_pos_encoding_mode={lmc_pos_encoding_mode!r}")
         lmc_pos_fourier_v2_scales = [float(v) for v in getattr(options, 'lmc_pos_fourier_v2_scales', [1.0, 2.0, 4.0, 8.0, 16.0])]
         if len(lmc_pos_fourier_v2_scales) == 0 or any(v <= 0.0 for v in lmc_pos_fourier_v2_scales):
@@ -1224,6 +1224,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             raise ValueError(f"lmc_pos_fourier_radius must be > 0, got {lmc_pos_fourier_radius!r}")
         lmc_pos_fourier_learnable_scale = bool(getattr(options, 'lmc_pos_fourier_learnable_scale', False))
         lmc_pos_fourier_residual_gate_init = float(getattr(options, 'lmc_pos_fourier_residual_gate_init', 0.0))
+        lmc_point_rope_coord_norm = str(getattr(options, 'lmc_point_rope_coord_norm', 'scene_radius'))
+        if lmc_point_rope_coord_norm != 'scene_radius':
+            raise ValueError(f"Unsupported lmc_point_rope_coord_norm={lmc_point_rope_coord_norm!r}")
+        lmc_point_rope_radius = float(getattr(options, 'lmc_point_rope_radius', 4.0))
+        lmc_point_rope_base = float(getattr(options, 'lmc_point_rope_base', 10000.0))
+        lmc_point_rope_axes = str(getattr(options, 'lmc_point_rope_axes', 'xyz_split'))
+        lmc_point_rope_apply_to = str(getattr(options, 'lmc_point_rope_apply_to', 'qk'))
+        lmc_geo_bias_crpb_dim = int(getattr(options, 'lmc_geo_bias_crpb_dim', 32))
+        lmc_geo_bias_crpb_input = str(getattr(options, 'lmc_geo_bias_crpb_input', 'delta_dist_log'))
+        lmc_geo_bias_crpb_radius = float(getattr(options, 'lmc_geo_bias_crpb_radius', 4.0))
+        lmc_geo_bias_crpb_per_head = bool(getattr(options, 'lmc_geo_bias_crpb_per_head', False))
+        lmc_geo_bias_crpb_zero_init = bool(getattr(options, 'lmc_geo_bias_crpb_zero_init', True))
         if lmc_feature_hierarchy_mode == 'levelwise_latent_merge':
             if lmc_mode not in ('global', 'local'):
                 raise ValueError(
@@ -1392,6 +1404,16 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'pos_fourier_learnable_scale': lmc_pos_fourier_learnable_scale,
             'pos_fourier_residual_gate_init': lmc_pos_fourier_residual_gate_init,
             'final_pos_fourier_residual_gate': None,
+            'point_rope_coord_norm': lmc_point_rope_coord_norm,
+            'point_rope_radius': lmc_point_rope_radius,
+            'point_rope_base': lmc_point_rope_base,
+            'point_rope_axes': lmc_point_rope_axes,
+            'point_rope_apply_to': lmc_point_rope_apply_to,
+            'geo_bias_crpb_dim': lmc_geo_bias_crpb_dim,
+            'geo_bias_crpb_input': lmc_geo_bias_crpb_input,
+            'geo_bias_crpb_radius': lmc_geo_bias_crpb_radius,
+            'geo_bias_crpb_per_head': lmc_geo_bias_crpb_per_head,
+            'geo_bias_crpb_zero_init': lmc_geo_bias_crpb_zero_init,
             'geo_sigma': geo_sigma,
             'pe_normalize_input': pe_normalize_input,
             'lmc_compressor_pe_scale_mode': compressor_pe_scale_mode,
@@ -1473,6 +1495,16 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             pos_fourier_radius=lmc_pos_fourier_radius,
             pos_fourier_learnable_scale=lmc_pos_fourier_learnable_scale,
             pos_fourier_residual_gate_init=lmc_pos_fourier_residual_gate_init,
+            point_rope_coord_norm=lmc_point_rope_coord_norm,
+            point_rope_radius=lmc_point_rope_radius,
+            point_rope_base=lmc_point_rope_base,
+            point_rope_axes=lmc_point_rope_axes,
+            point_rope_apply_to=lmc_point_rope_apply_to,
+            geo_bias_crpb_dim=lmc_geo_bias_crpb_dim,
+            geo_bias_crpb_input=lmc_geo_bias_crpb_input,
+            geo_bias_crpb_radius=lmc_geo_bias_crpb_radius,
+            geo_bias_crpb_per_head=lmc_geo_bias_crpb_per_head,
+            geo_bias_crpb_zero_init=lmc_geo_bias_crpb_zero_init,
         ).to(self.device)
         self.compressor.collect_runtime_stats = self.lmc_log_runtime_stats
 
@@ -2448,6 +2480,16 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "pos_fourier_learnable_scale",
             "pos_fourier_residual_gate_init",
             "final_pos_fourier_residual_gate",
+            "point_rope_coord_norm",
+            "point_rope_radius",
+            "point_rope_base",
+            "point_rope_axes",
+            "point_rope_apply_to",
+            "geo_bias_crpb_dim",
+            "geo_bias_crpb_input",
+            "geo_bias_crpb_radius",
+            "geo_bias_crpb_per_head",
+            "geo_bias_crpb_zero_init",
             "lmc_fps_start_policy",
             "pe_normalize_input",
             "lmc_compressor_pe_scale_mode",

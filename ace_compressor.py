@@ -216,7 +216,7 @@ class ResidualRBFDistanceBias(nn.Module):
         super().__init__()
         self.num_heads = int(num_heads)
         self.mode = str(mode)
-        if self.mode not in ("legacy", "rbf_residual"):
+        if self.mode not in ("legacy", "rbf_residual", "crpb"):
             raise ValueError(f"Unsupported geo_bias_mode={mode!r}.")
         if scales is None:
             scales = [0.25, 0.5, 1.0, 2.0, 4.0]
@@ -277,7 +277,7 @@ class ResidualRBFDistanceBias(nn.Module):
 # ---------------------------------------------------------------------------
 
 class DecoupledCrossAttention(nn.Module):
-    """Standard Cross Attention that accepts a pre-computed attn_bias."""
+    """Standard Cross Attention that accepts optional geometric biases."""
 
     def __init__(self, dim, num_heads=8, qkv_bias=False,
                  attn_drop=0., proj_drop=0.,
@@ -285,7 +285,18 @@ class DecoupledCrossAttention(nn.Module):
                  geo_bias_rbf_scales=None,
                  geo_bias_rbf_alpha_init=0.0,
                  geo_bias_rbf_learn_weights=True,
-                 geo_bias_rbf_per_head=False):
+                 geo_bias_rbf_per_head=False,
+                 geo_bias_crpb_dim=32,
+                 geo_bias_crpb_input="delta_dist_log",
+                 geo_bias_crpb_radius=4.0,
+                 geo_bias_crpb_per_head=False,
+                 geo_bias_crpb_zero_init=True,
+                 pos_encoding_mode="fourier_legacy",
+                 point_rope_coord_norm="scene_radius",
+                 point_rope_radius=4.0,
+                 point_rope_base=10000.0,
+                 point_rope_axes="xyz_split",
+                 point_rope_apply_to="qk"):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -301,29 +312,92 @@ class DecoupledCrossAttention(nn.Module):
             learn_weights=geo_bias_rbf_learn_weights,
             per_head=geo_bias_rbf_per_head,
         )
+        self.geo_bias_mode = str(geo_bias_mode)
+        self.geo_bias_crpb_radius = float(geo_bias_crpb_radius)
+        self.pos_encoding_mode = str(pos_encoding_mode)
+        self.point_rope_coord_norm = str(point_rope_coord_norm)
+        self.point_rope_radius = float(point_rope_radius)
+        self.point_rope_base = float(point_rope_base)
+        self.point_rope_axes = str(point_rope_axes)
+        self.point_rope_apply_to = str(point_rope_apply_to)
+        self.crpb = None
+        if self.geo_bias_mode == 'crpb':
+            out_dim = num_heads if bool(geo_bias_crpb_per_head) else 1
+            self.crpb = nn.Sequential(
+                nn.Linear(5, int(geo_bias_crpb_dim)),
+                nn.GELU(),
+                nn.Linear(int(geo_bias_crpb_dim), out_dim),
+            )
+            if bool(geo_bias_crpb_zero_init):
+                nn.init.zeros_(self.crpb[-1].weight)
+                nn.init.zeros_(self.crpb[-1].bias)
+
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         self.collect_runtime_stats = False
         self.last_runtime_stats = None
 
-    def forward(self, query, key, value, attn_bias=None, dist_sq=None):
+    def _apply_point_rope(self, x_bhnd, coords_bnd):
+        if coords_bnd is None or self.pos_encoding_mode != 'point_rope':
+            return x_bhnd
+        if self.point_rope_coord_norm != 'scene_radius' or self.point_rope_axes != 'xyz_split':
+            return x_bhnd
+        B, H, N, D = x_bhnd.shape
+        split = D // 3
+        seg = (split // 2) * 2
+        if seg <= 0:
+            return x_bhnd
+        coords = coords_bnd.to(device=x_bhnd.device, dtype=x_bhnd.dtype) / max(self.point_rope_radius, 1e-6)
+        out = x_bhnd
+        base = torch.tensor(self.point_rope_base, device=x_bhnd.device, dtype=x_bhnd.dtype).clamp(min=1.0001)
+        freq_idx = torch.arange(0, seg, 2, device=x_bhnd.device, dtype=x_bhnd.dtype)
+        inv_freq = torch.pow(base, -freq_idx / max(float(seg), 1.0))
+        for axis in range(3):
+            st = axis * split
+            ed = st + seg
+            if ed > D:
+                continue
+            part = out[..., st:ed]
+            angle = coords[..., axis].unsqueeze(1).unsqueeze(-1) * inv_freq.view(1, 1, 1, -1)
+            cos = torch.cos(angle)
+            sin = torch.sin(angle)
+            even = part[..., 0::2]
+            odd = part[..., 1::2]
+            rot = torch.stack([even * cos - odd * sin, even * sin + odd * cos], dim=-1).reshape_as(part)
+            out = torch.cat([out[..., :st], rot, out[..., ed:]], dim=-1)
+        return out
+
+    def _crpb_bias(self, query_coords, key_coords, dtype, device):
+        if self.crpb is None or query_coords is None or key_coords is None:
+            return None
+        delta = (key_coords.unsqueeze(1) - query_coords.unsqueeze(2)) / max(self.geo_bias_crpb_radius, 1e-6)
+        dist = torch.linalg.norm(delta, dim=-1, keepdim=True)
+        feat = torch.cat([delta, dist, torch.log(dist + 1e-6)], dim=-1).to(device=device, dtype=dtype)
+        out = self.crpb(feat).permute(0, 3, 1, 2)
+        return out
+
+    def forward(self, query, key, value, attn_bias=None, dist_sq=None, query_coords=None, key_coords=None):
         B, N_q, C = query.shape
         N_k = key.shape[1]
         q = self.q_proj(query).reshape(B, N_q, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         k = self.k_proj(key).reshape(B, N_k, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         v = self.v_proj(value).reshape(B, N_k, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        if self.point_rope_apply_to in ('qk', 'q'):
+            q = self._apply_point_rope(q, query_coords)
+        if self.point_rope_apply_to in ('qk', 'k'):
+            k = self._apply_point_rope(k, key_coords)
         attn = (q @ k.transpose(-2, -1)) * self.scale
         if attn_bias is not None:
             attn = attn + attn_bias
         rbf_bias = self.rbf_bias(dist_sq)
         if rbf_bias is not None:
             attn = attn + rbf_bias
+        crpb = self._crpb_bias(query_coords, key_coords, dtype=attn.dtype, device=attn.device)
+        if crpb is not None:
+            attn = attn + crpb
         attn = attn.softmax(dim=-1)
-        self.last_runtime_stats = (
-            _summarize_attention_scalars(attn)
-            if self.collect_runtime_stats else None
-        )
+        self.last_runtime_stats = _summarize_attention_scalars(attn) if self.collect_runtime_stats else None
         attn = self.attn_drop(attn)
         x = (attn @ v).transpose(1, 2).reshape(B, N_q, C)
         x = self.proj(x)
@@ -332,7 +406,7 @@ class DecoupledCrossAttention(nn.Module):
 
 
 class GlobalSoftAttention(nn.Module):
-    """Attention that learns a Soft Bias via MLP from dist_sq."""
+    """Attention that learns a soft bias from distances."""
 
     def __init__(self, dim, num_heads=8, qkv_bias=False,
                  attn_drop=0., proj_drop=0.,
@@ -340,59 +414,62 @@ class GlobalSoftAttention(nn.Module):
                  geo_bias_rbf_scales=None,
                  geo_bias_rbf_alpha_init=0.0,
                  geo_bias_rbf_learn_weights=True,
-                 geo_bias_rbf_per_head=False):
+                 geo_bias_rbf_per_head=False,
+                 geo_bias_crpb_dim=32,
+                 geo_bias_crpb_input="delta_dist_log",
+                 geo_bias_crpb_radius=4.0,
+                 geo_bias_crpb_per_head=False,
+                 geo_bias_crpb_zero_init=True,
+                 pos_encoding_mode="fourier_legacy",
+                 point_rope_coord_norm="scene_radius",
+                 point_rope_radius=4.0,
+                 point_rope_base=10000.0,
+                 point_rope_axes="xyz_split",
+                 point_rope_apply_to="qk"):
         super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.geo_bias_mlp = nn.Sequential(
-            nn.Linear(1, 32), nn.ReLU(), nn.Linear(32, num_heads))
-        self.rbf_bias = ResidualRBFDistanceBias(
+        self.geo_bias_mlp = nn.Sequential(nn.Linear(1, 32), nn.ReLU(), nn.Linear(32, num_heads))
+        self.inner = DecoupledCrossAttention(
+            dim=dim,
             num_heads=num_heads,
-            mode=geo_bias_mode,
-            scales=geo_bias_rbf_scales,
-            alpha_init=geo_bias_rbf_alpha_init,
-            learn_weights=geo_bias_rbf_learn_weights,
-            per_head=geo_bias_rbf_per_head,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+            geo_bias_mode=geo_bias_mode,
+            geo_bias_rbf_scales=geo_bias_rbf_scales,
+            geo_bias_rbf_alpha_init=geo_bias_rbf_alpha_init,
+            geo_bias_rbf_learn_weights=geo_bias_rbf_learn_weights,
+            geo_bias_rbf_per_head=geo_bias_rbf_per_head,
+            geo_bias_crpb_dim=geo_bias_crpb_dim,
+            geo_bias_crpb_input=geo_bias_crpb_input,
+            geo_bias_crpb_radius=geo_bias_crpb_radius,
+            geo_bias_crpb_per_head=geo_bias_crpb_per_head,
+            geo_bias_crpb_zero_init=geo_bias_crpb_zero_init,
+            pos_encoding_mode=pos_encoding_mode,
+            point_rope_coord_norm=point_rope_coord_norm,
+            point_rope_radius=point_rope_radius,
+            point_rope_base=point_rope_base,
+            point_rope_axes=point_rope_axes,
+            point_rope_apply_to=point_rope_apply_to,
         )
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
         self.collect_runtime_stats = False
         self.last_runtime_stats = None
 
-    def forward(self, query, key, value, dist_sq=None):
-        B, N_q, C = query.shape
-        N_k = key.shape[1]
-        q = self.q_proj(query).reshape(B, N_q, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-        k = self.k_proj(key).reshape(B, N_k, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-        v = self.v_proj(value).reshape(B, N_k, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+    def forward(self, query, key, value, dist_sq=None, query_coords=None, key_coords=None):
+        attn_bias = None
         if dist_sq is not None:
             d_log = torch.log(dist_sq.unsqueeze(-1) + 1e-6)
-            geo_bias = self.geo_bias_mlp(d_log).permute(0, 3, 1, 2)
-            attn = attn + geo_bias
-        rbf_bias = self.rbf_bias(dist_sq)
-        if rbf_bias is not None:
-            attn = attn + rbf_bias
-        attn = attn.softmax(dim=-1)
-        self.last_runtime_stats = (
-            _summarize_attention_scalars(attn)
-            if self.collect_runtime_stats else None
+            attn_bias = self.geo_bias_mlp(d_log).permute(0, 3, 1, 2)
+        self.inner.collect_runtime_stats = self.collect_runtime_stats
+        out = self.inner(
+            query, key, value,
+            attn_bias=attn_bias,
+            dist_sq=dist_sq,
+            query_coords=query_coords,
+            key_coords=key_coords,
         )
-        attn = self.attn_drop(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B, N_q, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        self.last_runtime_stats = self.inner.last_runtime_stats
+        return out
 
-
-# ---------------------------------------------------------------------------
-# 4. Attention Blocks
-# ---------------------------------------------------------------------------
 
 class GeoAttentionBlock(nn.Module):
     """Transformer Block for Geometric Modes (global / local / fine)."""
@@ -402,7 +479,18 @@ class GeoAttentionBlock(nn.Module):
                  geo_bias_rbf_scales=None,
                  geo_bias_rbf_alpha_init=0.0,
                  geo_bias_rbf_learn_weights=True,
-                 geo_bias_rbf_per_head=False):
+                 geo_bias_rbf_per_head=False,
+                 geo_bias_crpb_dim=32,
+                 geo_bias_crpb_input="delta_dist_log",
+                 geo_bias_crpb_radius=4.0,
+                 geo_bias_crpb_per_head=False,
+                 geo_bias_crpb_zero_init=True,
+                 pos_encoding_mode="fourier_legacy",
+                 point_rope_coord_norm="scene_radius",
+                 point_rope_radius=4.0,
+                 point_rope_base=10000.0,
+                 point_rope_axes="xyz_split",
+                 point_rope_apply_to="qk"):
         super().__init__()
         self.mode = mode
         attn_kwargs = dict(
@@ -411,6 +499,17 @@ class GeoAttentionBlock(nn.Module):
             geo_bias_rbf_alpha_init=geo_bias_rbf_alpha_init,
             geo_bias_rbf_learn_weights=geo_bias_rbf_learn_weights,
             geo_bias_rbf_per_head=geo_bias_rbf_per_head,
+            geo_bias_crpb_dim=geo_bias_crpb_dim,
+            geo_bias_crpb_input=geo_bias_crpb_input,
+            geo_bias_crpb_radius=geo_bias_crpb_radius,
+            geo_bias_crpb_per_head=geo_bias_crpb_per_head,
+            geo_bias_crpb_zero_init=geo_bias_crpb_zero_init,
+            pos_encoding_mode=pos_encoding_mode,
+            point_rope_coord_norm=point_rope_coord_norm,
+            point_rope_radius=point_rope_radius,
+            point_rope_base=point_rope_base,
+            point_rope_axes=point_rope_axes,
+            point_rope_apply_to=point_rope_apply_to,
         )
         if mode == 'global':
             self.attn = GlobalSoftAttention(dim, num_heads=num_heads, **attn_kwargs)
@@ -420,8 +519,7 @@ class GeoAttentionBlock(nn.Module):
             self.fine_bias_gen = AdaptiveGeometricBias(dim, base_sigma=geo_sigma)
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+        self.mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
 
     def forward(self, q, k, v, geometry_info=None):
         residual = q
@@ -429,43 +527,23 @@ class GeoAttentionBlock(nn.Module):
         if isinstance(geometry_info, dict):
             dist_sq = geometry_info.get("dist_sq")
             attn_bias = geometry_info.get("attn_bias")
+            query_coords = geometry_info.get("query_coords")
+            key_coords = geometry_info.get("key_coords")
         else:
             dist_sq = geometry_info
             attn_bias = geometry_info
+            query_coords = None
+            key_coords = None
         if self.mode == 'global':
-            q = residual + self.attn(q_norm, k, v, dist_sq=dist_sq)
+            q = residual + self.attn(q_norm, k, v, dist_sq=dist_sq, query_coords=query_coords, key_coords=key_coords)
         elif self.mode == 'local':
-            q = residual + self.attn(q_norm, k, v, attn_bias=attn_bias, dist_sq=dist_sq)
+            q = residual + self.attn(q_norm, k, v, attn_bias=attn_bias, dist_sq=dist_sq, query_coords=query_coords, key_coords=key_coords)
         elif self.mode == 'fine':
             bias = self.fine_bias_gen(q_norm, dist_sq)
-            q = residual + self.attn(q_norm, k, v, attn_bias=bias, dist_sq=dist_sq)
+            q = residual + self.attn(q_norm, k, v, attn_bias=bias, dist_sq=dist_sq, query_coords=query_coords, key_coords=key_coords)
         q = q + self.mlp(self.norm2(q))
         return q
 
-
-class StandardAttentionBlock(nn.Module):
-    """For 'Learned' Mode: Pure Transformer Block."""
-
-    def __init__(self, dim, num_heads=8):
-        super().__init__()
-        self.cross_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.self_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.norm3 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
-
-    def forward(self, q, k, v):
-        q = q + self.self_attn(self.norm1(q), self.norm1(q), self.norm1(q))[0]
-        q = q + self.cross_attn(self.norm2(q), k, v)[0]
-        q = q + self.mlp(self.norm3(q))
-        return q
-
-
-# ---------------------------------------------------------------------------
-# 5. Main Compressor: GeoLMC
-# ---------------------------------------------------------------------------
 
 class GeoLMC(nn.Module):
     """Geometric Latent Memory Compressor.
@@ -507,6 +585,16 @@ class GeoLMC(nn.Module):
                  geo_bias_rbf_learn_weights=True,
                  geo_bias_rbf_per_head=False,
                  pos_encoding_mode="fourier_legacy",
+                 point_rope_coord_norm="scene_radius",
+                 point_rope_radius=4.0,
+                 point_rope_base=10000.0,
+                 point_rope_axes="xyz_split",
+                 point_rope_apply_to="qk",
+                 geo_bias_crpb_dim=32,
+                 geo_bias_crpb_input="delta_dist_log",
+                 geo_bias_crpb_radius=4.0,
+                 geo_bias_crpb_per_head=False,
+                 geo_bias_crpb_zero_init=True,
                  pos_fourier_v2_scales=(1.0, 2.0, 4.0, 8.0, 16.0),
                  pos_fourier_coord_norm="scene_radius",
                  pos_fourier_radius=4.0,
@@ -549,7 +637,7 @@ class GeoLMC(nn.Module):
             if self.level_gate_entropy_weight != 0.0:
                 raise ValueError("level_gate_entropy_weight is reserved for a future ablation; use 0.0 for B3-lite.")
         self.geo_bias_mode = str(geo_bias_mode)
-        if self.geo_bias_mode not in ("legacy", "rbf_residual"):
+        if self.geo_bias_mode not in ("legacy", "rbf_residual", "crpb"):
             raise ValueError(f"Unsupported geo_bias_mode={geo_bias_mode!r}.")
         self.geo_bias_rbf_scales = [float(v) for v in geo_bias_rbf_scales]
         if len(self.geo_bias_rbf_scales) == 0 or any(v <= 0.0 for v in self.geo_bias_rbf_scales):
@@ -558,7 +646,7 @@ class GeoLMC(nn.Module):
         self.geo_bias_rbf_learn_weights = bool(geo_bias_rbf_learn_weights)
         self.geo_bias_rbf_per_head = bool(geo_bias_rbf_per_head)
         self.pos_encoding_mode = str(pos_encoding_mode)
-        if self.pos_encoding_mode not in ("fourier_legacy", "fourier_v2"):
+        if self.pos_encoding_mode not in ("fourier_legacy", "fourier_v2", "point_rope"):
             raise ValueError(f"Unsupported pos_encoding_mode={pos_encoding_mode!r}.")
         self.pos_fourier_v2_scales = [float(v) for v in pos_fourier_v2_scales]
         if len(self.pos_fourier_v2_scales) == 0 or any(v <= 0.0 for v in self.pos_fourier_v2_scales):
@@ -571,6 +659,16 @@ class GeoLMC(nn.Module):
             raise ValueError(f"pos_fourier_radius must be > 0, got {self.pos_fourier_radius!r}.")
         self.pos_fourier_learnable_scale = bool(pos_fourier_learnable_scale)
         self.pos_fourier_residual_gate_init = float(pos_fourier_residual_gate_init)
+        self.point_rope_coord_norm = str(point_rope_coord_norm)
+        self.point_rope_radius = float(point_rope_radius)
+        self.point_rope_base = float(point_rope_base)
+        self.point_rope_axes = str(point_rope_axes)
+        self.point_rope_apply_to = str(point_rope_apply_to)
+        self.geo_bias_crpb_dim = int(geo_bias_crpb_dim)
+        self.geo_bias_crpb_input = str(geo_bias_crpb_input)
+        self.geo_bias_crpb_radius = float(geo_bias_crpb_radius)
+        self.geo_bias_crpb_per_head = bool(geo_bias_crpb_per_head)
+        self.geo_bias_crpb_zero_init = bool(geo_bias_crpb_zero_init)
         self.pe_scale_mode = pe_scale_mode if pe_scale_mode is not None else (
             "std" if pe_normalize_input else "raw"
         )
@@ -585,7 +683,7 @@ class GeoLMC(nn.Module):
             normalize_input=pe_normalize_input,
             scale_mode=self.pe_scale_mode,
             scene_scale=self.pe_scene_scale,
-            mode=self.pos_encoding_mode,
+            mode="fourier_legacy" if self.pos_encoding_mode == "point_rope" else self.pos_encoding_mode,
             fourier_v2_scales=self.pos_fourier_v2_scales,
             coord_norm=self.pos_fourier_coord_norm,
             radius=self.pos_fourier_radius,
@@ -646,7 +744,18 @@ class GeoLMC(nn.Module):
                                   geo_bias_rbf_scales=self.geo_bias_rbf_scales,
                                   geo_bias_rbf_alpha_init=self.geo_bias_rbf_alpha_init,
                                   geo_bias_rbf_learn_weights=self.geo_bias_rbf_learn_weights,
-                                  geo_bias_rbf_per_head=self.geo_bias_rbf_per_head)
+                                  geo_bias_rbf_per_head=self.geo_bias_rbf_per_head,
+                                  geo_bias_crpb_dim=self.geo_bias_crpb_dim,
+                                  geo_bias_crpb_input=self.geo_bias_crpb_input,
+                                  geo_bias_crpb_radius=self.geo_bias_crpb_radius,
+                                  geo_bias_crpb_per_head=self.geo_bias_crpb_per_head,
+                                  geo_bias_crpb_zero_init=self.geo_bias_crpb_zero_init,
+                                  pos_encoding_mode=self.pos_encoding_mode,
+                                  point_rope_coord_norm=self.point_rope_coord_norm,
+                                  point_rope_radius=self.point_rope_radius,
+                                  point_rope_base=self.point_rope_base,
+                                  point_rope_axes=self.point_rope_axes,
+                                  point_rope_apply_to=self.point_rope_apply_to)
                 for _ in range(num_attn_layers)])
             self.fine_layers = nn.ModuleList([
                 GeoAttentionBlock(compress_dim, mode='fine', num_heads=8,
@@ -655,7 +764,18 @@ class GeoLMC(nn.Module):
                                   geo_bias_rbf_scales=self.geo_bias_rbf_scales,
                                   geo_bias_rbf_alpha_init=self.geo_bias_rbf_alpha_init,
                                   geo_bias_rbf_learn_weights=self.geo_bias_rbf_learn_weights,
-                                  geo_bias_rbf_per_head=self.geo_bias_rbf_per_head)
+                                  geo_bias_rbf_per_head=self.geo_bias_rbf_per_head,
+                                  geo_bias_crpb_dim=self.geo_bias_crpb_dim,
+                                  geo_bias_crpb_input=self.geo_bias_crpb_input,
+                                  geo_bias_crpb_radius=self.geo_bias_crpb_radius,
+                                  geo_bias_crpb_per_head=self.geo_bias_crpb_per_head,
+                                  geo_bias_crpb_zero_init=self.geo_bias_crpb_zero_init,
+                                  pos_encoding_mode=self.pos_encoding_mode,
+                                  point_rope_coord_norm=self.point_rope_coord_norm,
+                                  point_rope_radius=self.point_rope_radius,
+                                  point_rope_base=self.point_rope_base,
+                                  point_rope_axes=self.point_rope_axes,
+                                  point_rope_apply_to=self.point_rope_apply_to)
                 for _ in range(num_attn_layers)])
 
         else:  # global / local
@@ -671,7 +791,18 @@ class GeoLMC(nn.Module):
                                           geo_bias_rbf_scales=self.geo_bias_rbf_scales,
                                           geo_bias_rbf_alpha_init=self.geo_bias_rbf_alpha_init,
                                           geo_bias_rbf_learn_weights=self.geo_bias_rbf_learn_weights,
-                                          geo_bias_rbf_per_head=self.geo_bias_rbf_per_head)
+                                          geo_bias_rbf_per_head=self.geo_bias_rbf_per_head,
+                                  geo_bias_crpb_dim=self.geo_bias_crpb_dim,
+                                  geo_bias_crpb_input=self.geo_bias_crpb_input,
+                                  geo_bias_crpb_radius=self.geo_bias_crpb_radius,
+                                  geo_bias_crpb_per_head=self.geo_bias_crpb_per_head,
+                                  geo_bias_crpb_zero_init=self.geo_bias_crpb_zero_init,
+                                  pos_encoding_mode=self.pos_encoding_mode,
+                                  point_rope_coord_norm=self.point_rope_coord_norm,
+                                  point_rope_radius=self.point_rope_radius,
+                                  point_rope_base=self.point_rope_base,
+                                  point_rope_axes=self.point_rope_axes,
+                                  point_rope_apply_to=self.point_rope_apply_to)
                         for _ in range(num_attn_layers)])
                 else:
                     self.level_layers = nn.ModuleList([
@@ -682,7 +813,18 @@ class GeoLMC(nn.Module):
                                               geo_bias_rbf_scales=self.geo_bias_rbf_scales,
                                               geo_bias_rbf_alpha_init=self.geo_bias_rbf_alpha_init,
                                               geo_bias_rbf_learn_weights=self.geo_bias_rbf_learn_weights,
-                                              geo_bias_rbf_per_head=self.geo_bias_rbf_per_head)
+                                              geo_bias_rbf_per_head=self.geo_bias_rbf_per_head,
+                                  geo_bias_crpb_dim=self.geo_bias_crpb_dim,
+                                  geo_bias_crpb_input=self.geo_bias_crpb_input,
+                                  geo_bias_crpb_radius=self.geo_bias_crpb_radius,
+                                  geo_bias_crpb_per_head=self.geo_bias_crpb_per_head,
+                                  geo_bias_crpb_zero_init=self.geo_bias_crpb_zero_init,
+                                  pos_encoding_mode=self.pos_encoding_mode,
+                                  point_rope_coord_norm=self.point_rope_coord_norm,
+                                  point_rope_radius=self.point_rope_radius,
+                                  point_rope_base=self.point_rope_base,
+                                  point_rope_axes=self.point_rope_axes,
+                                  point_rope_apply_to=self.point_rope_apply_to)
                             for _ in range(num_attn_layers)
                         ])
                         for _ in range(num_layers)
@@ -695,7 +837,18 @@ class GeoLMC(nn.Module):
                                       geo_bias_rbf_scales=self.geo_bias_rbf_scales,
                                       geo_bias_rbf_alpha_init=self.geo_bias_rbf_alpha_init,
                                       geo_bias_rbf_learn_weights=self.geo_bias_rbf_learn_weights,
-                                      geo_bias_rbf_per_head=self.geo_bias_rbf_per_head)
+                                      geo_bias_rbf_per_head=self.geo_bias_rbf_per_head,
+                                  geo_bias_crpb_dim=self.geo_bias_crpb_dim,
+                                  geo_bias_crpb_input=self.geo_bias_crpb_input,
+                                  geo_bias_crpb_radius=self.geo_bias_crpb_radius,
+                                  geo_bias_crpb_per_head=self.geo_bias_crpb_per_head,
+                                  geo_bias_crpb_zero_init=self.geo_bias_crpb_zero_init,
+                                  pos_encoding_mode=self.pos_encoding_mode,
+                                  point_rope_coord_norm=self.point_rope_coord_norm,
+                                  point_rope_radius=self.point_rope_radius,
+                                  point_rope_base=self.point_rope_base,
+                                  point_rope_axes=self.point_rope_axes,
+                                  point_rope_apply_to=self.point_rope_apply_to)
                     for _ in range(num_attn_layers)])
 
     # -- helpers --
@@ -801,6 +954,14 @@ class GeoLMC(nn.Module):
             "attn_bias": self.local_bias_gen(dist_sq),
         }
 
+    def _build_geometry_info(self, *, dist_sq, query_coords, key_coords, attn_bias=None):
+        return {
+            "dist_sq": dist_sq,
+            "attn_bias": attn_bias,
+            "query_coords": query_coords,
+            "key_coords": key_coords,
+        }
+
     def _get_key_features(self, features):
         if self.key_feature_mode == "slice":
             return self._get_layer_slice(features, self.key_slice_idx)
@@ -862,10 +1023,12 @@ class GeoLMC(nn.Module):
             self._pe_logged = True
 
         dist_sq = torch.cdist(latent_coords, pooled_points, p=2) ** 2
-        if self.mode == 'local':
-            geometry_info = self._build_local_geometry_info(dist_sq)
-        else:
-            geometry_info = dist_sq
+        geometry_info = self._build_geometry_info(
+            dist_sq=dist_sq,
+            query_coords=latent_coords,
+            key_coords=pooled_points,
+            attn_bias=self.local_bias_gen(dist_sq) if self.mode == 'local' else None,
+        )
 
         collect_stats = bool(getattr(self, "collect_runtime_stats", False))
         per_layer = self._get_per_layer_features(pooled_features)
@@ -981,16 +1144,27 @@ class GeoLMC(nn.Module):
             dist_coarse = torch.cdist(coords_coarse, pooled_points, p=2) ** 2
             q_coarse = self.pe_encoder(
                 coords_coarse - scene_center.unsqueeze(1))
+            coarse_geo = self._build_geometry_info(
+                dist_sq=dist_coarse,
+                query_coords=coords_coarse,
+                key_coords=pooled_points,
+                attn_bias=None,
+            )
             for layer in self.coarse_layers:
-                q_coarse = layer(q_coarse, k_base, v,
-                                 geometry_info=dist_coarse)
+                q_coarse = layer(q_coarse, k_base, v, geometry_info=coarse_geo)
             z_coarse = self._inject_scale(q_coarse, memory_dict)
 
             dist_fine = torch.cdist(coords_fine, pooled_points, p=2) ** 2
             q_fine = self.pe_encoder(
                 coords_fine - scene_center.unsqueeze(1))
+            fine_geo = self._build_geometry_info(
+                dist_sq=dist_fine,
+                query_coords=coords_fine,
+                key_coords=pooled_points,
+                attn_bias=None,
+            )
             for layer in self.fine_layers:
-                q_fine = layer(q_fine, k_base, v, geometry_info=dist_fine)
+                q_fine = layer(q_fine, k_base, v, geometry_info=fine_geo)
             z_fine = self._inject_scale(q_fine, memory_dict)
 
             self._update_geo_bias_runtime_stats()
@@ -1017,10 +1191,12 @@ class GeoLMC(nn.Module):
             self._pe_logged = True
 
         dist_sq = torch.cdist(latent_coords, pooled_points, p=2) ** 2
-        if self.mode == 'local':
-            geometry_info = self._build_local_geometry_info(dist_sq)
-        else:
-            geometry_info = dist_sq
+        geometry_info = self._build_geometry_info(
+            dist_sq=dist_sq,
+            query_coords=latent_coords,
+            key_coords=pooled_points,
+            attn_bias=self.local_bias_gen(dist_sq) if self.mode == 'local' else None,
+        )
 
         for layer in self.layers:
             q = layer(q, k_base, v, geometry_info=geometry_info)

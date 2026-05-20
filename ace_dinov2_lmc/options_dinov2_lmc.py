@@ -691,7 +691,7 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--lmc_geo_bias_mode',
         type=str,
         default='legacy',
-        choices=['legacy', 'rbf_residual'],
+        choices=['legacy', 'rbf_residual', 'crpb'],
         help='GeoLMC attention logits 的几何 bias 路径。legacy 保持旧行为；rbf_residual 叠加零初始化的多尺度 RBF 残差。',
     )
     parser.add_argument(
@@ -723,7 +723,7 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--lmc_pos_encoding_mode',
         type=str,
         default='fourier_legacy',
-        choices=['fourier_legacy', 'fourier_v2'],
+        choices=['fourier_legacy', 'fourier_v2', 'point_rope'],
         help='Compressor 坐标位置编码模式。fourier_legacy 保持旧行为；fourier_v2 在旧分支上叠加归一化 Fourier 残差。',
     )
     parser.add_argument(
@@ -757,6 +757,71 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help='fourier_v2 残差门控的初始值。默认 0.0，保护旧初始化。',
+    )
+
+    parser.add_argument(
+        '--lmc_point_rope_coord_norm',
+        type=str,
+        default='scene_radius',
+        choices=['scene_radius'],
+        help='point_rope 的坐标归一化方式。',
+    )
+    parser.add_argument(
+        '--lmc_point_rope_radius',
+        type=float,
+        default=4.0,
+        help='point_rope 的坐标归一化半径。',
+    )
+    parser.add_argument(
+        '--lmc_point_rope_base',
+        type=float,
+        default=10000.0,
+        help='point_rope 的频率 base。',
+    )
+    parser.add_argument(
+        '--lmc_point_rope_axes',
+        type=str,
+        default='xyz_split',
+        choices=['xyz_split'],
+        help='point_rope 的轴向分块策略。',
+    )
+    parser.add_argument(
+        '--lmc_point_rope_apply_to',
+        type=str,
+        default='qk',
+        choices=['qk'],
+        help='point_rope 的作用位置。首版固定 qk。',
+    )
+    parser.add_argument(
+        '--lmc_geo_bias_crpb_dim',
+        type=int,
+        default=32,
+        help='crpb MLP hidden dim。',
+    )
+    parser.add_argument(
+        '--lmc_geo_bias_crpb_input',
+        type=str,
+        default='delta_dist_log',
+        choices=['delta_dist_log'],
+        help='crpb 输入特征格式。',
+    )
+    parser.add_argument(
+        '--lmc_geo_bias_crpb_radius',
+        type=float,
+        default=4.0,
+        help='crpb 坐标归一化半径。',
+    )
+    parser.add_argument(
+        '--lmc_geo_bias_crpb_per_head',
+        type=_strtobool,
+        default=False,
+        help='crpb 是否输出 per-head bias。',
+    )
+    parser.add_argument(
+        '--lmc_geo_bias_crpb_zero_init',
+        type=_strtobool,
+        default=True,
+        help='crpb 输出层是否零初始化。',
     )
     parser.add_argument(
         '--num_latent_tokens',

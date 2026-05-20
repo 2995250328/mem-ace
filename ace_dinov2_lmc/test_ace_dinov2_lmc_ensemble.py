@@ -263,6 +263,16 @@ def _load_bundle(
             pos_fourier_radius=lmc_config.get("pos_fourier_radius", 4.0),
             pos_fourier_learnable_scale=lmc_config.get("pos_fourier_learnable_scale", False),
             pos_fourier_residual_gate_init=lmc_config.get("pos_fourier_residual_gate_init", 0.0),
+            point_rope_coord_norm=lmc_config.get("point_rope_coord_norm", "scene_radius"),
+            point_rope_radius=lmc_config.get("point_rope_radius", 4.0),
+            point_rope_base=lmc_config.get("point_rope_base", 10000.0),
+            point_rope_axes=lmc_config.get("point_rope_axes", "xyz_split"),
+            point_rope_apply_to=lmc_config.get("point_rope_apply_to", "qk"),
+            geo_bias_crpb_dim=lmc_config.get("geo_bias_crpb_dim", 32),
+            geo_bias_crpb_input=lmc_config.get("geo_bias_crpb_input", "delta_dist_log"),
+            geo_bias_crpb_radius=lmc_config.get("geo_bias_crpb_radius", 4.0),
+            geo_bias_crpb_per_head=lmc_config.get("geo_bias_crpb_per_head", False),
+            geo_bias_crpb_zero_init=lmc_config.get("geo_bias_crpb_zero_init", True),
         ).to(device)
         compressor.load_state_dict(checkpoint["compressor_state_dict"])
         compressor.eval()
