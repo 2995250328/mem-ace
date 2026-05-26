@@ -139,6 +139,45 @@ class FourierPositionEncoding(nn.Module):
         return legacy + gate * self._encode_v2_residual(coords)
 
 
+class DeterministicSincosPositionEncoding(nn.Module):
+    """Parameter-free 3D sin/cos seed used by PointRoPE ablations."""
+
+    def __init__(self, output_dim=1024, radius=4.0, base=10000.0):
+        super().__init__()
+        self.output_dim = int(output_dim)
+        if self.output_dim <= 0:
+            raise ValueError(f"output_dim must be > 0, got {output_dim!r}.")
+        radius = float(radius)
+        if radius <= 0.0:
+            raise ValueError(f"radius must be > 0, got {radius!r}.")
+        base = float(base)
+        if base <= 1.0:
+            raise ValueError(f"base must be > 1, got {base!r}.")
+        self.register_buffer("default_radius", torch.tensor(radius, dtype=torch.float32), persistent=False)
+        self.register_buffer("base", torch.tensor(base, dtype=torch.float32), persistent=False)
+        num_freq = max(1, math.ceil(self.output_dim / 6))
+        self.register_buffer("freq_idx", torch.arange(num_freq, dtype=torch.float32), persistent=False)
+
+    def forward(self, coords, radius=None):
+        radius_t = self.default_radius if radius is None else torch.as_tensor(radius, device=coords.device, dtype=coords.dtype)
+        radius_t = radius_t.to(device=coords.device, dtype=coords.dtype).clamp(min=1e-6)
+        if radius_t.ndim > 0:
+            radius_t = radius_t.reshape(-1).mean()
+        coords = coords / radius_t
+        base = self.base.to(device=coords.device, dtype=coords.dtype).clamp(min=1.0001)
+        freq_idx = self.freq_idx.to(device=coords.device, dtype=coords.dtype)
+        denom = max(float(freq_idx.numel()), 1.0)
+        inv_freq = torch.pow(base, -freq_idx / denom)
+        encoded = []
+        for axis in range(3):
+            phase = 2.0 * math.pi * coords[..., axis:axis + 1] * inv_freq.view(1, 1, -1)
+            encoded.extend([torch.sin(phase), torch.cos(phase)])
+        out = torch.cat(encoded, dim=-1)
+        if out.shape[-1] < self.output_dim:
+            out = F.pad(out, (0, self.output_dim - out.shape[-1]))
+        return out[..., :self.output_dim]
+
+
 def farthest_point_sampling(points, K, start_policy="farthest_from_center", scene_center=None, generator=None):
     """GPU-accelerated Farthest Point Sampling with explicit first-point policy."""
     B, N, C = points.shape
@@ -294,6 +333,9 @@ class DecoupledCrossAttention(nn.Module):
                  pos_encoding_mode="fourier_legacy",
                  point_rope_coord_norm="scene_radius",
                  point_rope_radius=4.0,
+                 point_rope_radius_policy="fixed",
+                 point_rope_mixed_memory_ratio=0.5,
+                 point_rope_seed_pe="fourier_legacy",
                  point_rope_base=10000.0,
                  point_rope_axes="xyz_split",
                  point_rope_apply_to="qk"):
@@ -317,6 +359,19 @@ class DecoupledCrossAttention(nn.Module):
         self.pos_encoding_mode = str(pos_encoding_mode)
         self.point_rope_coord_norm = str(point_rope_coord_norm)
         self.point_rope_radius = float(point_rope_radius)
+        if self.point_rope_radius <= 0.0:
+            raise ValueError(f"point_rope_radius must be > 0, got {self.point_rope_radius!r}.")
+        self.point_rope_radius_policy = str(point_rope_radius_policy)
+        if self.point_rope_radius_policy not in ("fixed", "memory_p95", "mixed_fixed_memory_p95"):
+            raise ValueError(f"Unsupported point_rope_radius_policy={point_rope_radius_policy!r}.")
+        self.point_rope_mixed_memory_ratio = float(point_rope_mixed_memory_ratio)
+        if not 0.0 <= self.point_rope_mixed_memory_ratio <= 1.0:
+            raise ValueError(
+                f"point_rope_mixed_memory_ratio must be in [0, 1], got {self.point_rope_mixed_memory_ratio!r}."
+            )
+        self.point_rope_seed_pe = str(point_rope_seed_pe)
+        if self.point_rope_seed_pe not in ("fourier_legacy", "sincos_deterministic"):
+            raise ValueError(f"Unsupported point_rope_seed_pe={point_rope_seed_pe!r}.")
         self.point_rope_base = float(point_rope_base)
         self.point_rope_axes = str(point_rope_axes)
         self.point_rope_apply_to = str(point_rope_apply_to)
@@ -338,7 +393,7 @@ class DecoupledCrossAttention(nn.Module):
         self.collect_runtime_stats = False
         self.last_runtime_stats = None
 
-    def _apply_point_rope(self, x_bhnd, coords_bnd):
+    def _apply_point_rope(self, x_bhnd, coords_bnd, point_rope_radius=None):
         if coords_bnd is None or self.pos_encoding_mode != 'point_rope':
             return x_bhnd
         if self.point_rope_coord_norm != 'scene_radius' or self.point_rope_axes != 'xyz_split':
@@ -348,7 +403,16 @@ class DecoupledCrossAttention(nn.Module):
         seg = (split // 2) * 2
         if seg <= 0:
             return x_bhnd
-        coords = coords_bnd.to(device=x_bhnd.device, dtype=x_bhnd.dtype) / max(self.point_rope_radius, 1e-6)
+        radius = self.point_rope_radius if point_rope_radius is None else point_rope_radius
+        radius = torch.as_tensor(radius, device=x_bhnd.device, dtype=x_bhnd.dtype).clamp(min=1e-6)
+        if radius.ndim == 0:
+            coords = coords_bnd.to(device=x_bhnd.device, dtype=x_bhnd.dtype).unsqueeze(1) / radius
+        elif radius.ndim == 1:
+            if radius.numel() != H:
+                raise ValueError(f"PointRoPE per-head radius has {radius.numel()} entries, expected {H} heads.")
+            coords = coords_bnd.to(device=x_bhnd.device, dtype=x_bhnd.dtype).unsqueeze(1) / radius.view(1, H, 1, 1)
+        else:
+            raise ValueError(f"PointRoPE radius must be scalar or per-head vector, got shape={tuple(radius.shape)}.")
         out = x_bhnd
         base = torch.tensor(self.point_rope_base, device=x_bhnd.device, dtype=x_bhnd.dtype).clamp(min=1.0001)
         freq_idx = torch.arange(0, seg, 2, device=x_bhnd.device, dtype=x_bhnd.dtype)
@@ -359,7 +423,7 @@ class DecoupledCrossAttention(nn.Module):
             if ed > D:
                 continue
             part = out[..., st:ed]
-            angle = coords[..., axis].unsqueeze(1).unsqueeze(-1) * inv_freq.view(1, 1, 1, -1)
+            angle = coords[..., axis].unsqueeze(-1) * inv_freq.view(1, 1, 1, -1)
             cos = torch.cos(angle)
             sin = torch.sin(angle)
             even = part[..., 0::2]
@@ -377,27 +441,62 @@ class DecoupledCrossAttention(nn.Module):
         out = self.crpb(feat).permute(0, 3, 1, 2)
         return out
 
-    def forward(self, query, key, value, attn_bias=None, dist_sq=None, query_coords=None, key_coords=None):
+    def forward(self, query, key, value, attn_bias=None, dist_sq=None, query_coords=None, key_coords=None, point_rope_radius=None):
         B, N_q, C = query.shape
         N_k = key.shape[1]
         q = self.q_proj(query).reshape(B, N_q, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         k = self.k_proj(key).reshape(B, N_k, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         v = self.v_proj(value).reshape(B, N_k, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         if self.point_rope_apply_to in ('qk', 'q'):
-            q = self._apply_point_rope(q, query_coords)
+            q = self._apply_point_rope(q, query_coords, point_rope_radius=point_rope_radius)
         if self.point_rope_apply_to in ('qk', 'k'):
-            k = self._apply_point_rope(k, key_coords)
+            k = self._apply_point_rope(k, key_coords, point_rope_radius=point_rope_radius)
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        if attn_bias is not None:
-            attn = attn + attn_bias
+        qk_abs_mean = None
+        attn_entropy_before_bias = None
+        bias_accum = None
+        if self.collect_runtime_stats:
+            attn_float = attn.detach().float()
+            qk_abs_mean = float(attn_float.abs().mean().item())
+            qk_prob = attn_float.softmax(dim=-1)
+            attn_entropy_before_bias = float((-(qk_prob * (qk_prob + 1e-8).log()).sum(dim=-1)).mean().item())
+
+        def _add_bias(bias):
+            nonlocal attn, bias_accum
+            if bias is None:
+                return
+            attn = attn + bias
+            if self.collect_runtime_stats:
+                bias_float = bias.detach().float()
+                if bias_float.shape != attn.shape:
+                    bias_float = bias_float.expand_as(attn)
+                bias_accum = bias_float if bias_accum is None else bias_accum + bias_float
+
+        _add_bias(attn_bias)
         rbf_bias = self.rbf_bias(dist_sq)
-        if rbf_bias is not None:
-            attn = attn + rbf_bias
+        _add_bias(rbf_bias)
         crpb = self._crpb_bias(query_coords, key_coords, dtype=attn.dtype, device=attn.device)
-        if crpb is not None:
-            attn = attn + crpb
+        _add_bias(crpb)
         attn = attn.softmax(dim=-1)
         self.last_runtime_stats = _summarize_attention_scalars(attn) if self.collect_runtime_stats else None
+        if self.last_runtime_stats is not None:
+            bias_abs_mean = 0.0 if bias_accum is None else float(bias_accum.abs().mean().item())
+            bias_abs_max = 0.0 if bias_accum is None else float(bias_accum.abs().max().item())
+            qk_abs_mean = 0.0 if qk_abs_mean is None else qk_abs_mean
+            entropy_after = float(self.last_runtime_stats.get("attn_entropy_mean", 0.0))
+            entropy_before = 0.0 if attn_entropy_before_bias is None else attn_entropy_before_bias
+            self.last_runtime_stats.update({
+                "qk_logit_abs_mean": qk_abs_mean,
+                "bias_abs_mean": bias_abs_mean,
+                "bias_abs_max": bias_abs_max,
+                "bias_to_qk_ratio": bias_abs_mean / max(qk_abs_mean, 1e-8),
+                "attention_entropy_before_bias": entropy_before,
+                "attention_entropy_after_bias": entropy_after,
+                "attention_entropy_delta_after_minus_before": entropy_after - entropy_before,
+                "point_rope_effective_radius": float(torch.as_tensor(
+                    self.point_rope_radius if point_rope_radius is None else point_rope_radius
+                ).detach().float().mean().cpu().item()),
+            })
         attn = self.attn_drop(attn)
         x = (attn @ v).transpose(1, 2).reshape(B, N_q, C)
         x = self.proj(x)
@@ -423,6 +522,8 @@ class GlobalSoftAttention(nn.Module):
                  pos_encoding_mode="fourier_legacy",
                  point_rope_coord_norm="scene_radius",
                  point_rope_radius=4.0,
+                 point_rope_radius_policy="fixed",
+                 point_rope_mixed_memory_ratio=0.5,
                  point_rope_base=10000.0,
                  point_rope_axes="xyz_split",
                  point_rope_apply_to="qk"):
@@ -447,6 +548,8 @@ class GlobalSoftAttention(nn.Module):
             pos_encoding_mode=pos_encoding_mode,
             point_rope_coord_norm=point_rope_coord_norm,
             point_rope_radius=point_rope_radius,
+            point_rope_radius_policy=point_rope_radius_policy,
+            point_rope_mixed_memory_ratio=point_rope_mixed_memory_ratio,
             point_rope_base=point_rope_base,
             point_rope_axes=point_rope_axes,
             point_rope_apply_to=point_rope_apply_to,
@@ -454,7 +557,7 @@ class GlobalSoftAttention(nn.Module):
         self.collect_runtime_stats = False
         self.last_runtime_stats = None
 
-    def forward(self, query, key, value, dist_sq=None, query_coords=None, key_coords=None):
+    def forward(self, query, key, value, dist_sq=None, query_coords=None, key_coords=None, point_rope_radius=None):
         attn_bias = None
         if dist_sq is not None:
             d_log = torch.log(dist_sq.unsqueeze(-1) + 1e-6)
@@ -466,6 +569,7 @@ class GlobalSoftAttention(nn.Module):
             dist_sq=dist_sq,
             query_coords=query_coords,
             key_coords=key_coords,
+            point_rope_radius=point_rope_radius,
         )
         self.last_runtime_stats = self.inner.last_runtime_stats
         return out
@@ -488,6 +592,8 @@ class GeoAttentionBlock(nn.Module):
                  pos_encoding_mode="fourier_legacy",
                  point_rope_coord_norm="scene_radius",
                  point_rope_radius=4.0,
+                 point_rope_radius_policy="fixed",
+                 point_rope_mixed_memory_ratio=0.5,
                  point_rope_base=10000.0,
                  point_rope_axes="xyz_split",
                  point_rope_apply_to="qk"):
@@ -507,6 +613,8 @@ class GeoAttentionBlock(nn.Module):
             pos_encoding_mode=pos_encoding_mode,
             point_rope_coord_norm=point_rope_coord_norm,
             point_rope_radius=point_rope_radius,
+            point_rope_radius_policy=point_rope_radius_policy,
+            point_rope_mixed_memory_ratio=point_rope_mixed_memory_ratio,
             point_rope_base=point_rope_base,
             point_rope_axes=point_rope_axes,
             point_rope_apply_to=point_rope_apply_to,
@@ -529,18 +637,20 @@ class GeoAttentionBlock(nn.Module):
             attn_bias = geometry_info.get("attn_bias")
             query_coords = geometry_info.get("query_coords")
             key_coords = geometry_info.get("key_coords")
+            point_rope_radius = geometry_info.get("point_rope_radius")
         else:
             dist_sq = geometry_info
             attn_bias = geometry_info
             query_coords = None
             key_coords = None
+            point_rope_radius = None
         if self.mode == 'global':
-            q = residual + self.attn(q_norm, k, v, dist_sq=dist_sq, query_coords=query_coords, key_coords=key_coords)
+            q = residual + self.attn(q_norm, k, v, dist_sq=dist_sq, query_coords=query_coords, key_coords=key_coords, point_rope_radius=point_rope_radius)
         elif self.mode == 'local':
-            q = residual + self.attn(q_norm, k, v, attn_bias=attn_bias, dist_sq=dist_sq, query_coords=query_coords, key_coords=key_coords)
+            q = residual + self.attn(q_norm, k, v, attn_bias=attn_bias, dist_sq=dist_sq, query_coords=query_coords, key_coords=key_coords, point_rope_radius=point_rope_radius)
         elif self.mode == 'fine':
             bias = self.fine_bias_gen(q_norm, dist_sq)
-            q = residual + self.attn(q_norm, k, v, attn_bias=bias, dist_sq=dist_sq, query_coords=query_coords, key_coords=key_coords)
+            q = residual + self.attn(q_norm, k, v, attn_bias=bias, dist_sq=dist_sq, query_coords=query_coords, key_coords=key_coords, point_rope_radius=point_rope_radius)
         q = q + self.mlp(self.norm2(q))
         return q
 
@@ -579,6 +689,7 @@ class GeoLMC(nn.Module):
                  level_cross_attn_shared=True,
                  level_gate_entropy_weight=0.0,
                  level_token_gate=False,
+                 level_anchor_residual_gamma_init=0.0,
                  geo_bias_mode="legacy",
                  geo_bias_rbf_scales=(0.25, 0.5, 1.0, 2.0, 4.0),
                  geo_bias_rbf_alpha_init=0.0,
@@ -587,6 +698,9 @@ class GeoLMC(nn.Module):
                  pos_encoding_mode="fourier_legacy",
                  point_rope_coord_norm="scene_radius",
                  point_rope_radius=4.0,
+                 point_rope_radius_policy="fixed",
+                 point_rope_mixed_memory_ratio=0.5,
+                 point_rope_seed_pe="fourier_legacy",
                  point_rope_base=10000.0,
                  point_rope_axes="xyz_split",
                  point_rope_apply_to="qk",
@@ -614,28 +728,37 @@ class GeoLMC(nn.Module):
         if self.key_feature_mode not in ("slice", "scalar_mix"):
             raise ValueError(f"Unsupported key_feature_mode={key_feature_mode!r}.")
         self.feature_hierarchy_mode = str(feature_hierarchy_mode)
-        if self.feature_hierarchy_mode not in ("selected_key_concat_value", "levelwise_latent_merge"):
+        if self.feature_hierarchy_mode not in (
+            "selected_key_concat_value",
+            "levelwise_latent_merge",
+            "levelwise_anchor_residual",
+        ):
             raise ValueError(f"Unsupported feature_hierarchy_mode={feature_hierarchy_mode!r}.")
         self.level_merge_mode = str(level_merge_mode)
         if self.level_merge_mode != "softmax_gate":
             raise ValueError(f"Unsupported level_merge_mode={level_merge_mode!r}.")
         self.level_merge_init = str(level_merge_init)
-        if self.level_merge_init != "uniform":
+        if self.level_merge_init not in ("uniform", "key_slice_bias"):
             raise ValueError(f"Unsupported level_merge_init={level_merge_init!r}.")
         self.level_proj_shared = bool(level_proj_shared)
         self.level_cross_attn_shared = bool(level_cross_attn_shared)
         self.level_gate_entropy_weight = float(level_gate_entropy_weight)
         self.level_token_gate = bool(level_token_gate)
-        if self.feature_hierarchy_mode == "levelwise_latent_merge":
+        self.level_anchor_residual_gamma_init = float(level_anchor_residual_gamma_init)
+        self._uses_levelwise_path = self.feature_hierarchy_mode in (
+            "levelwise_latent_merge",
+            "levelwise_anchor_residual",
+        )
+        if self._uses_levelwise_path:
             if self.mode not in ("global", "local"):
                 raise ValueError(
-                    "levelwise_latent_merge currently supports only global/local GeoLMC modes, "
+                    f"{self.feature_hierarchy_mode} currently supports only global/local GeoLMC modes, "
                     f"got mode={self.mode!r}."
                 )
             if self.level_token_gate:
-                raise ValueError("level_token_gate is reserved for a future ablation; use False for B3-lite.")
+                raise ValueError("level_token_gate is reserved for a future ablation; use False.")
             if self.level_gate_entropy_weight != 0.0:
-                raise ValueError("level_gate_entropy_weight is reserved for a future ablation; use 0.0 for B3-lite.")
+                raise ValueError("level_gate_entropy_weight is reserved for a future ablation; use 0.0.")
         self.geo_bias_mode = str(geo_bias_mode)
         if self.geo_bias_mode not in ("legacy", "rbf_residual", "crpb"):
             raise ValueError(f"Unsupported geo_bias_mode={geo_bias_mode!r}.")
@@ -661,6 +784,19 @@ class GeoLMC(nn.Module):
         self.pos_fourier_residual_gate_init = float(pos_fourier_residual_gate_init)
         self.point_rope_coord_norm = str(point_rope_coord_norm)
         self.point_rope_radius = float(point_rope_radius)
+        if self.point_rope_radius <= 0.0:
+            raise ValueError(f"point_rope_radius must be > 0, got {self.point_rope_radius!r}.")
+        self.point_rope_radius_policy = str(point_rope_radius_policy)
+        if self.point_rope_radius_policy not in ("fixed", "memory_p95", "mixed_fixed_memory_p95"):
+            raise ValueError(f"Unsupported point_rope_radius_policy={point_rope_radius_policy!r}.")
+        self.point_rope_mixed_memory_ratio = float(point_rope_mixed_memory_ratio)
+        if not 0.0 <= self.point_rope_mixed_memory_ratio <= 1.0:
+            raise ValueError(
+                f"point_rope_mixed_memory_ratio must be in [0, 1], got {self.point_rope_mixed_memory_ratio!r}."
+            )
+        self.point_rope_seed_pe = str(point_rope_seed_pe)
+        if self.point_rope_seed_pe not in ("fourier_legacy", "sincos_deterministic"):
+            raise ValueError(f"Unsupported point_rope_seed_pe={point_rope_seed_pe!r}.")
         self.point_rope_base = float(point_rope_base)
         self.point_rope_axes = str(point_rope_axes)
         self.point_rope_apply_to = str(point_rope_apply_to)
@@ -690,7 +826,12 @@ class GeoLMC(nn.Module):
             learnable_scale=self.pos_fourier_learnable_scale,
             residual_gate_init=self.pos_fourier_residual_gate_init,
         )
-        if self.feature_hierarchy_mode == "levelwise_latent_merge":
+        self.point_rope_seed_encoder = DeterministicSincosPositionEncoding(
+            output_dim=compress_dim,
+            radius=self.point_rope_radius,
+            base=self.point_rope_base,
+        )
+        if self._uses_levelwise_path:
             self.level_latent_tokens = nn.Parameter(
                 torch.zeros(1, num_latent_tokens, compress_dim)
             )
@@ -707,8 +848,16 @@ class GeoLMC(nn.Module):
                     )
                     for _ in range(num_layers)
                 ])
-            self.level_logits = nn.Parameter(torch.zeros(num_layers))
-        else:
+            self.level_logits = nn.Parameter(self._init_level_logits(num_layers))
+            if self.feature_hierarchy_mode == "levelwise_anchor_residual":
+                self.level_anchor_residual = nn.Sequential(
+                    nn.LayerNorm(compress_dim),
+                    nn.Linear(compress_dim, compress_dim),
+                )
+                self.level_anchor_residual_gamma = nn.Parameter(
+                    torch.tensor(self.level_anchor_residual_gamma_init, dtype=torch.float32)
+                )
+        if self.feature_hierarchy_mode != "levelwise_latent_merge":
             self.k_proj = nn.Linear(input_dim, compress_dim)
             if self.key_feature_mode == "scalar_mix":
                 key_mix_logits = torch.full((num_layers,), -4.0)
@@ -753,6 +902,8 @@ class GeoLMC(nn.Module):
                                   pos_encoding_mode=self.pos_encoding_mode,
                                   point_rope_coord_norm=self.point_rope_coord_norm,
                                   point_rope_radius=self.point_rope_radius,
+                                  point_rope_radius_policy=self.point_rope_radius_policy,
+                                  point_rope_mixed_memory_ratio=self.point_rope_mixed_memory_ratio,
                                   point_rope_base=self.point_rope_base,
                                   point_rope_axes=self.point_rope_axes,
                                   point_rope_apply_to=self.point_rope_apply_to)
@@ -773,6 +924,8 @@ class GeoLMC(nn.Module):
                                   pos_encoding_mode=self.pos_encoding_mode,
                                   point_rope_coord_norm=self.point_rope_coord_norm,
                                   point_rope_radius=self.point_rope_radius,
+                                  point_rope_radius_policy=self.point_rope_radius_policy,
+                                  point_rope_mixed_memory_ratio=self.point_rope_mixed_memory_ratio,
                                   point_rope_base=self.point_rope_base,
                                   point_rope_axes=self.point_rope_axes,
                                   point_rope_apply_to=self.point_rope_apply_to)
@@ -782,7 +935,7 @@ class GeoLMC(nn.Module):
             if mode == 'local':
                 self.local_bias_gen = LocalGeometricBias(
                     sigma=geo_sigma, hard_cutoff_sigma=3.0)
-            if self.feature_hierarchy_mode == "levelwise_latent_merge":
+            if self._uses_levelwise_path:
                 if self.level_cross_attn_shared:
                     self.level_layers = nn.ModuleList([
                         GeoAttentionBlock(compress_dim, mode=mode, num_heads=8,
@@ -800,6 +953,8 @@ class GeoLMC(nn.Module):
                                   pos_encoding_mode=self.pos_encoding_mode,
                                   point_rope_coord_norm=self.point_rope_coord_norm,
                                   point_rope_radius=self.point_rope_radius,
+                                  point_rope_radius_policy=self.point_rope_radius_policy,
+                                  point_rope_mixed_memory_ratio=self.point_rope_mixed_memory_ratio,
                                   point_rope_base=self.point_rope_base,
                                   point_rope_axes=self.point_rope_axes,
                                   point_rope_apply_to=self.point_rope_apply_to)
@@ -822,6 +977,8 @@ class GeoLMC(nn.Module):
                                   pos_encoding_mode=self.pos_encoding_mode,
                                   point_rope_coord_norm=self.point_rope_coord_norm,
                                   point_rope_radius=self.point_rope_radius,
+                                  point_rope_radius_policy=self.point_rope_radius_policy,
+                                  point_rope_mixed_memory_ratio=self.point_rope_mixed_memory_ratio,
                                   point_rope_base=self.point_rope_base,
                                   point_rope_axes=self.point_rope_axes,
                                   point_rope_apply_to=self.point_rope_apply_to)
@@ -829,7 +986,7 @@ class GeoLMC(nn.Module):
                         ])
                         for _ in range(num_layers)
                     ])
-            else:
+            if self.feature_hierarchy_mode != "levelwise_latent_merge":
                 self.layers = nn.ModuleList([
                     GeoAttentionBlock(compress_dim, mode=mode, num_heads=8,
                                       geo_sigma=geo_sigma,
@@ -846,12 +1003,23 @@ class GeoLMC(nn.Module):
                                   pos_encoding_mode=self.pos_encoding_mode,
                                   point_rope_coord_norm=self.point_rope_coord_norm,
                                   point_rope_radius=self.point_rope_radius,
+                                  point_rope_radius_policy=self.point_rope_radius_policy,
+                                  point_rope_mixed_memory_ratio=self.point_rope_mixed_memory_ratio,
                                   point_rope_base=self.point_rope_base,
                                   point_rope_axes=self.point_rope_axes,
                                   point_rope_apply_to=self.point_rope_apply_to)
                     for _ in range(num_attn_layers)])
 
     # -- helpers --
+
+    def _init_level_logits(self, num_layers):
+        if self.level_merge_init == "uniform":
+            return torch.zeros(num_layers)
+        if self.level_merge_init == "key_slice_bias":
+            logits = torch.full((num_layers,), -4.0)
+            logits[self.key_slice_idx] = 4.0
+            return logits
+        raise ValueError(f"Unsupported level_merge_init={self.level_merge_init!r}.")
 
     def _resolve_key_slice_idx(self, key_slice_idx):
         if self.num_layers <= 1:
@@ -910,7 +1078,7 @@ class GeoLMC(nn.Module):
                 yield getattr(layer, 'attn', None)
         elif self.mode == 'learned':
             return
-        elif self.feature_hierarchy_mode == "levelwise_latent_merge":
+        elif self._uses_levelwise_path:
             if self.level_cross_attn_shared:
                 for layer in self.level_layers:
                     yield getattr(layer, 'attn', None)
@@ -927,25 +1095,42 @@ class GeoLMC(nn.Module):
         for idx, attn in enumerate(self._iter_attention_modules() or []):
             if attn is None:
                 continue
-            rbf_bias = getattr(attn, 'rbf_bias', None)
-            if rbf_bias is None:
+            inner = getattr(attn, 'inner', attn)
+            summary = None
+            rbf_bias = getattr(inner, 'rbf_bias', None)
+            if rbf_bias is not None:
+                summary = rbf_bias.summary()
+            runtime = getattr(attn, 'last_runtime_stats', None)
+            if runtime is None:
+                runtime = getattr(inner, 'last_runtime_stats', None)
+            if summary is None and runtime is None:
                 continue
-            summary = rbf_bias.summary()
+            item = {"layer": idx}
             if summary is not None:
-                summaries.append({"layer": idx, **summary})
+                item.update(summary)
+            if isinstance(runtime, dict):
+                for key in ("qk_logit_abs_mean", "bias_abs_mean", "bias_abs_max", "bias_to_qk_ratio", "attention_entropy_before_bias", "attention_entropy_after_bias", "attention_entropy_delta_after_minus_before", "point_rope_effective_radius"):
+                    if key in runtime:
+                        item[key] = runtime[key]
+            summaries.append(item)
         if not summaries:
             self.last_geo_bias_runtime_stats = None
             return
         if len(summaries) == 1:
             summary = summaries[0]
             self.last_geo_bias_runtime_stats = {
-                "final_geo_bias_rbf_alpha": summary["final_geo_bias_rbf_alpha"],
-                "final_geo_bias_rbf_weights": summary["final_geo_bias_rbf_weights"],
+                "final_geo_bias_rbf_alpha": summary.get("final_geo_bias_rbf_alpha"),
+                "final_geo_bias_rbf_weights": summary.get("final_geo_bias_rbf_weights"),
+                "attention_bias_stats": {k: v for k, v in summary.items() if k in ("qk_logit_abs_mean", "bias_abs_mean", "bias_abs_max", "bias_to_qk_ratio", "attention_entropy_before_bias", "attention_entropy_after_bias", "attention_entropy_delta_after_minus_before", "point_rope_effective_radius")},
             }
             return
         self.last_geo_bias_runtime_stats = {
-            "final_geo_bias_rbf_alpha": [item["final_geo_bias_rbf_alpha"] for item in summaries],
-            "final_geo_bias_rbf_weights": [item["final_geo_bias_rbf_weights"] for item in summaries],
+            "final_geo_bias_rbf_alpha": [item.get("final_geo_bias_rbf_alpha") for item in summaries],
+            "final_geo_bias_rbf_weights": [item.get("final_geo_bias_rbf_weights") for item in summaries],
+            "attention_bias_stats": [
+                {k: v for k, v in item.items() if k in ("layer", "qk_logit_abs_mean", "bias_abs_mean", "bias_abs_max", "bias_to_qk_ratio", "attention_entropy_before_bias", "attention_entropy_after_bias", "attention_entropy_delta_after_minus_before", "point_rope_effective_radius")}
+                for item in summaries
+            ],
         }
 
     def _build_local_geometry_info(self, dist_sq):
@@ -954,12 +1139,71 @@ class GeoLMC(nn.Module):
             "attn_bias": self.local_bias_gen(dist_sq),
         }
 
-    def _build_geometry_info(self, *, dist_sq, query_coords, key_coords, attn_bias=None):
+    def _encode_seed_coords(self, coords, point_rope_radius=None):
+        if self.pos_encoding_mode == "point_rope" and self.point_rope_seed_pe == "sincos_deterministic":
+            if not hasattr(self, "_point_rope_seed_logged"):
+                _logger.info("[PointRoPE] seed_pe=sincos_deterministic")
+                self._point_rope_seed_logged = True
+            return self.point_rope_seed_encoder(coords, radius=point_rope_radius)
+        return self.pe_encoder(coords)
+
+    def _memory_p95_point_rope_radius(self, pooled_points, scene_center):
+        center = scene_center.to(device=pooled_points.device, dtype=pooled_points.dtype)
+        if center.ndim == 1:
+            center = center.unsqueeze(0)
+        centered = pooled_points - center.unsqueeze(1)
+        distances = torch.linalg.norm(centered, dim=-1).reshape(-1)
+        finite = distances[torch.isfinite(distances)]
+        if finite.numel() == 0:
+            return pooled_points.new_tensor(self.point_rope_radius)
+        return torch.quantile(finite.float(), 0.95).to(
+            device=pooled_points.device, dtype=pooled_points.dtype
+        ).clamp(min=1e-6)
+
+    def _resolve_point_rope_radius(self, pooled_points, scene_center):
+        fixed_radius = pooled_points.new_tensor(self.point_rope_radius).clamp(min=1e-6)
+        memory_radius = None
+        if self.point_rope_radius_policy == "fixed":
+            radius = fixed_radius
+        elif self.point_rope_radius_policy == "memory_p95":
+            memory_radius = self._memory_p95_point_rope_radius(pooled_points, scene_center)
+            radius = memory_radius
+        elif self.point_rope_radius_policy == "mixed_fixed_memory_p95":
+            memory_radius = self._memory_p95_point_rope_radius(pooled_points, scene_center)
+            num_heads = 8
+            memory_heads = int(round(num_heads * self.point_rope_mixed_memory_ratio))
+            memory_heads = max(0, min(num_heads, memory_heads))
+            fixed_heads = num_heads - memory_heads
+            parts = []
+            if fixed_heads > 0:
+                parts.append(fixed_radius.expand(fixed_heads))
+            if memory_heads > 0:
+                parts.append(memory_radius.expand(memory_heads))
+            radius = torch.cat(parts, dim=0) if parts else fixed_radius.expand(num_heads)
+        else:
+            raise ValueError(f"Unsupported point_rope_radius_policy={self.point_rope_radius_policy!r}.")
+        if self.pos_encoding_mode == "point_rope" and not hasattr(self, "_point_rope_radius_logged"):
+            radius_for_log = radius.detach().float().reshape(-1).cpu()
+            _logger.info(
+                "[PointRoPE] radius_policy=%s fixed_radius=%.6f memory_p95_radius=%s "
+                "mixed_memory_ratio=%.3f effective_radius_mean=%.6f effective_radius_heads=%s",
+                self.point_rope_radius_policy,
+                self.point_rope_radius,
+                "none" if memory_radius is None else f"{float(memory_radius.detach().float().cpu().item()):.6f}",
+                self.point_rope_mixed_memory_ratio,
+                float(radius_for_log.mean().item()),
+                [float(v) for v in radius_for_log.tolist()],
+            )
+            self._point_rope_radius_logged = True
+        return radius
+
+    def _build_geometry_info(self, *, dist_sq, query_coords, key_coords, attn_bias=None, point_rope_radius=None):
         return {
             "dist_sq": dist_sq,
             "attn_bias": attn_bias,
             "query_coords": query_coords,
             "key_coords": key_coords,
+            "point_rope_radius": point_rope_radius,
         }
 
     def _get_key_features(self, features):
@@ -996,6 +1240,75 @@ class GeoLMC(nn.Module):
                 fps_idx.unsqueeze(-1).expand(-1, -1, 3))
         return pooled_points[:, :K_curr, :]
 
+    def _forward_selected_key_concat_value(self, memory_dict):
+        pooled_points = memory_dict["pooled_points"]
+        pooled_features = memory_dict["pooled_features"]
+        scene_center = memory_dict["scene_center"]
+
+        raw_key_feats = self._get_key_features(pooled_features)
+        k_base = self.k_proj(raw_key_feats)
+        v = self.v_proj(pooled_features)
+        latent_coords = self._sample_latent_coords(pooled_points, scene_center, self.K)
+
+        norm_coords = latent_coords - scene_center.unsqueeze(1)
+        point_rope_radius = self._resolve_point_rope_radius(pooled_points, scene_center)
+        q = self._encode_seed_coords(norm_coords, point_rope_radius=point_rope_radius)
+
+        if not hasattr(self, '_pe_logged'):
+            _logger.info(
+                "[PE] scale_mode=%s scene_scale=%.6f input range: %.3f~%.3f, "
+                "input_std=%.4f, output range: %.3f~%.3f",
+                self.pe_scale_mode,
+                self.pe_scene_scale,
+                float(norm_coords.min()), float(norm_coords.max()),
+                float(norm_coords.std(unbiased=False)),
+                float(q.min()), float(q.max()),
+            )
+            self._pe_logged = True
+
+        dist_sq = torch.cdist(latent_coords, pooled_points, p=2) ** 2
+        geometry_info = self._build_geometry_info(
+            dist_sq=dist_sq,
+            query_coords=latent_coords,
+            key_coords=pooled_points,
+            attn_bias=self.local_bias_gen(dist_sq) if self.mode == 'local' else None,
+            point_rope_radius=point_rope_radius,
+        )
+
+        self._set_cross_attention_stats(self.layers, bool(getattr(self, "collect_runtime_stats", False)))
+        for layer in self.layers:
+            q = layer(q, k_base, v, geometry_info=geometry_info)
+
+        x = self._inject_scale(q, memory_dict)
+        self._update_geo_bias_runtime_stats()
+        return x, latent_coords
+
+    def _forward_levelwise_anchor_residual(self, memory_dict):
+        base_x, latent_coords = self._forward_selected_key_concat_value(memory_dict)
+        level_x, level_coords = self._forward_levelwise_latent_merge(memory_dict)
+        residual = self.level_anchor_residual(level_x)
+        gamma = self.level_anchor_residual_gamma.to(dtype=residual.dtype)
+        out = base_x + gamma * residual
+
+        with torch.no_grad():
+            stats = dict(getattr(self, "last_levelwise_runtime_stats", None) or {})
+            stats.update({
+                "final_level_anchor_residual_gamma": float(
+                    self.level_anchor_residual_gamma.detach().float().cpu().item()
+                ),
+                "lmc_level_anchor_residual_gamma": float(
+                    self.level_anchor_residual_gamma.detach().float().cpu().item()
+                ),
+                "level_anchor_base_norm": float(base_x.detach().float().norm(dim=-1).mean().item()),
+                "level_anchor_residual_norm": float(residual.detach().float().norm(dim=-1).mean().item()),
+                "level_anchor_output_norm": float(out.detach().float().norm(dim=-1).mean().item()),
+            })
+            if level_coords.shape == latent_coords.shape:
+                coord_delta = (level_coords.detach().float() - latent_coords.detach().float()).norm(dim=-1)
+                stats["level_anchor_coord_delta_mean"] = float(coord_delta.mean().item())
+            self.last_levelwise_runtime_stats = stats
+        return out, latent_coords
+
     def _forward_levelwise_latent_merge(self, memory_dict):
         pooled_points = memory_dict["pooled_points"]
         pooled_features = memory_dict["pooled_features"]
@@ -1004,11 +1317,12 @@ class GeoLMC(nn.Module):
         latent_coords = self._sample_latent_coords(pooled_points, scene_center, self.K)
         centered_latent = latent_coords - scene_center.unsqueeze(1)
         centered_points = pooled_points - scene_center.unsqueeze(1)
-        q_seed = self.pe_encoder(centered_latent) + self.level_latent_tokens.to(
+        point_rope_radius = self._resolve_point_rope_radius(pooled_points, scene_center)
+        q_seed = self._encode_seed_coords(centered_latent, point_rope_radius=point_rope_radius) + self.level_latent_tokens.to(
             device=pooled_points.device,
             dtype=pooled_features.dtype,
         )
-        k_pos = self.pe_encoder(centered_points)
+        k_pos = self._encode_seed_coords(centered_points, point_rope_radius=point_rope_radius)
 
         if not hasattr(self, '_pe_logged'):
             _logger.info(
@@ -1028,6 +1342,7 @@ class GeoLMC(nn.Module):
             query_coords=latent_coords,
             key_coords=pooled_points,
             attn_bias=self.local_bias_gen(dist_sq) if self.mode == 'local' else None,
+            point_rope_radius=point_rope_radius,
         )
 
         collect_stats = bool(getattr(self, "collect_runtime_stats", False))
@@ -1102,6 +1417,10 @@ class GeoLMC(nn.Module):
 
         if self.feature_hierarchy_mode == "levelwise_latent_merge":
             return self._forward_levelwise_latent_merge(memory_dict)
+        if self.feature_hierarchy_mode == "levelwise_anchor_residual":
+            return self._forward_levelwise_anchor_residual(memory_dict)
+        if self.mode in ("global", "local"):
+            return self._forward_selected_key_concat_value(memory_dict)
 
         raw_key_feats = self._get_key_features(pooled_features)
         k_base = self.k_proj(raw_key_feats)
@@ -1111,7 +1430,8 @@ class GeoLMC(nn.Module):
         if self.mode == 'learned':
             B = pooled_points.shape[0]
             q = self.learned_queries.expand(B, -1, -1)
-            k_pos = self.pe_encoder(pooled_points - scene_center.unsqueeze(1))
+            point_rope_radius = self._resolve_point_rope_radius(pooled_points, scene_center)
+            k_pos = self._encode_seed_coords(pooled_points - scene_center.unsqueeze(1), point_rope_radius=point_rope_radius)
             k = k_base + k_pos
             for layer in self.learned_layers:
                 q = layer(q, k, v)
@@ -1141,28 +1461,33 @@ class GeoLMC(nn.Module):
                 coords_fine, 1,
                 idx_coarse_local.unsqueeze(-1).expand(-1, -1, 3))
 
+            point_rope_radius = self._resolve_point_rope_radius(pooled_points, scene_center)
             dist_coarse = torch.cdist(coords_coarse, pooled_points, p=2) ** 2
-            q_coarse = self.pe_encoder(
-                coords_coarse - scene_center.unsqueeze(1))
+            q_coarse = self._encode_seed_coords(
+                coords_coarse - scene_center.unsqueeze(1), point_rope_radius=point_rope_radius)
             coarse_geo = self._build_geometry_info(
                 dist_sq=dist_coarse,
                 query_coords=coords_coarse,
                 key_coords=pooled_points,
                 attn_bias=None,
+                point_rope_radius=point_rope_radius,
             )
+            self._set_cross_attention_stats(self.coarse_layers, bool(getattr(self, "collect_runtime_stats", False)))
             for layer in self.coarse_layers:
                 q_coarse = layer(q_coarse, k_base, v, geometry_info=coarse_geo)
             z_coarse = self._inject_scale(q_coarse, memory_dict)
 
             dist_fine = torch.cdist(coords_fine, pooled_points, p=2) ** 2
-            q_fine = self.pe_encoder(
-                coords_fine - scene_center.unsqueeze(1))
+            q_fine = self._encode_seed_coords(
+                coords_fine - scene_center.unsqueeze(1), point_rope_radius=point_rope_radius)
             fine_geo = self._build_geometry_info(
                 dist_sq=dist_fine,
                 query_coords=coords_fine,
                 key_coords=pooled_points,
                 attn_bias=None,
+                point_rope_radius=point_rope_radius,
             )
+            self._set_cross_attention_stats(self.fine_layers, bool(getattr(self, "collect_runtime_stats", False)))
             for layer in self.fine_layers:
                 q_fine = layer(q_fine, k_base, v, geometry_info=fine_geo)
             z_fine = self._inject_scale(q_fine, memory_dict)
@@ -1172,35 +1497,4 @@ class GeoLMC(nn.Module):
                     "z_fine": z_fine, "p_fine": coords_fine}
 
         # --- Single Level (global / local) ---
-        latent_coords = self._sample_latent_coords(pooled_points, scene_center, self.K)
-
-        norm_coords = latent_coords - scene_center.unsqueeze(1)
-        q = self.pe_encoder(norm_coords)
-
-        # One-time PE diagnostic log
-        if not hasattr(self, '_pe_logged'):
-            _logger.info(
-                "[PE] scale_mode=%s scene_scale=%.6f input range: %.3f~%.3f, "
-                "input_std=%.4f, output range: %.3f~%.3f",
-                self.pe_scale_mode,
-                self.pe_scene_scale,
-                float(norm_coords.min()), float(norm_coords.max()),
-                float(norm_coords.std(unbiased=False)),
-                float(q.min()), float(q.max()),
-            )
-            self._pe_logged = True
-
-        dist_sq = torch.cdist(latent_coords, pooled_points, p=2) ** 2
-        geometry_info = self._build_geometry_info(
-            dist_sq=dist_sq,
-            query_coords=latent_coords,
-            key_coords=pooled_points,
-            attn_bias=self.local_bias_gen(dist_sq) if self.mode == 'local' else None,
-        )
-
-        for layer in self.layers:
-            q = layer(q, k_base, v, geometry_info=geometry_info)
-
-        x = self._inject_scale(q, memory_dict)
-        self._update_geo_bias_runtime_stats()
-        return x, latent_coords
+        return self._forward_selected_key_concat_value(memory_dict)

@@ -33,6 +33,10 @@ if (_WORKSPACE_ROOT / "uniception" / "__init__.py").is_file():
 # Local modules
 from .bse_pooling import BSEPooler
 from .welford_meter import WelfordNormalizer
+try:
+    from ace_dinov2_lmc.glace_backend import build_glace_camloc_dataset, create_glace_regressor_from_encoder
+except ImportError:
+    from glace_backend import build_glace_camloc_dataset, create_glace_regressor_from_encoder
 
 
 # =============================================================================
@@ -843,6 +847,9 @@ class ExtractionConfig:
     patch_depth_sampling: str = "nearest_valid"
     # 两遍处理时 chunk/checkpoint 临时目录（建议 /dev/shm 加速 IO）
     temp_dir: str = "/dev/shm"
+    # Move BSE post-processing tensors to CPU after model inference. This keeps
+    # legacy behavior off by default but avoids high-res RIO10 GPU OOMs.
+    postprocess_on_cpu: bool = False
     # MapAnything Hydra 模型名（如 mapanything_store_intermediates_ace）
     model_str: Optional[str] = None
     # 自定义 YAML 配置路径；None 时用内置 default
@@ -873,6 +880,7 @@ class ExtractionConfig:
     dataset_transform: str = "imgnorm"
     dataset_data_norm_type: str = "dinov2"
     dataset_aug_crop: int = 0
+    dataset_resolution: int = 518
     # WAI view loading protocol:
     # fps_flat: dataset[idx] returns one view so actual model inputs match the
     #           original FPS-style memory list.
@@ -937,6 +945,12 @@ class ExtractionConfig:
     save_all_ray_strategies: bool = True
     # 特征骨干：mapanything（与 fps_memory 对齐）或 dinov2（DPT 式多尺度）
     use_model: str = "mapanything"
+    glace_root: str = '/home/xwh/project/glace'
+    glace_encoder_path: str = '/home/xwh/project/glace/ace_encoder_pretrained.pt'
+    glace_feat_name: str = 'features.npy'
+    # MapAnything infer mixed precision. Keep disabled by default for exact
+    # legacy behavior; enable for high-resolution RIO10 memory extraction.
+    mapanything_use_amp: bool = False
     # DINOv2 取的 block 索引列表；None 则默认 8 层 [2,5,8,11,14,17,20,23]
     dinov2_intermediate_layers: Optional[List[int]] = None
     # MapAnything infer 后：预测位姿相对 GT 的平移阈值（米），用于 OK/HIGH 分级
@@ -1506,6 +1520,56 @@ class DINOv2Extractor:
         return self._extract_multiscale(images)
 
 
+class GLACEEncoderExtractor:
+    """GLACE encoder feature extractor for pooled-memory generation."""
+
+    def __init__(
+        self,
+        glace_root: str,
+        encoder_path: str,
+        device: str = "cuda:0",
+    ):
+        self.device = device
+        self.model = create_glace_regressor_from_encoder(
+            glace_root=glace_root,
+            encoder_path=encoder_path,
+            mean=torch.zeros(3),
+            num_head_blocks=4,
+            use_homogeneous=True,
+            global_feat_dim=0,
+            head_channels=512,
+            mlp_ratio=1.0,
+            map_location="cpu",
+        )
+        self.model = self.model.to(device).eval()
+
+    def extract(
+        self,
+        images: torch.Tensor,
+        depths: torch.Tensor,
+        poses: torch.Tensor,
+        intrinsics: torch.Tensor
+    ) -> Dict[int, Dict[str, Any]]:
+        del depths, poses, intrinsics
+        if images.ndim != 4:
+            raise ValueError(f"GLACEEncoderExtractor expects BCHW images, got {tuple(images.shape)}")
+        if images.shape[1] != 1:
+            images = images[:, :1]
+        with torch.no_grad():
+            features = self.model.get_features(images)
+        result: Dict[int, Dict[str, Any]] = {}
+        for i in range(features.shape[0]):
+            feat = features[i].detach().cpu()
+            result[i] = {
+                'features': [feat],
+                'grid_H': int(feat.shape[-2]),
+                'grid_W': int(feat.shape[-1]),
+                'layer_indices': ['glace_encoder'],
+                'cls_token': None,
+            }
+        return result
+
+
 # =============================================================================
 # Input Validation (MEDIUM Priority)
 # =============================================================================
@@ -1541,13 +1605,25 @@ def validate_inputs(
             f"colors={len(colors)}, ray_dirs={len(ray_dirs)}"
         )
 
-    # Check for NaN/Inf
+    # Check for NaN/Inf without materializing a full-size boolean mask on GPU.
+    # High-resolution MapAnything features can be [N, 3840]; torch.isnan(tensor)
+    # would allocate another dense [N, 3840] mask and OOM after inference.
+    def _raise_if_nonfinite(name: str, tensor: torch.Tensor, chunk_elements: int = 4_000_000) -> None:
+        if not torch.is_floating_point(tensor):
+            return
+        flat = tensor.detach().reshape(-1)
+        total = int(flat.numel())
+        if total == 0:
+            return
+        step = max(1, int(chunk_elements))
+        for start in range(0, total, step):
+            chunk = flat[start:start + step]
+            if not bool(torch.isfinite(chunk).all().item()):
+                raise ValueError(f"{name} contains NaN or Inf values")
+
     for name, tensor in [("points", points), ("features", features),
                           ("colors", colors), ("ray_dirs", ray_dirs)]:
-        if torch.isnan(tensor).any():
-            raise ValueError(f"{name} contains NaN values")
-        if torch.isinf(tensor).any():
-            raise ValueError(f"{name} contains Inf values")
+        _raise_if_nonfinite(name, tensor)
 
 
 # =============================================================================
@@ -1575,14 +1651,46 @@ def prepare_batch_input(
     else:
         img = img_raw
 
-    # Force float32 BEFORE device transfer (ACE path may have float16)
-    if isinstance(img, torch.Tensor) and img.dtype != torch.float32:
+    if not isinstance(img, torch.Tensor):
+        raise TypeError(f"Expected image tensor/ndarray in raw_data['img'|'image'], got {type(img).__name__}")
+
+    # Normalize image layout for MapAnything: [B, 3, H, W].
+    # Some WAI loaders return HWC/BHWC numpy arrays, while ACE already returns CHW.
+    if img.ndim == 2:
+        img = img.unsqueeze(0).repeat(3, 1, 1)
+    elif img.ndim == 3:
+        if img.shape[0] in (1, 3, 4):
+            img = img[:3]
+            if img.shape[0] == 1:
+                img = img.repeat(3, 1, 1)
+        elif img.shape[-1] in (1, 3, 4):
+            img = img[..., :3]
+            if img.shape[-1] == 1:
+                img = img.repeat(1, 1, 3)
+            img = img.permute(2, 0, 1)
+        else:
+            raise ValueError(f"Unsupported 3D image shape {tuple(img.shape)}; expected CHW or HWC with 1/3/4 channels")
+        img = img.unsqueeze(0)
+    elif img.ndim == 4:
+        if img.shape[1] in (1, 3, 4):
+            img = img[:, :3]
+            if img.shape[1] == 1:
+                img = img.repeat(1, 3, 1, 1)
+        elif img.shape[-1] in (1, 3, 4):
+            img = img[..., :3]
+            if img.shape[-1] == 1:
+                img = img.repeat(1, 1, 1, 3)
+            img = img.permute(0, 3, 1, 2)
+        else:
+            raise ValueError(f"Unsupported 4D image shape {tuple(img.shape)}; expected BCHW or BHWC with 1/3/4 channels")
+    else:
+        raise ValueError(f"Unsupported image rank {img.ndim} for shape {tuple(img.shape)}")
+
+    # Force float32 BEFORE device transfer (ACE path may have float16).
+    if img.dtype != torch.float32:
         img = img.float()
 
-    img = img.to(device)
-
-    if img.ndim == 3:
-        img = img.unsqueeze(0)
+    img = img.contiguous().to(device)
     B = img.shape[0]
 
     view_input["img"] = img
@@ -1906,34 +2014,40 @@ def process_multiscale_features_to_grid(
             feat = feat.reshape(1, C, H_p, W_p)
 
         elif feat.ndim == 3:
-            # (B, L, C) -> (B, C, H, W)
-            B, L, C = feat.shape
-            # Strip CLS token if present
-            _strip_cls_batch = False
-            S = int(math.sqrt(L))
-            if S * S != L:
-                L_minus = L - 1
-                S_m = int(math.sqrt(L_minus))
-                if S_m * S_m == L_minus:
-                    L = L_minus
-                    _strip_cls_batch = True
-                    S = S_m
-            if S * S == L:
-                H_p, W_p = S, S
+            if feat.shape[0] > 16:
+                # (C, H, W) -> (1, C, H, W), e.g. GLACE encoder feature maps.
+                feat = feat.unsqueeze(0)
             else:
-                # Try aspect ratio (non-square grid)
-                W_p = int(math.sqrt(L))
-                H_p = L // W_p
-                if H_p * W_p != L:
-                    L_minus = L - 1 if not _strip_cls_batch else L
-                    W_p = int(math.sqrt(L_minus))
-                    H_p = L_minus // W_p
-                    if H_p * W_p == L_minus:
+                # (B, L, C) -> (B, C, H, W)
+                B, L, C = feat.shape
+                # Strip CLS token if present
+                _strip_cls_batch = False
+                S = int(math.sqrt(L))
+                if S * S != L:
+                    L_minus = L - 1
+                    S_m = int(math.sqrt(L_minus))
+                    if S_m * S_m == L_minus:
                         L = L_minus
                         _strip_cls_batch = True
-                    else:
-                        H_p, W_p = S, S  # fallback
-            feat = feat.transpose(1, 2).reshape(B, C, H_p, W_p)
+                        S = S_m
+                if S * S == L:
+                    H_p, W_p = S, S
+                else:
+                    # Try aspect ratio (non-square grid)
+                    W_p = int(math.sqrt(L))
+                    H_p = L // W_p
+                    if H_p * W_p != L:
+                        L_minus = L - 1 if not _strip_cls_batch else L
+                        W_p = int(math.sqrt(L_minus))
+                        H_p = L_minus // W_p
+                        if H_p * W_p == L_minus:
+                            L = L_minus
+                            _strip_cls_batch = True
+                        else:
+                            H_p, W_p = S, S  # fallback
+                if _strip_cls_batch:
+                    feat = feat[:, 1:]
+                feat = feat.transpose(1, 2).reshape(B, C, H_p, W_p)
 
         if feat.ndim == 4:
             B, C, H_p, W_p = feat.shape
@@ -2013,11 +2127,15 @@ def process_multiscale_features_to_image(
             feat = feat.reshape(1, H_p, W_p, channels).permute(0, 3, 1, 2)
 
         elif feat.ndim == 3:
-            B, n_tokens, channels = feat.shape
-            H_p, W_p, strip_cls = _infer_feature_hw(n_tokens, target_H, target_W)
-            if strip_cls:
-                feat = feat[:, 1:]
-            feat = feat.transpose(1, 2).reshape(B, channels, H_p, W_p)
+            if feat.shape[0] > 16:
+                # (C, H, W) -> (1, C, H, W), e.g. GLACE encoder feature maps.
+                feat = feat.unsqueeze(0)
+            else:
+                B, n_tokens, channels = feat.shape
+                H_p, W_p, strip_cls = _infer_feature_hw(n_tokens, target_H, target_W)
+                if strip_cls:
+                    feat = feat[:, 1:]
+                feat = feat.transpose(1, 2).reshape(B, channels, H_p, W_p)
 
         if feat.ndim != 4:
             raise ValueError(f"Unsupported feature tensor shape for image alignment: {tuple(feat.shape)}")
@@ -2939,6 +3057,15 @@ def two_pass_processing(
                 print(f"[Warning] No valid points for view {view_idx}")
                 continue
 
+            if config.postprocess_on_cpu:
+                points = points.detach().cpu()
+                ray_dirs = ray_dirs.detach().cpu()
+                colors = colors.detach().cpu()
+                features_flat = features_flat.detach().cpu()
+                camera_centers = camera_centers.detach().cpu()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
             # Optional: SOR filtering (MEDIUM priority)
             if config.enable_sor and config.pool_mode != "pooled":
                 print(
@@ -3035,8 +3162,10 @@ def two_pass_processing(
             completed_views.append(view_idx)
             save_checkpoint(checkpoint_path, completed_views, chunk_paths)
 
-            # HIGH Priority: GPU memory cleanup between views
-            torch.cuda.empty_cache()
+            # HIGH Priority: release per-view temporaries before the next view.
+            del batch_gpu, points, ray_dirs, colors, features_flat, camera_centers, chunk_payload
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Pass 2: assemble chunks -> optional global pool/merge -> normalize once
         print("[Pass 2] Assembling raw chunks...")
@@ -3065,7 +3194,7 @@ def two_pass_processing(
                     f"Missing chunk file during Pass2: {chunk_path}. "
                     f"If you changed N_VIEWS or temp_dir was cleared, remove {checkpoint_path} and rerun."
                 )
-            chunk = torch.load(chunk_path)
+            chunk = torch.load(chunk_path, map_location='cpu' if config.postprocess_on_cpu else None)
             all_points.append(chunk['points'])
             all_features.append(chunk['features'])
             all_colors.append(chunk['colors'])
@@ -3531,6 +3660,8 @@ def save_memory(
         memory_dict['dataset_transform'] = str(config.dataset_transform)
         memory_dict['dataset_data_norm_type'] = str(config.dataset_data_norm_type)
         memory_dict['dataset_aug_crop'] = int(config.dataset_aug_crop)
+        memory_dict['dataset_resolution'] = int(config.dataset_resolution)
+        memory_dict['postprocess_on_cpu'] = bool(config.postprocess_on_cpu)
         memory_dict['contract_mode'] = str(config.contract_mode).upper()
         if config.scene_name is not None:
             memory_dict['scene'] = config.scene_name
@@ -3699,32 +3830,71 @@ def save_ply(
 # =============================================================================
 
 class ACEDatasetWithDepth:
-    """Wrapper for CamLocDatasetDINOv2 that adds depth loading from depth/ directory."""
+    """Wrapper for CamLocDatasetDINOv2 that adds depth loading from local depth directories."""
     def __init__(self, base_dataset):
         self.base_dataset = base_dataset
-        self.depth_dir = Path(base_dataset.rgb_files[0].parent.parent) / 'depth'
+        self.dataset_root = Path(base_dataset.rgb_files[0].parent.parent)
+
+    @staticmethod
+    def _depth_candidates(rgb_file: Path, dataset_root: Path) -> list[Path]:
+        stem = rgb_file.stem
+        suffix = rgb_file.suffix.lower()
+        names = [
+            f"{stem}{suffix}",
+            f"{stem}.png",
+            f"{stem}.npy",
+            f"{stem}.npz",
+            f"{stem}.depth.png",
+            f"{stem}.rendered.depth.png",
+        ]
+        if stem.endswith(".color"):
+            base = stem[: -len(".color")]
+            names.extend([
+                f"{base}.depth{suffix}",
+                f"{base}.depth.png",
+                f"{base}.rendered.depth.png",
+                f"{base}.png",
+                f"{base}.npy",
+                f"{base}.npz",
+            ])
+        candidates = []
+        for dirname in ("depth", "gt_depth", "sparse_depth", "colmap_depth"):
+            depth_dir = dataset_root / dirname
+            candidates.extend(depth_dir / name for name in names)
+        return candidates
+
+    @staticmethod
+    def _load_depth(path: Path) -> np.ndarray:
+        from skimage import io
+        suffix = path.suffix.lower()
+        if suffix == ".npy":
+            depth = np.load(path, allow_pickle=False).astype(np.float32, copy=False)
+        elif suffix == ".npz":
+            depth = np.load(path, allow_pickle=False)["arr_0"].astype(np.float32, copy=False)
+        else:
+            raw = io.imread(str(path))
+            depth = np.asarray(raw).astype(np.float32, copy=False)
+            if suffix in {".png", ".tif", ".tiff"} and np.issubdtype(np.asarray(raw).dtype, np.integer):
+                depth = depth / 1000.0
+        if depth.ndim == 3:
+            depth = np.squeeze(depth)
+        return np.where(np.isfinite(depth), depth, 0.0).astype(np.float32, copy=False)
 
     def __len__(self):
         return len(self.base_dataset)
 
     def __getitem__(self, idx):
-        from skimage import io
-        # Get base data (image, mask, pose, intrinsics, etc.)
         data = self.base_dataset[idx]
-
-        # Load depth from depth/ directory
         rgb_file = self.base_dataset.rgb_files[self.base_dataset.valid_file_indices[idx]]
-        depth_file = self.depth_dir / rgb_file.name.replace('.color.png', '.depth.png')
+        depth_file = next((p for p in self._depth_candidates(rgb_file, self.dataset_root) if p.exists()), None)
 
-        if depth_file.exists():
-            depth = io.imread(str(depth_file))
-            depth = depth.astype(np.float32) / 1000.0  # mm to meters
+        if depth_file is not None:
+            depth = self._load_depth(depth_file)
         else:
             depth = np.zeros((self.base_dataset.image_height,
                             data[0].shape[2] if data[0].ndim == 3 else data[0].shape[1]),
                            dtype=np.float32)
 
-        # Return as dict compatible with WAI format
         return {
             'img': data[0],
             'depthmap': depth,
@@ -3734,6 +3904,166 @@ class ACEDatasetWithDepth:
             'pose': data[2],
             'intrinsics': data[4],
         }
+
+
+class SceneMetaWAISequentialDataset:
+    """Minimal WAI scene_meta loader for single-scene datasets."""
+
+    def __init__(self, root: str, scene_name: str, n_views: int = 1, resolution: int = 518):
+        if not scene_name:
+            raise ValueError("scene_name is required for WAI scene_meta loader")
+        if int(n_views) != 1:
+            raise ValueError("SceneMetaWAISequentialDataset currently supports n_views=1 only.")
+
+        self.root = Path(root)
+        self.scene_name = str(scene_name)
+        self.resolution = int(resolution) if int(resolution) > 0 else 518
+        self.scene_root = self.root / self.scene_name
+        self.scene_meta_path = self.scene_root / "scene_meta.json"
+        if not self.scene_meta_path.exists():
+            raise FileNotFoundError(f"Missing scene_meta.json: {self.scene_meta_path}")
+
+        from mapanything.utils.wai.core import load_data, load_frame  # pyright: ignore[reportMissingImports]
+
+        self._load_data = load_data
+        self._load_frame = load_frame
+        self.scene_meta = self._load_data(str(self.scene_meta_path), "scene_meta")
+
+        frame_mods = self.scene_meta.get("frame_modalities") or {}
+        if isinstance(frame_mods, list):
+            frame_mods = {name: {} for name in frame_mods}
+        if "gt_depth" in frame_mods:
+            self.depth_key = "gt_depth"
+        elif "sparse_depth" in frame_mods:
+            self.depth_key = "sparse_depth"
+        elif "colmap_depth" in frame_mods:
+            self.depth_key = "colmap_depth"
+        elif "depth" in frame_mods:
+            self.depth_key = "depth"
+        else:
+            self.depth_key = None
+
+        frames = self.scene_meta.get("frames", [])
+        if self.depth_key is None:
+            self.frame_names = sorted(str(frame["frame_name"]) for frame in frames if frame.get("image"))
+        else:
+            self.frame_names = sorted(str(frame["frame_name"]) for frame in frames if frame.get(self.depth_key))
+        if not self.frame_names:
+            modality = "image" if self.depth_key is None else self.depth_key
+            raise ValueError(f"No frames with {modality} in {self.scene_meta_path}")
+
+    @staticmethod
+    def _to_numpy(x):
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    @staticmethod
+    def _resize_hw_to_patch_multiple(height: int, width: int, target_size: int, patch_size: int = 14) -> Tuple[int, int]:
+        if height <= 0 or width <= 0:
+            raise ValueError(f"Invalid image size: {(height, width)}")
+        # Match the Indoor6 WAI preprocessing contract used by the existing 40-view memories:
+        # model inputs are square 518x518 by default, not short-side resized wide frames.
+        # Intrinsics are scaled independently below, so non-uniform resize remains geometrically consistent.
+        size = max(patch_size, int(round(float(target_size) / patch_size)) * patch_size)
+        return int(size), int(size)
+
+    @staticmethod
+    def _resize_image_depth_intrinsics(image: np.ndarray, depth: np.ndarray, intrinsics: np.ndarray, out_hw: Tuple[int, int]):
+        in_h, in_w = int(image.shape[0]), int(image.shape[1])
+        out_h, out_w = int(out_hw[0]), int(out_hw[1])
+        if (in_h, in_w) == (out_h, out_w):
+            return image.astype(np.float32, copy=False), depth.astype(np.float32, copy=False), intrinsics
+
+        img_t = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).float()
+        dep_t = torch.from_numpy(depth).unsqueeze(0).unsqueeze(0).float()
+        img_r = F.interpolate(img_t, size=(out_h, out_w), mode="bilinear", align_corners=False)[0].permute(1, 2, 0).numpy()
+        dep_r = F.interpolate(dep_t, size=(out_h, out_w), mode="nearest")[0, 0].numpy()
+
+        intrinsics = intrinsics.copy()
+        sx = float(out_w) / float(in_w)
+        sy = float(out_h) / float(in_h)
+        intrinsics[0, 0] *= sx
+        intrinsics[0, 2] *= sx
+        intrinsics[1, 1] *= sy
+        intrinsics[1, 2] *= sy
+        return img_r.astype(np.float32, copy=False), dep_r.astype(np.float32, copy=False), intrinsics.astype(np.float32, copy=False)
+
+    @staticmethod
+    def _resize_image_intrinsics(image: np.ndarray, intrinsics: np.ndarray, out_hw: Tuple[int, int]):
+        in_h, in_w = int(image.shape[0]), int(image.shape[1])
+        out_h, out_w = int(out_hw[0]), int(out_hw[1])
+        if (in_h, in_w) != (out_h, out_w):
+            img_t = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).float()
+            image = F.interpolate(img_t, size=(out_h, out_w), mode="bilinear", align_corners=False)[0].permute(1, 2, 0).numpy()
+            intrinsics = intrinsics.copy()
+            sx = float(out_w) / float(in_w)
+            sy = float(out_h) / float(in_h)
+            intrinsics[0, 0] *= sx
+            intrinsics[0, 2] *= sx
+            intrinsics[1, 1] *= sy
+            intrinsics[1, 2] *= sy
+        return image.astype(np.float32, copy=False), intrinsics.astype(np.float32, copy=False)
+
+    def __len__(self):
+        return len(self.frame_names)
+
+    def __getitem__(self, idx):
+        frame_name = self.frame_names[int(idx)]
+        modalities = ["image"]
+        if self.depth_key is not None:
+            modalities.append(self.depth_key)
+        view_data = self._load_frame(
+            self.scene_root,
+            frame_name,
+            modalities=modalities,
+            scene_meta=self.scene_meta,
+            load_intrinsics=True,
+            load_extrinsics=True,
+            fmt="np",
+        )
+
+        image = self._to_numpy(view_data["image"]).astype(np.float32, copy=False)
+        depth = None
+        if self.depth_key is not None:
+            depth = self._to_numpy(view_data[self.depth_key]).astype(np.float32, copy=False)
+        intrinsics = self._to_numpy(view_data["intrinsics"]).astype(np.float32, copy=False)
+        pose = self._to_numpy(view_data["extrinsics"]).astype(np.float32, copy=False)
+
+        if image.ndim == 2:
+            image = np.repeat(image[:, :, None], 3, axis=2)
+        elif image.ndim == 3 and image.shape[0] in (1, 3, 4) and image.shape[-1] not in (1, 3, 4):
+            image = np.transpose(image[:3], (1, 2, 0))
+        if image.ndim != 3 or image.shape[-1] not in (1, 3, 4):
+            raise ValueError(f"Unsupported WAI image shape for {frame_name}: {image.shape}")
+        image = image[..., :3]
+        if image.max(initial=0.0) > 1.01:
+            image = image / 255.0
+
+        out_hw = self._resize_hw_to_patch_multiple(image.shape[0], image.shape[1], self.resolution)
+        if depth is not None:
+            if depth.ndim == 3:
+                depth = np.squeeze(depth)
+            depth = np.where(np.isfinite(depth), depth, 0.0).astype(np.float32, copy=False)
+            image, depth, intrinsics = self._resize_image_depth_intrinsics(image, depth, intrinsics, out_hw)
+        else:
+            image, intrinsics = self._resize_image_intrinsics(image, intrinsics, out_hw)
+
+        result = {
+            "img": image,
+            "camera_pose": pose,
+            "camera_intrinsics": intrinsics,
+            "image": image,
+            "pose": pose,
+            "intrinsics": intrinsics,
+            "frame_name": frame_name,
+        }
+        if depth is not None:
+            result["depthmap"] = depth
+        return result
+
+
+MushroomWAISequentialDataset = SceneMetaWAISequentialDataset
 
 # =============================================================================
 # Dataset Detection
@@ -3751,6 +4081,8 @@ def detect_dataset_type(dataset_path: str) -> str:
         return "7scenes"
     elif "indoor6" in path_lower or "indoor-6" in path_lower:
         return "indoor6"
+    elif "mushroom" in path_lower or "mush_room" in path_lower:
+        return "mushroom"
     elif "rio10" in path_lower or "rio-10" in path_lower:
         return "rio10"
     return "custom"
@@ -3765,6 +4097,10 @@ def load_dataset(
     dataset_transform: str = "imgnorm",
     dataset_data_norm_type: str = "dinov2",
     dataset_aug_crop: int = 0,
+    dataset_resolution: int = 518,
+    use_model: str = "mapanything",
+    glace_root: Optional[str] = None,
+    glace_feat_name: str = "features.npy",
 ):
     """
     Load dataset based on type and loader.
@@ -3790,13 +4126,27 @@ def load_dataset(
 
     # === ACE dataset loader branch ===
     if dataset_loader == "ace":
-        print(f"[Dataset] Using ACE loader (CamLocDatasetDINOv2)")
+        print(f"[Dataset] Using ACE loader ({'GLACE CamLocDataset' if use_model == 'glace_encoder' else 'CamLocDatasetDINOv2'})")
         # Add parent directory to path for imports
         parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         if parent_dir not in sys.path:
             sys.path.insert(0, parent_dir)
-        from dataset_dinov2 import CamLocDatasetDINOv2
-        base_ds = CamLocDatasetDINOv2(dataset_path, mode=2)
+        if use_model == 'glace_encoder':
+            base_ds = build_glace_camloc_dataset(
+                glace_root=glace_root or '/home/xwh/project/glace',
+                root_dir=dataset_path,
+                mode=0,
+                augment=False,
+                aug_rotation=0.0,
+                aug_scale_min=1.0,
+                aug_scale_max=1.0,
+                image_height=dataset_resolution,
+                use_half=False,
+                feat_name=glace_feat_name,
+            )
+        else:
+            from dataset_dinov2 import CamLocDatasetDINOv2
+            base_ds = CamLocDatasetDINOv2(dataset_path, mode=0)
         return ACEDatasetWithDepth(base_ds)
 
     # === WAI / MapAnything dataset loader branch ===
@@ -3815,14 +4165,15 @@ def load_dataset(
 
     # Common kwargs for BaseDataset
     base_kwargs = dict(
-        resolution=518,
+        resolution=int(dataset_resolution),
         data_norm_type=dataset_data_norm_type,
         transform=dataset_transform,
         aug_crop=int(dataset_aug_crop),
     )
     print(
         f"[Dataset] WAI preprocessing: transform={dataset_transform}, "
-        f"data_norm_type={dataset_data_norm_type}, aug_crop={int(dataset_aug_crop)}",
+        f"data_norm_type={dataset_data_norm_type}, aug_crop={int(dataset_aug_crop)}, "
+        f"resolution={int(dataset_resolution)}",
         flush=True,
     )
 
@@ -3837,6 +4188,12 @@ def load_dataset(
             num_views=n_views,
             **base_kwargs,
         )
+    if dataset_type == "mushroom":
+        print("[Dataset] Using SceneMetaWAISequentialDataset for MuSHRoom WAI scenes.", flush=True)
+        return SceneMetaWAISequentialDataset(dataset_path, scene_name, n_views=n_views, resolution=dataset_resolution)
+    if dataset_type == "custom":
+        print("[Dataset] Using SceneMetaWAISequentialDataset for custom WAI scene_meta scenes.", flush=True)
+        return SceneMetaWAISequentialDataset(dataset_path, scene_name, n_views=n_views, resolution=dataset_resolution)
     if dataset_type == "indoor6":
         return Indoor6WAI(
             ROOT=dataset_path,
@@ -6930,7 +7287,7 @@ def _build_clustered_memory_package(
             predictions = extractor.model.infer(
                 c_views,
                 memory_efficient_inference=True,
-                use_amp=False,
+                use_amp=bool(getattr(config, "mapanything_use_amp", False)),
                 ignore_depth_inputs=False,
                 ignore_pose_inputs=False,
                 ignore_calibration_inputs=False,
@@ -7911,28 +8268,25 @@ def convert_ace_tuple_to_dict(
     image_height: int = 518,
 ) -> Dict[str, Any]:
     """
-    Convert CamLocDatasetDINOv2 tuple output to dict format expected by
+    Convert ACE-style dataset tuples to dict format expected by
     prepare_batch_input and two_pass_processing.
 
-    ACE dataset __getitem__ returns:
-        (image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, filename)
+    Supported tuple layouts:
+        DINO ACE / ACE-FCN:
+            (image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, filename)
+        GLACE CamLocDataset:
+            (image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, filename, global_feat, idx)
 
-    Depth is NOT in the tuple — it must be loaded separately from the depth/ directory.
-
-    Args:
-        sample: Tuple from CamLocDatasetDINOv2.__getitem__
-        dataset_path: Root path to the scene dataset (contains rgb/, depth/, poses/, etc.)
-        image_height: Target image height (for depth scaling)
-
-    Returns:
-        Dict with keys: img, camera_pose, camera_intrinsics, depthmap, filename
+    Depth is not in the tuple and is loaded separately from local depth directories.
     """
-    if len(sample) != 8:
+    if len(sample) < 8:
         raise ValueError(
-            f"ACE 样本应为 8 元组，实际 len={len(sample)}。"
+            f"ACE 样本应至少包含 8 个元素，实际 len={len(sample)}。"
             "若数据为 WAI（list[dict]），请使用 --dataset_loader wai，勿走 convert_ace_tuple_to_dict。"
         )
-    image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, filename = sample
+    image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, filename = sample[:8]
+    global_feat = sample[8] if len(sample) >= 9 else None
+    sample_idx = sample[9] if len(sample) >= 10 else None
 
     # Derive depth file path from the rgb filename.
     # filename is like ".../rgb/seq-02-frame-000102.color.png"
@@ -7948,32 +8302,13 @@ def convert_ace_tuple_to_dict(
     except Exception:
         target_hw = None
     if filename and isinstance(filename, str):
-        depth_base = filename.replace("/rgb/", "/depth/")
-        base, ext = os.path.splitext(depth_base)
-        candidates = []
-        if base.endswith(".color"):
-            no_color = base[:-6]
-            candidates.extend([
-                no_color + ".depth" + ext,
-                no_color + ".depth.png",
-                no_color + ".rendered.depth.png",
-            ])
-        candidates.extend([
-            depth_base,
-            base + ".depth.png",
-            base + ".rendered.depth.png",
-        ])
+        rgb_path = Path(filename)
+        dataset_root = rgb_path.parent.parent
+        candidates = ACEDatasetWithDepth._depth_candidates(rgb_path, dataset_root)
+        depth_path = next((candidate for candidate in candidates if candidate.exists()), None)
 
-        depth_path = None
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                depth_path = candidate
-                break
-
-        if depth_path is not None and os.path.exists(depth_path):
-            from skimage import io as skio
-
-            depth_np = skio.imread(depth_path).astype(np.float64) / 1000.0  # mm -> meters
+        if depth_path is not None and depth_path.exists():
+            depth_np = ACEDatasetWithDepth._load_depth(depth_path).astype(np.float64, copy=False)
 
             # 若深度分辨率与图像不一致，则使用最近邻重采样到图像分辨率，使其与 intrinsics 一致
             if target_hw is not None and depth_np.shape[:2] != target_hw:
@@ -8007,6 +8342,10 @@ def convert_ace_tuple_to_dict(
         "coords": coords,
         "filename": filename,
     }
+    if global_feat is not None:
+        result["global_feat"] = global_feat
+    if sample_idx is not None:
+        result["sample_idx"] = sample_idx
     if depth is not None:
         result["depthmap"] = depth            # [H, W] tensor in meters
         result["depth"] = depth
@@ -8047,9 +8386,10 @@ def parse_args() -> ExtractionConfig:
         '--use_model',
         type=str,
         default='mapanything',
-        choices=['mapanything', 'dinov2'],
+        choices=['mapanything', 'dinov2', 'glace_encoder'],
         help='特征提取器：mapanything（默认，与 fps_memory 一致，中间层多尺度）；'
-        'dinov2（DINOv2 块特征，DPT 式融合）。',
+        'dinov2（DINOv2 块特征，DPT 式融合）；'
+        'glace_encoder（GLACE encoder feature space，用于 GLACE+LMC memory）。',
     )
     parser.add_argument(
         '--model_str',
@@ -8082,6 +8422,29 @@ def parse_args() -> ExtractionConfig:
         default=None,
         help='DINOv2 参与融合的 block 索引；默认 8 层 [2,5,8,11,14,17,20,23]；'
         '仅传 23 表示只用最后一层（单尺度）。',
+    )
+    parser.add_argument(
+        '--mapanything_use_amp',
+        action='store_true',
+        help='MapAnything infer 使用 AMP 混合精度以降低显存峰值；默认关闭以保持旧行为。',
+    )
+    parser.add_argument(
+        '--glace_root',
+        type=str,
+        default='/home/xwh/project/glace',
+        help='GLACE repo root（--use_model glace_encoder 时使用）。',
+    )
+    parser.add_argument(
+        '--glace_encoder_path',
+        type=str,
+        default='/home/xwh/project/glace/ace_encoder_pretrained.pt',
+        help='GLACE encoder checkpoint path（--use_model glace_encoder 时使用）。',
+    )
+    parser.add_argument(
+        '--glace_feat_name',
+        type=str,
+        default='features.npy',
+        help='ACE-format split 下的 GLACE global feature 文件名。',
     )
 
     parser.add_argument(
@@ -8214,10 +8577,15 @@ def parse_args() -> ExtractionConfig:
         help='两遍处理时各 view 的 chunk 与断点文件目录（建议内存盘减少 IO）。',
     )
     parser.add_argument(
+        '--postprocess_on_cpu',
+        action='store_true',
+        help='MapAnything/DINO 推理后将 BSE 后处理张量转到 CPU，降低 GPU 显存峰值；默认关闭保持旧行为。',
+    )
+    parser.add_argument(
         '--dataset_type',
         type=str,
         default='auto',
-        choices=['auto', '7scenes', 'indoor6', 'rio10', 'custom'],
+        choices=['auto', '7scenes', 'indoor6', 'mushroom', 'rio10', 'custom'],
         help='数据集类型；auto 时根据路径启发式检测。',
     )
     parser.add_argument(
@@ -8260,6 +8628,12 @@ def parse_args() -> ExtractionConfig:
         default=0,
         help='WAI memory extraction 的随机 aug_crop 像素范围。默认 0，禁用随机 resize/crop，'
         '保证同一组选帧的 processed intrinsics 可复现。',
+    )
+    parser.add_argument(
+        '--dataset_resolution',
+        type=int,
+        default=518,
+        help='WAI memory extraction 的输入分辨率参数。RIO10 高分辨率诊断可设为 952，和训练 --image_resolution 对齐。',
     )
     parser.add_argument(
         '--wai_view_mode',
@@ -8643,6 +9017,7 @@ def parse_args() -> ExtractionConfig:
         depth_valid_range=tuple(args.depth_valid_range),
         patch_depth_sampling=args.patch_depth_sampling,
         temp_dir=args.temp_dir,
+        postprocess_on_cpu=bool(args.postprocess_on_cpu),
         model_str=args.model_str,
         model_config=args.model_config,
         model_checkpoint=args.model_checkpoint,
@@ -8658,6 +9033,7 @@ def parse_args() -> ExtractionConfig:
         dataset_transform=args.dataset_transform,
         dataset_data_norm_type=args.dataset_data_norm_type,
         dataset_aug_crop=int(args.dataset_aug_crop),
+        dataset_resolution=int(args.dataset_resolution),
         wai_view_mode=canonicalize_wai_view_mode(args.wai_view_mode),
         anchor_support_alpha=float(args.anchor_support_alpha),
         anchor_support_eps=float(args.anchor_support_eps),
@@ -8705,6 +9081,10 @@ def parse_args() -> ExtractionConfig:
         ray_pool_strategy=args.ray_pool_strategy,
         save_all_ray_strategies=args.save_all_ray_strategies,
         use_model=args.use_model,
+        glace_root=str(args.glace_root),
+        glace_encoder_path=str(args.glace_encoder_path),
+        glace_feat_name=str(args.glace_feat_name),
+        mapanything_use_amp=bool(args.mapanything_use_amp),
         dinov2_intermediate_layers=args.dinov2_intermediate_layers,
         pose_eval_translation_ok_m=args.pose_eval_translation_ok_m,
         pose_eval_strict=args.pose_eval_strict,
@@ -8776,14 +9156,19 @@ def main():
         f"{config.global_merge_voxel_size if config.global_merge_voxel_size is not None else config.voxel_size}"
     )
     print(
-        f"[Config] patch_depth_sampling: {config.patch_depth_sampling} "
-        f"(align map-anything fps_memory: nearest_valid for sparse Indoor6 depth)",
+        f"[Config] use_patch_based={bool(config.use_patch_based)}, patch_depth_sampling={config.patch_depth_sampling} "
+        f"(align map-anything fps_memory: nearest_valid for sparse Indoor6/RIO10 depth)",
         flush=True,
     )
     print(
         f"[Config] Depth valid range: [{config.depth_valid_range[0]:.3f}, {config.depth_valid_range[1]:.3f}] m",
         flush=True,
     )
+    print(
+        f"[Config] MapAnything memory_efficient_inference=True, use_amp={bool(config.mapanything_use_amp)}",
+        flush=True,
+    )
+    print(f"[Config] BSE postprocess_on_cpu={bool(config.postprocess_on_cpu)}", flush=True)
     if config.feature_diagnostics:
         print(
             f"[FeatureDiag] enabled: max_points_per_voxel={config.feature_diag_max_points_per_voxel}, "
@@ -8855,7 +9240,8 @@ def main():
     if config.dataset_loader == "wai":
         print(
             f"[Data] WAI preprocessing: transform={config.dataset_transform}, "
-            f"data_norm_type={config.dataset_data_norm_type}, aug_crop={config.dataset_aug_crop}",
+            f"data_norm_type={config.dataset_data_norm_type}, aug_crop={config.dataset_aug_crop}, "
+            f"resolution={config.dataset_resolution}",
             flush=True,
         )
         if config.dataset_transform != "imgnorm" or int(config.dataset_aug_crop) != 0:
@@ -8873,6 +9259,10 @@ def main():
         dataset_transform=config.dataset_transform,
         dataset_data_norm_type=config.dataset_data_norm_type,
         dataset_aug_crop=config.dataset_aug_crop,
+        dataset_resolution=config.dataset_resolution,
+        use_model=config.use_model,
+        glace_root=config.glace_root,
+        glace_feat_name=config.glace_feat_name,
     )
     print(f"[BSE Memory] Train dataset: {len(train_dataset)} frames")
 
@@ -9131,7 +9521,7 @@ def main():
             break
         raw_data = train_dataset[idx]
 
-        # ACE loader: CamLocDatasetDINOv2 returns an 8-tuple per frame.
+        # ACE loader: ACE-style datasets return tuple samples (8-tuple DINOACE / 10-tuple GLACE).
         # WAI loader: often returns list[dict] (one dict per view) — must NOT pass that to convert_ace_tuple_to_dict.
         if config.dataset_loader == "ace" and isinstance(raw_data, tuple):
             view = convert_ace_tuple_to_dict(raw_data, config.dataset_path)
@@ -9244,6 +9634,7 @@ def main():
     # Initialize feature extractor
     print("[BSE Memory] Initializing feature extractor...", flush=True)
     use_mapanything = config.use_model == "mapanything"
+    use_glace_encoder = config.use_model == "glace_encoder"
 
     if use_mapanything:
         try:
@@ -9261,7 +9652,18 @@ def main():
             print(f"[BSE Memory] Full traceback:\n{traceback.format_exc()}")
             use_mapanything = False
 
-    if not use_mapanything:
+    if use_glace_encoder:
+        print(
+            f"[BSE Memory] Using GLACE encoder extractor (encoder={config.glace_encoder_path}, feat_name={config.glace_feat_name})",
+            flush=True,
+        )
+        extractor = GLACEEncoderExtractor(
+            config.glace_root,
+            config.glace_encoder_path,
+            device=str(device),
+        )
+        layers_idx = ['glace_encoder']
+    elif not use_mapanything:
         layers = config.dinov2_intermediate_layers
         if layers is None:
             # Default DPT-style: 8 evenly-spaced layers across 24 blocks
@@ -9398,7 +9800,7 @@ def main():
             predictions = extractor.model.infer(
                 memory_views,
                 memory_efficient_inference=True,
-                use_amp=False,
+                use_amp=bool(getattr(config, "mapanything_use_amp", False)),
                 ignore_depth_inputs=False,
                 ignore_pose_inputs=False,
                 ignore_calibration_inputs=False
@@ -9437,10 +9839,14 @@ def main():
                     {**loaded_view_records[i], "pruned_from_view_idx": int(loaded_view_records[i].get("view_idx", i)), "view_idx": new_i}
                     for new_i, i in enumerate(keep_indices)
                 ]
-                memory_indices = [
-                    int(rec.get("actual_flat_idx", rec.get("selected_outer_fps_idx", idx)))
-                    for rec, idx in zip(loaded_view_records, keep_indices)
-                ]
+                memory_indices = []
+                for rec, idx in zip(loaded_view_records, keep_indices):
+                    rec_idx = rec.get("actual_flat_idx")
+                    if rec_idx is None:
+                        rec_idx = rec.get("selected_outer_fps_idx")
+                    if rec_idx is None:
+                        rec_idx = idx
+                    memory_indices.append(int(rec_idx))
                 try:
                     out_path = os.path.join(output_run_dir, "pose_pruned_model_input_views.json")
                     with open(out_path, "w", encoding="utf-8") as f:
@@ -9466,7 +9872,7 @@ def main():
                     predictions = extractor.model.infer(
                         memory_views,
                         memory_efficient_inference=True,
-                        use_amp=False,
+                        use_amp=bool(getattr(config, "mapanything_use_amp", False)),
                         ignore_depth_inputs=False,
                         ignore_pose_inputs=False,
                         ignore_calibration_inputs=False,
@@ -9495,6 +9901,15 @@ def main():
 
         stored_features = extractor.model.get_info_sharing_intermediate_features()
         features_dict = extractor._process_saved_features(stored_features, len(memory_views))
+        # Keep only the CPU feature dict needed by BSE. The raw predictions and
+        # stored MapAnything intermediates are large and otherwise keep GPU/CPU
+        # references alive during post-processing.
+        if hasattr(extractor.model, "get_info_sharing_intermediate_features"):
+            extractor.model.get_info_sharing_intermediate_features(clear=True)
+        del stored_features
+        del predictions
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     else:
         # DINOv2: batch tensors
         all_images = torch.cat([v['img'] for v in memory_views], dim=0).float()  # Ensure float32 for DINOv2
@@ -9542,6 +9957,10 @@ def main():
         "dataset_transform": str(config.dataset_transform),
         "dataset_data_norm_type": str(config.dataset_data_norm_type),
         "dataset_aug_crop": int(config.dataset_aug_crop),
+        "dataset_resolution": int(config.dataset_resolution),
+        "postprocess_on_cpu": bool(config.postprocess_on_cpu),
+        "use_patch_based": bool(config.use_patch_based),
+        "mapanything_use_amp": bool(config.mapanything_use_amp),
         "loaded_view_records": loaded_view_records,
         "repair": selection_debug.get("repair", {}) if isinstance(selection_debug, dict) else {},
     }

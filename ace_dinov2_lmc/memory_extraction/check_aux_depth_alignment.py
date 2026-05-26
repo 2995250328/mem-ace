@@ -10,6 +10,13 @@ from pathlib import Path
 import numpy as np
 
 
+def _load_numpy_array(path: Path) -> np.ndarray:
+    path = Path(path)
+    if path.suffix.lower() == ".npz":
+        return np.load(path, allow_pickle=False)["arr_0"]
+    return np.load(path, allow_pickle=False)
+
+
 def _ids_from_dir(path: Path, prefix: str = "", suffixes: tuple[str, ...] | None = None) -> dict[str, Path]:
     if not path.exists():
         raise FileNotFoundError(path)
@@ -32,7 +39,7 @@ def _depth_stats(paths: list[Path], max_samples: int) -> list[str]:
         return lines
     sample_paths = paths[:max_samples]
     for path in sample_paths:
-        arr = np.load(path)
+        arr = _load_numpy_array(path)
         finite = np.isfinite(arr)
         valid = finite & (arr > 0)
         values = arr[valid]
@@ -149,7 +156,7 @@ def main() -> None:
     args = parser.parse_args()
 
     ace_rgb = _ids_from_dir(args.ace_train_root / "rgb", suffixes=(".jpg", ".jpeg", ".png"))
-    wai_depth = _ids_from_dir(args.wai_scene_root / args.depth_kind, prefix="image-", suffixes=(".npy",))
+    wai_depth = _ids_from_dir(args.wai_scene_root / args.depth_kind, prefix="image-", suffixes=(".npy", ".npz"))
 
     ace_ids = set(ace_rgb)
     depth_ids = set(wai_depth)

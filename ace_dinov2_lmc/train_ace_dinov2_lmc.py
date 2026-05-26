@@ -127,6 +127,48 @@ TRAIN_PRESET_DEFAULTS = {
         "experiment_root": (Path(__file__).parent / "04_evaluation" / "train_compare").resolve(),
         "experiment_subdir": "indoor6_full_baselines_4090_forceglobal_fixedzero",
     },
+    "rio10_conservative_ace_g_v1": {
+        "use_lmc": True,
+        "lmc_flow": "ace_g",
+        "lmc_profile": "legacy",
+        "lmc_mode": "global",
+        "lmc_auto_mode_by_visibility": False,
+        "lmc_fps_start_policy": "farthest_from_center",
+        "lmc_key_slice_idx": 2,
+        "lmc_key_feature_mode": "slice",
+        "lmc_feature_hierarchy_mode": "selected_key_concat_value",
+        "lmc_fusion_geometry_mode": "value_only_raw",
+        "lmc_fusion_refinement_mode": "single",
+        "s1_loss_step_mode": "per_iter",
+        "lmc_memory_preflight_strict": True,
+        "lmc_scene_center_max_distance": 4.0,
+        "lmc_head_mean_max_shift": 4.0,
+        "bse_denorm_to_world": True,
+        "ace_g_fusion_in_s2": True,
+        "ace_g_cross_iter_eval": True,
+        "training_buffer_size": 2560000,
+        "buffer_size_final": 7680000,
+        "buffer_batch_size": 1,
+        "buffer_on_cpu": False,
+        "buffer_on_cpu_final": True,
+        "buffer_sample_valid_coords": False,
+        "buffer_valid_coord_sample_ratio": 1.0,
+        "buffer_valid_coord_neighbor_radius": 1,
+        "buffer_valid_coord_neighbor_mode": "cross",
+        "samples_per_image": 384,
+        "batch_size": 10240,
+        "s1_batch_size": 16,
+        "s1_use_buffer": True,
+        "s1_loss_mode": "sample_per_image",
+        "s1_buffer_refill_mode": "full",
+        "c1_aux_ref_loss_weight": 0.0,
+        "best_metric": "pct5",
+        "eval_deterministic": False,
+        "post_train_eval_seeds": [1305, 2026, 4242, 7777, 9001],
+        "post_train_hypotheses": 256,
+        "experiment_root": (Path(__file__).parent / "04_evaluation" / "train_compare").resolve(),
+        "experiment_subdir": "rio10_conservative_indoor6_migration",
+    },
     "memory_compare_ace_g_v2": {
         "use_lmc": True,
         "lmc_flow": "ace_g",
@@ -150,6 +192,41 @@ TRAIN_PRESET_DEFAULTS = {
         "post_train_hypotheses": 256,
         "experiment_root": (Path(__file__).parent / "04_evaluation" / "train_compare").resolve(),
         "experiment_subdir": "memory_pooled_vs_asb",
+    },
+    "mushroom_aceg_best_baseline_v1": {
+        "use_lmc": True,
+        "lmc_flow": "ace_g",
+        "lmc_mode": "global",
+        "lmc_memory_preflight_strict": True,
+        "lmc_scene_center_max_distance": 4.0,
+        "lmc_head_mean_max_shift": 4.0,
+        "bse_denorm_to_world": True,
+        "ace_g_fusion_in_s2": True,
+        "ace_g_cross_iter_eval": True,
+        "training_buffer_size": 4000000,
+        "buffer_size_final": 8000000,
+        "buffer_batch_size": 1,
+        "buffer_on_cpu": True,
+        "buffer_on_cpu_final": True,
+        "buffer_sample_valid_coords": True,
+        "buffer_valid_coord_sample_ratio": 1.0,
+        "buffer_valid_coord_neighbor_radius": 1,
+        "buffer_valid_coord_neighbor_mode": "cross",
+        "samples_per_image": 512,
+        "batch_size": 10240,
+        "s1_batch_size": 16,
+        "s1_use_buffer": True,
+        "s1_loss_mode": "sample_per_image",
+        "s1_buffer_refill_mode": "full",
+        "c1_aux_depth_kind": "gt_depth",
+        "best_metric": "composite",
+        "eval_deterministic": True,
+        "eval_dsacstar_seed": 1305,
+        "eval_dsacstar_seed_per_frame": True,
+        "post_train_eval_seeds": [1305, 2026, 4242],
+        "post_train_hypotheses": 256,
+        "experiment_root": (Path(__file__).parent / "04_evaluation" / "train_compare").resolve(),
+        "experiment_subdir": "mushroom_best_baseline_v1",
     },
 }
 
@@ -235,6 +312,9 @@ def _validate_args(args):
         scene_meta_path = args.scene / "scene_meta.json"
         if not scene_meta_path.exists():
             _logger.error("WAI backend requires scene_meta.json at: %s", scene_meta_path)
+            sys.exit(1)
+        if args.post_train_eval_scene is not None and not (args.post_train_eval_scene / "scene_meta.json").exists():
+            _logger.error("WAI post-train eval scene requires scene_meta.json at: %s", args.post_train_eval_scene / "scene_meta.json")
             sys.exit(1)
         if not args.wai_repo_root.exists():
             _logger.error("WAI repo root not found: %s", args.wai_repo_root)
@@ -599,7 +679,68 @@ def _apply_lmc_profile(args):
     )
 
 
+
+def _resolve_resume_checkpoint_from_run_dir(run_dir):
+    meta_path = run_dir / "best_checkpoint_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"resume_from_run_dir requires {meta_path}")
+    with open(meta_path, 'r', encoding='utf-8') as f:
+        meta = json.load(f)
+
+    raw_ckpt = meta.get("best_checkpoint_path")
+    if not raw_ckpt:
+        raise ValueError(f"{meta_path} does not contain best_checkpoint_path")
+    ckpt_path = Path(raw_ckpt)
+    if not ckpt_path.is_absolute():
+        ckpt_path = (run_dir / ckpt_path).resolve()
+    if not ckpt_path.exists():
+        candidates = sorted(run_dir.glob("best*.pt"))
+        if len(candidates) == 1:
+            _logger.warning(
+                "[Resume] best_checkpoint_path=%s is missing; falling back to %s",
+                ckpt_path,
+                candidates[0],
+            )
+            ckpt_path = candidates[0].resolve()
+        else:
+            raise FileNotFoundError(
+                f"Resume checkpoint does not exist: {ckpt_path}. "
+                f"Found {len(candidates)} best*.pt candidates in {run_dir}."
+            )
+
+    if "best_iter" not in meta:
+        raise ValueError(f"{meta_path} does not contain best_iter")
+    best_iter = int(meta["best_iter"])
+    if best_iter < 0:
+        raise ValueError(f"Invalid best_iter={best_iter} in {meta_path}")
+
+    best_score = float(meta.get("best_score", -float('inf')))
+    return meta_path, meta, ckpt_path, best_iter, best_score
+
+
+def _build_resume_run_dir(args):
+    if args.buffer_size_final is None:
+        args.buffer_size_final = args.training_buffer_size * 3
+
+    run_dir = Path(args.resume_from_run_dir).resolve()
+    if not run_dir.exists() or not run_dir.is_dir():
+        raise FileNotFoundError(f"resume_from_run_dir is not a directory: {run_dir}")
+
+    meta_path, meta, ckpt_path, best_iter, best_score = _resolve_resume_checkpoint_from_run_dir(run_dir)
+    args.run_dir = run_dir
+    args.output_map = ckpt_path
+    args.resume_checkpoint_path = ckpt_path
+    args.resume_meta_path = meta_path
+    args.resume_best_iter = best_iter
+    args.resume_best_score = best_score
+    args.resume_best_meta = meta
+    args.overwrite_run_dir = False
+    return 'resume', run_dir
+
 def _build_run_dir(args):
+    if getattr(args, 'resume_from_run_dir', None) is not None:
+        return _build_resume_run_dir(args)
+
     if args.buffer_size_final is None:
         args.buffer_size_final = args.training_buffer_size * 3
 
@@ -690,10 +831,12 @@ def _attach_full_log_file_handler(run_dir):
 
 
 def _persist_run_metadata(args, run_dir):
-    # Persist run metadata for reproducibility.
-    with open(run_dir / "run_config.json", 'w', encoding='utf-8') as f:
+    # Persist run metadata for reproducibility. Resume writes separate files so the original run contract remains intact.
+    config_name = "resume_config.json" if getattr(args, 'resume_from_run_dir', None) is not None else "run_config.json"
+    command_name = "resume_command.txt" if getattr(args, 'resume_from_run_dir', None) is not None else "run_command.txt"
+    with open(run_dir / config_name, 'w', encoding='utf-8') as f:
         json.dump({k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, f, indent=2, ensure_ascii=False)
-    with open(run_dir / "run_command.txt", 'w', encoding='utf-8') as f:
+    with open(run_dir / command_name, 'w', encoding='utf-8') as f:
         f.write("python " + " ".join(sys.argv) + "\n")
 
 
@@ -705,10 +848,16 @@ def _log_configuration_summary(args, output_layout, full_log_path):
     _logger.info("Data backend : %s", args.data_backend)
     if args.data_backend == 'wai':
         _logger.info("WAI repo     : %s", args.wai_repo_root)
+        if getattr(args, "post_train_eval_scene", None) is not None:
+            _logger.info("Eval scene   : %s", args.post_train_eval_scene)
         _logger.info("WAI image key: %s", args.wai_image_modality)
     _logger.info("Run Dir      : %s", args.run_dir)
     if output_layout == 'hierarchical':
         _logger.info("Output layout: hierarchical (dataset/scene/function/run_id)")
+    elif output_layout == 'resume':
+        _logger.info("Output layout: resume existing run_dir")
+        _logger.info("Resume ckpt  : %s", getattr(args, 'resume_checkpoint_path', None))
+        _logger.info("Resume best  : iter=%s score=%s", getattr(args, 'resume_best_iter', None), getattr(args, 'resume_best_score', None))
     _logger.info("Output       : %s", args.output_map)
     _logger.info("Full Log     : %s", full_log_path)
     _logger.info("Device       : %s", args.device)
@@ -870,8 +1019,11 @@ def run_post_train_eval(args, trainer):
             if len(post_train_seeds) > 1:
                 session_name = f"{args.eval_session}_seed{seed}"
             eval_opt = argparse.Namespace(
-                scene=args.scene,
+                scene=getattr(args, "post_train_eval_scene", None) or args.scene,
                 network=args.output_map,
+                data_backend=getattr(args, "data_backend", "ace"),
+                wai_repo_root=getattr(args, "wai_repo_root", None),
+                wai_image_modality=getattr(args, "wai_image_modality", "image"),
                 dinov2_path=args.dinov2_path,
                 device=eval_device,
                 image_resolution=args.image_resolution,

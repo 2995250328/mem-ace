@@ -57,6 +57,8 @@ if [ -z "$DATASET_ROOT" ]; then
     case "$DATASET_TYPE" in
         7scenes)  DATASET_ROOT="$ACE_DATA_ROOT/mapanything-dataset/wai_data/7scenes" ;;
         indoor6)  DATASET_ROOT="$ACE_DATA_ROOT/mapanything-dataset/wai_data/indoor6" ;;
+        mushroom) DATASET_ROOT="${MUSHROOM_WAI_ROOT:-/data/xwh/MuSHRoom_wai/kinect}" ;;
+        rio10)    DATASET_ROOT="${RIO10_WAI_ROOT:-/data/xwh/RIO10_wai/mapanything_wai}" ;;
         *)        DATASET_ROOT="$ACE_DATA_ROOT" ;;
     esac
 fi
@@ -144,6 +146,7 @@ CONTRACT_MODE="${CONTRACT_MODE:-C0}"
 WAI_TRANSFORM="${WAI_TRANSFORM:-imgnorm}"
 WAI_DATA_NORM_TYPE="${WAI_DATA_NORM_TYPE:-dinov2}"
 WAI_AUG_CROP="${WAI_AUG_CROP:-0}"
+WAI_RESOLUTION="${WAI_RESOLUTION:-518}"
 
 # WAI_VIEW_MODE — WAI 视图加载协议：
 #   fps_flat / fps_strict=每个 FPS index 只加载 1 张图，实际推理输入严格等于 FPS list
@@ -265,6 +268,15 @@ if [ "$DATASET_TYPE" = "indoor6" ]; then
     DEPTH_MAX="${DEPTH_MAX:-100.0}"
     # PATCH_DEPTH_SAMPLING — --patch_depth_sampling：Indoor6 默认 nearest_valid（邻域最近有效深度）
     PATCH_DEPTH_SAMPLING="${PATCH_DEPTH_SAMPLING:-nearest_valid}"
+elif [ "$DATASET_TYPE" = "mushroom" ]; then
+    DEPTH_MIN="${DEPTH_MIN:-0.1}"
+    DEPTH_MAX="${DEPTH_MAX:-20.0}"
+    PATCH_DEPTH_SAMPLING="${PATCH_DEPTH_SAMPLING:-nearest}"
+elif [ "$DATASET_TYPE" = "rio10" ]; then
+    DEPTH_MIN="${DEPTH_MIN:-0.1}"
+    DEPTH_MAX="${DEPTH_MAX:-10.0}"
+    # RIO10 sparse depth is sparse/incomplete; Step19 requires nearest_valid for memory geometry.
+    PATCH_DEPTH_SAMPLING="${PATCH_DEPTH_SAMPLING:-nearest_valid}"
 else
     DEPTH_MIN="${DEPTH_MIN:-0.1}"
     DEPTH_MAX="${DEPTH_MAX:-6.0}"
@@ -295,6 +307,9 @@ USE_MODEL="${USE_MODEL:-mapanything}"
 # MODEL_CONFIG — 可选；若设置则追加 --model_config（Hydra YAML 路径）
 MODEL_STR="${MODEL_STR:-mapanything_store_intermediates_ace}"
 MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-$ACE_DATA_ROOT/checkpoints/facebook_map-anything.pth}"
+MAPANYTHING_USE_AMP="${MAPANYTHING_USE_AMP:-false}"
+POSTPROCESS_ON_CPU="${POSTPROCESS_ON_CPU:-false}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # DINOV2_INTERMEDIATE_LAYERS — 空格分隔的整数，传给 --dinov2_intermediate_layers；空则 Python 用默认 8 层
 DINOV2_INTERMEDIATE_LAYERS="${DINOV2_INTERMEDIATE_LAYERS:-}"
@@ -335,6 +350,9 @@ if [ "$DATASET_LOADER" = "wai" ]; then
         CONFIG_TAG="${CONFIG_TAG}_noaug"
     else
         CONFIG_TAG="${CONFIG_TAG}_${_preproc_tag_transform}_aug${WAI_AUG_CROP}"
+    fi
+    if [ "$WAI_RESOLUTION" != "518" ]; then
+        CONFIG_TAG="${CONFIG_TAG}_res${WAI_RESOLUTION}"
     fi
     case "$WAI_VIEW_MODE" in
         original_multiview)
@@ -462,7 +480,7 @@ echo "    scene:      $SCENE_TRAIN → $SCENE_TEST"
 echo "    n_views:    $N_VIEWS"
 echo "    contract:   $CONTRACT_MODE"
 if [ "$DATASET_LOADER" = "wai" ]; then
-echo "    preprocessing: transform=$WAI_TRANSFORM data_norm=$WAI_DATA_NORM_TYPE aug_crop=$WAI_AUG_CROP"
+echo "    preprocessing: transform=$WAI_TRANSFORM data_norm=$WAI_DATA_NORM_TYPE aug_crop=$WAI_AUG_CROP resolution=$WAI_RESOLUTION"
 fi
 echo "    wai_view_mode: $WAI_VIEW_MODE"
 if [ "$WAI_VIEW_MODE" = "anchor_support" ]; then
@@ -493,7 +511,7 @@ echo "    ray_pool:   $RAY_POOL_STRATEGY"
 echo ""
 echo "  Depth:"
 echo "    valid_range: [$DEPTH_MIN, $DEPTH_MAX]"
-echo "    grid_sampling: $PATCH_DEPTH_SAMPLING  (fps_memory: indoor6→nearest_valid, 7scenes→nearest)"
+echo "    grid_sampling: $PATCH_DEPTH_SAMPLING  (fps_memory: indoor6/rio10 sparse→nearest_valid, 7scenes→nearest)"
 echo ""
 echo "  Feature:"
 echo "    use_model:   $USE_MODEL"
@@ -558,6 +576,7 @@ PYTHON_ARGS="$PYTHON_ARGS --contract_mode $CONTRACT_MODE"
 PYTHON_ARGS="$PYTHON_ARGS --dataset_transform $WAI_TRANSFORM"
 PYTHON_ARGS="$PYTHON_ARGS --dataset_data_norm_type $WAI_DATA_NORM_TYPE"
 PYTHON_ARGS="$PYTHON_ARGS --dataset_aug_crop $WAI_AUG_CROP"
+PYTHON_ARGS="$PYTHON_ARGS --dataset_resolution $WAI_RESOLUTION"
 PYTHON_ARGS="$PYTHON_ARGS --wai_view_mode $WAI_VIEW_MODE"
 if [ "$WAI_VIEW_MODE" = "anchor_support" ]; then
     PYTHON_ARGS="$PYTHON_ARGS --anchor_support_alpha $ASB_ALPHA"
@@ -665,6 +684,16 @@ fi
 if [ "$ENABLE_SOR" = "true" ]; then
     PYTHON_ARGS="$PYTHON_ARGS --enable_sor"
 fi
+case "${MAPANYTHING_USE_AMP,,}" in
+    true|1|yes|y|on)
+        PYTHON_ARGS="$PYTHON_ARGS --mapanything_use_amp"
+        ;;
+esac
+case "${POSTPROCESS_ON_CPU,,}" in
+    true|1|yes|y|on)
+        PYTHON_ARGS="$PYTHON_ARGS --postprocess_on_cpu"
+        ;;
+esac
 
 # MapAnything model config
 if [ "$USE_MODEL" = "mapanything" ]; then
@@ -702,6 +731,7 @@ cat > "${OUTPUT_DIR}/extraction_config.json" <<EOF
     "wai_transform": "$WAI_TRANSFORM",
     "wai_data_norm_type": "$WAI_DATA_NORM_TYPE",
     "wai_aug_crop": $WAI_AUG_CROP,
+    "wai_resolution": $WAI_RESOLUTION,
     "wai_view_mode": "$WAI_VIEW_MODE",
     "anchor_support_alpha": $ASB_ALPHA,
     "anchor_support_eps": $ASB_EPS,
@@ -770,6 +800,8 @@ cat > "${OUTPUT_DIR}/extraction_config.json" <<EOF
     "use_model": "$USE_MODEL",
     "model_str": "$MODEL_STR",
     "model_checkpoint": "$MODEL_CHECKPOINT",
+    "mapanything_use_amp": "$MAPANYTHING_USE_AMP",
+    "postprocess_on_cpu": "$POSTPROCESS_ON_CPU",
     "dinov2_intermediate_layers": "$DINOV2_INTERMEDIATE_LAYERS",
     "gpu_id": $GPU_ID,
     "temp_dir": "$TEMP_DIR",
@@ -783,7 +815,7 @@ EOF
 # =============================================================================
 echo ""
 echo "--- Running extraction ---"
-CUDA_VISIBLE_DEVICES=$GPU_ID PYTHONUNBUFFERED=1 python -u -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
+CUDA_VISIBLE_DEVICES=$GPU_ID PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" python -u -m ace_dinov2_lmc.memory_extraction.run_memory_extraction \
     $PYTHON_ARGS \
     2>&1 | tee "${OUTPUT_DIR}/extraction_log.txt"
 

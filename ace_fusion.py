@@ -190,35 +190,150 @@ class LMCFeatureFusion(nn.Module):
     Adapts to 'local', 'global', 'hierarchical', or 'learned' modes.
     """
 
+    VALID_REFINEMENT_MODES = {"single", "cascade_internal"}
+    VALID_ASSEMBLY_MODES = {"concat_mlp"}
+
     def __init__(self, feature_dim=1024, mode='global', num_heads=8,
                  dropout=0.1, query_feature_dim=None,
                  memory_feature_dim=None, fusion_geometry_mode="value_only_raw",
-                 fusion_scene_scale=1.0, fusion_key_geo_init=0.0):
+                 fusion_scene_scale=1.0, fusion_key_geo_init=0.0,
+                 fusion_refinement_mode="single", fusion_cascade_layers=4,
+                 fusion_assembly_mode="concat_mlp", fusion_assembly_gamma_init=0.0):
         super().__init__()
         self.mode = mode
         self.feature_dim = feature_dim
         self.fusion_geometry_mode = fusion_geometry_mode
+        self.fusion_refinement_mode = str(fusion_refinement_mode)
+        self.fusion_cascade_layers = int(fusion_cascade_layers)
+        self.fusion_assembly_mode = str(fusion_assembly_mode)
+
+        if self.fusion_refinement_mode not in self.VALID_REFINEMENT_MODES:
+            raise ValueError(
+                f"Unsupported fusion_refinement_mode={fusion_refinement_mode!r}. "
+                f"Expected one of {sorted(self.VALID_REFINEMENT_MODES)}."
+            )
+        if self.fusion_assembly_mode not in self.VALID_ASSEMBLY_MODES:
+            raise ValueError(
+                f"Unsupported fusion_assembly_mode={fusion_assembly_mode!r}. "
+                f"Expected one of {sorted(self.VALID_ASSEMBLY_MODES)}."
+            )
+        if self.fusion_cascade_layers < 1:
+            raise ValueError("fusion_cascade_layers must be >= 1.")
+        if mode == 'hierarchical' and self.fusion_refinement_mode != "single":
+            raise ValueError("cascade_internal fusion refinement is only supported for non-hierarchical LMC modes.")
+
+        block_kwargs = dict(
+            feature_dim=feature_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            query_feature_dim=query_feature_dim,
+            memory_feature_dim=memory_feature_dim,
+            fusion_geometry_mode=fusion_geometry_mode,
+            fusion_scene_scale=fusion_scene_scale,
+            fusion_key_geo_init=fusion_key_geo_init,
+        )
 
         if mode == 'hierarchical':
-            self.fusion_coarse = LMCFusionBlock(
-                feature_dim, num_heads, dropout,
-                query_feature_dim, memory_feature_dim,
-                fusion_geometry_mode=fusion_geometry_mode,
-                fusion_scene_scale=fusion_scene_scale,
-                fusion_key_geo_init=fusion_key_geo_init)
-            self.fusion_fine = LMCFusionBlock(
-                feature_dim, num_heads, dropout,
-                query_feature_dim, memory_feature_dim,
-                fusion_geometry_mode=fusion_geometry_mode,
-                fusion_scene_scale=fusion_scene_scale,
-                fusion_key_geo_init=fusion_key_geo_init)
+            self.fusion_coarse = LMCFusionBlock(**block_kwargs)
+            self.fusion_fine = LMCFusionBlock(**block_kwargs)
         else:
-            self.fusion_single = LMCFusionBlock(
-                feature_dim, num_heads, dropout,
-                query_feature_dim, memory_feature_dim,
-                fusion_geometry_mode=fusion_geometry_mode,
-                fusion_scene_scale=fusion_scene_scale,
-                fusion_key_geo_init=fusion_key_geo_init)
+            self.fusion_single = LMCFusionBlock(**block_kwargs)
+            if self.fusion_refinement_mode == "cascade_internal" and self.fusion_cascade_layers > 1:
+                cascade_kwargs = dict(block_kwargs)
+                cascade_kwargs["query_feature_dim"] = feature_dim
+                self.fusion_cascade = nn.ModuleList([
+                    LMCFusionBlock(**cascade_kwargs)
+                    for _ in range(self.fusion_cascade_layers - 1)
+                ])
+                assembly_in_dim = feature_dim * (self.fusion_cascade_layers - 1)
+                self.fusion_assembly = nn.Sequential(
+                    nn.LayerNorm(assembly_in_dim),
+                    nn.Linear(assembly_in_dim, feature_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(feature_dim, feature_dim),
+                )
+                self.fusion_assembly_gamma = nn.Parameter(
+                    torch.tensor(float(fusion_assembly_gamma_init), dtype=torch.float32)
+                )
+            else:
+                self.fusion_cascade = nn.ModuleList()
+                self.fusion_assembly = None
+                self.register_buffer(
+                    "fusion_assembly_gamma",
+                    torch.tensor(float(fusion_assembly_gamma_init), dtype=torch.float32),
+                    persistent=False,
+                )
+
+    @staticmethod
+    def _prefix_stats(prefix, stats):
+        return {f"{prefix}{k}": v for k, v in stats.items()}
+
+    def _forward_single_or_cascade(self, query_feats, latent_z, latent_p, scene_center,
+                                   return_stats=False, stats_max_pixels=4096):
+        first_out = self.fusion_single(
+            query_feats,
+            latent_z,
+            latent_p,
+            scene_center,
+            return_stats=return_stats,
+            stats_max_pixels=stats_max_pixels,
+        )
+        if return_stats:
+            anchor_feats, stats = first_out
+        else:
+            anchor_feats = first_out
+            stats = None
+
+        if self.fusion_refinement_mode != "cascade_internal" or len(self.fusion_cascade) == 0:
+            if return_stats:
+                stats = dict(stats)
+                stats.update({
+                    "fusion_refinement_mode": self.fusion_refinement_mode,
+                    "fusion_cascade_layers": int(self.fusion_cascade_layers),
+                    "fusion_assembly_gamma": float(self.fusion_assembly_gamma.detach().float().cpu().item()),
+                })
+                return anchor_feats, stats
+            return anchor_feats
+
+        cascade_states = []
+        current = anchor_feats
+        cascade_stats = {}
+        for layer_idx, block in enumerate(self.fusion_cascade, start=2):
+            block_out = block(
+                current,
+                latent_z,
+                latent_p,
+                scene_center,
+                return_stats=return_stats,
+                stats_max_pixels=stats_max_pixels,
+            )
+            if return_stats:
+                current, block_stats = block_out
+                cascade_stats.update(self._prefix_stats(f"cascade_l{layer_idx}_", block_stats))
+            else:
+                current = block_out
+            cascade_states.append(current)
+
+        residual = self.fusion_assembly(torch.cat(cascade_states, dim=-1))
+        gamma = self.fusion_assembly_gamma.to(dtype=residual.dtype)
+        fused = anchor_feats + gamma * residual
+
+        if return_stats:
+            stats = dict(stats)
+            stats.update(cascade_stats)
+            with torch.no_grad():
+                stats.update({
+                    "fusion_refinement_mode": self.fusion_refinement_mode,
+                    "fusion_cascade_layers": int(self.fusion_cascade_layers),
+                    "fusion_assembly_mode": self.fusion_assembly_mode,
+                    "fusion_assembly_gamma": float(self.fusion_assembly_gamma.detach().float().cpu().item()),
+                    "fusion_assembly_residual_norm": float(residual.detach().float().norm(dim=-1).mean().item()),
+                    "fusion_cascade_output_norm": float(current.detach().float().norm(dim=-1).mean().item()),
+                    "fused_feature_norm": float(fused.detach().float().norm(dim=-1).mean().item()),
+                })
+            return fused, stats
+        return fused
 
     def forward(self, query_feats, compressor_out, scene_center,
                 return_stats=False, stats_max_pixels=4096):
@@ -253,14 +368,20 @@ class LMCFeatureFusion(nn.Module):
                 feats_final, fine_stats = fine_out
                 stats = {f"coarse_{k}": v for k, v in coarse_stats.items()}
                 stats.update({f"fine_{k}": v for k, v in fine_stats.items()})
+                stats.update({
+                    "fusion_refinement_mode": self.fusion_refinement_mode,
+                    "fusion_cascade_layers": int(self.fusion_cascade_layers),
+                    "fusion_assembly_gamma": float(self.fusion_assembly_gamma.detach().float().cpu().item()),
+                })
                 return feats_final, stats
             return fine_out
-        else:
-            latent_z, latent_p = compressor_out
-            return self.fusion_single(
-                query_feats,
-                latent_z,
-                latent_p,
-                scene_center,
-                return_stats=return_stats,
-                stats_max_pixels=stats_max_pixels)
+
+        latent_z, latent_p = compressor_out
+        return self._forward_single_or_cascade(
+            query_feats,
+            latent_z,
+            latent_p,
+            scene_center,
+            return_stats=return_stats,
+            stats_max_pixels=stats_max_pixels,
+        )

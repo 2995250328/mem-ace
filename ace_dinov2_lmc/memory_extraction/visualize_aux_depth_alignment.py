@@ -12,6 +12,13 @@ import numpy as np
 from PIL import Image
 
 
+def _load_numpy_array(path: Path) -> np.ndarray:
+    path = Path(path)
+    if path.suffix.lower() == ".npz":
+        return np.load(path, allow_pickle=False)["arr_0"]
+    return np.load(path, allow_pickle=False)
+
+
 def _pose_key(pose: np.ndarray, decimals: int = 5) -> tuple:
     return tuple(np.round(pose.reshape(-1), decimals=decimals).tolist())
 
@@ -85,7 +92,7 @@ def _resize_depth_nearest(depth: np.ndarray, size_wh: tuple[int, int]) -> np.nda
 
 
 def _load_resized_valid_depth(depth_path: Path, size_wh: tuple[int, int], depth_min: float, depth_max: float) -> tuple[np.ndarray, np.ndarray]:
-    depth = np.load(depth_path).astype(np.float32)
+    depth = _load_numpy_array(depth_path).astype(np.float32)
     if depth.ndim == 3:
         depth = np.squeeze(depth)
     depth = np.where(np.isfinite(depth), depth, 0.0).astype(np.float32)

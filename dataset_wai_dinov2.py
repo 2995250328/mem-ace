@@ -138,6 +138,14 @@ class CamLocDatasetWAIDINOv2(Dataset):
     def _round_to_patch_size(self, size):
         return int(round(size / self.patch_size) * self.patch_size)
 
+    def _resize_image_to_height(self, image, image_height):
+        """Resize to an explicit target height while preserving aspect ratio."""
+        image_height = self._round_to_patch_size(image_height)
+        image = TF.to_pil_image(image)
+        orig_width, orig_height = image.size
+        target_width = self._round_to_patch_size(orig_width * image_height / max(1, orig_height))
+        return TF.resize(image, (image_height, target_width))
+
     @staticmethod
     def _rotate_image(image, angle, order, mode="constant"):
         image = image.permute(1, 2, 0).numpy()
@@ -265,8 +273,7 @@ class CamLocDatasetWAIDINOv2(Dataset):
         centre_point = [c * f_scale_factor for c in centre_point]
         focal_length = [f * f_scale_factor for f in focal_length]
 
-        image = TF.to_pil_image(image)
-        image = TF.resize(image, image_height)
+        image = self._resize_image_to_height(image, image_height)
 
         current_width = image.size[0]
         target_width = self.image_width if self.image_width is not None else self._round_to_patch_size(current_width)

@@ -37,6 +37,12 @@ from torch.utils.data import DataLoader
 import dsacstar
 from ace_network_dinov2 import Regressor
 from dataset_dinov2 import CamLocDatasetDINOv2
+from dataset_wai_dinov2 import CamLocDatasetWAIDINOv2
+from glace_backend import (
+    GLACEDecoderFeatureResidualAdapter,
+    build_glace_camloc_dataset,
+    create_glace_regressor_from_split_state_dict,
+)
 
 logging.basicConfig(level=logging.INFO)
 _logger = logging.getLogger(__name__)
@@ -284,15 +290,31 @@ def run_evaluation_lmc(opt):
         lmc_config = checkpoint['lmc_config']
         head_state_dict = checkpoint['head_state_dict']
         memory_path = lmc_config.get('memory_path')
+        model_backend = str(lmc_config.get('model_backend', 'ace_dinov2'))
     else:
+        model_backend = 'ace_dinov2'
         _logger.info("[LMC] Vanilla checkpoint — delegating to standard eval")
         head_state_dict = checkpoint
 
     # Build regressor (encoder + head)
-    network = Regressor.create_from_split_state_dict(
-        dinov2_path=dinov2_path,
-        head_state_dict=head_state_dict,
-    )
+    if model_backend == 'glace_lmc':
+        if not is_lmc:
+            raise ValueError('[Eval] GLACE backend is only supported through LMC checkpoints in this entrypoint.')
+        glace_root = Path(getattr(opt, 'glace_root', None) or lmc_config.get('glace_root') or '/home/xwh/project/glace')
+        glace_encoder_path = Path(
+            getattr(opt, 'glace_encoder_path', None) or lmc_config.get('glace_encoder_path') or '/home/xwh/project/glace/ace_encoder_pretrained.pt'
+        )
+        network = create_glace_regressor_from_split_state_dict(
+            glace_root=glace_root,
+            encoder_path=glace_encoder_path,
+            head_state_dict=head_state_dict,
+            map_location='cpu',
+        )
+    else:
+        network = Regressor.create_from_split_state_dict(
+            dinov2_path=dinov2_path,
+            head_state_dict=head_state_dict,
+        )
     network = network.to(device)
     network.eval()
     # Verify the model actually landed on the requested device (catches silent CPU fallbacks).
@@ -306,6 +328,7 @@ def run_evaluation_lmc(opt):
     # Build LMC modules if needed
     compressor = None
     fusion = None
+    glace_residual_adapter = None
     memory_dict = None
     bank_data = None
     reference_eval_state = {"enabled": False, "contract_mode": "C0", "output_space": "points_world"}
@@ -352,6 +375,7 @@ def run_evaluation_lmc(opt):
             level_cross_attn_shared=lmc_config.get('lmc_level_cross_attn_shared', True),
             level_gate_entropy_weight=lmc_config.get('lmc_level_gate_entropy_weight', 0.0),
             level_token_gate=lmc_config.get('lmc_level_token_gate', False),
+            level_anchor_residual_gamma_init=lmc_config.get('lmc_level_anchor_residual_gamma_init', 0.0),
             geo_bias_mode=lmc_config.get('geo_bias_mode', 'legacy'),
             geo_bias_rbf_scales=lmc_config.get('geo_bias_rbf_scales', [0.25, 0.5, 1.0, 2.0, 4.0]),
             geo_bias_rbf_alpha_init=lmc_config.get('geo_bias_rbf_alpha_init', 0.0),
@@ -365,6 +389,9 @@ def run_evaluation_lmc(opt):
             pos_fourier_residual_gate_init=lmc_config.get('pos_fourier_residual_gate_init', 0.0),
             point_rope_coord_norm=lmc_config.get('point_rope_coord_norm', 'scene_radius'),
             point_rope_radius=lmc_config.get('point_rope_radius', 4.0),
+            point_rope_radius_policy=lmc_config.get('point_rope_radius_policy', 'fixed'),
+            point_rope_mixed_memory_ratio=lmc_config.get('point_rope_mixed_memory_ratio', 0.5),
+            point_rope_seed_pe=lmc_config.get('point_rope_seed_pe', 'fourier_legacy'),
             point_rope_base=lmc_config.get('point_rope_base', 10000.0),
             point_rope_axes=lmc_config.get('point_rope_axes', 'xyz_split'),
             point_rope_apply_to=lmc_config.get('point_rope_apply_to', 'qk'),
@@ -386,9 +413,23 @@ def run_evaluation_lmc(opt):
             fusion_geometry_mode=lmc_config.get('lmc_fusion_geometry_mode', 'value_only_raw'),
             fusion_scene_scale=lmc_config.get('lmc_fusion_scene_scale', 1.0),
             fusion_key_geo_init=lmc_config.get('lmc_fusion_key_geo_init', 0.0),
+            fusion_refinement_mode=lmc_config.get('lmc_fusion_refinement_mode', 'single'),
+            fusion_cascade_layers=lmc_config.get('lmc_fusion_cascade_layers', 4),
+            fusion_assembly_mode=lmc_config.get('lmc_fusion_assembly_mode', 'concat_mlp'),
+            fusion_assembly_gamma_init=lmc_config.get('lmc_fusion_assembly_gamma_init', 0.0),
         ).to(device)
         fusion.load_state_dict(checkpoint['fusion_state_dict'])
         fusion.eval()
+        if model_backend == 'glace_lmc':
+            glace_residual_adapter = GLACEDecoderFeatureResidualAdapter(
+                residual_gate_init=float(lmc_config.get('glace_residual_gate_init', 0.0) or 0.0),
+                mode=str(lmc_config.get('glace_residual_mode', 'decoder_delta_tanh_scalar') or 'decoder_delta_tanh_scalar'),
+                global_dim=int(lmc_config.get('glace_residual_global_dim', lmc_config.get('glace_global_feat_dim', 0)) or 0),
+            ).to(device)
+            adapter_state = checkpoint.get('glace_residual_adapter_state_dict')
+            if adapter_state is not None:
+                glace_residual_adapter.load_state_dict(adapter_state, strict=True)
+            glace_residual_adapter.eval()
 
         # Load memory (supports both pooled and BSE formats)
         from utils_lmc import load_memory_features
@@ -442,9 +483,43 @@ def run_evaluation_lmc(opt):
         _logger.info("[LMC] Memory compressed once (cached for all test frames)")
 
     # Dataset
-    testset = CamLocDatasetDINOv2(
-        scene_path / "test", mode=0, use_half=False,
-        image_height=image_resolution, augment=False)
+    data_backend = getattr(opt, "data_backend", None)
+    if data_backend is None:
+        data_backend = lmc_config.get("data_backend", "ace") if is_lmc else "ace"
+    data_backend = str(data_backend)
+    if data_backend == "wai":
+        testset = CamLocDatasetWAIDINOv2(
+            scene_path,
+            mode=0,
+            use_half=False,
+            image_height=image_resolution,
+            augment=False,
+            wai_repo_root=getattr(opt, "wai_repo_root", lmc_config.get("wai_repo_root", None)),
+            wai_image_modality=getattr(opt, "wai_image_modality", lmc_config.get("wai_image_modality", "image")),
+        )
+    elif model_backend == 'glace_lmc':
+        if is_lmc and lmc_config is not None:
+            glace_root = Path(getattr(opt, 'glace_root', None) or lmc_config.get('glace_root') or '/home/xwh/project/glace')
+            feat_name = str(getattr(opt, 'glace_feat_name', None) or lmc_config.get('glace_feat_name', 'features.npy'))
+        else:
+            glace_root = Path(getattr(opt, 'glace_root', None) or '/home/xwh/project/glace')
+            feat_name = str(getattr(opt, 'glace_feat_name', 'features.npy'))
+        testset = build_glace_camloc_dataset(
+            glace_root=glace_root,
+            root_dir=scene_path / 'test',
+            mode=0,
+            augment=False,
+            aug_rotation=0.0,
+            aug_scale_max=1.0,
+            aug_scale_min=1.0,
+            image_height=image_resolution,
+            use_half=False,
+            feat_name=feat_name,
+        )
+    else:
+        testset = CamLocDatasetDINOv2(
+            scene_path / "test", mode=0, use_half=False,
+            image_height=image_resolution, augment=False)
     loader_generator = None
     worker_init_fn = None
     if eval_deterministic:
@@ -480,12 +555,31 @@ def run_evaluation_lmc(opt):
     lmc_runtime_stats_calls = 0
 
     with torch.no_grad():
-        for image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames in testset_loader:
+        for batch in testset_loader:
+            if model_backend == 'glace_lmc':
+                image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames, global_feat_BC, _ = batch
+                global_feat_BC = global_feat_BC.to(device, non_blocking=True)
+            else:
+                image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames = batch
+                global_feat_BC = None
             batch_start_time = time.time()
             image_B1HW = image_B1HW.to(device, non_blocking=True)
 
             with autocast(enabled=True):
-                features = network.get_features(image_B1HW)
+                local_features = network.get_features(image_B1HW)
+                if model_backend == 'glace_lmc':
+                    if global_feat_BC.dtype != local_features.dtype:
+                        global_feat_BC = global_feat_BC.to(dtype=local_features.dtype)
+                    features = torch.cat(
+                        (
+                            global_feat_BC[..., None, None].expand(-1, -1, local_features.shape[2], local_features.shape[3]),
+                            local_features,
+                        ),
+                        dim=1,
+                    )
+                else:
+                    features = local_features
+                base_features = features
 
                 # Apply LMC fusion if active (reuse single cached compression for this batch)
                 if fusion is not None and compressor_out_cached is not None:
@@ -525,7 +619,17 @@ def run_evaluation_lmc(opt):
                         _log_fusion_runtime_stats("EvalFusion", lmc_runtime_stats_calls, stats)
                     features = fused.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
-                scene_coordinates_B3HW = network.get_scene_coordinates(features)
+                if model_backend == 'glace_lmc':
+                    if glace_residual_adapter is not None:
+                        B, C, H, W = features.shape
+                        base_bC = base_features.permute(0, 2, 3, 1).reshape(B * H * W, C)
+                        cand_bC = features.permute(0, 2, 3, 1).reshape(B * H * W, C)
+                        mixed_bC = glace_residual_adapter(base_bC, cand_bC)
+                        features = mixed_bC.view(B, H, W, C).permute(0, 3, 1, 2)
+                    head_features = features
+                else:
+                    head_features = features
+                scene_coordinates_B3HW = network.get_scene_coordinates(head_features)
 
             scene_coordinates_B3HW = scene_coordinates_B3HW.float().cpu()
 
@@ -668,6 +772,12 @@ def run_evaluation_lmc(opt):
             "lmc_level_cross_attn_shared": lmc_config.get("lmc_level_cross_attn_shared", True),
             "lmc_level_gate_entropy_weight": lmc_config.get("lmc_level_gate_entropy_weight", 0.0),
             "lmc_level_token_gate": lmc_config.get("lmc_level_token_gate", False),
+            "lmc_level_anchor_residual_gamma_init": lmc_config.get(
+                "lmc_level_anchor_residual_gamma_init", 0.0
+            ),
+            "final_lmc_level_anchor_residual_gamma": lmc_config.get(
+                "final_lmc_level_anchor_residual_gamma"
+            ),
             "lmc_level_merge_weights": lmc_config.get("lmc_level_merge_weights"),
             "lmc_level_gate_entropy": lmc_config.get("lmc_level_gate_entropy"),
             "geo_bias_mode": lmc_config.get("geo_bias_mode", "legacy"),
@@ -686,6 +796,9 @@ def run_evaluation_lmc(opt):
             "final_pos_fourier_residual_gate": lmc_config.get("final_pos_fourier_residual_gate"),
             "point_rope_coord_norm": lmc_config.get("point_rope_coord_norm", "scene_radius"),
             "point_rope_radius": lmc_config.get("point_rope_radius", 4.0),
+            "point_rope_radius_policy": lmc_config.get("point_rope_radius_policy", "fixed"),
+            "point_rope_mixed_memory_ratio": lmc_config.get("point_rope_mixed_memory_ratio", 0.5),
+            "point_rope_seed_pe": lmc_config.get("point_rope_seed_pe", "fourier_legacy"),
             "point_rope_base": lmc_config.get("point_rope_base", 10000.0),
             "point_rope_axes": lmc_config.get("point_rope_axes", "xyz_split"),
             "point_rope_apply_to": lmc_config.get("point_rope_apply_to", "qk"),
@@ -704,6 +817,11 @@ def run_evaluation_lmc(opt):
             "lmc_fusion_key_geo_init": lmc_config.get("lmc_fusion_key_geo_init"),
             "lmc_fusion_scene_scale": lmc_config.get("lmc_fusion_scene_scale"),
             "lmc_fusion_scene_scale_source": lmc_config.get("lmc_fusion_scene_scale_source"),
+            "lmc_fusion_refinement_mode": lmc_config.get("lmc_fusion_refinement_mode", "single"),
+            "lmc_fusion_cascade_layers": lmc_config.get("lmc_fusion_cascade_layers", 4),
+            "lmc_fusion_assembly_mode": lmc_config.get("lmc_fusion_assembly_mode", "concat_mlp"),
+            "lmc_fusion_assembly_gamma_init": lmc_config.get("lmc_fusion_assembly_gamma_init", 0.0),
+            "final_lmc_fusion_assembly_gamma": lmc_config.get("final_lmc_fusion_assembly_gamma"),
             "lmc_log_runtime_stats": lmc_log_runtime_stats,
             "lmc_runtime_stats_interval": lmc_runtime_stats_interval,
             "lmc_runtime_stats_max_pixels": lmc_runtime_stats_max_pixels,
@@ -734,6 +852,12 @@ if __name__ == '__main__':
     parser.add_argument('network', type=Path, help='Path to checkpoint')
     parser.add_argument('--dinov2_path', type=Path,
                         default=DATA_ROOT / 'checkpoints' / 'dinov2_vitl14_pretrain.pth')
+    parser.add_argument('--glace_root', type=Path, default=Path('/home/xwh/project/glace'),
+                        help='GLACE repo root for glace_lmc checkpoint reconstruction.')
+    parser.add_argument('--glace_encoder_path', type=Path, default=Path('/home/xwh/project/glace/ace_encoder_pretrained.pt'),
+                        help='GLACE encoder checkpoint path for glace_lmc checkpoint reconstruction.')
+    parser.add_argument('--glace_feat_name', type=str, default='features.npy',
+                        help='GLACE per-split global feature filename (ACE-format only).')
     parser.add_argument('--ensemble_networks', nargs='*', type=Path, default=None,
                         help='Additional checkpoints for joint evaluation. When set, the primary positional '
                              '`network` plus these checkpoints are evaluated per-frame and the final pose is '
@@ -743,6 +867,12 @@ if __name__ == '__main__':
                              'output directory; for single-checkpoint mode it overrides the checkpoint parent.')
     parser.add_argument('--session', '-sid', default='')
     parser.add_argument('--image_resolution', type=int, default=518)
+    parser.add_argument('--data_backend', type=str, default=None, choices=['ace', 'wai'],
+                        help='Evaluation dataset backend. None uses checkpoint lmc_config or ace fallback.')
+    parser.add_argument('--wai_repo_root', type=Path, default=None,
+                        help='map-anything repo root for WAI eval.')
+    parser.add_argument('--wai_image_modality', type=str, default='image',
+                        help='WAI image modality key.')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--hypotheses', '-hyps', type=int, default=64)
     parser.add_argument('--threshold', '-t', type=float, default=10)

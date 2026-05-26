@@ -252,6 +252,7 @@ def _load_bundle(
             level_cross_attn_shared=lmc_config.get("lmc_level_cross_attn_shared", True),
             level_gate_entropy_weight=lmc_config.get("lmc_level_gate_entropy_weight", 0.0),
             level_token_gate=lmc_config.get("lmc_level_token_gate", False),
+            level_anchor_residual_gamma_init=lmc_config.get("lmc_level_anchor_residual_gamma_init", 0.0),
             geo_bias_mode=lmc_config.get("geo_bias_mode", "legacy"),
             geo_bias_rbf_scales=lmc_config.get("geo_bias_rbf_scales", [0.25, 0.5, 1.0, 2.0, 4.0]),
             geo_bias_rbf_alpha_init=lmc_config.get("geo_bias_rbf_alpha_init", 0.0),
@@ -265,6 +266,9 @@ def _load_bundle(
             pos_fourier_residual_gate_init=lmc_config.get("pos_fourier_residual_gate_init", 0.0),
             point_rope_coord_norm=lmc_config.get("point_rope_coord_norm", "scene_radius"),
             point_rope_radius=lmc_config.get("point_rope_radius", 4.0),
+            point_rope_radius_policy=lmc_config.get("point_rope_radius_policy", "fixed"),
+            point_rope_mixed_memory_ratio=lmc_config.get("point_rope_mixed_memory_ratio", 0.5),
+            point_rope_seed_pe=lmc_config.get("point_rope_seed_pe", "fourier_legacy"),
             point_rope_base=lmc_config.get("point_rope_base", 10000.0),
             point_rope_axes=lmc_config.get("point_rope_axes", "xyz_split"),
             point_rope_apply_to=lmc_config.get("point_rope_apply_to", "qk"),
@@ -285,6 +289,10 @@ def _load_bundle(
             fusion_geometry_mode=lmc_config.get("lmc_fusion_geometry_mode", "value_only_raw"),
             fusion_scene_scale=lmc_config.get("lmc_fusion_scene_scale", 1.0),
             fusion_key_geo_init=lmc_config.get("lmc_fusion_key_geo_init", 0.0),
+            fusion_refinement_mode=lmc_config.get("lmc_fusion_refinement_mode", "single"),
+            fusion_cascade_layers=lmc_config.get("lmc_fusion_cascade_layers", 4),
+            fusion_assembly_mode=lmc_config.get("lmc_fusion_assembly_mode", "concat_mlp"),
+            fusion_assembly_gamma_init=lmc_config.get("lmc_fusion_assembly_gamma_init", 0.0),
         ).to(device)
         fusion.load_state_dict(checkpoint["fusion_state_dict"])
         fusion.eval()

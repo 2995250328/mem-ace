@@ -42,6 +42,13 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         help='数据读取后端：ace=原始 rgb/poses/calibration 目录；wai=WAI scene_meta.json。',
     )
     parser.add_argument(
+        '--model_backend',
+        type=str,
+        default='ace_dinov2',
+        choices=['ace_dinov2', 'glace_lmc'],
+        help='模型后端。ace_dinov2=当前 DINOv2 ACE/LMC；glace_lmc=GLACE encoder+global feature branch + 当前 LMC 训练逻辑。',
+    )
+    parser.add_argument(
         '--wai_repo_root',
         type=Path,
         default=DATA_ROOT / 'map-anything',
@@ -52,6 +59,15 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=str,
         default='image',
         help='WAI 图像模态键（默认 image）。',
+    )
+    parser.add_argument(
+        '--post_train_eval_scene',
+        type=Path,
+        default=None,
+        help=(
+            'post-train eval 使用的场景目录。None 时沿用训练 scene；'
+            'WAI/RIO10 可显式传入对应 *_test scene。'
+        ),
     )
     parser.add_argument(
         'output_map',
@@ -99,6 +115,26 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         default=True,
         help='当 run_name 非 auto 且 run_dir 已存在时，是否先清空目录再写（默认 True，保证目录里只有本次结果）。',
     )
+    parser.add_argument(
+        '--resume_from_run_dir',
+        type=Path,
+        default=None,
+        help=(
+            '从已有 LMC run_dir 的 best_checkpoint_meta.json 恢复训练。'
+            '恢复时会复用该目录和 best checkpoint，并强制不清空目录。'
+        ),
+    )
+    parser.add_argument(
+        '--resume_strict_config',
+        type=_strtobool,
+        default=True,
+        help='resume 时是否严格检查当前 LMC 架构配置与 checkpoint 中的 lmc_config 一致。',
+    )
+    parser.add_argument(
+        '--resume_allow_config_mismatch',
+        action='store_true',
+        help='允许 resume 时跳过严格配置不一致报错，仅记录 warning。',
+    )
 
     # ------------------------------------------------------------------
     # DINOv2 编码器相关
@@ -108,6 +144,70 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DATA_ROOT / 'checkpoints' / 'dinov2_vitl14_pretrain.pth',
         help='DINOv2 ViT-L/14 预训练权重路径。',
+    )
+    parser.add_argument(
+        '--glace_root',
+        type=Path,
+        default=Path('/home/xwh/project/glace'),
+        help='GLACE 仓库根目录（glace_lmc 后端使用）。',
+    )
+    parser.add_argument(
+        '--glace_encoder_path',
+        type=Path,
+        default=Path('/home/xwh/project/glace/ace_encoder_pretrained.pt'),
+        help='GLACE 预训练 encoder 权重路径（glace_lmc 后端使用）。',
+    )
+    parser.add_argument(
+        '--glace_feat_name',
+        type=str,
+        default='features.npy',
+        help='ACE-format split 根目录下的 GLACE 全局特征文件名（默认 features.npy）。',
+    )
+    parser.add_argument(
+        '--glace_head_channels',
+        type=int,
+        default=512,
+        help='GLACE 回归头隐藏通道数（glace_lmc 后端使用）。',
+    )
+    parser.add_argument(
+        '--glace_mlp_ratio',
+        type=float,
+        default=1.0,
+        help='GLACE 回归头 MLP ratio（glace_lmc 后端使用）。',
+    )
+    parser.add_argument(
+        '--glace_residual_mode',
+        type=str,
+        default='local_delta_tanh_scalar',
+        choices=['decoder_delta_tanh_scalar', 'local_delta_tanh_scalar'],
+        help=(
+            'GLACE-LMC residual 融合方式。local_delta_tanh_scalar 只更新 GLACE local feature，'
+            '保留原 GLACE global feature；decoder_delta_tanh_scalar 更新完整 global+local decoder feature。'
+        ),
+    )
+    parser.add_argument(
+        '--glace_residual_gate_init',
+        type=float,
+        default=0.0,
+        help='GLACE-LMC residual tanh 门控初值；实际初始 gain=tanh(value)。',
+    )
+    parser.add_argument(
+        '--glace_head_freeze_iters',
+        type=int,
+        default=0,
+        help=(
+            'GLACE-LMC 前 N 个 ACE-G outer iterations 冻结 GLACE head，'
+            '只训练 compressor/fusion/residual plugin。0 表示关闭。'
+        ),
+    )
+    parser.add_argument(
+        '--glace_residual_lr_ratio',
+        type=float,
+        default=-1.0,
+        help=(
+            'GLACE residual adapter 在 S2 中相对 head_lr 的学习率比例。'
+            '小于 0 时沿用 --ace_g_fusion_lr_ratio。'
+        ),
     )
     parser.add_argument(
         '--freeze_backbone',
@@ -361,7 +461,9 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
             'none',
             'memory_compare_ace_g_v1',
             'memory_compare_ace_g_v2',
+            'mushroom_aceg_best_baseline_v1',
             'ace_g_indoor6_4090_global_fixedzero_v1',
+            'rio10_conservative_ace_g_v1',
         ],
         help=(
             '训练预设。none=不改动 parser 默认值；'
@@ -369,7 +471,9 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
             '会自动补齐 use_lmc、ace_g、strict preflight、scene/head 容差、'
             'BSE world-point 路径、S1 buffer 训练，以及 train_compare 输出目录；'
             'memory_compare_ace_g_v2=deterministic-eval/composite 指标版本；'
-            'ace_g_indoor6_4090_global_fixedzero_v1=indoor6/4090 true-global fixed-zero ACE-G 配方。'
+            'mushroom_aceg_best_baseline_v1=MuSHRoom 当前最强基线对齐版本（gt_depth valid sampling + 40-view memory）；'
+            'ace_g_indoor6_4090_global_fixedzero_v1=indoor6/4090 true-global fixed-zero ACE-G 配方；'
+            'rio10_conservative_ace_g_v1=Step19 RIO10 保守迁移：ACE backend、true-global、per_iter、无 aux sparse-depth loss。'
         ),
     )
     parser.add_argument(
@@ -504,8 +608,17 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--c1_aux_depth_kind',
         type=str,
         default='gt_depth',
-        choices=['gt_depth', 'colmap_depth'],
-        help='C1 aux_ref 自动查找或 scene 根目录下使用的 WAI 深度子目录。',
+        choices=[
+            'gt_depth',
+            'colmap_depth',
+            'sparse_depth',
+            'sparse_depth_sampling_sp',
+            'sparse_depth_mapanything',
+        ],
+        help=(
+            'C1 aux_ref/valid sampling 自动查找或 scene 根目录下使用的 WAI 深度子目录。'
+            'RIO10 稀疏深度使用 sparse_depth；Wayspots LMC 推荐 sparse_depth_sampling_sp。'
+        ),
     )
     parser.add_argument(
         '--c1_aux_ref_sample_ratio',
@@ -644,11 +757,12 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--lmc_feature_hierarchy_mode',
-        choices=['selected_key_concat_value', 'levelwise_latent_merge'],
+        choices=['selected_key_concat_value', 'levelwise_latent_merge', 'levelwise_anchor_residual'],
         default='selected_key_concat_value',
         help=(
             '多层 memory feature 的压缩路径。selected_key_concat_value 保持旧行为；'
-            'levelwise_latent_merge 对每层独立投影/压缩后用全局 level gate 合并。'
+            'levelwise_latent_merge 对每层独立投影/压缩后用全局 level gate 合并；'
+            'levelwise_anchor_residual 保留旧路径作为锚点，并零门控叠加多层 residual。'
         ),
     )
     parser.add_argument(
@@ -659,9 +773,9 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--lmc_level_merge_init',
-        choices=['uniform'],
+        choices=['uniform', 'key_slice_bias'],
         default='uniform',
-        help='levelwise_latent_merge 的 gate 初始化。uniform 表示各层初始等权。',
+        help='levelwise 分支的 gate 初始化。uniform 表示各层初始等权；key_slice_bias 强偏向 lmc_key_slice_idx。',
     )
     parser.add_argument(
         '--lmc_level_proj_shared',
@@ -686,6 +800,12 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=_strtobool,
         default=False,
         help='预留的 token-wise level gate 开关。B3-lite 首版保持 False。',
+    )
+    parser.add_argument(
+        '--lmc_level_anchor_residual_gamma_init',
+        type=float,
+        default=0.0,
+        help='levelwise_anchor_residual 的 residual gate 初始值；默认 0.0 保持初始输出等于 selected_key_concat_value 锚点。',
     )
     parser.add_argument(
         '--lmc_geo_bias_mode',
@@ -771,6 +891,26 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=float,
         default=4.0,
         help='point_rope 的坐标归一化半径。',
+    )
+    parser.add_argument(
+        '--lmc_point_rope_radius_policy',
+        type=str,
+        default='fixed',
+        choices=['fixed', 'memory_p95', 'mixed_fixed_memory_p95'],
+        help='point_rope 半径策略。fixed 使用 lmc_point_rope_radius；memory_p95 使用 memory 点到 scene_center 距离的 95 分位；mixed_fixed_memory_p95 按 head 混合 fixed 和 memory_p95。',
+    )
+    parser.add_argument(
+        '--lmc_point_rope_mixed_memory_ratio',
+        type=float,
+        default=0.5,
+        help='mixed_fixed_memory_p95 中使用 memory_p95 半径的 attention head 比例，范围 [0,1]。',
+    )
+    parser.add_argument(
+        '--lmc_point_rope_seed_pe',
+        type=str,
+        default='fourier_legacy',
+        choices=['fourier_legacy', 'sincos_deterministic'],
+        help='point_rope 模式下 latent seed 的位置编码。fourier_legacy 保持旧行为；sincos_deterministic 使用无参数确定性 sin/cos。',
     )
     parser.add_argument(
         '--lmc_point_rope_base',
@@ -884,6 +1024,32 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         help='当 --lmc_fusion_scene_scale_source fixed 时使用的正数 scene_scale。',
     )
     parser.add_argument(
+        '--lmc_fusion_refinement_mode',
+        type=str,
+        default='single',
+        choices=['single', 'cascade_internal'],
+        help='Fusion refinement 模式。single=旧行为；cascade_internal=Step15 C1 内部级联 fusion residual。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_cascade_layers',
+        type=int,
+        default=4,
+        help='cascade_internal 总 fusion block 数，包含第一个 baseline anchor block。默认 4。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_assembly_mode',
+        type=str,
+        default='concat_mlp',
+        choices=['concat_mlp'],
+        help='cascade_internal 的 assembly 方式。concat_mlp=concat(H2..HN) 后 MLP residual。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_assembly_gamma_init',
+        type=float,
+        default=0.0,
+        help='cascade_internal residual gate 初始值。默认 0.0，使初始输出等于第一层 fusion anchor。',
+    )
+    parser.add_argument(
         '--s1_batch_size',
         type=int,
         default=28,
@@ -970,7 +1136,7 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--s1_early_stop_rel_improve',
         type=float,
         default=0.01,
-        help='S1 早停最小相对改善阈值，例如 0.01 表示需优于历史最好值 1% 才算改善。',
+        help='S1 早停最小相对改善阈值，例如 0.01 表示需优于历史最好值 1%% 才算改善。',
     )
     parser.add_argument(
         '--s1_early_stop_ema_beta',

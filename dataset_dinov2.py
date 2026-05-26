@@ -187,12 +187,13 @@ class CamLocDatasetDINOv2(Dataset):
 
         return prediction_grid
 
-    @staticmethod
-    def _resize_image(image, image_height):
-        """Resize image to target height, maintaining aspect ratio."""
+    def _resize_image(self, image, image_height):
+        """Resize image to an explicit target height, maintaining aspect ratio."""
+        image_height = self._round_to_patch_size(image_height)
         image = TF.to_pil_image(image)
-        image = TF.resize(image, image_height)
-        return image
+        orig_width, orig_height = image.size
+        target_width = self._round_to_patch_size(orig_width * image_height / max(1, orig_height))
+        return TF.resize(image, (image_height, target_width))
 
     @staticmethod
     def _rotate_image(image, angle, order, mode='constant'):
@@ -395,6 +396,8 @@ class CamLocDatasetDINOv2(Dataset):
 
         # Generate initialization targets from depth if needed
         if self.init and not self.sparse:
+            if self.prediction_grid is None:
+                self.prediction_grid = self._create_prediction_grid()
             offsetX = int(Regressor.OUTPUT_SUBSAMPLE / 2)
             offsetY = int(Regressor.OUTPUT_SUBSAMPLE / 2)
             coords = torch.zeros((3,
@@ -406,7 +409,11 @@ class CamLocDatasetDINOv2(Dataset):
             xy[1] += offsetY
             xy[0] -= image.shape[2] / 2
             xy[1] -= image.shape[1] / 2
-            xy /= focal_length
+            if isinstance(focal_length, (list, tuple, np.ndarray)):
+                xy[0] /= float(focal_length[0])
+                xy[1] /= float(focal_length[1])
+            else:
+                xy /= float(focal_length)
             xy[0] *= depth
             xy[1] *= depth
             eye = np.ndarray((4, depth.shape[0], depth.shape[1]))

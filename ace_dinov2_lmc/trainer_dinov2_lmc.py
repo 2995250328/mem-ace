@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as Fnn
 import torch.optim as optim
 import torchvision.transforms.functional as TF
+from skimage import io as skio
 from skimage.transform import rotate, resize
 from torch.amp import autocast
 from torch.utils.data import DataLoader, sampler
@@ -38,6 +39,12 @@ from utils_lmc import (
     estimate_memory_front_visibility,
     load_memory_features,
     preflight_memory_features,
+)
+
+from glace_backend import (
+    GLACEDecoderFeatureResidualAdapter,
+    build_glace_camloc_dataset,
+    create_glace_regressor_from_encoder,
 )
 
 _logger = logging.getLogger(__name__)
@@ -73,6 +80,32 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 "intrinsics_inv": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
                 "gt_scene_coords_world": {"rank": 2, "shape_suffix": (3,), "dtype": torch.float32},
                 "gt_scene_coords_valid": {"rank": 2, "shape_suffix": (1,), "dtype": torch.bool},
+            },
+        },
+        "fused_buffer_glace": {
+            "description": "S2 iterative fused feature buffer for GLACE backend",
+            "fields": {
+                "features": {"rank": 2, "shape_suffix": ("feature_dim",), "dtype": "feature"},
+                "target_px": {"rank": 2, "shape_suffix": (2,), "dtype": torch.float32},
+                "gt_poses_inv": {"rank": 3, "shape_suffix": (3, 4), "dtype": torch.float32},
+                "intrinsics": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
+                "intrinsics_inv": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
+                "gt_scene_coords_world": {"rank": 2, "shape_suffix": (3,), "dtype": torch.float32},
+                "gt_scene_coords_valid": {"rank": 2, "shape_suffix": (1,), "dtype": torch.bool},
+                "img_idx": {"rank": 1, "shape_suffix": (), "dtype": torch.int64},
+            },
+        },
+        "raw_buffer_glace": {
+            "description": "ACE-G and S1 raw backbone feature buffer for GLACE backend",
+            "fields": {
+                "features": {"rank": 2, "shape_suffix": ("feature_dim",), "dtype": "feature"},
+                "target_px": {"rank": 2, "shape_suffix": (2,), "dtype": torch.float32},
+                "gt_poses_inv": {"rank": 3, "shape_suffix": (3, 4), "dtype": torch.float32},
+                "intrinsics": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
+                "intrinsics_inv": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
+                "gt_scene_coords_world": {"rank": 2, "shape_suffix": (3,), "dtype": torch.float32},
+                "gt_scene_coords_valid": {"rank": 2, "shape_suffix": (1,), "dtype": torch.bool},
+                "img_idx": {"rank": 1, "shape_suffix": (), "dtype": torch.int64},
             },
         },
     }
@@ -515,10 +548,25 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     def _infer_c1_aux_depth_dir(self, train_root: Path) -> Optional[Path]:
         explicit_root = getattr(self.options, "c1_aux_depth_root", None)
         depth_kind = str(getattr(self.options, "c1_aux_depth_kind", "gt_depth") or "gt_depth")
+        if getattr(self.options, "data_backend", "ace") == "wai":
+            return self._resolve_wai_aux_depth_dir(train_root, explicit_root, depth_kind)
         if explicit_root is not None and str(explicit_root):
             explicit_root = Path(explicit_root)
-            if explicit_root.name in {"gt_depth", "colmap_depth"}:
+            if explicit_root.name in {"gt_depth", "colmap_depth", "sparse_depth"}:
                 return explicit_root
+            if depth_kind == "sparse_depth":
+                # RIO10 sparse-depth root stores scans as sceneXX_seqXX_seqXX_YY/sparse_depth.
+                scene_name = Path(train_root).parent.name
+                sparse_scan_name = self._derive_rio10_sparse_scan_name(scene_name)
+                candidates = [
+                    explicit_root / sparse_scan_name / "sparse_depth",
+                    explicit_root / scene_name / "sparse_depth",
+                    explicit_root / "sparse_depth",
+                ]
+                for candidate in candidates:
+                    if candidate.exists():
+                        return candidate
+                return candidates[0]
             return explicit_root / depth_kind
 
         scene_name = train_root.parent.name
@@ -534,7 +582,26 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
     @staticmethod
     def _load_wai_depth_npy(path: Path) -> np.ndarray:
-        depth = np.load(path).astype(np.float64, copy=False)
+        path = Path(path)
+        if not path.exists():
+            alt = None
+            if path.suffix.lower() == ".npy":
+                alt = path.with_suffix(".npz")
+            elif path.suffix.lower() == ".npz":
+                alt = path.with_suffix(".npy")
+            if alt is not None and alt.exists():
+                path = alt
+
+        if path.suffix.lower() == ".npy":
+            depth = np.load(path, allow_pickle=False).astype(np.float64, copy=False)
+        elif path.suffix.lower() == ".npz":
+            depth = np.load(path, allow_pickle=False)["arr_0"].astype(np.float64, copy=False)
+        else:
+            depth_raw = skio.imread(path)
+            depth = np.asarray(depth_raw).astype(np.float64, copy=False)
+            if path.suffix.lower() in {".png", ".tif", ".tiff"} and np.issubdtype(np.asarray(depth_raw).dtype, np.integer):
+                # RIO10 sparse_depth PNGs are stored as millimeters. ACE reprojection expects meters.
+                depth = depth / 1000.0
         if depth.ndim == 3:
             depth = np.squeeze(depth)
         if depth.ndim != 2:
@@ -743,6 +810,124 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             )
         return depth_paths
 
+    @staticmethod
+    def _derive_rio10_sparse_scan_name(scene_name: str) -> str:
+        base = str(scene_name)
+        for suffix in ("_train", "_test", "_val"):
+            if base.endswith(suffix):
+                base = base[:-len(suffix)]
+                break
+        parts = base.split("_")
+        if len(parts) >= 3 and parts[0].startswith("scene") and parts[1].startswith("seq"):
+            return f"{parts[0]}_{parts[1]}_{parts[1]}_{parts[2]}"
+        return base
+
+    def _resolve_wai_aux_depth_dir(self, scene_root: Path, explicit_root, depth_kind: str) -> Path:
+        scene_root = Path(scene_root)
+        if explicit_root is None or not str(explicit_root):
+            return scene_root / depth_kind
+
+        root = Path(explicit_root)
+        if root.name == depth_kind:
+            return root
+        if (root / "scene_meta.json").exists():
+            return root / depth_kind
+        if (root / depth_kind).exists() and not any((root / child).exists() for child in ("logs", "metadata")):
+            return root / depth_kind
+        if depth_kind == "sparse_depth" and (root / "sparse_depth").exists():
+            return root / "sparse_depth"
+
+        sparse_scan_name = self._derive_rio10_sparse_scan_name(scene_root.name)
+        candidates = [
+            root / sparse_scan_name / depth_kind,
+            root / sparse_scan_name / "sparse_depth",
+            root / scene_root.name / depth_kind,
+            root / depth_kind,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
+
+    @staticmethod
+    def _wai_frame_sparse_depth_stems(frame_name: str):
+        stems = []
+        text = str(frame_name)
+        if "frame-" in text:
+            stems.append(text[text.index("frame-"):])
+        stems.append(Path(text).stem)
+        deduped = []
+        for item in stems:
+            if item and item not in deduped:
+                deduped.append(item)
+        return deduped
+
+    def _build_wai_depth_paths_by_index(self, dataset, scene_root: Path, depth_dir: Path):
+        depth_kind = str(getattr(self.options, "c1_aux_depth_kind", depth_dir.name) or depth_dir.name)
+        frames = getattr(dataset, "scene_meta", {}).get("frames", [])
+        frame_meta = {str(f.get("frame_name")): f for f in frames if "frame_name" in f}
+        depth_paths = [None] * len(getattr(dataset, "frame_names", []))
+        matched = 0
+        for real_idx, frame_name in enumerate(getattr(dataset, "frame_names", [])):
+            candidates = []
+            meta = frame_meta.get(str(frame_name))
+            if isinstance(meta, dict) and depth_kind in meta:
+                candidates.append(Path(scene_root) / str(meta[depth_kind]))
+            for stem in self._wai_frame_sparse_depth_stems(frame_name):
+                candidates.extend([
+                    depth_dir / f"{stem}.stable.depth.png",
+                    depth_dir / f"{stem}.depth.png",
+                    depth_dir / f"{stem}.png",
+                    depth_dir / f"{stem}.npy",
+                    depth_dir / f"{stem}.npz",
+                    depth_dir / f"{stem}.exr",
+                ])
+            chosen = next((p for p in candidates if p.exists()), None)
+            if chosen is not None:
+                depth_paths[real_idx] = chosen
+                matched += 1
+        _logger.info(
+            "[LMC] WAI aux depth alignment: scene=%s depth_dir=%s matched=%d/%d depth_kind=%s",
+            scene_root, depth_dir, matched, len(depth_paths), depth_kind,
+        )
+        if matched == 0:
+            raise ValueError(f"[LMC] WAI aux depth found no matching frames: scene={scene_root}, depth_dir={depth_dir}")
+        return depth_paths
+
+    def _attach_wai_aux_depth_dataset(self, dataset, scene_root: Path, depth_dir: Path):
+        if not depth_dir.exists():
+            raise FileNotFoundError(
+                f"[LMC] WAI aux depth dir is missing: {depth_dir}. "
+                "For RIO10 sparse depth, pass --c1_aux_depth_root /data/xwh/RIO10_sparse_depth "
+                "--c1_aux_depth_kind sparse_depth."
+            )
+        depth_paths_by_index = self._build_wai_depth_paths_by_index(dataset, scene_root, depth_dir)
+        original_get_single_item = dataset._get_single_item
+
+        def _get_single_item_with_aux_depth(ds, idx, image_height):
+            image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, _coords, rgb_path = original_get_single_item(idx, image_height)
+            real_idx = int(ds.valid_file_indices[int(idx)])
+            depth_path = depth_paths_by_index[real_idx] if real_idx < len(depth_paths_by_index) else None
+            image_hw = (int(image.shape[1]), int(image.shape[2]))
+            if depth_path is None:
+                depth = np.zeros(image_hw, dtype=np.float64)
+            else:
+                depth = TrainerACEDINOv2LMC._load_wai_depth_npy(depth_path)
+            coords = TrainerACEDINOv2LMC._depth_to_patch_scene_coords(
+                depth,
+                pose,
+                image_hw=image_hw,
+                focal_length=[float(intrinsics[0, 0]), float(intrinsics[1, 1])],
+                centre_point=[float(intrinsics[0, 2]), float(intrinsics[1, 2])],
+            )
+            return image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, rgb_path
+
+        dataset._lmc_original_get_single_item = original_get_single_item
+        dataset._lmc_aux_depth_dir = depth_dir
+        dataset._lmc_aux_depth_missing_count = sum(path is None for path in depth_paths_by_index)
+        dataset._get_single_item = MethodType(_get_single_item_with_aux_depth, dataset)
+        return dataset
+
     def _attach_ace_aux_depth_dataset(self, dataset, train_root: Path, depth_dir: Path):
         if not depth_dir.exists():
             raise FileNotFoundError(
@@ -753,10 +938,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         rgb_files = getattr(dataset, "rgb_files", [])
         depth_paths_by_index = self._build_aux_depth_map_from_scene_meta(dataset, depth_dir)
         if depth_paths_by_index is None:
+            def _depth_match_key(path: Path) -> str:
+                stem = path.stem.replace("image-", "")
+                for suffix in (".stable.depth", ".depth"):
+                    if stem.endswith(suffix):
+                        stem = stem[:-len(suffix)]
+                        break
+                return stem
+
             depth_files = {
-                p.stem.replace("image-", ""): p
+                _depth_match_key(p): p
                 for p in depth_dir.iterdir()
-                if p.is_file() and p.suffix.lower() == ".npy"
+                if p.is_file() and p.suffix.lower() in {".npy", ".npz", ".png", ".tif", ".tiff", ".exr"}
             }
             rgb_ids = {Path(p).stem for p in rgb_files}
             matched = sorted(rgb_ids & set(depth_files))
@@ -782,45 +975,24 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         original_get_single_item = dataset._get_single_item
 
         def _get_single_item_with_aux_depth(ds, idx, image_height):
-            # Keep the original path for non-ACE edge cases.
             idx = int(idx)
-            real_idx = int(ds.valid_file_indices[idx])
-            rgb_path = Path(ds.rgb_files[real_idx])
+            real_idx = int(ds.valid_file_indices[idx]) if hasattr(ds, "valid_file_indices") else idx
             depth_path = depth_paths_by_index[real_idx] if real_idx < len(depth_paths_by_index) else None
 
-            image = ds._load_image(real_idx)
-            k = np.loadtxt(ds.calibration_files[real_idx])
-            if k.size == 1:
-                focal_length = float(k)
-                centre_point = None
-            elif k.shape == (3, 3):
-                k = k.tolist()
-                focal_length = [float(k[0][0]), float(k[1][1])]
-                centre_point = [float(k[0][2]), float(k[1][2])]
-            else:
-                raise ValueError("Calibration file must contain either a 3x3 matrix or a single float.")
+            # Preserve the backend dataset behavior exactly (GLACE global features,
+            # image resizing, augmentation, intrinsics, pose handling, etc.). We only
+            # replace the coords slot with sparse-depth-derived scene coordinates.
+            item = list(original_get_single_item(idx, image_height))
+            if len(item) < 7:
+                raise ValueError(f"[LMC] ACE aux depth wrapper expected dataset item with coords slot, got len={len(item)}")
 
-            image_height_rounded = ds._round_to_patch_size(image_height)
-            h_scale = image_height_rounded / image.shape[0]
-            if centre_point:
-                centre_point = [centre_point[0] * h_scale, centre_point[1] * h_scale]
-                focal_length = [focal_length[0] * h_scale, focal_length[1] * h_scale]
-            else:
-                focal_length *= h_scale
+            image = item[0]
+            pose = item[2]
+            intrinsics = item[4]
+            if not torch.is_tensor(image) or image.ndim != 3:
+                raise ValueError(f"[LMC] ACE aux depth wrapper expected image CHW tensor, got {type(image)} shape={getattr(image, 'shape', None)}")
+            image_hw = (int(image.shape[1]), int(image.shape[2]))
 
-            image = ds._resize_image(image, image_height_rounded)
-            current_width = image.size[0]
-            target_width = ds.image_width if ds.image_width is not None else ds._round_to_patch_size(current_width)
-            if target_width != current_width:
-                image = TF.resize(image, (image_height_rounded, target_width))
-                w_scale = target_width / current_width
-                if centre_point:
-                    centre_point[0] *= w_scale
-                    focal_length[0] *= w_scale
-                else:
-                    focal_length *= w_scale
-
-            image_hw = (image.size[1], image.size[0])
             if depth_path is None:
                 depth = np.zeros(image_hw, dtype=np.float64)
             else:
@@ -834,51 +1006,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         anti_aliasing=False,
                     )
 
-            image_mask = torch.ones((1, image.size[1], image.size[0]))
-            image = ds.image_transform(image)
-            pose = ds._load_pose(real_idx)
-
-            if ds.augment:
-                angle = random.uniform(-ds.aug_rotation, ds.aug_rotation)
-                image = ds._rotate_image(image, angle, 1, "reflect")
-                image_mask = ds._rotate_image(image_mask, angle, order=1, mode="constant")
-                depth = rotate(depth, angle, order=0, mode="constant", preserve_range=True)
-
-                angle_rad = angle * math.pi / 180.0
-                pose_rot = torch.eye(4)
-                pose_rot[0, 0] = math.cos(angle_rad)
-                pose_rot[0, 1] = -math.sin(angle_rad)
-                pose_rot[1, 0] = math.sin(angle_rad)
-                pose_rot[1, 1] = math.cos(angle_rad)
-                pose = torch.matmul(pose, pose_rot)
-
+            focal_length = [float(intrinsics[0, 0]), float(intrinsics[1, 1])]
+            centre_point = [float(intrinsics[0, 2]), float(intrinsics[1, 2])]
             coords = TrainerACEDINOv2LMC._depth_to_patch_scene_coords(
                 depth,
                 pose,
-                image_hw=(image.shape[1], image.shape[2]),
+                image_hw=image_hw,
                 focal_length=focal_length,
                 centre_point=centre_point,
             )
-
-            if ds.use_half and torch.cuda.is_available():
-                image = image.half()
-            image_mask = image_mask > 0
-            pose_inv = pose.inverse()
-
-            intrinsics = torch.eye(3)
-            if centre_point:
-                intrinsics[0, 2] = centre_point[0]
-                intrinsics[1, 2] = centre_point[1]
-                intrinsics[0, 0] = focal_length[0]
-                intrinsics[1, 1] = focal_length[1]
-            else:
-                intrinsics[0, 2] = image.shape[2] / 2
-                intrinsics[1, 2] = image.shape[1] / 2
-                intrinsics[0, 0] = focal_length
-                intrinsics[1, 1] = focal_length
-
-            return image, image_mask, pose, pose_inv, intrinsics, intrinsics.inverse(), coords, str(rgb_path)
-
+            item[6] = coords
+            return tuple(item)
         dataset._lmc_original_get_single_item = original_get_single_item
         dataset._lmc_aux_depth_dir = depth_dir
         dataset._lmc_aux_depth_missing_count = sum(path is None for path in depth_paths_by_index)
@@ -894,50 +1032,240 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "For indoor6_ace exports, provide train/depth or use a dataset backend that returns coords."
         )
 
-    def _build_train_dataset(self, image_width=None, augment=False, aug_rotation=0, aug_scale_max=1.0, aug_scale_min=1.0):
-        dataset = super()._build_train_dataset(
-            image_width=image_width,
-            augment=augment,
-            aug_rotation=aug_rotation,
-            aug_scale_max=aug_scale_max,
-            aug_scale_min=aug_scale_min,
+    def _is_glace_backend(self):
+        return str(getattr(self.options, "model_backend", "ace_dinov2")) == "glace_lmc"
+
+    def _glace_head_freeze_active(self, iteration_idx):
+        if not self._is_glace_backend():
+            return False
+        freeze_iters = max(0, int(getattr(self.options, "glace_head_freeze_iters", 0)))
+        return int(iteration_idx) < freeze_iters
+
+    def _set_glace_head_trainable(self, trainable, *, stage_tag):
+        if not self._is_glace_backend():
+            return
+        trainable = bool(trainable)
+        for param in self.regressor.heads.parameters():
+            param.requires_grad_(trainable)
+        self.regressor.heads.train(trainable)
+        _logger.info("[%s] GLACE head trainable=%s.", stage_tag, trainable)
+
+    def _glace_residual_lr_ratio(self, fallback_ratio):
+        ratio = float(getattr(self.options, "glace_residual_lr_ratio", -1.0))
+        if ratio < 0:
+            return float(fallback_ratio)
+        return ratio
+
+    def _buffer_schema_name(self, base_name):
+        if self._is_glace_backend():
+            return f"{base_name}_glace"
+        return base_name
+
+    def _glace_decoder_feature_dim(self):
+        if not self._is_glace_backend():
+            return int(getattr(getattr(self.regressor, "encoder", None), "feature_dim", 0) or 0)
+        decoder_dim = int(getattr(self.regressor, "decoder_dim", 0) or 0)
+        if decoder_dim <= 0:
+            encoder_dim = int(getattr(self.regressor, "feature_dim", 0))
+            decoder_dim = encoder_dim + int(getattr(self, "glace_global_feat_dim", 0))
+        return decoder_dim
+
+    def _buffer_feature_dim(self):
+        return self._glace_decoder_feature_dim() if self._is_glace_backend() else int(getattr(self.regressor, "feature_dim", 0))
+
+    def _mix_glace_decoder_features(self, base_decoder_features_bC, candidate_decoder_features_bC, *, stage_tag):
+        if not self._is_glace_backend():
+            return candidate_decoder_features_bC
+        if base_decoder_features_bC is None:
+            return candidate_decoder_features_bC
+        if getattr(self, "glace_residual_adapter", None) is None:
+            return candidate_decoder_features_bC
+        if tuple(base_decoder_features_bC.shape) != tuple(candidate_decoder_features_bC.shape):
+            raise ValueError(
+                f"[{stage_tag}] GLACE decoder feature shape mismatch: "
+                f"base={tuple(base_decoder_features_bC.shape)} candidate={tuple(candidate_decoder_features_bC.shape)}"
+            )
+        return self.glace_residual_adapter(base_decoder_features_bC, candidate_decoder_features_bC)
+
+    def _mix_glace_decoder_feature_maps(self, base_decoder_features_BCHW, candidate_decoder_features_BCHW, *, stage_tag):
+        if not self._is_glace_backend():
+            return candidate_decoder_features_BCHW
+        if base_decoder_features_BCHW is None:
+            return candidate_decoder_features_BCHW
+        if tuple(base_decoder_features_BCHW.shape) != tuple(candidate_decoder_features_BCHW.shape):
+            raise ValueError(
+                f"[{stage_tag}] GLACE decoder feature-map shape mismatch: "
+                f"base={tuple(base_decoder_features_BCHW.shape)} candidate={tuple(candidate_decoder_features_BCHW.shape)}"
+            )
+        B, C, H, W = candidate_decoder_features_BCHW.shape
+        base_bC = base_decoder_features_BCHW.permute(0, 2, 3, 1).reshape(B * H * W, C)
+        cand_bC = candidate_decoder_features_BCHW.permute(0, 2, 3, 1).reshape(B * H * W, C)
+        mixed_bC = self._mix_glace_decoder_features(base_bC, cand_bC, stage_tag=stage_tag)
+        return mixed_bC.view(B, H, W, C).permute(0, 3, 1, 2)
+
+    def _build_glace_decoder_feature_maps(self, local_features_BCHW, img_idx_B, *, stage_tag):
+        if not self._is_glace_backend():
+            return local_features_BCHW
+        if img_idx_B is None:
+            raise ValueError(f"[{stage_tag}] GLACE backend requires img_idx to assemble decoder features.")
+        if not hasattr(self, "global_feats") or self.global_feats is None:
+            raise ValueError(f"[{stage_tag}] GLACE backend global_feats are not initialized.")
+        idx = img_idx_B.to(self.global_feats.device, non_blocking=True).long().view(-1)
+        global_features_BC = self.global_feats[idx]
+        if global_features_BC.device != local_features_BCHW.device:
+            global_features_BC = global_features_BC.to(local_features_BCHW.device, non_blocking=True)
+        if global_features_BC.dtype != local_features_BCHW.dtype:
+            global_features_BC = global_features_BC.to(dtype=local_features_BCHW.dtype)
+        return torch.cat(
+            (global_features_BC[..., None, None].expand(-1, -1, local_features_BCHW.shape[2], local_features_BCHW.shape[3]), local_features_BCHW),
+            dim=1,
         )
+
+    def _build_glace_decoder_features(self, local_features_bC, img_idx_b1, *, stage_tag):
+        if not self._is_glace_backend():
+            return local_features_bC
+        if img_idx_b1 is None:
+            raise ValueError(f"[{stage_tag}] GLACE backend requires img_idx to assemble decoder features.")
+        if not hasattr(self, "global_feats") or self.global_feats is None:
+            raise ValueError(f"[{stage_tag}] GLACE backend global_feats are not initialized.")
+        idx = img_idx_b1.to(self.global_feats.device, non_blocking=True).long().view(-1)
+        global_features_bC = self.global_feats[idx]
+        if global_features_bC.device != local_features_bC.device:
+            global_features_bC = global_features_bC.to(local_features_bC.device, non_blocking=True)
+        if global_features_bC.dtype != local_features_bC.dtype:
+            global_features_bC = global_features_bC.to(dtype=local_features_bC.dtype)
+        return torch.cat((global_features_bC, local_features_bC), dim=1)
+
+    def _build_train_dataset(self, image_width=None, augment=False, aug_rotation=0, aug_scale_max=1.0, aug_scale_min=1.0):
+        if self._is_glace_backend():
+            backend = getattr(self.options, "data_backend", "ace")
+            if backend != "ace":
+                raise ValueError("[GLACE-LMC] model_backend=glace_lmc currently supports only data_backend=ace.")
+            train_root = self._get_train_root()
+            dataset = build_glace_camloc_dataset(
+                glace_root=self.options.glace_root,
+                root_dir=train_root,
+                mode=0,
+                augment=augment,
+                aug_rotation=aug_rotation,
+                aug_scale_max=aug_scale_max,
+                aug_scale_min=aug_scale_min,
+                image_height=self.options.image_resolution,
+                use_half=self.options.use_half,
+                num_clusters=None,
+                cluster_idx=None,
+                feat_name=str(getattr(self.options, "glace_feat_name", "features.npy")),
+            )
+        else:
+            dataset = super()._build_train_dataset(
+                image_width=image_width,
+                augment=augment,
+                aug_rotation=aug_rotation,
+                aug_scale_max=aug_scale_max,
+                aug_scale_min=aug_scale_min,
+            )
         aux_ref_required = float(getattr(self.options, "c1_aux_ref_loss_weight", 0.0)) > 0.0
         valid_coord_sampling = bool(getattr(self.options, "buffer_sample_valid_coords", True))
-        if (
-            (aux_ref_required or valid_coord_sampling)
-            and getattr(self.options, "data_backend", "ace") == "ace"
-            and hasattr(dataset, "init")
-        ):
+        if (aux_ref_required or valid_coord_sampling) and hasattr(dataset, "init"):
             train_root = self._get_train_root()
-            ace_depth_dir = train_root / "depth"
-            if ace_depth_dir.exists():
-                dataset.init = True
-                dataset.sparse = False
-                dataset.eye = False
-                dataset.coord_files = sorted(ace_depth_dir.iterdir())
-            else:
+            backend = getattr(self.options, "data_backend", "ace")
+            if backend == "ace":
+                ace_depth_dir = train_root / "depth"
+                if ace_depth_dir.exists():
+                    dataset.init = True
+                    dataset.sparse = False
+                    dataset.eye = False
+                    dataset.coord_files = sorted(ace_depth_dir.iterdir())
+                    if getattr(dataset, "prediction_grid", None) is None:
+                        dataset.prediction_grid = dataset._create_prediction_grid()
+                else:
+                    depth_dir = self._infer_c1_aux_depth_dir(train_root)
+                    if aux_ref_required or depth_dir.exists():
+                        dataset = self._attach_ace_aux_depth_dataset(dataset, train_root, depth_dir)
+                    elif not getattr(self, "_warned_missing_valid_coord_sampling_depth", False):
+                        _logger.warning(
+                            "[LMC] --buffer_sample_valid_coords=True but no aux depth dir found at %s; "
+                            "falling back to image-mask random sampling.",
+                            depth_dir,
+                        )
+                        self._warned_missing_valid_coord_sampling_depth = True
+            elif backend == "wai":
                 depth_dir = self._infer_c1_aux_depth_dir(train_root)
                 if aux_ref_required or depth_dir.exists():
-                    dataset = self._attach_ace_aux_depth_dataset(dataset, train_root, depth_dir)
+                    dataset = self._attach_wai_aux_depth_dataset(dataset, train_root, depth_dir)
                 elif not getattr(self, "_warned_missing_valid_coord_sampling_depth", False):
                     _logger.warning(
-                        "[LMC] --buffer_sample_valid_coords=True but no aux depth dir found at %s; "
+                        "[LMC] --buffer_sample_valid_coords=True but no WAI aux depth dir found at %s; "
                         "falling back to image-mask random sampling.",
                         depth_dir,
                     )
                     self._warned_missing_valid_coord_sampling_depth = True
         return dataset
 
+    def _create_regressor(self):
+        if not self._is_glace_backend():
+            return super()._create_regressor()
+        global_feat_dim = int(getattr(self.dataset, "global_feat_dim", 0))
+        regressor = create_glace_regressor_from_encoder(
+            glace_root=self.options.glace_root,
+            encoder_path=self.options.glace_encoder_path,
+            mean=self.dataset.mean_cam_center,
+            num_head_blocks=self.options.num_head_blocks,
+            use_homogeneous=self.options.use_homogeneous,
+            global_feat_dim=global_feat_dim,
+            head_channels=int(getattr(self.options, "glace_head_channels", 512)),
+            mlp_ratio=float(getattr(self.options, "glace_mlp_ratio", 1.0)),
+            map_location="cpu",
+        )
+        _logger.info(
+            "Loaded GLACE encoder from: %s (global_feat_dim=%d, feat_name=%s)",
+            self.options.glace_encoder_path,
+            global_feat_dim,
+            getattr(self.options, "glace_feat_name", "features.npy"),
+        )
+        return regressor
+
     def __init__(self, options):
         # Determine if LMC is active *before* parent __init__
+        self.model_backend = str(getattr(options, 'model_backend', 'ace_dinov2'))
         self.use_lmc = getattr(options, 'use_lmc', False)
         memory_path = getattr(options, 'memory_path', None)
         if memory_path is None:
             self.use_lmc = False
+        if self.model_backend == 'glace_lmc' and not self.use_lmc:
+            raise ValueError('[GLACE-LMC] model_backend=glace_lmc requires --use_lmc True and a valid --memory_path.')
+        if self.model_backend == 'glace_lmc' and str(getattr(options, 'data_backend', 'ace')) != 'ace':
+            raise ValueError('[GLACE-LMC] model_backend=glace_lmc currently supports only data_backend=ace.')
+        if self.model_backend == 'glace_lmc' and str(getattr(options, 'lmc_flow', 'iterative')) != 'ace_g':
+            raise ValueError('[GLACE-LMC] full-decoder fusion currently requires --lmc_flow ace_g.')
 
         # Parent builds: dataset, regressor, optimizer, scheduler, loss, buffer
         super().__init__(options)
+        self.global_feats = None
+        self.glace_global_feat_dim = 0
+        self.glace_residual_adapter = None
+        if self._is_glace_backend():
+            self.glace_global_feat_dim = int(getattr(self.dataset, 'global_feat_dim', 0))
+            self.global_feats = torch.tensor(
+                self.dataset.global_feats,
+                dtype=(torch.float32, torch.float16)[self.options.use_half],
+                device=self.device,
+            )
+            glace_residual_mode = str(getattr(self.options, 'glace_residual_mode', 'local_delta_tanh_scalar'))
+            glace_residual_gate_init = float(getattr(self.options, 'glace_residual_gate_init', 0.0))
+            self.glace_residual_adapter = GLACEDecoderFeatureResidualAdapter(
+                residual_gate_init=glace_residual_gate_init,
+                mode=glace_residual_mode,
+                global_dim=self.glace_global_feat_dim,
+            ).to(self.device)
+            _logger.info('[GLACE-LMC] Loaded %d global features with dim=%d.', int(self.global_feats.shape[0]), self.glace_global_feat_dim)
+            _logger.info(
+                '[GLACE-LMC] Decoder residual adapter initialized: mode=%s, init=%.4f, gain=%.4f, global_dim=%d.',
+                glace_residual_mode,
+                glace_residual_gate_init,
+                float(self.glace_residual_adapter.residual_gain().detach().cpu().item()),
+                self.glace_global_feat_dim,
+            )
         self._training_generator_cpu = torch.Generator().manual_seed(self.base_seed + 8191)
         self._training_generator_cuda = None
         if torch.cuda.is_available():
@@ -1193,7 +1521,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         lmc_feature_hierarchy_mode = str(
             getattr(options, 'lmc_feature_hierarchy_mode', 'selected_key_concat_value')
         )
-        if lmc_feature_hierarchy_mode not in ('selected_key_concat_value', 'levelwise_latent_merge'):
+        if lmc_feature_hierarchy_mode not in (
+            'selected_key_concat_value',
+            'levelwise_latent_merge',
+            'levelwise_anchor_residual',
+        ):
             raise ValueError(f"Unsupported lmc_feature_hierarchy_mode={lmc_feature_hierarchy_mode!r}")
         lmc_level_merge_mode = str(getattr(options, 'lmc_level_merge_mode', 'softmax_gate'))
         lmc_level_merge_init = str(getattr(options, 'lmc_level_merge_init', 'uniform'))
@@ -1201,6 +1533,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         lmc_level_cross_attn_shared = bool(getattr(options, 'lmc_level_cross_attn_shared', True))
         lmc_level_gate_entropy_weight = float(getattr(options, 'lmc_level_gate_entropy_weight', 0.0))
         lmc_level_token_gate = bool(getattr(options, 'lmc_level_token_gate', False))
+        lmc_level_anchor_residual_gamma_init = float(
+            getattr(options, 'lmc_level_anchor_residual_gamma_init', 0.0)
+        )
         lmc_geo_bias_mode = str(getattr(options, 'lmc_geo_bias_mode', 'legacy'))
         if lmc_geo_bias_mode not in ('legacy', 'rbf_residual', 'crpb'):
             raise ValueError(f"Unsupported lmc_geo_bias_mode={lmc_geo_bias_mode!r}")
@@ -1228,6 +1563,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if lmc_point_rope_coord_norm != 'scene_radius':
             raise ValueError(f"Unsupported lmc_point_rope_coord_norm={lmc_point_rope_coord_norm!r}")
         lmc_point_rope_radius = float(getattr(options, 'lmc_point_rope_radius', 4.0))
+        lmc_point_rope_radius_policy = str(getattr(options, 'lmc_point_rope_radius_policy', 'fixed'))
+        if lmc_point_rope_radius_policy not in ('fixed', 'memory_p95', 'mixed_fixed_memory_p95'):
+            raise ValueError(f"Unsupported lmc_point_rope_radius_policy={lmc_point_rope_radius_policy!r}")
+        lmc_point_rope_mixed_memory_ratio = float(getattr(options, 'lmc_point_rope_mixed_memory_ratio', 0.5))
+        if not 0.0 <= lmc_point_rope_mixed_memory_ratio <= 1.0:
+            raise ValueError(
+                f"lmc_point_rope_mixed_memory_ratio must be in [0,1], got {lmc_point_rope_mixed_memory_ratio!r}"
+            )
+        lmc_point_rope_seed_pe = str(getattr(options, 'lmc_point_rope_seed_pe', 'fourier_legacy'))
+        if lmc_point_rope_seed_pe not in ('fourier_legacy', 'sincos_deterministic'):
+            raise ValueError(f"Unsupported lmc_point_rope_seed_pe={lmc_point_rope_seed_pe!r}")
         lmc_point_rope_base = float(getattr(options, 'lmc_point_rope_base', 10000.0))
         lmc_point_rope_axes = str(getattr(options, 'lmc_point_rope_axes', 'xyz_split'))
         lmc_point_rope_apply_to = str(getattr(options, 'lmc_point_rope_apply_to', 'qk'))
@@ -1236,20 +1582,20 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         lmc_geo_bias_crpb_radius = float(getattr(options, 'lmc_geo_bias_crpb_radius', 4.0))
         lmc_geo_bias_crpb_per_head = bool(getattr(options, 'lmc_geo_bias_crpb_per_head', False))
         lmc_geo_bias_crpb_zero_init = bool(getattr(options, 'lmc_geo_bias_crpb_zero_init', True))
-        if lmc_feature_hierarchy_mode == 'levelwise_latent_merge':
+        if lmc_feature_hierarchy_mode in ('levelwise_latent_merge', 'levelwise_anchor_residual'):
             if lmc_mode not in ('global', 'local'):
                 raise ValueError(
-                    "levelwise_latent_merge currently supports only global/local LMC modes, "
+                    f"{lmc_feature_hierarchy_mode} currently supports only global/local LMC modes, "
                     f"got {lmc_mode!r}."
                 )
             if lmc_level_merge_mode != 'softmax_gate':
                 raise ValueError(f"Unsupported lmc_level_merge_mode={lmc_level_merge_mode!r}")
-            if lmc_level_merge_init != 'uniform':
+            if lmc_level_merge_init not in ('uniform', 'key_slice_bias'):
                 raise ValueError(f"Unsupported lmc_level_merge_init={lmc_level_merge_init!r}")
             if lmc_level_gate_entropy_weight != 0.0:
-                raise ValueError("lmc_level_gate_entropy_weight must be 0.0 for B3-lite.")
+                raise ValueError("lmc_level_gate_entropy_weight must be 0.0 for current levelwise modes.")
             if lmc_level_token_gate:
-                raise ValueError("lmc_level_token_gate must be False for B3-lite.")
+                raise ValueError("lmc_level_token_gate must be False for current levelwise modes.")
         _logger.info(
             "[LMC] Mode contract: requested=%s effective=%s auto_by_visibility=%s",
             requested_lmc_mode,
@@ -1284,8 +1630,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 scale_token_dim = st.shape[-1]
                 _logger.info("[LMC] scale_token_dim=%d from all_scale_tokens", scale_token_dim)
 
-        backbone_feature_dim = getattr(self.regressor.encoder, 'feature_dim', 1024)
-        _logger.info("[LMC] backbone_feature_dim=%d (from regressor.encoder)", backbone_feature_dim)
+        encoder_feature_dim = int(getattr(self.regressor.encoder, 'feature_dim', getattr(self.regressor, 'feature_dim', 1024)))
+        backbone_feature_dim = self._glace_decoder_feature_dim() if self._is_glace_backend() else encoder_feature_dim
+        _logger.info(
+            "[LMC] encoder_feature_dim=%d fusion_query_dim=%d%s",
+            encoder_feature_dim,
+            backbone_feature_dim,
+            " (GLACE decoder feature: global+local)" if self._is_glace_backend() else "",
+        )
 
         # --- Full-pipeline normalization: store mu/sigma for config ---
         norm_mu = bank_data.get("normalization_mu")   # [3] or None
@@ -1347,6 +1699,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if lmc_fusion_geometry_mode not in ('value_only_raw', 'value_only_norm', 'geokey_norm'):
             raise ValueError(f"Unsupported lmc_fusion_geometry_mode={lmc_fusion_geometry_mode!r}")
         lmc_fusion_key_geo_init = float(getattr(options, 'lmc_fusion_key_geo_init', 0.0))
+        lmc_fusion_refinement_mode = str(getattr(options, 'lmc_fusion_refinement_mode', 'single'))
+        if lmc_fusion_refinement_mode not in ('single', 'cascade_internal'):
+            raise ValueError(f"Unsupported lmc_fusion_refinement_mode={lmc_fusion_refinement_mode!r}")
+        lmc_fusion_cascade_layers = int(getattr(options, 'lmc_fusion_cascade_layers', 4))
+        if lmc_fusion_cascade_layers < 1:
+            raise ValueError(f"lmc_fusion_cascade_layers must be >= 1, got {lmc_fusion_cascade_layers}")
+        lmc_fusion_assembly_mode = str(getattr(options, 'lmc_fusion_assembly_mode', 'concat_mlp'))
+        if lmc_fusion_assembly_mode not in ('concat_mlp',):
+            raise ValueError(f"Unsupported lmc_fusion_assembly_mode={lmc_fusion_assembly_mode!r}")
+        lmc_fusion_assembly_gamma_init = float(getattr(options, 'lmc_fusion_assembly_gamma_init', 0.0))
+        if lmc_fusion_refinement_mode == 'cascade_internal' and lmc_mode == 'hierarchical':
+            raise ValueError('cascade_internal fusion refinement is only supported for non-hierarchical LMC modes.')
         needs_scene_scale = (
             lmc_fusion_geometry_mode != 'value_only_raw'
             or compressor_pe_scale_mode == 'scene_scale'
@@ -1361,6 +1725,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             lmc_geometry_scene_scale,
             lmc_geometry_scene_scale_source,
             lmc_fusion_key_geo_init,
+        )
+        _logger.info(
+            "[LMC-Fusion] refinement_mode=%s cascade_layers=%d assembly_mode=%s gamma_init=%.6f",
+            lmc_fusion_refinement_mode,
+            lmc_fusion_cascade_layers,
+            lmc_fusion_assembly_mode,
+            lmc_fusion_assembly_gamma_init,
         )
 
         self.lmc_config = {
@@ -1388,6 +1759,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'lmc_level_cross_attn_shared': lmc_level_cross_attn_shared,
             'lmc_level_gate_entropy_weight': lmc_level_gate_entropy_weight,
             'lmc_level_token_gate': lmc_level_token_gate,
+            'lmc_level_anchor_residual_gamma_init': lmc_level_anchor_residual_gamma_init,
+            'final_lmc_level_anchor_residual_gamma': None,
             'lmc_level_merge_weights': None,
             'lmc_level_gate_entropy': None,
             'geo_bias_mode': lmc_geo_bias_mode,
@@ -1397,6 +1770,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'geo_bias_rbf_per_head': lmc_geo_bias_rbf_per_head,
             'final_geo_bias_rbf_alpha': None,
             'final_geo_bias_rbf_weights': None,
+            'attention_bias_stats': None,
             'pos_encoding_mode': lmc_pos_encoding_mode,
             'pos_fourier_v2_scales': lmc_pos_fourier_v2_scales,
             'pos_fourier_coord_norm': lmc_pos_fourier_coord_norm,
@@ -1406,6 +1780,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'final_pos_fourier_residual_gate': None,
             'point_rope_coord_norm': lmc_point_rope_coord_norm,
             'point_rope_radius': lmc_point_rope_radius,
+            'point_rope_radius_policy': lmc_point_rope_radius_policy,
+            'point_rope_mixed_memory_ratio': lmc_point_rope_mixed_memory_ratio,
+            'point_rope_seed_pe': lmc_point_rope_seed_pe,
             'point_rope_base': lmc_point_rope_base,
             'point_rope_axes': lmc_point_rope_axes,
             'point_rope_apply_to': lmc_point_rope_apply_to,
@@ -1428,10 +1805,33 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'lmc_fusion_key_geo_init': lmc_fusion_key_geo_init,
             'lmc_fusion_scene_scale': lmc_geometry_scene_scale,
             'lmc_fusion_scene_scale_source': lmc_geometry_scene_scale_source,
+            'lmc_fusion_refinement_mode': lmc_fusion_refinement_mode,
+            'lmc_fusion_cascade_layers': lmc_fusion_cascade_layers,
+            'lmc_fusion_assembly_mode': lmc_fusion_assembly_mode,
+            'lmc_fusion_assembly_gamma_init': lmc_fusion_assembly_gamma_init,
+            'final_lmc_fusion_assembly_gamma': None,
             'ace_g_fusion_in_s2': bool(getattr(options, 'ace_g_fusion_in_s2', False)),
             'backbone_feature_dim': backbone_feature_dim,
+            'encoder_feature_dim': encoder_feature_dim,
+            'memory_feature_dim': feature_dim,
             'scale_token_dim': scale_token_dim,
             'memory_path': str(memory_path),
+            'model_backend': self.model_backend,
+            'data_backend': str(getattr(options, 'data_backend', 'ace')),
+            'wai_repo_root': str(getattr(options, 'wai_repo_root', '')),
+            'wai_image_modality': str(getattr(options, 'wai_image_modality', 'image')),
+            'glace_root': str(getattr(options, 'glace_root', '')),
+            'glace_encoder_path': str(getattr(options, 'glace_encoder_path', '')),
+            'glace_feat_name': str(getattr(options, 'glace_feat_name', 'features.npy')),
+            'glace_global_feat_dim': int(getattr(self, 'glace_global_feat_dim', 0)),
+            'glace_head_channels': int(getattr(options, 'glace_head_channels', 512)),
+            'glace_mlp_ratio': float(getattr(options, 'glace_mlp_ratio', 1.0)),
+            'glace_fusion_query': 'decoder_global_local' if self._is_glace_backend() else '',
+            'glace_residual_mode': str(getattr(options, 'glace_residual_mode', 'local_delta_tanh_scalar')) if self._is_glace_backend() else '',
+            'glace_residual_gate_init': float(getattr(options, 'glace_residual_gate_init', 0.0)) if self._is_glace_backend() else 0.0,
+            'glace_residual_global_dim': int(getattr(self, 'glace_global_feat_dim', 0)) if self._is_glace_backend() else 0,
+            'glace_head_freeze_iters': int(getattr(options, 'glace_head_freeze_iters', 0)) if self._is_glace_backend() else 0,
+            'glace_residual_lr_ratio': float(getattr(options, 'glace_residual_lr_ratio', -1.0)) if self._is_glace_backend() else -1.0,
             # Normalization metadata for test-time de-normalization
             'normalization_mu': self.coord_mu.cpu().tolist() if self.coord_mu is not None else None,
             'normalization_sigma': self.coord_sigma if self.coord_sigma is not None else None,
@@ -1484,6 +1884,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             level_cross_attn_shared=lmc_level_cross_attn_shared,
             level_gate_entropy_weight=lmc_level_gate_entropy_weight,
             level_token_gate=lmc_level_token_gate,
+            level_anchor_residual_gamma_init=lmc_level_anchor_residual_gamma_init,
             geo_bias_mode=lmc_geo_bias_mode,
             geo_bias_rbf_scales=lmc_geo_bias_rbf_scales,
             geo_bias_rbf_alpha_init=lmc_geo_bias_rbf_alpha_init,
@@ -1497,6 +1898,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             pos_fourier_residual_gate_init=lmc_pos_fourier_residual_gate_init,
             point_rope_coord_norm=lmc_point_rope_coord_norm,
             point_rope_radius=lmc_point_rope_radius,
+            point_rope_radius_policy=lmc_point_rope_radius_policy,
+            point_rope_mixed_memory_ratio=lmc_point_rope_mixed_memory_ratio,
+            point_rope_seed_pe=lmc_point_rope_seed_pe,
             point_rope_base=lmc_point_rope_base,
             point_rope_axes=lmc_point_rope_axes,
             point_rope_apply_to=lmc_point_rope_apply_to,
@@ -1517,6 +1921,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             fusion_geometry_mode=lmc_fusion_geometry_mode,
             fusion_scene_scale=lmc_geometry_scene_scale,
             fusion_key_geo_init=lmc_fusion_key_geo_init,
+            fusion_refinement_mode=lmc_fusion_refinement_mode,
+            fusion_cascade_layers=lmc_fusion_cascade_layers,
+            fusion_assembly_mode=lmc_fusion_assembly_mode,
+            fusion_assembly_gamma_init=lmc_fusion_assembly_gamma_init,
         ).to(self.device)
 
         # --- LMC training params ---
@@ -1614,10 +2022,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             f"loss_invalid_max_delta={self._loss_invalid_max_delta}, "
             f"s2_grad_clip={self._s2_grad_clip_max_norm}"
         )
+        self._load_resume_checkpoint_if_requested()
 
     def _resolve_buffer_schema_dim(self, dim_spec):
         if dim_spec == "feature_dim":
-            return int(self.regressor.feature_dim)
+            return int(self._buffer_feature_dim())
         return int(dim_spec)
 
     def _expected_training_buffer_feature_dtype(self):
@@ -1967,7 +2376,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         self.training_buffer = {
             'features': torch.empty(
-                (effective_size, self.regressor.feature_dim),
+                (effective_size, self._buffer_feature_dim()),
                 dtype=(torch.float32, torch.float16)[self.options.use_half],
                 device=buffer_device,
             ),
@@ -1978,6 +2387,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'gt_scene_coords_world': torch.empty((effective_size, 3), dtype=torch.float32, device=buffer_device),
             'gt_scene_coords_valid': torch.empty((effective_size, 1), dtype=torch.bool, device=buffer_device),
         }
+        if self._is_glace_backend():
+            self.training_buffer['img_idx'] = torch.empty((effective_size,), dtype=torch.int64, device=buffer_device)
 
         regressor_mode_snapshot = self._capture_module_training_modes(
             self.regressor,
@@ -2008,6 +2419,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 dataset_passes += 1
                 for batch in training_dataloader:
                     image_BCHW, image_mask_B1HW, _, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, *_ = batch
+                    img_idx_B = None
+                    if self._is_glace_backend():
+                        img_idx_B = batch[-1]
                     coords_B3HW = self._extract_gt_scene_coords_from_batch(batch, image_BCHW=image_BCHW)
 
                     image_BCHW = image_BCHW.to(self.device, non_blocking=True)
@@ -2029,7 +2443,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         image_BCHW = image_BCHW.float()
 
                     with autocast("cuda", enabled=self.options.use_half):
-                        features_BCHW = self.regressor.get_features(image_BCHW)
+                        local_features_BCHW = self.regressor.get_features(image_BCHW)
+                    if self._is_glace_backend():
+                        if img_idx_B is None:
+                            raise ValueError('[Buffer] GLACE backend batch is missing img_idx.')
+                        img_idx_B = img_idx_B.to(self.device, non_blocking=True).long()
+                        features_BCHW = self._build_glace_decoder_feature_maps(
+                            local_features_BCHW,
+                            img_idx_B,
+                            stage_tag='Buffer',
+                        )
+                    else:
+                        features_BCHW = local_features_BCHW
 
                     B, C, H, W = features_BCHW.shape
                     image_mask_B1HW = TF.resize(image_mask_B1HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
@@ -2067,6 +2492,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         'gt_scene_coords_world': normalize_shape(coords_B3HW),
                         'gt_scene_coords_valid': normalize_shape(coords_valid_B1HW),
                     }
+                    if self._is_glace_backend():
+                        batch_data['img_idx'] = img_idx_B.unsqueeze(1).expand(B, H * W).reshape(-1)
 
                     image_mask_B1HW = image_mask_B1HW.float()
                     image_mask_N1 = normalize_shape(image_mask_B1HW)
@@ -2152,6 +2579,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         params = (
             list(self.compressor.parameters()) +
             list(self.fusion.parameters()) +
+            list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters()) +
             list(self.regressor.heads.parameters())
         )
         self.optimizer = optim.AdamW(params, lr=self.options.learning_rate_min)
@@ -2464,6 +2892,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "lmc_level_cross_attn_shared",
             "lmc_level_gate_entropy_weight",
             "lmc_level_token_gate",
+            "lmc_level_anchor_residual_gamma_init",
+            "final_lmc_level_anchor_residual_gamma",
             "lmc_level_merge_weights",
             "lmc_level_gate_entropy",
             "geo_bias_mode",
@@ -2473,6 +2903,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "geo_bias_rbf_per_head",
             "final_geo_bias_rbf_alpha",
             "final_geo_bias_rbf_weights",
+            "attention_bias_stats",
             "pos_encoding_mode",
             "pos_fourier_v2_scales",
             "pos_fourier_coord_norm",
@@ -2482,6 +2913,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "final_pos_fourier_residual_gate",
             "point_rope_coord_norm",
             "point_rope_radius",
+            "point_rope_radius_policy",
+            "point_rope_mixed_memory_ratio",
+            "point_rope_seed_pe",
             "point_rope_base",
             "point_rope_axes",
             "point_rope_apply_to",
@@ -2503,6 +2937,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "lmc_fusion_key_geo_init",
             "lmc_fusion_scene_scale",
             "lmc_fusion_scene_scale_source",
+            "lmc_fusion_refinement_mode",
+            "lmc_fusion_cascade_layers",
+            "lmc_fusion_assembly_mode",
+            "lmc_fusion_assembly_gamma_init",
         ]
         key_mix_logits = getattr(getattr(self, "compressor", None), "key_mix_logits", None)
         if key_mix_logits is not None:
@@ -2512,10 +2950,19 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if isinstance(level_stats, dict):
             self.lmc_config["lmc_level_merge_weights"] = level_stats.get("lmc_level_merge_weights")
             self.lmc_config["lmc_level_gate_entropy"] = level_stats.get("lmc_level_gate_entropy")
+            self.lmc_config["final_lmc_level_anchor_residual_gamma"] = level_stats.get(
+                "lmc_level_anchor_residual_gamma"
+            )
         geo_bias_stats = getattr(getattr(self, "compressor", None), "last_geo_bias_runtime_stats", None)
         if isinstance(geo_bias_stats, dict):
             self.lmc_config["final_geo_bias_rbf_alpha"] = geo_bias_stats.get("final_geo_bias_rbf_alpha")
             self.lmc_config["final_geo_bias_rbf_weights"] = geo_bias_stats.get("final_geo_bias_rbf_weights")
+            self.lmc_config["attention_bias_stats"] = geo_bias_stats.get("attention_bias_stats")
+        level_anchor_gamma = getattr(getattr(self, "compressor", None), "level_anchor_residual_gamma", None)
+        if level_anchor_gamma is not None:
+            self.lmc_config["final_lmc_level_anchor_residual_gamma"] = float(
+                level_anchor_gamma.detach().float().cpu().item()
+            )
         pos_gate = getattr(getattr(getattr(self, "compressor", None), "pe_encoder", None), "residual_gate", None)
         if pos_gate is not None:
             self.lmc_config["final_pos_fourier_residual_gate"] = float(pos_gate.detach().float().cpu().item())
@@ -2602,13 +3049,21 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 weights_str = "[" + ",".join(f"{float(w):.3f}" for w in weights) + "]"
                 self.lmc_config["lmc_level_merge_weights"] = level_stats.get("lmc_level_merge_weights")
                 self.lmc_config["lmc_level_gate_entropy"] = level_stats.get("lmc_level_gate_entropy")
+                self.lmc_config["final_lmc_level_anchor_residual_gamma"] = level_stats.get(
+                    "lmc_level_anchor_residual_gamma"
+                )
                 _logger.info(
                     "[LMC-Runtime][%s] level_merge_weights=%s level_gate_entropy=%.4f "
+                    "anchor_gamma=%s anchor_norms(base/res/out)=%s/%s/%s "
                     "per_level_latent_norm_mean=%s per_level_latent_norm_std=%s "
                     "per_level_attention_entropy_mean=%s per_level_effective_memory_token_count=%s",
                     stage_tag,
                     weights_str,
                     float(level_stats.get("final_level_gate_entropy", 0.0)),
+                    str(level_stats.get("lmc_level_anchor_residual_gamma")),
+                    str(level_stats.get("level_anchor_base_norm")),
+                    str(level_stats.get("level_anchor_residual_norm")),
+                    str(level_stats.get("level_anchor_output_norm")),
                     level_stats.get("per_level_latent_norm_mean", []),
                     level_stats.get("per_level_latent_norm_std", []),
                     level_stats.get("per_level_attention_entropy_mean", []),
@@ -2619,11 +3074,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 self.lmc_config["final_geo_bias_rbf_alpha"] = geo_bias_stats.get("final_geo_bias_rbf_alpha")
                 self.lmc_config["final_geo_bias_rbf_weights"] = geo_bias_stats.get("final_geo_bias_rbf_weights")
                 _logger.info(
-                    "[LMC-Runtime][%s] geo_bias_mode=%s rbf_alpha=%s rbf_weights=%s",
+                    "[LMC-Runtime][%s] geo_bias_mode=%s rbf_alpha=%s rbf_weights=%s attention_bias_stats=%s",
                     stage_tag,
                     str(self.lmc_config.get("geo_bias_mode", "legacy")),
                     str(geo_bias_stats.get("final_geo_bias_rbf_alpha")),
                     str(geo_bias_stats.get("final_geo_bias_rbf_weights")),
+                    str(geo_bias_stats.get("attention_bias_stats")),
                 )
             pos_gate = getattr(getattr(self.compressor, "pe_encoder", None), "residual_gate", None)
             if pos_gate is not None:
@@ -2762,7 +3218,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if self.training_buffer is not None:
             self._validate_training_buffer_schema(
                 buffer_dict=self.training_buffer,
-                schema_name="fused_buffer",
+                schema_name=self._buffer_schema_name("fused_buffer"),
                 expected_size=target_buf_size,
             )
         # Normalize poses for full-pipeline normalization
@@ -2816,7 +3272,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if self.training_buffer is not None:
             self._validate_training_buffer_schema(
                 buffer_dict=self.training_buffer,
-                schema_name="raw_buffer",
+                schema_name=self._buffer_schema_name("raw_buffer"),
                 expected_size=target_buf_size,
             )
         # Normalize poses for full-pipeline normalization
@@ -2883,7 +3339,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         image_mask_B1HW,
         gt_scene_coords_B3HW=None,
         gt_scene_coords_valid_B1HW=None,
+        img_idx_B=None,
         s1_step=0,
+        base_decoder_feats_BCHW=None,
     ):
         """Full E2E: head on (B,C,H,W), repro loss on spatial positions (optionally subsampled).
         Aligns with map-anything:
@@ -2897,7 +3355,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         # Restrict to image mask (align with map-anything: only train on pixels with valid GT)
         mask_flat = image_mask_B1HW.flatten()
 
-        pred_scene_B3HW = self.regressor.get_scene_coordinates(fused_feats_BCHW)
+        head_input_BCHW = self._mix_glace_decoder_feature_maps(
+            base_decoder_feats_BCHW,
+            fused_feats_BCHW,
+            stage_tag='S1-FullMap',
+        )
+        pred_scene_B3HW = self.regressor.get_scene_coordinates(head_input_BCHW)
         pred_scene_B3HW = self._recover_pred_scene_to_training_world(pred_scene_B3HW)
         pred_scene_N31 = pred_scene_B3HW.permute(0, 2, 3, 1).reshape(N, 3).unsqueeze(-1).float()
 
@@ -2960,7 +3423,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         invKs_b33,
         gt_scene_coords_world_b3=None,
         gt_scene_coords_valid_b1=None,
+        img_idx_b1=None,
         s1_step=0,
+        base_decoder_features_bC=None,
     ):
         """Compute ace_depth reprojection loss from sampled fused features (same formula as TrainerACEDINOv2.training_step)."""
         channels = features_bC.shape[1]
@@ -2979,8 +3444,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if batch_size is None:
             return None, None
         target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
+        img_idx_b1 = img_idx_b1[:batch_size] if img_idx_b1 is not None else None
+        if base_decoder_features_bC is not None:
+            base_decoder_features_bC = base_decoder_features_bC[: batch_size * h * w]
+        head_features_bC = self._mix_glace_decoder_features(base_decoder_features_bC, features_bC, stage_tag="S1")
 
-        features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
+        features_bCHW = head_features_bC.view(1, h, w, head_features_bC.shape[1]).permute(0, 3, 1, 2)
         pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(features_bCHW)
         pred_scene_coords_b3HW = self._recover_pred_scene_to_training_world(pred_scene_coords_b3HW)
 
@@ -3146,7 +3615,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         previous_size = int(previous_buffer["features"].shape[0])
         self._validate_training_buffer_schema(
             buffer_dict=previous_buffer,
-            schema_name="raw_buffer",
+            schema_name=self._buffer_schema_name("raw_buffer"),
             expected_size=previous_size,
         )
         keep_count, refill_count = self._resolve_s1_partial_refill_counts(total_size=total_size)
@@ -3175,14 +3644,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             generator=self._get_training_generator(prev_device),
             device=prev_device,
         )[:keep_count]
-        kept_buffer = self._slice_training_buffer_rows(previous_buffer, "raw_buffer", keep_indices)
+        kept_buffer = self._slice_training_buffer_rows(previous_buffer, self._buffer_schema_name("raw_buffer"), keep_indices)
         self.training_buffer = None
         del previous_buffer
 
         self.create_training_buffer_ace_g(buffer_size_override=refill_count)
         refill_buffer = self.training_buffer
         merged_buffer = self._merge_training_buffers(
-            schema_name="raw_buffer",
+            schema_name=self._buffer_schema_name("raw_buffer"),
             buffers=[kept_buffer, refill_buffer],
             expected_size=total_size,
         )
@@ -3202,7 +3671,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self._set_compressor_trainable(True)
         self.compressor.train()
         self.fusion.train()
-        self.regressor.heads.train()
+        freeze_glace_head = self._glace_head_freeze_active(iteration_idx)
+        if self._is_glace_backend():
+            self._set_glace_head_trainable(not freeze_glace_head, stage_tag="S1-Buffer")
+        else:
+            self.regressor.heads.train()
         self.regressor.encoder.eval()
         self._log_stage_trainability("S1-Buffer")
 
@@ -3211,7 +3684,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         buffer_len = int(self.training_buffer['features'].shape[0])
         self._validate_training_buffer_schema(
             buffer_dict=self.training_buffer,
-            schema_name="raw_buffer",
+            schema_name=self._buffer_schema_name("raw_buffer"),
             expected_size=buffer_len,
         )
         if buffer_len < 16:
@@ -3222,11 +3695,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if iteration_idx > 0:
             _logger.info("  [S1 LR] iter>0: base_lr scaled by %.2f -> %.2e", s1_lr_scale_later, base_lr_s1)
 
-        comp_optimizer = optim.AdamW([
+        s1_param_groups = [
             {'params': self.compressor.parameters()},
-            {'params': self.fusion.parameters()},
-            {'params': self.regressor.heads.parameters(), 'lr': base_lr_s1 * 0.1},
-        ], lr=base_lr_s1)
+            {'params': list(self.fusion.parameters()) + list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())},
+        ]
+        if freeze_glace_head:
+            _logger.info("  [S1-Buffer] GLACE head freeze warmup active at iter %d; head excluded from optimizer.", iteration_idx + 1)
+        else:
+            s1_param_groups.append({'params': self.regressor.heads.parameters(), 'lr': base_lr_s1 * 0.1})
+        comp_optimizer = optim.AdamW(s1_param_groups, lr=base_lr_s1)
         sched_lmc = self._build_s1_scheduler(comp_optimizer, n_steps, iteration_idx, base_lr=base_lr_s1)
 
         log_interval = 10
@@ -3296,6 +3773,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             gt_inv_poses_b34 = _to_dev(buf['gt_poses_inv'])
             Ks_b33 = _to_dev(buf['intrinsics'])
             invKs_b33 = _to_dev(buf['intrinsics_inv'])
+            img_idx_b1 = _to_dev(buf['img_idx']) if 'img_idx' in buf else None
 
             channels = raw_features_bC.shape[1]
             raw_features_bC, batch_size, h, w, trimmed = self._pack_feature_rows_for_head(
@@ -3323,7 +3801,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 gt_inv_poses_b34.contiguous(),
                 Ks_b33.contiguous(),
                 invKs_b33.contiguous(),
+                img_idx_b1=img_idx_b1.contiguous() if img_idx_b1 is not None else None,
                 s1_step=update_step,
+                base_decoder_features_bC=raw_features_bC.contiguous() if self._is_glace_backend() else None,
             )
 
             if loss is None:
@@ -3368,6 +3848,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             torch.nn.utils.clip_grad_norm_(
                 list(self.compressor.parameters()) +
                 list(self.fusion.parameters()) +
+                list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters()) +
                 list(self.regressor.heads.parameters()),
                 max_norm=1.0
             )
@@ -3458,7 +3939,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self._set_compressor_trainable(True)
         self.compressor.train()
         self.fusion.train()
-        self.regressor.heads.train()
+        freeze_glace_head = self._glace_head_freeze_active(iteration_idx)
+        if self._is_glace_backend():
+            self._set_glace_head_trainable(not freeze_glace_head, stage_tag="S1")
+        else:
+            self.regressor.heads.train()
 
         # Backbone remains frozen / inference-only in S1.
         self.regressor.encoder.eval()
@@ -3470,11 +3955,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if iteration_idx > 0:
             _logger.info("  [S1 LR] iter>0: base_lr scaled by %.2f -> %.2e", s1_lr_scale_later, base_lr_s1)
 
-        comp_optimizer = optim.AdamW([
+        s1_param_groups = [
             {'params': self.compressor.parameters()},
-            {'params': self.fusion.parameters()},
-            {'params': self.regressor.heads.parameters(), 'lr': base_lr_s1 * 0.1},
-        ], lr=base_lr_s1)
+            {'params': list(self.fusion.parameters()) + list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())},
+        ]
+        if freeze_glace_head:
+            _logger.info("  [S1] GLACE head freeze warmup active at iter %d; head excluded from optimizer.", iteration_idx + 1)
+        else:
+            s1_param_groups.append({'params': self.regressor.heads.parameters(), 'lr': base_lr_s1 * 0.1})
+        comp_optimizer = optim.AdamW(s1_param_groups, lr=base_lr_s1)
 
         sched_lmc = self._build_s1_scheduler(comp_optimizer, n_steps, iteration_idx, base_lr=base_lr_s1)
         s1_loader = self._build_s1_dataloader()
@@ -3562,7 +4051,16 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
             with autocast("cuda", enabled=self.options.use_half):
                 with torch.no_grad():
-                    raw_feats = self.regressor.get_features(image_BCHW)
+                    local_feats = self.regressor.get_features(image_BCHW)
+                if self._is_glace_backend():
+                    img_idx_B_for_decoder = batch[-1].to(self.device, non_blocking=True).long()
+                    raw_feats = self._build_glace_decoder_feature_maps(
+                        local_feats,
+                        img_idx_B_for_decoder,
+                        stage_tag='S1-Online',
+                    )
+                else:
+                    raw_feats = local_feats
 
                 comp_out = self.compressor(self.memory_dict)
                 fused_feats = self._fuse_features(raw_feats, comp_out, stage_tag="S1-Online")
@@ -3603,7 +4101,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         fused_feats, gt_pose_inv_B34, intrinsics_B33, intrinsics_inv_B33, image_mask_B1HW,
                         gt_scene_coords_B3HW=gt_scene_coords_B3HW,
                         gt_scene_coords_valid_B1HW=gt_scene_coords_valid_B1HW,
+                        img_idx_B=batch[-1].to(self.device, non_blocking=True).long() if self._is_glace_backend() else None,
                         s1_step=s1_step,
+                        base_decoder_feats_BCHW=raw_feats if self._is_glace_backend() else None,
                     )
                 else:
                     pixel_positions_B2HW = self.pixel_grid_2HW[:, :H, :W].clone().unsqueeze(0).expand(B, 2, H, W)
@@ -3623,6 +4123,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         'gt_scene_coords_world': normalize_shape(gt_scene_coords_B3HW),
                         'gt_scene_coords_valid': normalize_shape(gt_scene_coords_valid_B1HW),
                     }
+                    if self._is_glace_backend():
+                        batch_data['base_decoder_features'] = normalize_shape(raw_feats)
+                    if self._is_glace_backend():
+                        img_idx_B = batch[-1].to(self.device, non_blocking=True).long()
+                        batch_data['img_idx'] = img_idx_B.unsqueeze(1).expand(B, H * W).reshape(-1)
 
                     image_mask_N1 = normalize_shape(image_mask_B1HW.float())
                     coord_valid_N1 = normalize_shape(coord_sampling_B1HW)
@@ -3675,7 +4180,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         batch_data['intrinsics_inv'].contiguous(),
                         batch_data['gt_scene_coords_world'].contiguous(),
                         batch_data['gt_scene_coords_valid'].contiguous(),
+                        batch_data['img_idx'].contiguous() if 'img_idx' in batch_data else None,
                         s1_step=update_step,
+                        base_decoder_features_bC=batch_data['base_decoder_features'].contiguous() if 'base_decoder_features' in batch_data else None,
                     )
 
             if loss is None:
@@ -3730,6 +4237,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             torch.nn.utils.clip_grad_norm_(
                 list(self.compressor.parameters()) +
                 list(self.fusion.parameters()) +
+                list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters()) +
                 list(self.regressor.heads.parameters()),
                 max_norm=1.0
             )
@@ -3853,24 +4361,40 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self.lmc_flow == 'ace_g'
             and getattr(self.options, 'ace_g_fusion_in_s2', False)
         )
+        freeze_glace_head = self._glace_head_freeze_active(iteration_idx)
+        if self._is_glace_backend():
+            self._set_glace_head_trainable(not freeze_glace_head, stage_tag="S2-G")
+            if freeze_glace_head and not ace_g_fusion_in_s2:
+                raise ValueError(
+                    "GLACE head-freeze warmup requires --ace_g_fusion_in_s2 True so plugin parameters can train in S2."
+                )
+
+        max_lrs = []
         if ace_g_fusion_in_s2:
             fusion_lr_ratio = float(getattr(self.options, 'ace_g_fusion_lr_ratio', 0.01))
+            residual_lr_ratio = self._glace_residual_lr_ratio(fusion_lr_ratio)
             fusion_lr = head_lr * fusion_lr_ratio
-            # S2 optimizer: only head + fusion. Compressor stays frozen during S2.
-            # Reason: S1 trains compressor via reprojection loss; S2 trains head via
-            # scene-coord loss. Allowing S2 to drift compressor (even at low LR)
-            # introduces cross-objective conflict that accumulates across iterations,
-            # causing S1 convergence to worsen in late iterations (iter 26+).
-            self.optimizer_head = optim.AdamW([
-                {'params': self.regressor.heads.parameters(), 'lr': head_lr},
-                {'params': self.fusion.parameters(), 'lr': fusion_lr},
-            ])
+            residual_lr = head_lr * residual_lr_ratio
+            # S2 optimizer: compressor stays frozen. During GLACE warmup, the
+            # original GLACE head is also frozen and only the memory plugin moves.
+            s2_param_groups = []
+            if not freeze_glace_head:
+                s2_param_groups.append({'params': self.regressor.heads.parameters(), 'lr': head_lr})
+                max_lrs.append(head_lr)
+            s2_param_groups.append({'params': list(self.fusion.parameters()), 'lr': fusion_lr})
+            max_lrs.append(fusion_lr)
+            adapter_params = list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())
+            if adapter_params:
+                s2_param_groups.append({'params': adapter_params, 'lr': residual_lr})
+                max_lrs.append(residual_lr)
+            self.optimizer_head = optim.AdamW(s2_param_groups)
             _logger.info(
-                "[S2-G] R2 active: fusion_lr=%.2e (ratio=%.4f of head_lr=%.2e)",
-                fusion_lr, fusion_lr_ratio, head_lr,
+                "[S2-G] R2 active: head_frozen=%s head_lr=%.2e fusion_lr=%.2e (ratio=%.4f) residual_lr=%.2e (ratio=%.4f)",
+                freeze_glace_head, head_lr, fusion_lr, fusion_lr_ratio, residual_lr, residual_lr_ratio,
             )
         else:
             self.optimizer_head = optim.AdamW(self.regressor.heads.parameters(), lr=head_lr)
+            max_lrs = [head_lr]
         self._validate_s2_compressor_contract()
 
         warmup_ratio = (self.s2_lr_warmup_steps / self.steps_per_s2_phase) if self.s2_lr_warmup_steps else 0.1
@@ -3902,7 +4426,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 )
         self.scheduler_head = optim.lr_scheduler.OneCycleLR(
             self.optimizer_head,
-            max_lr=[head_lr, fusion_lr] if ace_g_fusion_in_s2 else head_lr,
+            max_lr=max_lrs,
             total_steps=self.steps_per_s2_phase,
             pct_start=warmup_ratio_clamped,
             anneal_strategy='cos',
@@ -3930,21 +4454,36 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             and getattr(self.options, 'ace_g_fusion_in_s2', False)
         )
         head_lr = self.s2_polish_head_lr
+        freeze_glace_head = self._glace_head_freeze_active(iteration_idx)
+        if self._is_glace_backend():
+            self._set_glace_head_trainable(not freeze_glace_head, stage_tag="S2-Polish")
         if ace_g_fusion_in_s2:
             fusion_lr = head_lr * self.s2_polish_fusion_lr_ratio
-            self.optimizer_head = optim.AdamW([
-                {'params': self.regressor.heads.parameters(), 'lr': head_lr},
-                {'params': self.fusion.parameters(), 'lr': fusion_lr},
-            ])
-            max_lrs = [head_lr, fusion_lr]
+            residual_lr_ratio = self._glace_residual_lr_ratio(self.s2_polish_fusion_lr_ratio)
+            residual_lr = head_lr * residual_lr_ratio
+            polish_param_groups = []
+            max_lrs = []
+            if not freeze_glace_head:
+                polish_param_groups.append({'params': self.regressor.heads.parameters(), 'lr': head_lr})
+                max_lrs.append(head_lr)
+            polish_param_groups.append({'params': list(self.fusion.parameters()), 'lr': fusion_lr})
+            max_lrs.append(fusion_lr)
+            adapter_params = list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())
+            if adapter_params:
+                polish_param_groups.append({'params': adapter_params, 'lr': residual_lr})
+                max_lrs.append(residual_lr)
+            self.optimizer_head = optim.AdamW(polish_param_groups)
             _logger.info(
-                "[S2-Polish] iter=%d epochs=%d head_lr=%.2e fusion_lr=%.2e "
-                "(ratio=%.4f, constant LR)",
+                "[S2-Polish] iter=%d epochs=%d head_frozen=%s head_lr=%.2e fusion_lr=%.2e "
+                "(ratio=%.4f) residual_lr=%.2e (ratio=%.4f, constant LR)",
                 iteration_idx + 1,
                 self.s2_polish_epochs,
+                freeze_glace_head,
                 head_lr,
                 fusion_lr,
                 self.s2_polish_fusion_lr_ratio,
+                residual_lr,
+                residual_lr_ratio,
             )
         else:
             self.optimizer_head = optim.AdamW(self.regressor.heads.parameters(), lr=head_lr)
@@ -3971,7 +4510,144 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     # Iteration eval / best-checkpoint helpers
     # ------------------------------------------------------------------
 
-    def _write_train_header(self):
+    @staticmethod
+    def _torch_load_trusted_checkpoint(path, *, map_location='cpu'):
+        try:
+            return torch.load(path, map_location=map_location, weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location=map_location)
+
+    def _resume_enabled(self):
+        return bool(getattr(self, "_resume_active", False))
+
+    def _resume_config_values_equal(self, lhs, rhs):
+        lhs = self._tensor_to_config_value(lhs)
+        rhs = self._tensor_to_config_value(rhs)
+        if isinstance(lhs, bool) or isinstance(rhs, bool):
+            return bool(lhs) == bool(rhs)
+        if isinstance(lhs, (int, float)) and isinstance(rhs, (int, float)):
+            return math.isclose(float(lhs), float(rhs), rel_tol=1e-6, abs_tol=1e-6)
+        if isinstance(lhs, list) and isinstance(rhs, list):
+            return len(lhs) == len(rhs) and all(
+                self._resume_config_values_equal(a, b) for a, b in zip(lhs, rhs)
+            )
+        if lhs is None or rhs is None:
+            return lhs is rhs
+        return lhs == rhs
+
+    def _validate_resume_lmc_config(self, checkpoint_config):
+        if not isinstance(checkpoint_config, dict):
+            raise ValueError("Resume checkpoint is missing lmc_config.")
+        strict = bool(getattr(self.options, "resume_strict_config", True))
+        strict = strict and not bool(getattr(self.options, "resume_allow_config_mismatch", False))
+        critical_keys = [
+            "lmc_flow", "lmc_mode", "effective_lmc_mode", "num_latent_tokens", "num_fine",
+            "num_coarse", "num_attn_layers", "use_scale_token", "compress_dim", "num_layers",
+            "layers_idx", "lmc_key_slice_idx", "lmc_key_feature_mode", "lmc_feature_hierarchy_mode",
+            "lmc_level_merge_mode", "lmc_level_merge_init", "lmc_level_token_gate",
+            "lmc_level_anchor_residual_gamma_init", "geo_bias_mode", "geo_bias_rbf_scales",
+            "geo_bias_rbf_per_head", "pos_encoding_mode", "point_rope_coord_norm", "point_rope_radius",
+            "point_rope_radius_policy", "point_rope_mixed_memory_ratio", "point_rope_seed_pe", "point_rope_base", "point_rope_axes",
+            "point_rope_apply_to", "geo_bias_crpb_dim", "geo_bias_crpb_input", "geo_bias_crpb_radius",
+            "geo_bias_crpb_per_head", "pe_normalize_input", "lmc_compressor_pe_scale_mode",
+            "lmc_fusion_geometry_mode", "lmc_fusion_key_geo_init", "lmc_fusion_refinement_mode",
+            "lmc_fusion_cascade_layers", "lmc_fusion_assembly_mode", "lmc_fusion_assembly_gamma_init",
+            "ace_g_fusion_in_s2", "backbone_feature_dim", "encoder_feature_dim", "memory_feature_dim",
+            "scale_token_dim", "memory_path", "model_backend", "glace_encoder_path", "glace_feat_name",
+            "glace_global_feat_dim", "glace_head_channels", "glace_mlp_ratio", "glace_fusion_query",
+            "glace_residual_mode", "glace_residual_gate_init", "glace_residual_global_dim", "glace_head_freeze_iters", "glace_residual_lr_ratio",
+        ]
+        mismatches = []
+        missing = []
+        for key in critical_keys:
+            if key not in checkpoint_config:
+                missing.append(key)
+                continue
+            current_value = self.lmc_config.get(key)
+            checkpoint_value = checkpoint_config.get(key)
+            if not self._resume_config_values_equal(current_value, checkpoint_value):
+                mismatches.append((key, checkpoint_value, current_value))
+        if missing:
+            _logger.warning("[Resume] checkpoint lmc_config missing keys: %s", ", ".join(missing))
+        if mismatches:
+            preview = "; ".join(
+                f"{key}: ckpt={old!r} current={new!r}"
+                for key, old, new in mismatches[:12]
+            )
+            message = f"Resume config mismatch for {len(mismatches)} critical LMC fields: {preview}"
+            if strict:
+                raise ValueError(message + " (use --resume_allow_config_mismatch to override)")
+            _logger.warning("[Resume] %s", message)
+
+    def _estimate_resume_iteration_counter(self, start_iter):
+        if start_iter <= 0:
+            return int(getattr(self, "iteration", 0))
+        completed_s1 = self.lmc_warmup_steps + max(0, start_iter - 1) * self.lmc_train_steps
+        default_s2_batches = max(1, int(self.options.training_buffer_size) // int(self.options.batch_size))
+        completed_s2 = start_iter * int(self.options.epochs) * default_s2_batches
+        if getattr(self, "mapany_flow_profile", False):
+            estimated = completed_s1 + completed_s2
+        else:
+            estimated = completed_s2
+        return max(int(getattr(self, "iteration", 0)), int(estimated))
+
+    def _load_resume_checkpoint_if_requested(self):
+        self._resume_active = False
+        self.resume_start_iter = 0
+        self.resume_checkpoint_path = None
+        checkpoint_path = getattr(self.options, "resume_checkpoint_path", None)
+        if checkpoint_path is None:
+            return
+
+        checkpoint_path = Path(checkpoint_path).resolve()
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+        checkpoint = self._torch_load_trusted_checkpoint(checkpoint_path, map_location='cpu')
+        if not isinstance(checkpoint, dict):
+            raise ValueError(f"Resume checkpoint must be a dict: {checkpoint_path}")
+
+        checkpoint_config = checkpoint.get("lmc_config")
+        self._validate_resume_lmc_config(checkpoint_config)
+
+        required_state_keys = ["head_state_dict", "compressor_state_dict", "fusion_state_dict"]
+        missing_state = [key for key in required_state_keys if key not in checkpoint]
+        if missing_state:
+            raise ValueError(f"Resume checkpoint missing state dicts: {missing_state}")
+        self.regressor.heads.load_state_dict(checkpoint["head_state_dict"], strict=True)
+        self.compressor.load_state_dict(checkpoint["compressor_state_dict"], strict=True)
+        self.fusion.load_state_dict(checkpoint["fusion_state_dict"], strict=True)
+        if self._is_glace_backend() and getattr(self, 'glace_residual_adapter', None) is not None:
+            adapter_state = checkpoint.get('glace_residual_adapter_state_dict')
+            if adapter_state is not None:
+                self.glace_residual_adapter.load_state_dict(adapter_state, strict=True)
+
+        start_iter = int(getattr(self.options, "resume_best_iter", 0))
+        if start_iter <= 0:
+            raise ValueError(f"Invalid resume_best_iter={start_iter}; expected a 1-based completed best iteration.")
+        if start_iter >= int(self.lmc_iterations):
+            raise ValueError(
+                f"Resume best_iter={start_iter} leaves no remaining LMC iterations "
+                f"for lmc_iterations={self.lmc_iterations}. Increase --lmc_iterations to continue."
+            )
+
+        self.resume_start_iter = start_iter
+        self.resume_checkpoint_path = checkpoint_path
+        self.best_iter = start_iter
+        self.best_score = float(getattr(self.options, "resume_best_score", -float('inf')))
+        self.best_eval = getattr(self.options, "resume_best_meta", None)
+        self.iteration = self._estimate_resume_iteration_counter(start_iter)
+        self._resume_active = True
+        _logger.info(
+            "[Resume] Loaded best checkpoint %s | best_iter=%d | best_score=%.4f | continuing at iter %d/%d | iteration_counter=%d",
+            checkpoint_path,
+            self.best_iter,
+            self.best_score,
+            self.resume_start_iter + 1,
+            self.lmc_iterations,
+            self.iteration,
+        )
+
+    def _write_fresh_train_header(self):
         with open(self.step_log_path, 'w', encoding='utf-8') as f:
             f.write("Timestamp   Iter      Step  Stage               Loss       PxErr          LR    3D_Med  Mode        \n")
         with open(self.training_log_path, 'w', encoding='utf-8') as f:
@@ -3985,6 +4661,34 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             f.write(
                 "# Each iter: median_rotation_deg, median_translation_cm, acc25/10/5/2/1cm%% "
                 "same as post_train_eval; avg_time_ms=per-frame infer\n"
+            )
+
+    def _write_train_header(self):
+        if not self._resume_enabled():
+            self._write_fresh_train_header()
+            return
+
+        if not (self.step_log_path.exists() and self.training_log_path.exists() and self.eval_log_path.exists()):
+            self._write_fresh_train_header()
+
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        with open(self.step_log_path, 'a', encoding='utf-8') as f:
+            f.write(
+                f"# Resume {stamp}: checkpoint={self.resume_checkpoint_path} "
+                f"best_iter={self.best_iter} best_score={self.best_score:.4f} "
+                f"next_iter={self.resume_start_iter + 1}\n"
+            )
+        with open(self.training_log_path, 'a', encoding='utf-8') as f:
+            f.write(
+                f"# resume,{stamp},checkpoint={self.resume_checkpoint_path},"
+                f"best_iter={self.best_iter},best_score={self.best_score:.4f},"
+                f"next_iter={self.resume_start_iter + 1}\n"
+            )
+        with open(self.eval_log_path, 'a', encoding='utf-8') as f:
+            f.write(
+                f"# Resume {stamp}: checkpoint={self.resume_checkpoint_path} "
+                f"best_iter={self.best_iter} best_score={self.best_score:.4f} "
+                f"next_iter={self.resume_start_iter + 1}\n"
             )
 
     def _append_step_log(self, iter_idx, step, stage, loss, px_err, lr, mode, med3d=-1.0):
@@ -4003,7 +4707,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         with open(self.step_log_path, 'a', encoding='utf-8') as f:
             f.write(line)
 
-    def _evaluate_checkpoint(self, ckpt_path, iter_idx):
+    def _evaluate_checkpoint(self, ckpt_path, iter_idx, eval_stage="posts2"):
         from test_ace_dinov2_lmc import run_evaluation_lmc
         # Always use 'cuda:0': after setup_cuda_environment() sets CUDA_VISIBLE_DEVICES to the
         # physical GPU index, that GPU is always visible as logical cuda:0 within this process.
@@ -4013,14 +4717,24 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             eval_device = 'cuda:0'
         else:
             eval_device = str(_eval_d)
-        _logger.info("[Eval] iter %d: ckpt=%s  eval_device=%s", iter_idx + 1, ckpt_path, eval_device)
+        session = f"iter_{iter_idx+1:02d}" if not eval_stage else f"iter_{iter_idx+1:02d}_{eval_stage}"
+        _logger.info(
+            "[Eval] iter %d stage=%s: ckpt=%s  eval_device=%s",
+            iter_idx + 1,
+            eval_stage,
+            ckpt_path,
+            eval_device,
+        )
         eval_opt = SimpleNamespace(
-            scene=self.options.scene,
+            scene=getattr(self.options, 'post_train_eval_scene', None) or self.options.scene,
             network=ckpt_path,
+            data_backend=getattr(self.options, 'data_backend', 'ace'),
+            wai_repo_root=getattr(self.options, 'wai_repo_root', None),
+            wai_image_modality=getattr(self.options, 'wai_image_modality', 'image'),
             dinov2_path=self.options.dinov2_path,
             device=eval_device,
             image_resolution=self.options.image_resolution,
-            session=f"iter_{iter_idx+1:02d}",
+            session=session,
             hypotheses=64,
             eval_deterministic=getattr(self.options, 'eval_deterministic', False),
             dsacstar_seed=getattr(self.options, 'eval_dsacstar_seed', 1305),
@@ -4156,7 +4870,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             score = -float('inf')
             if self.eval_each_iteration:
                 try:
-                    eval_result = self._evaluate_checkpoint(iter_ckpt, it)
+                    eval_result = self._evaluate_checkpoint(iter_ckpt, it, eval_stage="posts2")
                     score = self._score_eval(eval_result)
                 except Exception as e:
                     _logger.warning("[Eval] vanilla iteration %d failed: %s", it + 1, e, exc_info=True)
@@ -4211,9 +4925,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         """Two-stage iterative training (S1+S2) with iteration-level eval and best-checkpoint policy."""
         self.training_start = time.time()
         self._write_train_header()
-        best_ckpt_exists = False
+        best_ckpt_exists = bool(self._resume_enabled() and Path(self.options.output_map).exists())
+        start_iter = int(getattr(self, 'resume_start_iter', 0))
+        if start_iter > 0:
+            _logger.info(
+                "[Resume] Iterative flow continuing from completed best_iter=%d; next iteration=%d/%d",
+                self.best_iter, start_iter + 1, self.lmc_iterations,
+            )
 
-        for it in range(self.lmc_iterations):
+        for it in range(start_iter, self.lmc_iterations):
             iter_start = time.time()
             is_last = (it == self.lmc_iterations - 1)
             _logger.info(f"\n{'='*60}")
@@ -4280,7 +5000,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             score = -float('inf')
             if self.eval_each_iteration:
                 try:
-                    eval_result = self._evaluate_checkpoint(iter_ckpt, it)
+                    eval_result = self._evaluate_checkpoint(iter_ckpt, it, eval_stage="posts2")
                     score = self._score_eval(eval_result)
                 except Exception as e:
                     _logger.warning("[Eval] iteration %d failed: %s", it + 1, e, exc_info=True)
@@ -4332,7 +5052,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         """
         self.training_start = time.time()
         self._write_train_header()
-        best_ckpt_exists = False
+        best_ckpt_exists = bool(self._resume_enabled() and Path(self.options.output_map).exists())
+        start_iter = int(getattr(self, 'resume_start_iter', 0))
+        if start_iter > 0:
+            _logger.info(
+                "[Resume] ACE-G flow continuing from completed best_iter=%d; next iteration=%d/%d",
+                self.best_iter, start_iter + 1, self.lmc_iterations,
+            )
 
         ace_g_fusion_in_s2 = getattr(self.options, 'ace_g_fusion_in_s2', False)
         ace_g_cross_iter_eval = getattr(self.options, 'ace_g_cross_iter_eval', False)
@@ -4342,7 +5068,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         prev_post_s2_score = None  # Tracks previous iteration post-S2 score
         prev_post_s2_head_state = None  # Snapshot of previous iteration head after S2
 
-        for it in range(self.lmc_iterations):
+        for it in range(start_iter, self.lmc_iterations):
             iter_start = time.time()
             is_last = (it == self.lmc_iterations - 1)
             _logger.info(f"\n{'='*60}")
@@ -4407,7 +5133,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     # Replace current head with previous-iteration post-S2 head to isolate compressor shift.
                     self.regressor.heads.load_state_dict(prev_post_s2_head_state, strict=True)
                     self.save_model(cross_ckpt)
-                    cross_eval = self._evaluate_checkpoint(cross_ckpt, it)
+                    cross_eval = self._evaluate_checkpoint(cross_ckpt, it, eval_stage="cross")
                     cross_score = self._score_eval(cross_eval)
                     drop = prev_post_s2_score - cross_score
                     drop_ratio = drop / max(abs(prev_post_s2_score), 1e-6)
@@ -4469,7 +5195,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             score = -float('inf')
             if self.eval_each_iteration:
                 try:
-                    eval_result = self._evaluate_checkpoint(iter_ckpt, it)
+                    eval_result = self._evaluate_checkpoint(iter_ckpt, it, eval_stage="posts2")
                     score = self._score_eval(eval_result)
                 except Exception as e:
                     _logger.warning("[Eval] iteration %d failed: %s", it + 1, e, exc_info=True)
@@ -4551,7 +5277,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return super().run_epoch()
         torch.backends.cudnn.benchmark = True
         buf = self.training_buffer
-        schema_name = "raw_buffer" if self.lmc_flow == 'ace_g' else "fused_buffer"
+        schema_name = self._buffer_schema_name("raw_buffer") if self.lmc_flow == 'ace_g' else self._buffer_schema_name("fused_buffer")
         self._validate_training_buffer_schema(
             buffer_dict=buf,
             schema_name=schema_name,
@@ -4577,6 +5303,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     out = out.to(self.device, non_blocking=True)
                 return out
             step_fn = self._training_step_ace_g if self.lmc_flow == 'ace_g' else self.training_step
+            img_idx_batch = _to_dev(buf['img_idx'][random_batch_indices]) if 'img_idx' in buf else None
             step_fn(
                 _to_dev(buf['features'][random_batch_indices]),
                 _to_dev(buf['target_px'][random_batch_indices]),
@@ -4585,6 +5312,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 _to_dev(buf['intrinsics_inv'][random_batch_indices]),
                 _to_dev(buf['gt_scene_coords_world'][random_batch_indices]),
                 _to_dev(buf['gt_scene_coords_valid'][random_batch_indices]),
+                img_idx_batch,
             )
             if not bool(getattr(self, "_s2_update_applied_last", True)):
                 continue
@@ -4592,7 +5320,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self.global_s2_step += 1
             self.local_s2_step += 1
 
-    def training_step(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None):
+    def training_step(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None, img_idx_b1=None):
         """When LMC S2: use step_eff for ReproLoss and head-only optimizer/scheduler."""
         if not self.use_lmc or self.optimizer_head is None:
             return super().training_step(features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33)
@@ -4612,7 +5340,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self._s2_update_applied_last = False
             return None
         target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
-        features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
+        img_idx_b1 = img_idx_b1[:batch_size] if img_idx_b1 is not None else None
+        head_features_bC = self._mix_glace_decoder_features(None, features_bC, stage_tag="S2")
+        features_bCHW = head_features_bC.view(1, h, w, head_features_bC.shape[1]).permute(0, 3, 1, 2)
 
         if self.repro_step_mode == "global_monotonic":
             step_eff = self._monotonic_repro_step()
@@ -4717,7 +5447,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             )
         return loss
 
-    def _training_step_ace_g(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None):
+    def _training_step_ace_g(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None, img_idx_b1=None):
         """ACE-G S2 training step: apply fusion on-the-fly then head.
 
         Key difference from training_step(): raw backbone features are fused
@@ -4738,6 +5468,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self._s2_update_applied_last = False
             return None
         target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
+        img_idx_b1 = img_idx_b1[:batch_size] if img_idx_b1 is not None else None
         features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
 
         # --- Same repro loss as training_step from here on ---
@@ -4761,7 +5492,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 # R1 path: fusion frozen (default)
                 with torch.no_grad():
                     fused_bCHW = self._fuse_features(features_bCHW, self._s2_compressor_out, stage_tag="S2-G")
-            pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(fused_bCHW)
+            fused_features_bC = fused_bCHW.permute(0, 2, 3, 1).reshape(-1, channels)
+            base_features_bC = features_bCHW.permute(0, 2, 3, 1).reshape(-1, channels)
+            head_features_bC = self._mix_glace_decoder_features(base_features_bC, fused_features_bC, stage_tag="S2-G")
+            head_features_bCHW = head_features_bC.view(1, h, w, head_features_bC.shape[1]).permute(0, 3, 1, 2)
+            pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(head_features_bCHW)
         pred_scene_coords_b3HW = self._recover_pred_scene_to_training_world(pred_scene_coords_b3HW)
 
         pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
@@ -4804,6 +5539,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 params_to_clip = list(self.regressor.heads.parameters())
                 if ace_g_fusion_in_s2:
                     params_to_clip += list(self.fusion.parameters())
+                    params_to_clip += list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())
                 torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=self._s2_grad_clip_max_norm)
             self.scaler.step(self.optimizer_head)
             self.scaler.update()
@@ -4869,6 +5605,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'mean_cam_center': self.dataset.mean_cam_center,
             'lmc_config': self._lmc_config_for_checkpoint(),
         }
+        if self._is_glace_backend() and getattr(self, 'glace_residual_adapter', None) is not None:
+            checkpoint['glace_residual_adapter_state_dict'] = self.glace_residual_adapter.state_dict()
         torch.save(checkpoint, output_path)
         _logger.info(f"Saved LMC checkpoint to: {output_path}")
 
@@ -4882,6 +5620,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if isinstance(level_stats, dict):
             config["lmc_level_merge_weights"] = level_stats.get("lmc_level_merge_weights")
             config["lmc_level_gate_entropy"] = level_stats.get("lmc_level_gate_entropy")
+            config["final_lmc_level_anchor_residual_gamma"] = level_stats.get(
+                "lmc_level_anchor_residual_gamma"
+            )
+        level_anchor_gamma = getattr(self.compressor, "level_anchor_residual_gamma", None)
+        if level_anchor_gamma is not None:
+            config["final_lmc_level_anchor_residual_gamma"] = float(
+                level_anchor_gamma.detach().float().cpu().item()
+            )
         geo_bias_stats = getattr(self.compressor, "last_geo_bias_runtime_stats", None)
         if isinstance(geo_bias_stats, dict):
             config["final_geo_bias_rbf_alpha"] = geo_bias_stats.get("final_geo_bias_rbf_alpha")
@@ -4889,4 +5635,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         pos_gate = getattr(getattr(self.compressor, "pe_encoder", None), "residual_gate", None)
         if pos_gate is not None:
             config["final_pos_fourier_residual_gate"] = float(pos_gate.detach().float().cpu().item())
+        fusion_gamma = getattr(self.fusion, "fusion_assembly_gamma", None)
+        if fusion_gamma is not None:
+            config["final_lmc_fusion_assembly_gamma"] = float(fusion_gamma.detach().float().cpu().item())
+        if self._is_glace_backend() and getattr(self, 'glace_residual_adapter', None) is not None:
+            config['final_glace_residual_gain'] = float(self.glace_residual_adapter.residual_gain().detach().float().cpu().item())
         return config
