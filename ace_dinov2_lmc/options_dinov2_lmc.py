@@ -45,8 +45,12 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--model_backend',
         type=str,
         default='ace_dinov2',
-        choices=['ace_dinov2', 'glace_lmc'],
-        help='模型后端。ace_dinov2=当前 DINOv2 ACE/LMC；glace_lmc=GLACE encoder+global feature branch + 当前 LMC 训练逻辑。',
+        choices=['ace_dinov2', 'glace_lmc', 'ace_fcn_lmc'],
+        help=(
+            '模型后端。ace_dinov2=当前 DINOv2 ACE/LMC；'
+            'glace_lmc=GLACE encoder+global feature branch + 当前 LMC 训练逻辑；'
+            'ace_fcn_lmc=原版 ACE FCN encoder + 当前 LMC 训练逻辑。'
+        ),
     )
     parser.add_argument(
         '--wai_repo_root',
@@ -146,6 +150,31 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         help='DINOv2 ViT-L/14 预训练权重路径。',
     )
     parser.add_argument(
+        '--ace_encoder_path',
+        type=Path,
+        default=Path('/home/xwh/project/ace_depth/ace_encoder_pretrained.pt'),
+        help='原版 ACE FCN encoder 权重路径（ace_fcn_lmc 后端使用）。',
+    )
+    parser.add_argument(
+        '--ace_lmc_global_head_mode',
+        type=str,
+        default='none',
+        choices=['none', 'glace_concat'],
+        help='ace_fcn_lmc 后端最终 head 输入模式：none=纯 ACE local LMC；glace_concat=拼接 GLACE image-level global feature。',
+    )
+    parser.add_argument(
+        '--ace_lmc_local_checkpoint_path',
+        type=Path,
+        default=None,
+        help='ace_fcn_lmc 第二阶段 global head 训练时加载的第一阶段 local LMC checkpoint。',
+    )
+    parser.add_argument(
+        '--ace_lmc_freeze_local_stack',
+        type=_strtobool,
+        default=True,
+        help='ace_fcn_lmc/glace_concat 第二阶段是否冻结 ACE encoder、compressor、fusion，只训练最终 head。',
+    )
+    parser.add_argument(
         '--glace_root',
         type=Path,
         default=Path('/home/xwh/project/glace'),
@@ -156,6 +185,16 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path('/home/xwh/project/glace/ace_encoder_pretrained.pt'),
         help='GLACE 预训练 encoder 权重路径（glace_lmc 后端使用）。',
+    )
+    # GLACE-LMC warm-start / stability knobs.
+    parser.add_argument(
+        '--glace_init_head_path',
+        type=Path,
+        default=None,
+        help=(
+            '可选：用已训练 vanilla GLACE scene head 初始化 GLACE-LMC。'
+            '启用 head-freeze warmup 时应提供该路径。'
+        ),
     )
     parser.add_argument(
         '--glace_feat_name',
@@ -201,6 +240,30 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        '--glace_freeze_base_network',
+        type=_strtobool,
+        default=True,
+        help=(
+            '兼容旧配置：GLACE-LMC 是否固定原始 GLACE encoder/head。'
+            '若显式传入 --glace_freeze_head，则 head 以新参数为准。'
+        ),
+    )
+    parser.add_argument(
+        '--glace_freeze_encoder',
+        type=_strtobool,
+        default=True,
+        help='GLACE-LMC 是否冻结 GLACE encoder。默认 True。',
+    )
+    parser.add_argument(
+        '--glace_freeze_head',
+        type=_strtobool,
+        default=None,
+        help=(
+            'GLACE-LMC 是否冻结 GLACE scene head。None 时沿用 --glace_freeze_base_network；'
+            '显式 False 可在 encoder 冻结时训练 head。'
+        ),
+    )
+    parser.add_argument(
         '--glace_residual_lr_ratio',
         type=float,
         default=-1.0,
@@ -209,13 +272,45 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
             '小于 0 时沿用 --ace_g_fusion_lr_ratio。'
         ),
     )
+    # Guardrail for S2: keep fused output from regressing too far behind the
+    # frozen vanilla GLACE reference on the same batch.
+    parser.add_argument(
+        '--glace_antiregression_weight',
+        type=float,
+        default=0.0,
+        help=(
+            'GLACE-LMC S2 反退化约束权重。>0 时，同 batch 计算 base GLACE reprojection error，'
+            '惩罚 fused 输出比 base 差超过 margin 的像素。默认 0 关闭。'
+        ),
+    )
+    parser.add_argument(
+        '--glace_antiregression_margin_px',
+        type=float,
+        default=0.25,
+        help='GLACE-LMC 反退化约束的像素 margin；fused_err <= base_err + margin 不惩罚。',
+    )
+    parser.add_argument(
+        '--glace_antiregression_max_px',
+        type=float,
+        default=100.0,
+        help='GLACE-LMC 反退化约束单点 penalty 上限，防止少量坏点主导梯度。',
+    )
+    parser.add_argument(
+        '--glace_pixel_diag_interval',
+        type=int,
+        default=100,
+        help=(
+            'GLACE-LMC S2-G base-vs-fused pixel diagnostic 日志间隔。'
+            '默认 100；首个 S2-G batch 总会记录一次；<=0 关闭。'
+        ),
+    )
     parser.add_argument(
         '--freeze_backbone',
         type=_strtobool,
         default=True,
         help=(
-            '是否冻结 DINOv2 backbone。\n'
-            'True: 显存/速度更稳，通常用于 LMC 训练；False: 会训练 backbone，代价更高。'
+            '是否冻结 DINOv2/ACE backbone。\n'
+            'True: 显存/速度更稳，通常用于 LMC 训练；ace_fcn_lmc v1 要求 True。'
         ),
     )
     parser.add_argument(
@@ -516,6 +611,52 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
             'iterative=当前双阶段 S1+S2 循环（默认，行为完全不变）；'
             'ace_g=ACE-G 混合路径：buffer 存 raw backbone 特征，S2 按 batch 做 fusion forward。'
         ),
+    )
+    parser.add_argument(
+        '--lmc_fusion_target',
+        type=str,
+        default='decoder',
+        choices=['decoder', 'local'],
+        help=(
+            'LMC fusion query 目标。decoder=当前行为，对完整 GLACE decoder feature '
+            '(global+local) 做 fusion；local=GLACE-LMC 专用路径，只对 local feature 做 fusion，'
+            'global feature bypass 后再拼回 GLACE head input。'
+        ),
+    )
+    parser.add_argument(
+        '--local_residual_mode',
+        type=str,
+        default='none',
+        choices=['none', 'fixed_alpha', 'learned_alpha'],
+        help=(
+            '仅在 GLACE-LMC 且 --lmc_fusion_target local 时生效。'
+            'none=直接使用 fused local；fixed_alpha=local + alpha * delta；'
+            'learned_alpha=local + alpha_eff * delta，其中 alpha_eff 为可学习 scalar gate。'
+        ),
+    )
+    parser.add_argument(
+        '--local_residual_alpha',
+        type=float,
+        default=1.0,
+        help='fixed_alpha 的目标 alpha，要求位于 [0,1]；learned_alpha 未显式设置 max 时也作为 alpha_max。',
+    )
+    parser.add_argument(
+        '--local_residual_alpha_init',
+        type=float,
+        default=0.001,
+        help='learned_alpha 的初始有效 alpha，要求位于 [0, alpha_max]。',
+    )
+    parser.add_argument(
+        '--local_residual_alpha_max',
+        type=float,
+        default=None,
+        help='learned_alpha 的 alpha 上限；None 时沿用 --local_residual_alpha。',
+    )
+    parser.add_argument(
+        '--local_residual_alpha_warmup_steps',
+        type=int,
+        default=0,
+        help='local residual alpha/gate 上限 warmup 步数；0 表示不 warmup。',
     )
     parser.add_argument(
         '--memory_path',
@@ -1470,6 +1611,18 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=_strtobool,
         default=True,
         help='是否对每一帧使用 base_seed + frame_idx 的 DSAC* 种子，降低线程调度带来的抖动。',
+    )
+    parser.add_argument(
+        '--iteration_eval_hypotheses',
+        type=int,
+        default=64,
+        help='每轮 iteration eval 使用的 RANSAC hypotheses 数量；默认保持旧行为 64。',
+    )
+    parser.add_argument(
+        '--iteration_eval_seed',
+        type=int,
+        default=None,
+        help='每轮 iteration eval 使用的 DSAC* seed；默认沿用 --eval_dsacstar_seed。',
     )
     parser.add_argument(
         '--eval_num_workers',

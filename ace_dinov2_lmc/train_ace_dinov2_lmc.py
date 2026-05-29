@@ -266,6 +266,7 @@ def _collect_cli_flags(argv=None):
     return cli_flags
 
 
+# Train presets are convenience bundles for repeated GLACE / ACE-G experiments.
 def _apply_train_preset(args):
     preset = getattr(args, "train_preset", "none")
     if preset == "none":
@@ -297,14 +298,20 @@ def _apply_train_preset(args):
 
 
 def _validate_args(args):
-    if args.image_resolution % 14 != 0:
-        args.image_resolution = (args.image_resolution // 14) * 14
+    stride = 8 if getattr(args, 'model_backend', 'ace_dinov2') == 'ace_fcn_lmc' else 14
+    if args.image_resolution % stride != 0:
+        args.image_resolution = (args.image_resolution // stride) * stride
         _logger.warning(
-            "Image resolution adjusted to %s (must be multiple of 14)",
+            "Image resolution adjusted to %s (must be multiple of %d)",
             args.image_resolution,
+            stride,
         )
 
-    if not args.dinov2_path.exists():
+    if getattr(args, 'model_backend', 'ace_dinov2') == 'ace_fcn_lmc':
+        if not args.ace_encoder_path.exists():
+            _logger.error("ACE encoder weights not found: %s", args.ace_encoder_path)
+            sys.exit(1)
+    elif not args.dinov2_path.exists():
         _logger.error("DINOv2 weights not found: %s", args.dinov2_path)
         sys.exit(1)
 
@@ -737,6 +744,8 @@ def _build_resume_run_dir(args):
     args.overwrite_run_dir = False
     return 'resume', run_dir
 
+# Run directory layout is intentionally hierarchical so experiment artifacts
+# and best checkpoints are easy to audit by dataset / scene / flow.
 def _build_run_dir(args):
     if getattr(args, 'resume_from_run_dir', None) is not None:
         return _build_resume_run_dir(args)
@@ -1025,6 +1034,9 @@ def run_post_train_eval(args, trainer):
                 wai_repo_root=getattr(args, "wai_repo_root", None),
                 wai_image_modality=getattr(args, "wai_image_modality", "image"),
                 dinov2_path=args.dinov2_path,
+                ace_encoder_path=getattr(args, 'ace_encoder_path', None),
+                glace_root=getattr(args, 'glace_root', None),
+                glace_feat_name=getattr(args, 'glace_feat_name', 'features.npy'),
                 device=eval_device,
                 image_resolution=args.image_resolution,
                 session=session_name,
@@ -1078,10 +1090,33 @@ def run_post_train_eval(args, trainer):
             checkpoint = _torch_load_trusted_checkpoint(args.output_map, map_location='cpu')
             lmc_config = checkpoint.get('lmc_config', {}) if isinstance(checkpoint, dict) else {}
             semantic_fields = {
+                "model_backend": lmc_config.get("model_backend"),
+                "ace_encoder_path": lmc_config.get("ace_encoder_path"),
+                "ace_lmc_global_head_mode": lmc_config.get("ace_lmc_global_head_mode"),
+                "ace_lmc_local_checkpoint_path": lmc_config.get("ace_lmc_local_checkpoint_path"),
+                "ace_lmc_freeze_local_stack": lmc_config.get("ace_lmc_freeze_local_stack"),
+                "ace_lmc_final_head_dim": lmc_config.get("ace_lmc_final_head_dim"),
+                "lmc_flow": lmc_config.get("lmc_flow"),
+                "lmc_fusion_target": lmc_config.get("lmc_fusion_target"),
+                "requested_lmc_fusion_target": lmc_config.get("requested_lmc_fusion_target"),
+                "effective_lmc_fusion_target": lmc_config.get("effective_lmc_fusion_target", lmc_config.get("lmc_fusion_target")),
+                "fusion_query_dim": lmc_config.get("fusion_query_dim"),
+                "local_residual_mode": lmc_config.get("local_residual_mode"),
+                "local_residual_alpha": lmc_config.get("local_residual_alpha"),
+                "local_residual_alpha_init": lmc_config.get("local_residual_alpha_init"),
+                "local_residual_alpha_max": lmc_config.get("local_residual_alpha_max"),
+                "local_residual_alpha_warmup_steps": lmc_config.get("local_residual_alpha_warmup_steps"),
+                "final_local_residual_alpha": lmc_config.get("final_local_residual_alpha"),
+                "final_local_residual_alpha_logit": lmc_config.get("final_local_residual_alpha_logit"),
+                "glace_freeze_base_network": lmc_config.get("glace_freeze_base_network"),
+                "glace_freeze_encoder": lmc_config.get("glace_freeze_encoder"),
+                "glace_freeze_head": lmc_config.get("glace_freeze_head"),
+                "glace_pixel_diag_interval": lmc_config.get("glace_pixel_diag_interval"),
+                "last_glace_pixel_diag": lmc_config.get("last_glace_pixel_diag"),
+                "ace_g_fusion_in_s2": lmc_config.get("ace_g_fusion_in_s2"),
                 "requested_lmc_mode": lmc_config.get("requested_lmc_mode"),
                 "effective_lmc_mode": lmc_config.get("effective_lmc_mode", lmc_config.get("lmc_mode")),
                 "lmc_auto_mode_by_visibility": lmc_config.get("lmc_auto_mode_by_visibility"),
-                "lmc_flow": lmc_config.get("lmc_flow"),
                 "lmc_key_slice_idx": lmc_config.get("lmc_key_slice_idx"),
                 "lmc_key_layer_label": lmc_config.get("lmc_key_layer_label"),
                 "lmc_key_feature_mode": lmc_config.get("lmc_key_feature_mode"),
@@ -1091,7 +1126,6 @@ def run_post_train_eval(args, trainer):
                 "lmc_compressor_pe_scale_mode": lmc_config.get("lmc_compressor_pe_scale_mode"),
                 "lmc_compressor_pe_scene_scale": lmc_config.get("lmc_compressor_pe_scene_scale"),
                 "s1_loss_step_mode": lmc_config.get("s1_loss_step_mode"),
-                "ace_g_fusion_in_s2": lmc_config.get("ace_g_fusion_in_s2"),
                 "lmc_fusion_geometry_mode": lmc_config.get("lmc_fusion_geometry_mode"),
                 "lmc_fusion_key_geo_init": lmc_config.get("lmc_fusion_key_geo_init"),
                 "lmc_fusion_scene_scale": lmc_config.get("lmc_fusion_scene_scale"),
@@ -1101,10 +1135,14 @@ def run_post_train_eval(args, trainer):
             _logger.warning("Could not read LMC semantics from checkpoint for post-train eval summary: %s", e)
         eval_log_path = args.run_dir / "post_train_eval.txt"
         with open(eval_log_path, "w", encoding="utf-8") as f:
+            f.write("eval_type\tpost_train\n")
             f.write(f"eval_deterministic\t{bool(getattr(args, 'eval_deterministic', False))}\n")
             f.write(f"aggregation\t{'median' if len(seed_results) > 1 else 'single'}\n")
             f.write(f"seeds\t{','.join(str(r['seed']) for r in seed_results)}\n")
+            f.write(f"post_train_eval_seeds\t{','.join(str(r['seed']) for r in seed_results)}\n")
             f.write(f"hypotheses\t{post_train_hypotheses}\n")
+            f.write(f"post_train_hypotheses\t{post_train_hypotheses}\n")
+            f.write(f"dsacstar_seed_per_frame\t{bool(getattr(args, 'eval_dsacstar_seed_per_frame', True))}\n")
             f.write(f"median_rotation_deg\t{result['median_rErr']:.4f}\n")
             f.write(f"median_translation_cm\t{result['median_tErr']:.4f}\n")
             f.write(f"accuracy_25cm5deg_pct\t{result['pct25_5']:.2f}\n")

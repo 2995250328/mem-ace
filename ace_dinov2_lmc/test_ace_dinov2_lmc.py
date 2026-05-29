@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -35,9 +36,11 @@ from torch.cuda.amp import autocast
 from torch.utils.data import DataLoader
 
 import dsacstar
-from ace_network_dinov2 import Regressor
+from ace_network_dinov2 import Head, Regressor
 from dataset_dinov2 import CamLocDatasetDINOv2
 from dataset_wai_dinov2 import CamLocDatasetWAIDINOv2
+from ace_network_ace import RegressorACE
+from dataset_ace_fcn_lmc import CamLocDatasetACEFCNLMC
 from glace_backend import (
     GLACEDecoderFeatureResidualAdapter,
     build_glace_camloc_dataset,
@@ -267,8 +270,8 @@ def run_evaluation_lmc(opt):
     if eval_deterministic:
         _configure_eval_determinism(dsacstar_seed)
 
-    if image_resolution % 14 != 0:
-        image_resolution = (image_resolution // 14) * 14
+    # The exact stride is known after checkpoint inspection; keep DINOv2's
+    # legacy default here and adjust again once model_backend is known.
 
     _logger.info(
         "[Eval] mode=%s dsacstar_seed=%s per_frame_seed=%s num_workers=%d",
@@ -284,6 +287,7 @@ def run_evaluation_lmc(opt):
     # Load checkpoint
     checkpoint = _torch_load_trusted_checkpoint(head_network_path, map_location='cpu')
     is_lmc = _is_lmc_checkpoint(checkpoint)
+    lmc_config = None
 
     if is_lmc:
         _logger.info("[LMC] Detected LMC checkpoint")
@@ -295,6 +299,14 @@ def run_evaluation_lmc(opt):
         model_backend = 'ace_dinov2'
         _logger.info("[LMC] Vanilla checkpoint — delegating to standard eval")
         head_state_dict = checkpoint
+
+    ace_lmc_global_head_mode = str(lmc_config.get('ace_lmc_global_head_mode', 'none')) if is_lmc else 'none'
+    if model_backend != 'ace_fcn_lmc' and ace_lmc_global_head_mode != 'none':
+        raise ValueError('ace_lmc_global_head_mode is only valid for model_backend=ace_fcn_lmc.')
+    output_subsample = 8 if model_backend == 'ace_fcn_lmc' else 14
+    if image_resolution % output_subsample != 0:
+        image_resolution = (image_resolution // output_subsample) * output_subsample
+        _logger.warning("Image resolution adjusted to %s (must be multiple of %d)", image_resolution, output_subsample)
 
     # Build regressor (encoder + head)
     if model_backend == 'glace_lmc':
@@ -310,6 +322,28 @@ def run_evaluation_lmc(opt):
             head_state_dict=head_state_dict,
             map_location='cpu',
         )
+    elif model_backend == 'ace_fcn_lmc':
+        if not is_lmc:
+            raise ValueError('[Eval] ACE-FCN backend is only supported through LMC checkpoints in this entrypoint.')
+        ace_encoder_path = Path(
+            getattr(opt, 'ace_encoder_path', None) or lmc_config.get('ace_encoder_path') or '/home/xwh/project/ace_depth/ace_encoder_pretrained.pt'
+        )
+        local_dim = int(lmc_config.get('encoder_feature_dim', 512))
+        in_channels = int(head_state_dict['res3_conv1.weight'].shape[1])
+        pattern_count = sum(1 for key in head_state_dict.keys() if re.match(r'^\d+c0\.weight$', key))
+        use_homogeneous = head_state_dict['fc3.weight'].shape[0] == 4
+        network = RegressorACE.create_from_encoder(
+            encoder_path=ace_encoder_path,
+            mean=torch.zeros((3,)),
+            num_head_blocks=pattern_count,
+            use_homogeneous=use_homogeneous,
+            num_encoder_features=local_dim,
+            freeze_backbone=True,
+        )
+        network.heads = Head(torch.zeros((3,)), pattern_count, use_homogeneous, in_channels=in_channels)
+        network.heads.load_state_dict(head_state_dict)
+        network.ace_lmc_local_feature_dim = local_dim
+        network.ace_lmc_final_head_dim = in_channels
     else:
         network = Regressor.create_from_split_state_dict(
             dinov2_path=dinov2_path,
@@ -333,6 +367,30 @@ def run_evaluation_lmc(opt):
     bank_data = None
     reference_eval_state = {"enabled": False, "contract_mode": "C0", "output_space": "points_world"}
     compressor_out_cached = None  # single compression result, reused for all test frames
+    glace_lmc_fusion_target = str(
+        lmc_config.get('effective_lmc_fusion_target', lmc_config.get('lmc_fusion_target', 'decoder'))
+    ) if lmc_config is not None else 'decoder'
+    local_residual_mode = str(lmc_config.get('local_residual_mode', 'none')) if lmc_config is not None else 'none'
+    local_residual_alpha = float(lmc_config.get('local_residual_alpha', 1.0)) if lmc_config is not None else 1.0
+    local_residual_alpha_init = float(lmc_config.get('local_residual_alpha_init', 0.001)) if lmc_config is not None else 0.001
+    local_residual_alpha_max = float(lmc_config.get('local_residual_alpha_max', local_residual_alpha)) if lmc_config is not None else local_residual_alpha
+    local_residual_alpha_warmup_steps = int(lmc_config.get('local_residual_alpha_warmup_steps', 0)) if lmc_config is not None else 0
+    final_local_residual_alpha = None
+    if lmc_config is not None and lmc_config.get('final_local_residual_alpha') is not None:
+        final_local_residual_alpha = float(lmc_config.get('final_local_residual_alpha'))
+    if local_residual_mode not in ('none', 'fixed_alpha', 'learned_alpha'):
+        raise ValueError(f"Unsupported local_residual_mode={local_residual_mode!r}")
+    if not math.isfinite(local_residual_alpha) or local_residual_alpha < 0.0 or local_residual_alpha > 1.0:
+        raise ValueError(f"local_residual_alpha must be in [0,1], got {local_residual_alpha}")
+    if not math.isfinite(local_residual_alpha_max) or local_residual_alpha_max < 0.0 or local_residual_alpha_max > 1.0:
+        raise ValueError(f"local_residual_alpha_max must be in [0,1], got {local_residual_alpha_max}")
+    if local_residual_mode == 'learned_alpha':
+        if final_local_residual_alpha is None:
+            raise ValueError("learned_alpha checkpoint is missing lmc_config['final_local_residual_alpha']; cannot evaluate deterministically.")
+        if not math.isfinite(final_local_residual_alpha) or final_local_residual_alpha < 0.0 or final_local_residual_alpha > 1.0:
+            raise ValueError(f"final_local_residual_alpha must be in [0,1], got {final_local_residual_alpha}")
+    local_residual_alpha_eval = final_local_residual_alpha if local_residual_mode == 'learned_alpha' else local_residual_alpha
+    glace_eval_local_dims_logged = False
 
     if is_lmc and memory_path is not None:
         from ace_compressor import GeoLMC
@@ -516,6 +574,19 @@ def run_evaluation_lmc(opt):
             use_half=False,
             feat_name=feat_name,
         )
+    elif model_backend == 'ace_fcn_lmc':
+        feat_name = str(getattr(opt, 'glace_feat_name', None) or lmc_config.get('glace_feat_name', 'features.npy'))
+        testset = CamLocDatasetACEFCNLMC(
+            scene_path / 'test',
+            mode=0,
+            augment=False,
+            aug_rotation=0.0,
+            aug_scale_max=1.0,
+            aug_scale_min=1.0,
+            image_height=image_resolution,
+            use_half=False,
+            feat_name=feat_name if ace_lmc_global_head_mode == 'glace_concat' else None,
+        )
     else:
         testset = CamLocDatasetDINOv2(
             scene_path / "test", mode=0, use_half=False,
@@ -556,7 +627,7 @@ def run_evaluation_lmc(opt):
 
     with torch.no_grad():
         for batch in testset_loader:
-            if model_backend == 'glace_lmc':
+            if model_backend == 'glace_lmc' or (model_backend == 'ace_fcn_lmc' and ace_lmc_global_head_mode == 'glace_concat'):
                 image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames, global_feat_BC, _ = batch
                 global_feat_BC = global_feat_BC.to(device, non_blocking=True)
             else:
@@ -601,32 +672,81 @@ def run_evaluation_lmc(opt):
                             compressor_out_batch = (z, p)
                     else:
                         compressor_out_batch = compressor_out_cached
-                    query = features.permute(0, 2, 3, 1).reshape(B, H * W, C)
                     lmc_runtime_stats_calls += 1
                     collect_stats = lmc_log_runtime_stats and (
                         lmc_runtime_stats_calls == 1
                         or lmc_runtime_stats_calls % lmc_runtime_stats_interval == 0
                     )
-                    fused = fusion(
-                        query,
-                        compressor_out_batch,
-                        sc,
-                        return_stats=collect_stats,
-                        stats_max_pixels=lmc_runtime_stats_max_pixels,
-                    )
-                    if collect_stats:
-                        fused, stats = fused
-                        _log_fusion_runtime_stats("EvalFusion", lmc_runtime_stats_calls, stats)
-                    features = fused.reshape(B, H, W, C).permute(0, 3, 1, 2)
+                    if model_backend == 'glace_lmc' and glace_lmc_fusion_target == 'local':
+                        global_dim = int(lmc_config.get('glace_global_feat_dim', lmc_config.get('glace_residual_global_dim', 0)) or 0)
+                        if global_dim <= 0 or C <= global_dim:
+                            raise ValueError(
+                                f"[EvalFusion] invalid GLACE local fusion split: C={C}, global_dim={global_dim}"
+                            )
+                        global_part = features[:, :global_dim]
+                        local_part = features[:, global_dim:]
+                        local_C = local_part.shape[1]
+                        if not glace_eval_local_dims_logged:
+                            _logger.info(
+                                "[GLACE-LMC] Eval local-only fusion: global_dim=%d local_dim=%d head_dim=%d local_residual=%s alpha_eval=%.6f alpha_target=%.6f alpha_init=%.6f alpha_max=%.6f warmup_steps=%d",
+                                global_dim, local_C, C, local_residual_mode, local_residual_alpha_eval,
+                                local_residual_alpha, local_residual_alpha_init, local_residual_alpha_max,
+                                local_residual_alpha_warmup_steps,
+                            )
+                            glace_eval_local_dims_logged = True
+                        query = local_part.permute(0, 2, 3, 1).reshape(B, H * W, local_C)
+                        fused = fusion(
+                            query,
+                            compressor_out_batch,
+                            sc,
+                            return_stats=collect_stats,
+                            stats_max_pixels=lmc_runtime_stats_max_pixels,
+                        )
+                        if collect_stats:
+                            fused, stats = fused
+                            _log_fusion_runtime_stats("EvalFusionLocal", lmc_runtime_stats_calls, stats)
+                        fused_local = fused.reshape(B, H, W, local_C).permute(0, 3, 1, 2)
+                        if local_residual_mode == 'none':
+                            local_out = fused_local
+                        elif local_residual_mode in ('fixed_alpha', 'learned_alpha'):
+                            local_out = local_part + local_residual_alpha_eval * (fused_local - local_part)
+                        else:
+                            raise ValueError(f"Unsupported local_residual_mode={local_residual_mode!r}")
+                        features = torch.cat((global_part, local_out), dim=1)
+                    else:
+                        query = features.permute(0, 2, 3, 1).reshape(B, H * W, C)
+                        fused = fusion(
+                            query,
+                            compressor_out_batch,
+                            sc,
+                            return_stats=collect_stats,
+                            stats_max_pixels=lmc_runtime_stats_max_pixels,
+                        )
+                        if collect_stats:
+                            fused, stats = fused
+                            _log_fusion_runtime_stats("EvalFusion", lmc_runtime_stats_calls, stats)
+                        features = fused.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
                 if model_backend == 'glace_lmc':
-                    if glace_residual_adapter is not None:
+                    if glace_residual_adapter is not None and glace_lmc_fusion_target != 'local':
                         B, C, H, W = features.shape
                         base_bC = base_features.permute(0, 2, 3, 1).reshape(B * H * W, C)
                         cand_bC = features.permute(0, 2, 3, 1).reshape(B * H * W, C)
                         mixed_bC = glace_residual_adapter(base_bC, cand_bC)
                         features = mixed_bC.view(B, H, W, C).permute(0, 3, 1, 2)
                     head_features = features
+                elif model_backend == 'ace_fcn_lmc' and ace_lmc_global_head_mode == 'glace_concat':
+                    if global_feat_BC is None:
+                        raise ValueError('[Eval] ace_fcn_lmc/glace_concat requires global features in the dataset batch.')
+                    if global_feat_BC.dtype != features.dtype:
+                        global_feat_BC = global_feat_BC.to(dtype=features.dtype)
+                    head_features = torch.cat(
+                        (
+                            global_feat_BC[..., None, None].expand(-1, -1, features.shape[2], features.shape[3]),
+                            features,
+                        ),
+                        dim=1,
+                    )
                 else:
                     head_features = features
                 scene_coordinates_B3HW = network.get_scene_coordinates(head_features)
@@ -759,6 +879,13 @@ def run_evaluation_lmc(opt):
             "effective_lmc_mode": lmc_config.get("effective_lmc_mode", lmc_config.get("lmc_mode")),
             "lmc_auto_mode_by_visibility": lmc_config.get("lmc_auto_mode_by_visibility"),
             "lmc_flow": lmc_config.get("lmc_flow"),
+            "model_backend": lmc_config.get("model_backend"),
+            "ace_encoder_path": lmc_config.get("ace_encoder_path"),
+            "ace_lmc_global_head_mode": lmc_config.get("ace_lmc_global_head_mode"),
+            "ace_lmc_local_checkpoint_path": lmc_config.get("ace_lmc_local_checkpoint_path"),
+            "ace_lmc_freeze_local_stack": lmc_config.get("ace_lmc_freeze_local_stack"),
+            "ace_lmc_final_head_dim": lmc_config.get("ace_lmc_final_head_dim"),
+            "glace_global_feat_dim": lmc_config.get("glace_global_feat_dim"),
             "lmc_key_slice_idx": lmc_config.get("lmc_key_slice_idx"),
             "lmc_key_layer_label": lmc_config.get("lmc_key_layer_label"),
             "lmc_key_feature_mode": lmc_config.get("lmc_key_feature_mode"),
@@ -822,6 +949,16 @@ def run_evaluation_lmc(opt):
             "lmc_fusion_assembly_mode": lmc_config.get("lmc_fusion_assembly_mode", "concat_mlp"),
             "lmc_fusion_assembly_gamma_init": lmc_config.get("lmc_fusion_assembly_gamma_init", 0.0),
             "final_lmc_fusion_assembly_gamma": lmc_config.get("final_lmc_fusion_assembly_gamma"),
+            "local_residual_mode": lmc_config.get("local_residual_mode", "none"),
+            "local_residual_alpha": lmc_config.get("local_residual_alpha", 1.0),
+            "local_residual_alpha_init": lmc_config.get("local_residual_alpha_init", 0.001),
+            "local_residual_alpha_max": lmc_config.get("local_residual_alpha_max", lmc_config.get("local_residual_alpha", 1.0)),
+            "local_residual_alpha_warmup_steps": lmc_config.get("local_residual_alpha_warmup_steps", 0),
+            "final_local_residual_alpha": lmc_config.get("final_local_residual_alpha"),
+            "final_local_residual_alpha_logit": lmc_config.get("final_local_residual_alpha_logit"),
+            "glace_freeze_base_network": lmc_config.get("glace_freeze_base_network"),
+            "glace_freeze_encoder": lmc_config.get("glace_freeze_encoder"),
+            "glace_freeze_head": lmc_config.get("glace_freeze_head"),
             "lmc_log_runtime_stats": lmc_log_runtime_stats,
             "lmc_runtime_stats_interval": lmc_runtime_stats_interval,
             "lmc_runtime_stats_max_pixels": lmc_runtime_stats_max_pixels,
@@ -852,6 +989,8 @@ if __name__ == '__main__':
     parser.add_argument('network', type=Path, help='Path to checkpoint')
     parser.add_argument('--dinov2_path', type=Path,
                         default=DATA_ROOT / 'checkpoints' / 'dinov2_vitl14_pretrain.pth')
+    parser.add_argument('--ace_encoder_path', type=Path, default=Path('/home/xwh/project/ace_depth/ace_encoder_pretrained.pt'),
+                        help='ACE FCN encoder checkpoint path for ace_fcn_lmc checkpoint reconstruction.')
     parser.add_argument('--glace_root', type=Path, default=Path('/home/xwh/project/glace'),
                         help='GLACE repo root for glace_lmc checkpoint reconstruction.')
     parser.add_argument('--glace_encoder_path', type=Path, default=Path('/home/xwh/project/glace/ace_encoder_pretrained.pt'),

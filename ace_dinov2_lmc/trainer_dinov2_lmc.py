@@ -4,6 +4,7 @@
 # Memory loading mirrors map-anything/tasks/ace/utils.py load_memory_features.
 
 import gc
+import copy
 import json
 import logging
 import math
@@ -28,12 +29,14 @@ from torch.amp import autocast
 from torch.utils.data import DataLoader, sampler
 from tqdm import tqdm
 
-from ace_network_dinov2 import Regressor
+from ace_network_dinov2 import Head, Regressor
 from ace_util import to_homogeneous
 from trainer_dinov2 import TrainerACEDINOv2, set_seed
 from ace_compressor import GeoLMC
 from ace_fusion import LMCFeatureFusion
 from ace_loss import ReproLoss
+from ace_network_ace import RegressorACE
+from dataset_ace_fcn_lmc import CamLocDatasetACEFCNLMC
 from utils_lmc import (
     _normalize_scene_tag,
     estimate_memory_front_visibility,
@@ -45,6 +48,7 @@ from glace_backend import (
     GLACEDecoderFeatureResidualAdapter,
     build_glace_camloc_dataset,
     create_glace_regressor_from_encoder,
+    create_glace_regressor_from_split_state_dict,
 )
 
 _logger = logging.getLogger(__name__)
@@ -183,6 +187,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         return sum(p.numel() for p in module.parameters() if p.requires_grad)
 
     @staticmethod
+    def _count_total_params(module):
+        if module is None:
+            return 0
+        return sum(p.numel() for p in module.parameters())
+
+    @staticmethod
     def _optimizer_contains_module_params(optimizer, module):
         if optimizer is None or module is None:
             return False
@@ -192,6 +202,42 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 if id(param) in module_param_ids:
                     return True
         return False
+
+    @staticmethod
+    def _optimizer_group_param_count(group):
+        return sum(param.numel() for param in group.get("params", []))
+
+    def _log_optimizer_groups(self, stage_tag: str, optimizer):
+        if optimizer is None:
+            return
+        for group_idx, group in enumerate(optimizer.param_groups):
+            params = group.get("params", [])
+            group_name = group.get("name", f"group{group_idx}")
+            _logger.info(
+                "[%s] optimizer group %d (%s): lr=%.3e tensors=%d params=%d",
+                stage_tag,
+                group_idx,
+                group_name,
+                float(group.get("lr", 0.0)),
+                len(params),
+                self._optimizer_group_param_count(group),
+            )
+
+    def _validate_glace_head_optimizer_membership(self, stage_tag: str, optimizer, *, expected_trainable: bool):
+        if not self._is_glace_backend():
+            return
+        head = getattr(self.regressor, "heads", None)
+        head_trainable_params = self._count_trainable_params(head)
+        head_in_optimizer = self._optimizer_contains_module_params(optimizer, head)
+        if expected_trainable and (head_trainable_params <= 0 or not head_in_optimizer):
+            raise RuntimeError(
+                f"[{stage_tag}] GLACE head was expected to be trainable, but "
+                f"trainable_params={head_trainable_params} optimizer_contains_head={head_in_optimizer}."
+            )
+        if (not expected_trainable) and head_in_optimizer and head_trainable_params > 0:
+            raise RuntimeError(
+                f"[{stage_tag}] GLACE head was expected to be frozen, but trainable head params are in the optimizer."
+            )
 
     def _get_training_generator(self, device: Optional[torch.device] = None) -> torch.Generator:
         """Return the training RNG that matches the target tensor device."""
@@ -659,6 +705,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         image_hw,
         focal_length,
         centre_point,
+        output_subsample=None,
     ) -> torch.Tensor:
         """Project resized metric depth to patch-level raw world scene coordinates."""
         image_h, image_w = image_hw
@@ -671,7 +718,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 anti_aliasing=False,
             )
 
-        stride = int(Regressor.OUTPUT_SUBSAMPLE)
+        stride = int(output_subsample or Regressor.OUTPUT_SUBSAMPLE)
         coords_h = math.ceil(image_h / stride)
         coords_w = math.ceil(image_w / stride)
         depth_patch, px, py, valid = TrainerACEDINOv2LMC._sample_patch_depth_nearest_valid(
@@ -919,6 +966,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 image_hw=image_hw,
                 focal_length=[float(intrinsics[0, 0]), float(intrinsics[1, 1])],
                 centre_point=[float(intrinsics[0, 2]), float(intrinsics[1, 2])],
+                output_subsample=int(getattr(self.regressor, 'OUTPUT_SUBSAMPLE', Regressor.OUTPUT_SUBSAMPLE)),
             )
             return image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, rgb_path
 
@@ -1014,6 +1062,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 image_hw=image_hw,
                 focal_length=focal_length,
                 centre_point=centre_point,
+                output_subsample=int(getattr(self.regressor, 'OUTPUT_SUBSAMPLE', Regressor.OUTPUT_SUBSAMPLE)),
             )
             item[6] = coords
             return tuple(item)
@@ -1035,6 +1084,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     def _is_glace_backend(self):
         return str(getattr(self.options, "model_backend", "ace_dinov2")) == "glace_lmc"
 
+    def _is_ace_fcn_backend(self):
+        return str(getattr(self.options, "model_backend", "ace_dinov2")) == "ace_fcn_lmc"
+
+    def _ace_lmc_global_head_mode(self):
+        return str(getattr(self.options, "ace_lmc_global_head_mode", "none"))
+
+    def _uses_ace_lmc_global_head(self):
+        return bool(self._is_ace_fcn_backend() and self._ace_lmc_global_head_mode() == "glace_concat")
+
+    def _uses_image_global_features(self):
+        return bool(self._is_glace_backend() or self._uses_ace_lmc_global_head())
+
     def _glace_head_freeze_active(self, iteration_idx):
         if not self._is_glace_backend():
             return False
@@ -1044,11 +1105,28 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     def _set_glace_head_trainable(self, trainable, *, stage_tag):
         if not self._is_glace_backend():
             return
+        if self._glace_freeze_head():
+            trainable = False
         trainable = bool(trainable)
         for param in self.regressor.heads.parameters():
             param.requires_grad_(trainable)
         self.regressor.heads.train(trainable)
         _logger.info("[%s] GLACE head trainable=%s.", stage_tag, trainable)
+
+    # Legacy compatibility: when glace_freeze_head is unset, this still freezes the head.
+    def _glace_freeze_base_network(self):
+        return bool(self._is_glace_backend() and getattr(self.options, "glace_freeze_base_network", True))
+
+    def _glace_freeze_encoder(self):
+        return bool(self._is_glace_backend() and getattr(self.options, "glace_freeze_encoder", True))
+
+    def _glace_freeze_head(self):
+        if not self._is_glace_backend():
+            return False
+        explicit = getattr(self.options, "glace_freeze_head", None)
+        if explicit is None:
+            return self._glace_freeze_base_network()
+        return bool(explicit)
 
     def _glace_residual_lr_ratio(self, fallback_ratio):
         ratio = float(getattr(self.options, "glace_residual_lr_ratio", -1.0))
@@ -1056,8 +1134,200 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return float(fallback_ratio)
         return ratio
 
+    @staticmethod
+    def _logit_from_probability(prob):
+        prob = min(max(float(prob), 1e-6), 1.0 - 1e-6)
+        return math.log(prob / (1.0 - prob))
+
+    def _local_residual_warmup_scale(self):
+        warmup_steps = max(0, int(getattr(self, "local_residual_alpha_warmup_steps", 0)))
+        if warmup_steps <= 0:
+            return 1.0
+        return min(1.0, max(0.0, float(getattr(self, "iteration", 0)) / float(warmup_steps)))
+
+    def _current_local_residual_alpha_tensor(self, *, device, dtype):
+        mode = str(getattr(self, "local_residual_mode", "none"))
+        if mode == "none":
+            return torch.ones((), device=device, dtype=dtype)
+        warmup = self._local_residual_warmup_scale()
+        if mode == "fixed_alpha":
+            return torch.tensor(
+                float(getattr(self, "local_residual_alpha", 1.0)) * warmup,
+                device=device,
+                dtype=dtype,
+            )
+        if mode == "learned_alpha":
+            logit = getattr(self, "local_residual_alpha_logit", None)
+            if logit is None:
+                raise RuntimeError("local_residual_mode=learned_alpha but local_residual_alpha_logit is not initialized.")
+            alpha_max = float(getattr(self, "local_residual_alpha_max", getattr(self, "local_residual_alpha", 1.0)))
+            return torch.sigmoid(logit.to(device=device, dtype=dtype)) * alpha_max * warmup
+        raise ValueError(f"Unsupported local_residual_mode={mode!r}")
+
+    def _current_local_residual_alpha_value(self):
+        alpha = self._current_local_residual_alpha_tensor(device=self.device, dtype=torch.float32)
+        return float(alpha.detach().cpu().item())
+
+    def _local_residual_gate_params(self):
+        param = getattr(self, "local_residual_alpha_logit", None)
+        return [param] if isinstance(param, torch.nn.Parameter) else []
+
+    def _log_glace_lmc_config_diagnostics(self):
+        if not self._is_glace_backend():
+            return
+        _logger.info(
+            "[GLACE-LMC config] freeze_base_network=%s freeze_encoder=%s freeze_head=%s "
+            "lmc_fusion_target=%s effective_lmc_fusion_target=%s local_residual_mode=%s "
+            "local_residual_alpha=%.4f alpha_init=%.6f alpha_max=%.6f alpha_warmup=%d ace_g_fusion_in_s2=%s",
+            self._glace_freeze_base_network(),
+            self._glace_freeze_encoder(),
+            self._glace_freeze_head(),
+            getattr(self, "requested_lmc_fusion_target", getattr(self.options, "lmc_fusion_target", "decoder")),
+            getattr(self, "effective_lmc_fusion_target", getattr(self.options, "lmc_fusion_target", "decoder")),
+            getattr(self, "local_residual_mode", getattr(self.options, "local_residual_mode", "none")),
+            float(getattr(self, "local_residual_alpha", getattr(self.options, "local_residual_alpha", 1.0))),
+            float(getattr(self, "local_residual_alpha_init", getattr(self.options, "local_residual_alpha_init", 0.001))),
+            float(getattr(self, "local_residual_alpha_max", getattr(self.options, "local_residual_alpha_max", None) or getattr(self.options, "local_residual_alpha", 1.0))),
+            int(getattr(self, "local_residual_alpha_warmup_steps", getattr(self.options, "local_residual_alpha_warmup_steps", 0))),
+            bool(getattr(self.options, "ace_g_fusion_in_s2", False)),
+        )
+
+    def _select_glace_delta_local_features(self, base_features_bC, head_features_bC):
+        target = str(getattr(self, "effective_lmc_fusion_target", "decoder"))
+        global_dim = int(getattr(self, "glace_global_feat_dim", 0) or 0)
+        encoder_dim = int(getattr(self, "lmc_config", {}).get(
+            "encoder_feature_dim",
+            getattr(getattr(self.regressor, "encoder", None), "feature_dim", 0) or 0,
+        ))
+        if target == "decoder":
+            if global_dim > 0 and base_features_bC.shape[1] > global_dim and head_features_bC.shape[1] > global_dim:
+                return base_features_bC[:, global_dim:], head_features_bC[:, global_dim:], "decoder_local_slice"
+            return base_features_bC, head_features_bC, "decoder_full_fallback"
+        if target == "local":
+            if base_features_bC.shape[1] == encoder_dim and head_features_bC.shape[1] == encoder_dim:
+                return base_features_bC, head_features_bC, "local_query"
+            if global_dim > 0 and base_features_bC.shape[1] > global_dim and head_features_bC.shape[1] > global_dim:
+                return base_features_bC[:, global_dim:], head_features_bC[:, global_dim:], "local_head_input_slice"
+            return base_features_bC, head_features_bC, "local_query_fallback"
+        raise ValueError(f"Unsupported effective_lmc_fusion_target={target!r}")
+
+    def _should_log_glace_pixel_diag(self):
+        if not self._is_glace_backend():
+            return False
+        interval = int(getattr(self.options, "glace_pixel_diag_interval", 100))
+        if interval <= 0:
+            return False
+        if not getattr(self, "_logged_glace_pixel_diag_once", False):
+            return True
+        return int(getattr(self, "iteration", 0)) % interval == 0
+
+    @staticmethod
+    def _glace_pixel_bucket_stats(base_err, fused_err, mask):
+        mask = mask & torch.isfinite(base_err) & torch.isfinite(fused_err)
+        count = int(mask.sum().item())
+        if count <= 0:
+            return count, float("nan"), float("nan")
+        delta = fused_err[mask] - base_err[mask]
+        improved_ratio = float((delta < 0).float().mean().item())
+        damaged_ratio = float((delta > 0).float().mean().item())
+        return count, improved_ratio, damaged_ratio
+
+    def _compute_glace_base_vs_fused_pixel_diag(
+        self,
+        *,
+        features_bCHW,
+        fused_reprojection_error_b1,
+        target_px_b2,
+        gt_inv_poses_b34,
+        Ks_b33,
+        invKs_b33,
+        step_eff,
+        normalizer,
+    ):
+        if not self._should_log_glace_pixel_diag():
+            return None
+        with torch.no_grad():
+            with autocast("cuda", enabled=self.options.use_half):
+                base_pred_b3HW = self.regressor.get_scene_coordinates(features_bCHW)
+            base_pred_b3HW = self._recover_pred_scene_to_training_world(base_pred_b3HW)
+            base_pred_b31 = base_pred_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
+            base_contract = self._compute_reprojection_invalid_loss_contract(
+                base_pred_b31,
+                target_px_b2,
+                gt_inv_poses_b34,
+                Ks_b33,
+                invKs_b33,
+                step_eff=step_eff,
+                normalizer=normalizer,
+                invalid_max_delta=self._loss_invalid_max_delta,
+                invalid_posinf=0.0,
+                invalid_neginf=0.0,
+            )
+            base_err = base_contract["reprojection_error_l1"].detach().float().flatten()
+            fused_err = fused_reprojection_error_b1.detach().float().flatten()
+            base_valid = base_contract["valid_mask"].detach().flatten().bool()
+            compare_mask = base_valid & torch.isfinite(base_err) & torch.isfinite(fused_err)
+            count = int(compare_mask.sum().item())
+            if count <= 0:
+                diag = {
+                    "count": 0,
+                    "mean_delta": float("nan"),
+                    "median_delta": float("nan"),
+                    "improved_ratio": float("nan"),
+                    "worsened_ratio": float("nan"),
+                    "easy_count": 0,
+                    "easy_damaged_ratio": float("nan"),
+                    "medium_count": 0,
+                    "medium_improved_ratio": float("nan"),
+                    "hard_count": 0,
+                    "hard_improved_ratio": float("nan"),
+                }
+            else:
+                delta = fused_err[compare_mask] - base_err[compare_mask]
+                easy_mask = compare_mask & (base_err < 5.0)
+                medium_mask = compare_mask & (base_err >= 5.0) & (base_err < 20.0)
+                hard_mask = compare_mask & (base_err >= 20.0)
+                easy_count, _, easy_damaged_ratio = self._glace_pixel_bucket_stats(base_err, fused_err, easy_mask)
+                medium_count, medium_improved_ratio, _ = self._glace_pixel_bucket_stats(base_err, fused_err, medium_mask)
+                hard_count, hard_improved_ratio, _ = self._glace_pixel_bucket_stats(base_err, fused_err, hard_mask)
+                diag = {
+                    "count": count,
+                    "mean_delta": float(delta.mean().item()),
+                    "median_delta": float(delta.median().item()),
+                    "improved_ratio": float((delta < 0).float().mean().item()),
+                    "worsened_ratio": float((delta > 0).float().mean().item()),
+                    "easy_count": easy_count,
+                    "easy_damaged_ratio": easy_damaged_ratio,
+                    "medium_count": medium_count,
+                    "medium_improved_ratio": medium_improved_ratio,
+                    "hard_count": hard_count,
+                    "hard_improved_ratio": hard_improved_ratio,
+                }
+            self._logged_glace_pixel_diag_once = True
+            self._last_glace_pixel_diag = diag
+            return diag
+
+    def _log_glace_pixel_diag(self, diag):
+        if diag is None:
+            return
+        _logger.info(
+            "[GLACE-LMC pixel diag] n=%d mean_delta=%.3fpx median_delta=%.3fpx improved=%.2f%% worsened=%.2f%% "
+            "easy_n=%d easy_damaged=%.2f%% medium_n=%d medium_improved=%.2f%% hard_n=%d hard_improved=%.2f%%",
+            int(diag.get("count", 0)),
+            float(diag.get("mean_delta", float("nan"))),
+            float(diag.get("median_delta", float("nan"))),
+            100.0 * float(diag.get("improved_ratio", float("nan"))),
+            100.0 * float(diag.get("worsened_ratio", float("nan"))),
+            int(diag.get("easy_count", 0)),
+            100.0 * float(diag.get("easy_damaged_ratio", float("nan"))),
+            int(diag.get("medium_count", 0)),
+            100.0 * float(diag.get("medium_improved_ratio", float("nan"))),
+            int(diag.get("hard_count", 0)),
+            100.0 * float(diag.get("hard_improved_ratio", float("nan"))),
+        )
+
     def _buffer_schema_name(self, base_name):
-        if self._is_glace_backend():
+        if self._uses_image_global_features():
             return f"{base_name}_glace"
         return base_name
 
@@ -1072,6 +1342,95 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
     def _buffer_feature_dim(self):
         return self._glace_decoder_feature_dim() if self._is_glace_backend() else int(getattr(self.regressor, "feature_dim", 0))
+
+    def _get_image_global_features(self, img_idx_B, *, device, dtype):
+        if img_idx_B is None:
+            raise ValueError("Image-level global features require img_idx.")
+        if not hasattr(self, "global_feats") or self.global_feats is None:
+            raise ValueError("Image-level global features are not initialized.")
+        idx = img_idx_B.to(self.global_feats.device, non_blocking=True).long().view(-1)
+        global_features_BC = self.global_feats[idx]
+        if global_features_BC.device != device:
+            global_features_BC = global_features_BC.to(device, non_blocking=True)
+        if global_features_BC.dtype != dtype:
+            global_features_BC = global_features_BC.to(dtype=dtype)
+        return global_features_BC
+
+    def _get_glace_global_features(self, img_idx_B, *, device, dtype):
+        if not self._is_glace_backend():
+            raise ValueError("GLACE global features are only available for model_backend=glace_lmc.")
+        return self._get_image_global_features(img_idx_B, device=device, dtype=dtype)
+
+    def _append_ace_lmc_global_to_features(self, local_features_bC, img_idx_b1, *, stage_tag):
+        if not self._uses_ace_lmc_global_head():
+            return local_features_bC
+        global_bG = self._get_image_global_features(
+            img_idx_b1,
+            device=local_features_bC.device,
+            dtype=local_features_bC.dtype,
+        )
+        if global_bG.shape[0] != local_features_bC.shape[0]:
+            raise ValueError(
+                f"[{stage_tag}] Global/local row mismatch: global={tuple(global_bG.shape)} "
+                f"local={tuple(local_features_bC.shape)}"
+            )
+        return torch.cat((global_bG, local_features_bC), dim=1)
+
+    def _append_ace_lmc_global_to_feature_maps(self, local_BCHW, img_idx_B, *, stage_tag):
+        if not self._uses_ace_lmc_global_head():
+            return local_BCHW
+        if local_BCHW.dim() != 4:
+            raise ValueError(f"[{stage_tag}] Expected local feature map [B,C,H,W], got {tuple(local_BCHW.shape)}.")
+        global_BC = self._get_image_global_features(
+            img_idx_B,
+            device=local_BCHW.device,
+            dtype=local_BCHW.dtype,
+        )
+        B, _, H, W = local_BCHW.shape
+        if global_BC.shape[0] != B:
+            raise ValueError(
+                f"[{stage_tag}] Global/local batch mismatch: global={tuple(global_BC.shape)} "
+                f"local={tuple(local_BCHW.shape)}"
+            )
+        global_map = global_BC[:, :, None, None].expand(-1, -1, H, W)
+        return torch.cat((global_map, local_BCHW), dim=1)
+
+    def _split_glace_decoder_feature_maps(self, decoder_BCHW, *, stage_tag):
+        if not self._is_glace_backend():
+            return None, decoder_BCHW
+        global_dim = int(getattr(self, "glace_global_feat_dim", 0) or 0)
+        if global_dim <= 0:
+            raise ValueError(f"[{stage_tag}] GLACE decoder split requires global_dim > 0.")
+        if decoder_BCHW.dim() != 4:
+            raise ValueError(f"[{stage_tag}] Expected decoder feature map [B,C,H,W], got {tuple(decoder_BCHW.shape)}.")
+        if decoder_BCHW.shape[1] <= global_dim:
+            raise ValueError(
+                f"[{stage_tag}] GLACE decoder feature dim must exceed global_dim, "
+                f"got C={decoder_BCHW.shape[1]} global_dim={global_dim}."
+            )
+        global_map_BCHW = decoder_BCHW[:, :global_dim]
+        local_BCHW = decoder_BCHW[:, global_dim:]
+        global_BC = global_map_BCHW[:, :, 0, 0].contiguous()
+        return global_BC, local_BCHW
+
+    def _build_glace_head_input(self, global_BC, local_BCHW):
+        if not self._is_glace_backend():
+            return local_BCHW
+        if global_BC is None:
+            raise ValueError("GLACE head input requires global features.")
+        if local_BCHW.dim() != 4:
+            raise ValueError(f"Expected local feature map [B,C,H,W], got {tuple(local_BCHW.shape)}.")
+        if global_BC.dim() != 2:
+            raise ValueError(f"Expected global features [B,Cg], got {tuple(global_BC.shape)}.")
+        B, _, H, W = local_BCHW.shape
+        if global_BC.shape[0] != B:
+            raise ValueError(f"GLACE global/local batch mismatch: global_B={global_BC.shape[0]} local_B={B}.")
+        if global_BC.device != local_BCHW.device:
+            global_BC = global_BC.to(local_BCHW.device, non_blocking=True)
+        if global_BC.dtype != local_BCHW.dtype:
+            global_BC = global_BC.to(dtype=local_BCHW.dtype)
+        global_BCHW = global_BC[..., None, None].expand(-1, -1, H, W)
+        return torch.cat((global_BCHW, local_BCHW), dim=1)
 
     def _mix_glace_decoder_features(self, base_decoder_features_bC, candidate_decoder_features_bC, *, stage_tag):
         if not self._is_glace_backend():
@@ -1108,18 +1467,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return local_features_BCHW
         if img_idx_B is None:
             raise ValueError(f"[{stage_tag}] GLACE backend requires img_idx to assemble decoder features.")
-        if not hasattr(self, "global_feats") or self.global_feats is None:
-            raise ValueError(f"[{stage_tag}] GLACE backend global_feats are not initialized.")
-        idx = img_idx_B.to(self.global_feats.device, non_blocking=True).long().view(-1)
-        global_features_BC = self.global_feats[idx]
-        if global_features_BC.device != local_features_BCHW.device:
-            global_features_BC = global_features_BC.to(local_features_BCHW.device, non_blocking=True)
-        if global_features_BC.dtype != local_features_BCHW.dtype:
-            global_features_BC = global_features_BC.to(dtype=local_features_BCHW.dtype)
-        return torch.cat(
-            (global_features_BC[..., None, None].expand(-1, -1, local_features_BCHW.shape[2], local_features_BCHW.shape[3]), local_features_BCHW),
-            dim=1,
+        global_features_BC = self._get_glace_global_features(
+            img_idx_B,
+            device=local_features_BCHW.device,
+            dtype=local_features_BCHW.dtype,
         )
+        return self._build_glace_head_input(global_features_BC, local_features_BCHW)
 
     def _build_glace_decoder_features(self, local_features_bC, img_idx_b1, *, stage_tag):
         if not self._is_glace_backend():
@@ -1155,6 +1508,23 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 num_clusters=None,
                 cluster_idx=None,
                 feat_name=str(getattr(self.options, "glace_feat_name", "features.npy")),
+            )
+        elif self._is_ace_fcn_backend():
+            backend = getattr(self.options, "data_backend", "ace")
+            if backend != "ace":
+                raise ValueError("[ACE-FCN-LMC] model_backend=ace_fcn_lmc currently supports only data_backend=ace.")
+            dataset = CamLocDatasetACEFCNLMC(
+                root_dir=self._get_train_root(),
+                mode=0,
+                augment=augment,
+                aug_rotation=aug_rotation,
+                aug_scale_max=aug_scale_max,
+                aug_scale_min=aug_scale_min,
+                image_height=self.options.image_resolution,
+                use_half=self.options.use_half,
+                num_clusters=None,
+                cluster_idx=None,
+                feat_name=str(getattr(self.options, "glace_feat_name", "features.npy")) if self._uses_ace_lmc_global_head() else None,
             )
         else:
             dataset = super()._build_train_dataset(
@@ -1203,9 +1573,66 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         return dataset
 
     def _create_regressor(self):
+        if self._is_ace_fcn_backend():
+            encoder_dim = int(getattr(self.options, "ace_encoder_features", 512))
+            regressor = RegressorACE.create_from_encoder(
+                encoder_path=self.options.ace_encoder_path,
+                mean=self.dataset.mean_cam_center,
+                num_head_blocks=self.options.num_head_blocks,
+                use_homogeneous=self.options.use_homogeneous,
+                num_encoder_features=encoder_dim,
+                freeze_backbone=self.options.freeze_backbone,
+            )
+            if self._uses_ace_lmc_global_head():
+                global_feat_dim = int(getattr(self.dataset, "global_feat_dim", 0))
+                if global_feat_dim <= 0:
+                    raise ValueError("[ACE-FCN-LMC] glace_concat requires non-empty GLACE global features.")
+                final_head_dim = encoder_dim + global_feat_dim
+                regressor.heads = Head(
+                    self.dataset.mean_cam_center,
+                    self.options.num_head_blocks,
+                    self.options.use_homogeneous,
+                    in_channels=final_head_dim,
+                )
+                regressor.ace_lmc_local_feature_dim = encoder_dim
+                regressor.ace_lmc_final_head_dim = final_head_dim
+                _logger.info(
+                    "Loaded ACE FCN encoder from %s and created GLACE-concat head: local_dim=%d global_dim=%d final_dim=%d",
+                    self.options.ace_encoder_path,
+                    encoder_dim,
+                    global_feat_dim,
+                    final_head_dim,
+                )
+            else:
+                _logger.info("Loaded ACE FCN encoder from: %s", self.options.ace_encoder_path)
+            return regressor
         if not self._is_glace_backend():
             return super()._create_regressor()
         global_feat_dim = int(getattr(self.dataset, "global_feat_dim", 0))
+        init_head_path = getattr(self.options, "glace_init_head_path", None)
+        if init_head_path is not None:
+            init_head_path = Path(init_head_path)
+        # If a vanilla GLACE head checkpoint is supplied, reuse it as the
+        # starting point instead of rebuilding a fresh head from scratch.
+        if init_head_path is not None and str(init_head_path) and init_head_path.exists():
+            head_state_dict = self._torch_load_trusted_checkpoint(init_head_path, map_location="cpu")
+            regressor = create_glace_regressor_from_split_state_dict(
+                glace_root=self.options.glace_root,
+                encoder_path=self.options.glace_encoder_path,
+                head_state_dict=head_state_dict,
+                map_location="cpu",
+            )
+            _logger.info(
+                "Loaded GLACE encoder from %s and initialized scene head from %s (global_feat_dim=%d, feat_name=%s)",
+                self.options.glace_encoder_path,
+                init_head_path,
+                global_feat_dim,
+                getattr(self.options, "glace_feat_name", "features.npy"),
+            )
+            return regressor
+        if init_head_path is not None and str(init_head_path):
+            raise FileNotFoundError(f"GLACE init head checkpoint not found: {init_head_path}")
+
         regressor = create_glace_regressor_from_encoder(
             glace_root=self.options.glace_root,
             encoder_path=self.options.glace_encoder_path,
@@ -1232,18 +1659,32 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         memory_path = getattr(options, 'memory_path', None)
         if memory_path is None:
             self.use_lmc = False
-        if self.model_backend == 'glace_lmc' and not self.use_lmc:
-            raise ValueError('[GLACE-LMC] model_backend=glace_lmc requires --use_lmc True and a valid --memory_path.')
-        if self.model_backend == 'glace_lmc' and str(getattr(options, 'data_backend', 'ace')) != 'ace':
-            raise ValueError('[GLACE-LMC] model_backend=glace_lmc currently supports only data_backend=ace.')
+        if self.model_backend in ('glace_lmc', 'ace_fcn_lmc') and not self.use_lmc:
+            raise ValueError(f'[{self.model_backend}] requires --use_lmc True and a valid --memory_path.')
+        if self.model_backend in ('glace_lmc', 'ace_fcn_lmc') and str(getattr(options, 'data_backend', 'ace')) != 'ace':
+            raise ValueError(f'[{self.model_backend}] currently supports only data_backend=ace.')
         if self.model_backend == 'glace_lmc' and str(getattr(options, 'lmc_flow', 'iterative')) != 'ace_g':
             raise ValueError('[GLACE-LMC] full-decoder fusion currently requires --lmc_flow ace_g.')
+        if self.model_backend == 'ace_fcn_lmc' and str(getattr(options, 'lmc_flow', 'iterative')) != 'ace_g':
+            raise ValueError('[ACE-FCN-LMC] v1 requires --lmc_flow ace_g.')
+        if self.model_backend == 'ace_fcn_lmc' and not bool(getattr(options, 'freeze_backbone', True)):
+            raise ValueError('[ACE-FCN-LMC] v1 keeps the ACE FCN encoder frozen; use --freeze_backbone True.')
+        ace_lmc_global_head_mode = str(getattr(options, 'ace_lmc_global_head_mode', 'none'))
+        if self.model_backend != 'ace_fcn_lmc' and ace_lmc_global_head_mode != 'none':
+            raise ValueError('--ace_lmc_global_head_mode is only supported for model_backend=ace_fcn_lmc.')
+        if self.model_backend == 'ace_fcn_lmc' and ace_lmc_global_head_mode == 'glace_concat' and getattr(options, 'ace_lmc_local_checkpoint_path', None) is None:
+            raise ValueError('[ACE-FCN-LMC] glace_concat requires --ace_lmc_local_checkpoint_path from stage 1.')
+        if self.model_backend == 'glace_lmc' and str(getattr(options, 'glace_freeze_encoder', True)).lower() in ('false', '0', 'no', 'off'):
+            raise ValueError(
+                'glace_freeze_encoder=False is not supported yet: encoder params are not included in S1/S2 optimizers.'
+            )
 
         # Parent builds: dataset, regressor, optimizer, scheduler, loss, buffer
         super().__init__(options)
         self.global_feats = None
         self.glace_global_feat_dim = 0
         self.glace_residual_adapter = None
+        self.glace_reference_regressor = None
         if self._is_glace_backend():
             self.glace_global_feat_dim = int(getattr(self.dataset, 'global_feat_dim', 0))
             self.global_feats = torch.tensor(
@@ -1264,6 +1705,48 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 glace_residual_mode,
                 glace_residual_gate_init,
                 float(self.glace_residual_adapter.residual_gain().detach().cpu().item()),
+                self.glace_global_feat_dim,
+            )
+            # Anti-regression adds a small penalty when S2 fused output is worse
+            # than the frozen reference regressor on the same batch.
+            self.glace_antiregression_weight = max(0.0, float(getattr(options, 'glace_antiregression_weight', 0.0)))
+            self.glace_antiregression_margin_px = max(0.0, float(getattr(options, 'glace_antiregression_margin_px', 0.25)))
+            self.glace_antiregression_max_px = max(0.0, float(getattr(options, 'glace_antiregression_max_px', 100.0)))
+            if self.glace_antiregression_weight > 0.0:
+                self.glace_reference_regressor = copy.deepcopy(self.regressor).to(self.device).eval()
+                for param in self.glace_reference_regressor.parameters():
+                    param.requires_grad_(False)
+                _logger.info(
+                    '[GLACE-LMC] Anti-regression enabled: weight=%.4f margin=%.3fpx max=%.1fpx '
+                    '(fixed frozen GLACE reference).',
+                    self.glace_antiregression_weight,
+                    self.glace_antiregression_margin_px,
+                    self.glace_antiregression_max_px,
+                )
+            if self._glace_freeze_encoder():
+                self.regressor.encoder.eval()
+                for param in self.regressor.encoder.parameters():
+                    param.requires_grad_(False)
+            else:
+                for param in self.regressor.encoder.parameters():
+                    param.requires_grad_(True)
+            self._set_glace_head_trainable(not self._glace_freeze_head(), stage_tag="GLACE-LMC")
+            _logger.info(
+                '[GLACE-LMC] Freeze policy: legacy_base=%s encoder_frozen=%s head_frozen=%s.',
+                self._glace_freeze_base_network(),
+                self._glace_freeze_encoder(),
+                self._glace_freeze_head(),
+            )
+        if self._uses_ace_lmc_global_head():
+            self.glace_global_feat_dim = int(getattr(self.dataset, 'global_feat_dim', 0))
+            self.global_feats = torch.tensor(
+                self.dataset.global_feats,
+                dtype=(torch.float32, torch.float16)[self.options.use_half],
+                device=self.device,
+            )
+            _logger.info(
+                '[ACE-FCN-LMC] Loaded %d GLACE global features with dim=%d for final head concat.',
+                int(self.global_feats.shape[0]),
                 self.glace_global_feat_dim,
             )
         self._training_generator_cpu = torch.Generator().manual_seed(self.base_seed + 8191)
@@ -1631,12 +2114,70 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 _logger.info("[LMC] scale_token_dim=%d from all_scale_tokens", scale_token_dim)
 
         encoder_feature_dim = int(getattr(self.regressor.encoder, 'feature_dim', getattr(self.regressor, 'feature_dim', 1024)))
-        backbone_feature_dim = self._glace_decoder_feature_dim() if self._is_glace_backend() else encoder_feature_dim
+        decoder_feature_dim = self._glace_decoder_feature_dim() if self._is_glace_backend() else encoder_feature_dim
+        requested_lmc_fusion_target = str(getattr(options, 'lmc_fusion_target', 'decoder'))
+        if requested_lmc_fusion_target not in ('decoder', 'local'):
+            raise ValueError(f"Unsupported lmc_fusion_target={requested_lmc_fusion_target!r}")
+        if requested_lmc_fusion_target == 'local' and not self._is_glace_backend():
+            raise ValueError("--lmc_fusion_target=local is only supported for model_backend=glace_lmc.")
+        effective_lmc_fusion_target = requested_lmc_fusion_target
+        fusion_query_dim = decoder_feature_dim if effective_lmc_fusion_target == 'decoder' else encoder_feature_dim
+        backbone_feature_dim = fusion_query_dim
+        self.requested_lmc_fusion_target = requested_lmc_fusion_target
+        self.effective_lmc_fusion_target = effective_lmc_fusion_target
+        self.lmc_fusion_target = effective_lmc_fusion_target
+        local_residual_mode = str(getattr(options, 'local_residual_mode', 'none'))
+        if local_residual_mode not in ('none', 'fixed_alpha', 'learned_alpha'):
+            raise ValueError(f"Unsupported local_residual_mode={local_residual_mode!r}")
+        local_residual_alpha = float(getattr(options, 'local_residual_alpha', 1.0))
+        if not math.isfinite(local_residual_alpha) or local_residual_alpha < 0.0 or local_residual_alpha > 1.0:
+            raise ValueError(f"--local_residual_alpha must be in [0,1], got {local_residual_alpha}")
+        local_residual_alpha_max_arg = getattr(options, 'local_residual_alpha_max', None)
+        local_residual_alpha_max = local_residual_alpha if local_residual_alpha_max_arg is None else float(local_residual_alpha_max_arg)
+        if not math.isfinite(local_residual_alpha_max) or local_residual_alpha_max < 0.0 or local_residual_alpha_max > 1.0:
+            raise ValueError(f"--local_residual_alpha_max must be in [0,1], got {local_residual_alpha_max}")
+        local_residual_alpha_init = float(getattr(options, 'local_residual_alpha_init', 0.001))
+        if not math.isfinite(local_residual_alpha_init) or local_residual_alpha_init < 0.0:
+            raise ValueError(f"--local_residual_alpha_init must be finite and >=0, got {local_residual_alpha_init}")
+        local_residual_alpha_warmup_steps = max(0, int(getattr(options, 'local_residual_alpha_warmup_steps', 0)))
+        if local_residual_mode == 'learned_alpha':
+            if local_residual_alpha_max <= 0.0:
+                raise ValueError("--local_residual_alpha_max must be >0 for learned_alpha.")
+            if local_residual_alpha_init > local_residual_alpha_max:
+                raise ValueError(
+                    f"--local_residual_alpha_init ({local_residual_alpha_init}) must be <= alpha_max ({local_residual_alpha_max})."
+                )
+        self.local_residual_mode = local_residual_mode
+        self.local_residual_alpha = local_residual_alpha
+        self.local_residual_alpha_init = local_residual_alpha_init
+        self.local_residual_alpha_max = local_residual_alpha_max
+        self.local_residual_alpha_warmup_steps = local_residual_alpha_warmup_steps
+        self.local_residual_alpha_logit = None
+        if self._is_glace_backend() and local_residual_mode == 'learned_alpha':
+            init_prob = local_residual_alpha_init / max(local_residual_alpha_max, 1e-12)
+            self.local_residual_alpha_logit = torch.nn.Parameter(
+                torch.tensor(self._logit_from_probability(init_prob), dtype=torch.float32, device=self.device)
+            )
+
+        fusion_query_desc = 'decoder_global_local'
+        if self._is_glace_backend() and effective_lmc_fusion_target == 'local':
+            fusion_query_desc = 'local_only_global_bypass'
+            if local_residual_mode == 'fixed_alpha':
+                fusion_query_desc = 'local_only_global_bypass_fixed_alpha'
+            elif local_residual_mode == 'learned_alpha':
+                fusion_query_desc = 'local_only_global_bypass_learned_alpha'
+        elif not self._is_glace_backend():
+            fusion_query_desc = 'encoder'
         _logger.info(
-            "[LMC] encoder_feature_dim=%d fusion_query_dim=%d%s",
+            "[LMC] encoder_feature_dim=%d decoder_feature_dim=%d fusion_query_dim=%d fusion_target=%s requested=%s query=%s local_residual=%s alpha=%.4f",
             encoder_feature_dim,
-            backbone_feature_dim,
-            " (GLACE decoder feature: global+local)" if self._is_glace_backend() else "",
+            decoder_feature_dim,
+            fusion_query_dim,
+            effective_lmc_fusion_target,
+            requested_lmc_fusion_target,
+            fusion_query_desc,
+            local_residual_mode,
+            local_residual_alpha,
         )
 
         # --- Full-pipeline normalization: store mu/sigma for config ---
@@ -1811,27 +2352,50 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'lmc_fusion_assembly_gamma_init': lmc_fusion_assembly_gamma_init,
             'final_lmc_fusion_assembly_gamma': None,
             'ace_g_fusion_in_s2': bool(getattr(options, 'ace_g_fusion_in_s2', False)),
+            'lmc_fusion_target': effective_lmc_fusion_target,
+            'requested_lmc_fusion_target': requested_lmc_fusion_target,
+            'effective_lmc_fusion_target': effective_lmc_fusion_target,
+            'fusion_query_dim': fusion_query_dim,
+            'local_residual_mode': local_residual_mode,
+            'local_residual_alpha': local_residual_alpha,
+            'local_residual_alpha_init': local_residual_alpha_init,
+            'local_residual_alpha_max': local_residual_alpha_max,
+            'local_residual_alpha_warmup_steps': local_residual_alpha_warmup_steps,
+            'final_local_residual_alpha': None,
             'backbone_feature_dim': backbone_feature_dim,
             'encoder_feature_dim': encoder_feature_dim,
             'memory_feature_dim': feature_dim,
             'scale_token_dim': scale_token_dim,
             'memory_path': str(memory_path),
             'model_backend': self.model_backend,
+            'ace_encoder_path': str(getattr(options, 'ace_encoder_path', '')),
+            'ace_lmc_global_head_mode': self._ace_lmc_global_head_mode() if self._is_ace_fcn_backend() else 'none',
+            'ace_lmc_local_checkpoint_path': str(getattr(options, 'ace_lmc_local_checkpoint_path', '') or ''),
+            'ace_lmc_freeze_local_stack': bool(getattr(options, 'ace_lmc_freeze_local_stack', True)),
+            'ace_lmc_final_head_dim': int(getattr(self.regressor, 'ace_lmc_final_head_dim', backbone_feature_dim)),
             'data_backend': str(getattr(options, 'data_backend', 'ace')),
             'wai_repo_root': str(getattr(options, 'wai_repo_root', '')),
             'wai_image_modality': str(getattr(options, 'wai_image_modality', 'image')),
             'glace_root': str(getattr(options, 'glace_root', '')),
             'glace_encoder_path': str(getattr(options, 'glace_encoder_path', '')),
+            'glace_init_head_path': str(getattr(options, 'glace_init_head_path', '') or ''),
             'glace_feat_name': str(getattr(options, 'glace_feat_name', 'features.npy')),
             'glace_global_feat_dim': int(getattr(self, 'glace_global_feat_dim', 0)),
             'glace_head_channels': int(getattr(options, 'glace_head_channels', 512)),
             'glace_mlp_ratio': float(getattr(options, 'glace_mlp_ratio', 1.0)),
-            'glace_fusion_query': 'decoder_global_local' if self._is_glace_backend() else '',
+            'glace_fusion_query': fusion_query_desc if self._is_glace_backend() else '',
             'glace_residual_mode': str(getattr(options, 'glace_residual_mode', 'local_delta_tanh_scalar')) if self._is_glace_backend() else '',
             'glace_residual_gate_init': float(getattr(options, 'glace_residual_gate_init', 0.0)) if self._is_glace_backend() else 0.0,
             'glace_residual_global_dim': int(getattr(self, 'glace_global_feat_dim', 0)) if self._is_glace_backend() else 0,
             'glace_head_freeze_iters': int(getattr(options, 'glace_head_freeze_iters', 0)) if self._is_glace_backend() else 0,
             'glace_residual_lr_ratio': float(getattr(options, 'glace_residual_lr_ratio', -1.0)) if self._is_glace_backend() else -1.0,
+            'glace_antiregression_weight': float(getattr(options, 'glace_antiregression_weight', 0.0)) if self._is_glace_backend() else 0.0,
+            'glace_antiregression_margin_px': float(getattr(options, 'glace_antiregression_margin_px', 0.25)) if self._is_glace_backend() else 0.0,
+            'glace_antiregression_max_px': float(getattr(options, 'glace_antiregression_max_px', 100.0)) if self._is_glace_backend() else 0.0,
+            'glace_pixel_diag_interval': int(getattr(options, 'glace_pixel_diag_interval', 100)) if self._is_glace_backend() else 0,
+            'glace_freeze_base_network': bool(getattr(options, 'glace_freeze_base_network', True)) if self._is_glace_backend() else False,
+            'glace_freeze_encoder': self._glace_freeze_encoder() if self._is_glace_backend() else False,
+            'glace_freeze_head': self._glace_freeze_head() if self._is_glace_backend() else False,
             # Normalization metadata for test-time de-normalization
             'normalization_mu': self.coord_mu.cpu().tolist() if self.coord_mu is not None else None,
             'normalization_sigma': self.coord_sigma if self.coord_sigma is not None else None,
@@ -1912,7 +2476,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         ).to(self.device)
         self.compressor.collect_runtime_stats = self.lmc_log_runtime_stats
 
-        # --- Build fusion (query=backbone 1024, memory=compressor output feature_dim) ---
+        # --- Build fusion (query dimension follows --lmc_fusion_target, memory=compressor output feature_dim) ---
         self.fusion = LMCFeatureFusion(
             feature_dim=backbone_feature_dim,
             mode=lmc_mode,
@@ -2011,8 +2575,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self._loss_invalid_max_delta = float(getattr(options, 'loss_invalid_max_delta', 1000.0))
         self._s2_grad_clip_max_norm = float(getattr(options, 's2_grad_clip_max_norm', 1.0))
 
+        self._load_ace_lmc_local_checkpoint_if_requested()
+
         # Rebuild optimizer to include compressor + fusion params (used only when not in LMC; S1/S2 use their own)
         self._rebuild_optimizer()
+        self._log_glace_lmc_config_diagnostics()
+        self._log_stage_trainability("LMC-init")
+        self._log_optimizer_groups("LMC-init", self.optimizer)
 
         _logger.info(
             f"[LMC] mode={lmc_mode}, tokens={num_latent_tokens}, "
@@ -2325,6 +2894,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self._current_buffer_size = effective_size
 
         buffer_batch_size = getattr(self.options, 'buffer_batch_size', 10)
+        if self._is_ace_fcn_backend() and buffer_batch_size != 1:
+            _logger.info('[ACE-FCN-LMC] Forcing buffer_batch_size=1 because the ACE dataset keeps variable image widths.')
+            buffer_batch_size = 1
         if buffer_batch_size > 1:
             buffer_image_width = getattr(self.options, 'buffer_image_width', None)
             if buffer_image_width is None:
@@ -2387,7 +2959,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'gt_scene_coords_world': torch.empty((effective_size, 3), dtype=torch.float32, device=buffer_device),
             'gt_scene_coords_valid': torch.empty((effective_size, 1), dtype=torch.bool, device=buffer_device),
         }
-        if self._is_glace_backend():
+        if self._uses_image_global_features():
             self.training_buffer['img_idx'] = torch.empty((effective_size,), dtype=torch.int64, device=buffer_device)
 
         regressor_mode_snapshot = self._capture_module_training_modes(
@@ -2420,7 +2992,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 for batch in training_dataloader:
                     image_BCHW, image_mask_B1HW, _, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, *_ = batch
                     img_idx_B = None
-                    if self._is_glace_backend():
+                    if self._uses_image_global_features():
                         img_idx_B = batch[-1]
                     coords_B3HW = self._extract_gt_scene_coords_from_batch(batch, image_BCHW=image_BCHW)
 
@@ -2454,6 +3026,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                             stage_tag='Buffer',
                         )
                     else:
+                        if self._uses_image_global_features() and img_idx_B is None:
+                            raise ValueError('[Buffer] image-global backend batch is missing img_idx.')
+                        if img_idx_B is not None:
+                            img_idx_B = img_idx_B.to(self.device, non_blocking=True).long()
                         features_BCHW = local_features_BCHW
 
                     B, C, H, W = features_BCHW.shape
@@ -2492,7 +3068,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         'gt_scene_coords_world': normalize_shape(coords_B3HW),
                         'gt_scene_coords_valid': normalize_shape(coords_valid_B1HW),
                     }
-                    if self._is_glace_backend():
+                    if self._uses_image_global_features():
                         batch_data['img_idx'] = img_idx_B.unsqueeze(1).expand(B, H * W).reshape(-1)
 
                     image_mask_B1HW = image_mask_B1HW.float()
@@ -2580,9 +3156,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             list(self.compressor.parameters()) +
             list(self.fusion.parameters()) +
             list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters()) +
+            self._local_residual_gate_params() +
             list(self.regressor.heads.parameters())
         )
-        self.optimizer = optim.AdamW(params, lr=self.options.learning_rate_min)
+        self.optimizer = optim.AdamW([{'name': 'lmc_all', 'params': params}], lr=self.options.learning_rate_min)
 
         total_s2_steps = (self.lmc_iterations *
                           self.options.training_buffer_size //
@@ -2806,6 +3383,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
     def _maybe_reset_head(self, iteration_idx):
         """Apply head reset strategy."""
+        if self._is_glace_backend() and getattr(self.options, "glace_init_head_path", None):
+            if iteration_idx == 0:
+                _logger.info(
+                    "[GLACE-LMC] Keeping GLACE init scene head; skipping LMC head reset "
+                    "(glace_init_head_path=%s).",
+                    getattr(self.options, "glace_init_head_path", None),
+                )
+            return
         strategy = self.head_reset_strategy
         if strategy == 'none':
             return
@@ -2851,13 +3436,26 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         """Log trainable parameter counts for stage-contract debugging."""
         if not self.use_lmc:
             return
+        adapter = getattr(self, "glace_residual_adapter", None)
+        gate_params = self._local_residual_gate_params()
+        gate_trainable = sum(p.numel() for p in gate_params if p.requires_grad)
+        gate_total = sum(p.numel() for p in gate_params)
         _logger.info(
-            "[%s] trainable params: compressor=%d fusion=%d head=%d encoder=%d",
+            "[%s] trainable params: encoder=%d/%d head=%d/%d compressor=%d/%d fusion=%d/%d residual_adapter=%d/%d local_residual_gate=%d/%d alpha_eff=%.6f",
             stage_tag,
-            self._count_trainable_params(getattr(self, "compressor", None)),
-            self._count_trainable_params(getattr(self, "fusion", None)),
-            self._count_trainable_params(getattr(self.regressor, "heads", None)),
             self._count_trainable_params(getattr(self.regressor, "encoder", None)),
+            self._count_total_params(getattr(self.regressor, "encoder", None)),
+            self._count_trainable_params(getattr(self.regressor, "heads", None)),
+            self._count_total_params(getattr(self.regressor, "heads", None)),
+            self._count_trainable_params(getattr(self, "compressor", None)),
+            self._count_total_params(getattr(self, "compressor", None)),
+            self._count_trainable_params(getattr(self, "fusion", None)),
+            self._count_total_params(getattr(self, "fusion", None)),
+            self._count_trainable_params(adapter),
+            self._count_total_params(adapter),
+            gate_trainable,
+            gate_total,
+            self._current_local_residual_alpha_value() if gate_total > 0 or getattr(self, 'local_residual_mode', 'none') != 'none' else -1.0,
         )
 
     def _validate_s2_compressor_contract(self):
@@ -2941,6 +3539,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "lmc_fusion_cascade_layers",
             "lmc_fusion_assembly_mode",
             "lmc_fusion_assembly_gamma_init",
+            "local_residual_mode",
+            "local_residual_alpha",
+            "local_residual_alpha_init",
+            "local_residual_alpha_max",
+            "local_residual_alpha_warmup_steps",
+            "final_local_residual_alpha",
+            "ace_encoder_path",
+            "ace_lmc_global_head_mode",
+            "ace_lmc_local_checkpoint_path",
+            "ace_lmc_freeze_local_stack",
+            "ace_lmc_final_head_dim",
         ]
         key_mix_logits = getattr(getattr(self, "compressor", None), "key_mix_logits", None)
         if key_mix_logits is not None:
@@ -2966,6 +3575,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         pos_gate = getattr(getattr(getattr(self, "compressor", None), "pe_encoder", None), "residual_gate", None)
         if pos_gate is not None:
             self.lmc_config["final_pos_fourier_residual_gate"] = float(pos_gate.detach().float().cpu().item())
+        if self._is_glace_backend():
+            self.lmc_config["final_local_residual_alpha"] = self._current_local_residual_alpha_value()
         meta = {key: self._tensor_to_config_value(self.lmc_config.get(key)) for key in keys}
         meta["lmc_flow"] = str(getattr(self.options, "lmc_flow", "iterative"))
         meta["lmc_auto_mode_by_visibility"] = bool(getattr(self.options, "lmc_auto_mode_by_visibility", False))
@@ -3152,6 +3763,73 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self._log_fusion_runtime_stats(stage_tag, stats)
         return fused.reshape(B, H, W, C).permute(0, 3, 1, 2)
 
+    def _use_glace_local_fusion(self):
+        return bool(self._is_glace_backend() and getattr(self, 'effective_lmc_fusion_target', 'decoder') == 'local')
+
+    def _fuse_lmc_features_for_head(self, decoder_features_BCHW, compressor_out, *, stage_tag):
+        """Return head input plus optional base decoder features for the legacy residual adapter."""
+        if not self._is_glace_backend():
+            return self._fuse_features(decoder_features_BCHW, compressor_out, stage_tag=stage_tag), None
+
+        target = getattr(self, 'effective_lmc_fusion_target', 'decoder')
+        if target == 'decoder':
+            fused_decoder_BCHW = self._fuse_features(decoder_features_BCHW, compressor_out, stage_tag=stage_tag)
+            return fused_decoder_BCHW, decoder_features_BCHW
+        if target != 'local':
+            raise ValueError(f"Unsupported effective_lmc_fusion_target={target!r}")
+
+        global_BC, local_BCHW = self._split_glace_decoder_feature_maps(
+            decoder_features_BCHW,
+            stage_tag=stage_tag,
+        )
+        fused_local_BCHW = self._fuse_features(local_BCHW, compressor_out, stage_tag=f"{stage_tag}-Local")
+        local_residual_mode = getattr(self, 'local_residual_mode', 'none')
+        local_residual_alpha_eff = self._current_local_residual_alpha_tensor(
+            device=local_BCHW.device,
+            dtype=local_BCHW.dtype,
+        )
+        if local_residual_mode == 'none':
+            local_out_BCHW = fused_local_BCHW
+        elif local_residual_mode in ('fixed_alpha', 'learned_alpha'):
+            local_out_BCHW = local_BCHW + local_residual_alpha_eff * (fused_local_BCHW - local_BCHW)
+        else:
+            raise ValueError(f"Unsupported local_residual_mode={local_residual_mode!r}")
+
+        head_input_BCHW = self._build_glace_head_input(global_BC, local_out_BCHW)
+        if tuple(head_input_BCHW.shape) != tuple(decoder_features_BCHW.shape):
+            raise ValueError(
+                f"[{stage_tag}] GLACE local fusion changed head input shape: "
+                f"base={tuple(decoder_features_BCHW.shape)} head={tuple(head_input_BCHW.shape)}"
+            )
+        if not getattr(self, '_logged_glace_local_fusion_dims', False):
+            _logger.info(
+                "[GLACE-LMC] local-only fusion enabled: global_dim=%d local_dim=%d head_dim=%d local_residual=%s alpha_eff=%.6f alpha_target=%.6f alpha_max=%.6f warmup_steps=%d",
+                int(global_BC.shape[1]),
+                int(local_BCHW.shape[1]),
+                int(head_input_BCHW.shape[1]),
+                local_residual_mode,
+                float(local_residual_alpha_eff.detach().float().cpu().item()),
+                float(getattr(self, 'local_residual_alpha', 1.0)),
+                float(getattr(self, 'local_residual_alpha_max', getattr(self, 'local_residual_alpha', 1.0))),
+                int(getattr(self, 'local_residual_alpha_warmup_steps', 0)),
+            )
+            self._logged_glace_local_fusion_dims = True
+        return head_input_BCHW, None
+
+    def _apply_lmc_fusion_and_residual_for_head(self, decoder_features_BCHW, compressor_out, *, stage_tag):
+        fused_BCHW, base_for_residual_BCHW = self._fuse_lmc_features_for_head(
+            decoder_features_BCHW,
+            compressor_out,
+            stage_tag=stage_tag,
+        )
+        if base_for_residual_BCHW is None:
+            return fused_BCHW
+        return self._mix_glace_decoder_feature_maps(
+            base_for_residual_BCHW,
+            fused_BCHW,
+            stage_tag=stage_tag,
+        )
+
     # ------------------------------------------------------------------
     # Override: create_training_buffer (adds fusion step)
     # ------------------------------------------------------------------
@@ -3194,6 +3872,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         def fused_get_features(images):
             raw_feats = original_get_features(images)
+            if self._use_glace_local_fusion():
+                # _create_training_buffer_with_scene_coords appends the bypassed global features.
+                return self._fuse_features(raw_feats, compressor_out, stage_tag="S2-Buffer-Local")
             return self._fuse_features(raw_feats, compressor_out, stage_tag="S2-Buffer")
 
         self.regressor.get_features = fused_get_features
@@ -3360,6 +4041,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             fused_feats_BCHW,
             stage_tag='S1-FullMap',
         )
+        head_input_BCHW = self._append_ace_lmc_global_to_feature_maps(
+            head_input_BCHW,
+            img_idx_B,
+            stage_tag='S1-FullMap',
+        )
         pred_scene_B3HW = self.regressor.get_scene_coordinates(head_input_BCHW)
         pred_scene_B3HW = self._recover_pred_scene_to_training_world(pred_scene_B3HW)
         pred_scene_N31 = pred_scene_B3HW.permute(0, 2, 3, 1).reshape(N, 3).unsqueeze(-1).float()
@@ -3448,6 +4134,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if base_decoder_features_bC is not None:
             base_decoder_features_bC = base_decoder_features_bC[: batch_size * h * w]
         head_features_bC = self._mix_glace_decoder_features(base_decoder_features_bC, features_bC, stage_tag="S1")
+        head_features_bC = self._append_ace_lmc_global_to_features(head_features_bC, img_idx_b1, stage_tag="S1")
 
         features_bCHW = head_features_bC.view(1, h, w, head_features_bC.shape[1]).permute(0, 3, 1, 2)
         pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(features_bCHW)
@@ -3481,6 +4168,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         # s1_batch_size: default 8 to avoid OOM (full_map and sample_per_image both use encoder on full batch;
         # DINOv2 attention ~(B*N)^2 causes fragmentation OOM after many steps on 24GB GPUs).
         effective_batch = max(1, getattr(self.options, 's1_batch_size', 8))
+        if self._is_ace_fcn_backend() and effective_batch != 1:
+            _logger.info('[ACE-FCN-LMC] Forcing s1_batch_size=1 because the ACE dataset keeps variable image widths.')
+            effective_batch = 1
         buffer_image_width = getattr(self.options, 'buffer_image_width', None)
         if buffer_image_width is None:
             buffer_image_width = (self.options.image_resolution * 4 // 3 + 13) // 14 * 14
@@ -3557,14 +4247,16 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             pct = getattr(self.options, 'lmc_lr_pct_start', 0.3)
             div = getattr(self.options, 'lmc_lr_div_factor', 25.0)
             final_div = getattr(self.options, 'lmc_lr_final_div_factor', 10000.0)
+            group_max_lrs = [float(pg.get('lr', base_lr)) for pg in optimizer_s1.param_groups]
             return optim.lr_scheduler.OneCycleLR(
-                optimizer_s1, max_lr=base_lr, total_steps=target_steps,
+                optimizer_s1, max_lr=group_max_lrs, total_steps=target_steps,
                 pct_start=pct, div_factor=div, final_div_factor=final_div, anneal_strategy='cos',
             )
         # onecycle_legacy
         pct = getattr(self.options, 'lmc_lr_pct_start', 0.4)
+        group_max_lrs = [float(pg.get('lr', base_lr)) for pg in optimizer_s1.param_groups]
         return optim.lr_scheduler.OneCycleLR(
-            optimizer_s1, max_lr=base_lr, total_steps=target_steps, pct_start=pct,
+            optimizer_s1, max_lr=group_max_lrs, total_steps=target_steps, pct_start=pct,
         )
 
     def _prepare_s1_buffer_for_iteration(self, iteration_idx, buffer_size_override=None):
@@ -3671,7 +4363,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self._set_compressor_trainable(True)
         self.compressor.train()
         self.fusion.train()
-        freeze_glace_head = self._glace_head_freeze_active(iteration_idx)
+        # When the base network is frozen, the head is excluded here and only
+        # the plugin path is allowed to move.
+        # Same freeze rule for standard S1 updates.
+        # Same freeze rule carries into S2 / ACE-G head training.
+        # Same freeze rule applies to the S2 polish phase.
+        freeze_glace_head = self._glace_freeze_head() or self._glace_head_freeze_active(iteration_idx)
         if self._is_glace_backend():
             self._set_glace_head_trainable(not freeze_glace_head, stage_tag="S1-Buffer")
         else:
@@ -3696,14 +4393,19 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             _logger.info("  [S1 LR] iter>0: base_lr scaled by %.2f -> %.2e", s1_lr_scale_later, base_lr_s1)
 
         s1_param_groups = [
-            {'params': self.compressor.parameters()},
-            {'params': list(self.fusion.parameters()) + list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())},
+            {'name': 'compressor', 'params': self.compressor.parameters()},
+            {'name': 'fusion_residual', 'params': list(self.fusion.parameters()) + list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())},
         ]
+        gate_params = self._local_residual_gate_params()
+        if gate_params:
+            s1_param_groups.append({'name': 'local_residual_gate', 'params': gate_params, 'lr': base_lr_s1 * 0.1})
         if freeze_glace_head:
             _logger.info("  [S1-Buffer] GLACE head freeze warmup active at iter %d; head excluded from optimizer.", iteration_idx + 1)
         else:
-            s1_param_groups.append({'params': self.regressor.heads.parameters(), 'lr': base_lr_s1 * 0.1})
+            s1_param_groups.append({'name': 'head', 'params': self.regressor.heads.parameters(), 'lr': base_lr_s1 * 0.1})
         comp_optimizer = optim.AdamW(s1_param_groups, lr=base_lr_s1)
+        self._validate_glace_head_optimizer_membership("S1-Buffer", comp_optimizer, expected_trainable=not freeze_glace_head)
+        self._log_optimizer_groups("S1-Buffer", comp_optimizer)
         sched_lmc = self._build_s1_scheduler(comp_optimizer, n_steps, iteration_idx, base_lr=base_lr_s1)
 
         log_interval = 10
@@ -3788,12 +4490,20 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 skipped_sample += 1
                 continue
             target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33 = trimmed
+            img_idx_b1 = img_idx_b1[:batch_size] if img_idx_b1 is not None else None
 
             with autocast("cuda", enabled=self.options.use_half):
                 comp_out = self.compressor(self.memory_dict)
                 raw_features_bCHW = raw_features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
-                fused_bCHW = self._fuse_features(raw_features_bCHW, comp_out, stage_tag="S1-Buffer")
-            fused_features_bC = fused_bCHW.permute(0, 2, 3, 1).reshape(-1, channels)
+                fused_bCHW, base_for_residual_bCHW = self._fuse_lmc_features_for_head(
+                    raw_features_bCHW,
+                    comp_out,
+                    stage_tag="S1-Buffer",
+                )
+            fused_features_bC = fused_bCHW.permute(0, 2, 3, 1).reshape(-1, fused_bCHW.shape[1])
+            base_decoder_features_bC = None
+            if base_for_residual_bCHW is not None:
+                base_decoder_features_bC = base_for_residual_bCHW.permute(0, 2, 3, 1).reshape(-1, base_for_residual_bCHW.shape[1])
 
             loss, s1_stats = self._s1_compute_loss_from_features(
                 fused_features_bC.contiguous(),
@@ -3803,7 +4513,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 invKs_b33.contiguous(),
                 img_idx_b1=img_idx_b1.contiguous() if img_idx_b1 is not None else None,
                 s1_step=update_step,
-                base_decoder_features_bC=raw_features_bC.contiguous() if self._is_glace_backend() else None,
+                base_decoder_features_bC=base_decoder_features_bC.contiguous() if base_decoder_features_bC is not None else None,
             )
 
             if loss is None:
@@ -3939,7 +4649,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self._set_compressor_trainable(True)
         self.compressor.train()
         self.fusion.train()
-        freeze_glace_head = self._glace_head_freeze_active(iteration_idx)
+        freeze_glace_head = self._glace_freeze_head() or self._glace_head_freeze_active(iteration_idx)
         if self._is_glace_backend():
             self._set_glace_head_trainable(not freeze_glace_head, stage_tag="S1")
         else:
@@ -3956,14 +4666,19 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             _logger.info("  [S1 LR] iter>0: base_lr scaled by %.2f -> %.2e", s1_lr_scale_later, base_lr_s1)
 
         s1_param_groups = [
-            {'params': self.compressor.parameters()},
-            {'params': list(self.fusion.parameters()) + list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())},
+            {'name': 'compressor', 'params': self.compressor.parameters()},
+            {'name': 'fusion_residual', 'params': list(self.fusion.parameters()) + list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())},
         ]
+        gate_params = self._local_residual_gate_params()
+        if gate_params:
+            s1_param_groups.append({'name': 'local_residual_gate', 'params': gate_params, 'lr': base_lr_s1 * 0.1})
         if freeze_glace_head:
             _logger.info("  [S1] GLACE head freeze warmup active at iter %d; head excluded from optimizer.", iteration_idx + 1)
         else:
-            s1_param_groups.append({'params': self.regressor.heads.parameters(), 'lr': base_lr_s1 * 0.1})
+            s1_param_groups.append({'name': 'head', 'params': self.regressor.heads.parameters(), 'lr': base_lr_s1 * 0.1})
         comp_optimizer = optim.AdamW(s1_param_groups, lr=base_lr_s1)
+        self._validate_glace_head_optimizer_membership("S1", comp_optimizer, expected_trainable=not freeze_glace_head)
+        self._log_optimizer_groups("S1", comp_optimizer)
 
         sched_lmc = self._build_s1_scheduler(comp_optimizer, n_steps, iteration_idx, base_lr=base_lr_s1)
         s1_loader = self._build_s1_dataloader()
@@ -4049,21 +4764,28 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             if image_BCHW.dtype == torch.float16:
                 image_BCHW = image_BCHW.float()
 
+            img_idx_B_for_head = None
+            if self._uses_image_global_features():
+                img_idx_B_for_head = batch[-1].to(self.device, non_blocking=True).long()
+
             with autocast("cuda", enabled=self.options.use_half):
                 with torch.no_grad():
                     local_feats = self.regressor.get_features(image_BCHW)
                 if self._is_glace_backend():
-                    img_idx_B_for_decoder = batch[-1].to(self.device, non_blocking=True).long()
                     raw_feats = self._build_glace_decoder_feature_maps(
                         local_feats,
-                        img_idx_B_for_decoder,
+                        img_idx_B_for_head,
                         stage_tag='S1-Online',
                     )
                 else:
                     raw_feats = local_feats
 
                 comp_out = self.compressor(self.memory_dict)
-                fused_feats = self._fuse_features(raw_feats, comp_out, stage_tag="S1-Online")
+                fused_feats, base_for_residual_feats = self._fuse_lmc_features_for_head(
+                    raw_feats,
+                    comp_out,
+                    stage_tag="S1-Online",
+                )
 
                 B, C, H, W = fused_feats.shape
                 image_mask_B1HW = TF.resize(image_mask_B1HW, [H, W], interpolation=TF.InterpolationMode.NEAREST)
@@ -4101,9 +4823,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         fused_feats, gt_pose_inv_B34, intrinsics_B33, intrinsics_inv_B33, image_mask_B1HW,
                         gt_scene_coords_B3HW=gt_scene_coords_B3HW,
                         gt_scene_coords_valid_B1HW=gt_scene_coords_valid_B1HW,
-                        img_idx_B=batch[-1].to(self.device, non_blocking=True).long() if self._is_glace_backend() else None,
+                        img_idx_B=img_idx_B_for_head,
                         s1_step=s1_step,
-                        base_decoder_feats_BCHW=raw_feats if self._is_glace_backend() else None,
+                        base_decoder_feats_BCHW=base_for_residual_feats,
                     )
                 else:
                     pixel_positions_B2HW = self.pixel_grid_2HW[:, :H, :W].clone().unsqueeze(0).expand(B, 2, H, W)
@@ -4123,11 +4845,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         'gt_scene_coords_world': normalize_shape(gt_scene_coords_B3HW),
                         'gt_scene_coords_valid': normalize_shape(gt_scene_coords_valid_B1HW),
                     }
-                    if self._is_glace_backend():
-                        batch_data['base_decoder_features'] = normalize_shape(raw_feats)
-                    if self._is_glace_backend():
-                        img_idx_B = batch[-1].to(self.device, non_blocking=True).long()
-                        batch_data['img_idx'] = img_idx_B.unsqueeze(1).expand(B, H * W).reshape(-1)
+                    if base_for_residual_feats is not None:
+                        batch_data['base_decoder_features'] = normalize_shape(base_for_residual_feats)
+                    if self._uses_image_global_features():
+                        batch_data['img_idx'] = img_idx_B_for_head.unsqueeze(1).expand(B, H * W).reshape(-1)
 
                     image_mask_N1 = normalize_shape(image_mask_B1HW.float())
                     coord_valid_N1 = normalize_shape(coord_sampling_B1HW)
@@ -4361,7 +5082,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self.lmc_flow == 'ace_g'
             and getattr(self.options, 'ace_g_fusion_in_s2', False)
         )
-        freeze_glace_head = self._glace_head_freeze_active(iteration_idx)
+        freeze_glace_head = self._glace_freeze_head() or self._glace_head_freeze_active(iteration_idx)
         if self._is_glace_backend():
             self._set_glace_head_trainable(not freeze_glace_head, stage_tag="S2-G")
             if freeze_glace_head and not ace_g_fusion_in_s2:
@@ -4379,13 +5100,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             # original GLACE head is also frozen and only the memory plugin moves.
             s2_param_groups = []
             if not freeze_glace_head:
-                s2_param_groups.append({'params': self.regressor.heads.parameters(), 'lr': head_lr})
+                s2_param_groups.append({'name': 'head', 'params': self.regressor.heads.parameters(), 'lr': head_lr})
                 max_lrs.append(head_lr)
-            s2_param_groups.append({'params': list(self.fusion.parameters()), 'lr': fusion_lr})
+            s2_param_groups.append({'name': 'fusion', 'params': list(self.fusion.parameters()), 'lr': fusion_lr})
             max_lrs.append(fusion_lr)
             adapter_params = list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())
             if adapter_params:
-                s2_param_groups.append({'params': adapter_params, 'lr': residual_lr})
+                s2_param_groups.append({'name': 'residual_adapter', 'params': adapter_params, 'lr': residual_lr})
+                max_lrs.append(residual_lr)
+            gate_params = self._local_residual_gate_params()
+            if gate_params:
+                s2_param_groups.append({'name': 'local_residual_gate', 'params': gate_params, 'lr': residual_lr})
                 max_lrs.append(residual_lr)
             self.optimizer_head = optim.AdamW(s2_param_groups)
             _logger.info(
@@ -4393,8 +5118,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 freeze_glace_head, head_lr, fusion_lr, fusion_lr_ratio, residual_lr, residual_lr_ratio,
             )
         else:
-            self.optimizer_head = optim.AdamW(self.regressor.heads.parameters(), lr=head_lr)
+            self.optimizer_head = optim.AdamW([{'name': 'head', 'params': self.regressor.heads.parameters(), 'lr': head_lr}])
             max_lrs = [head_lr]
+        self._validate_glace_head_optimizer_membership("S2-G", self.optimizer_head, expected_trainable=not freeze_glace_head)
+        self._log_optimizer_groups("S2-G", self.optimizer_head)
         self._validate_s2_compressor_contract()
 
         warmup_ratio = (self.s2_lr_warmup_steps / self.steps_per_s2_phase) if self.s2_lr_warmup_steps else 0.1
@@ -4454,7 +5181,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             and getattr(self.options, 'ace_g_fusion_in_s2', False)
         )
         head_lr = self.s2_polish_head_lr
-        freeze_glace_head = self._glace_head_freeze_active(iteration_idx)
+        freeze_glace_head = self._glace_freeze_head() or self._glace_head_freeze_active(iteration_idx)
         if self._is_glace_backend():
             self._set_glace_head_trainable(not freeze_glace_head, stage_tag="S2-Polish")
         if ace_g_fusion_in_s2:
@@ -4464,13 +5191,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             polish_param_groups = []
             max_lrs = []
             if not freeze_glace_head:
-                polish_param_groups.append({'params': self.regressor.heads.parameters(), 'lr': head_lr})
+                polish_param_groups.append({'name': 'head', 'params': self.regressor.heads.parameters(), 'lr': head_lr})
                 max_lrs.append(head_lr)
-            polish_param_groups.append({'params': list(self.fusion.parameters()), 'lr': fusion_lr})
+            polish_param_groups.append({'name': 'fusion', 'params': list(self.fusion.parameters()), 'lr': fusion_lr})
             max_lrs.append(fusion_lr)
             adapter_params = list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())
             if adapter_params:
-                polish_param_groups.append({'params': adapter_params, 'lr': residual_lr})
+                polish_param_groups.append({'name': 'residual_adapter', 'params': adapter_params, 'lr': residual_lr})
+                max_lrs.append(residual_lr)
+            gate_params = self._local_residual_gate_params()
+            if gate_params:
+                polish_param_groups.append({'name': 'local_residual_gate', 'params': gate_params, 'lr': residual_lr})
                 max_lrs.append(residual_lr)
             self.optimizer_head = optim.AdamW(polish_param_groups)
             _logger.info(
@@ -4486,7 +5217,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 residual_lr_ratio,
             )
         else:
-            self.optimizer_head = optim.AdamW(self.regressor.heads.parameters(), lr=head_lr)
+            self.optimizer_head = optim.AdamW([{'name': 'head', 'params': self.regressor.heads.parameters(), 'lr': head_lr}])
             max_lrs = [head_lr]
             _logger.info(
                 "[S2-Polish] iter=%d epochs=%d head_lr=%.2e (constant LR)",
@@ -4494,6 +5225,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 self.s2_polish_epochs,
                 head_lr,
             )
+
+        self._validate_glace_head_optimizer_membership("S2-Polish", self.optimizer_head, expected_trainable=not freeze_glace_head)
+        self._log_optimizer_groups("S2-Polish", self.optimizer_head)
 
         # Keep local_s2_step untouched: in per_iter mode this pins ReproLoss at the
         # low-clamp tail, matching the late-S2 refinement regime we want to test.
@@ -4535,6 +5269,39 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return lhs is rhs
         return lhs == rhs
 
+    def _load_ace_lmc_local_checkpoint_if_requested(self):
+        if not self._uses_ace_lmc_global_head():
+            return
+        checkpoint_path = getattr(self.options, 'ace_lmc_local_checkpoint_path', None)
+        if checkpoint_path is None:
+            raise ValueError('[ACE-FCN-LMC] glace_concat requires --ace_lmc_local_checkpoint_path.')
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f'ACE-FCN local checkpoint not found: {checkpoint_path}')
+        checkpoint = self._torch_load_trusted_checkpoint(checkpoint_path, map_location='cpu')
+        if not isinstance(checkpoint, dict) or 'lmc_config' not in checkpoint:
+            raise ValueError(f'ACE-FCN local checkpoint must be an LMC checkpoint: {checkpoint_path}')
+        checkpoint_config = checkpoint.get('lmc_config') or {}
+        if str(checkpoint_config.get('model_backend', '')) != 'ace_fcn_lmc':
+            raise ValueError(
+                f"ACE-FCN local checkpoint model_backend must be ace_fcn_lmc, got {checkpoint_config.get('model_backend')!r}"
+            )
+        if str(checkpoint_config.get('ace_lmc_global_head_mode', 'none')) != 'none':
+            raise ValueError('Stage-2 --ace_lmc_local_checkpoint_path must point to a pure local stage-1 checkpoint.')
+        self.compressor.load_state_dict(checkpoint['compressor_state_dict'], strict=True)
+        self.fusion.load_state_dict(checkpoint['fusion_state_dict'], strict=True)
+        self.lmc_config['ace_lmc_local_checkpoint_path'] = str(checkpoint_path)
+        _logger.info('[ACE-FCN-LMC] Loaded stage-1 compressor/fusion from %s', checkpoint_path)
+
+        if bool(getattr(self.options, 'ace_lmc_freeze_local_stack', True)):
+            for module in (getattr(self.regressor, 'encoder', None), self.compressor, self.fusion):
+                if module is None:
+                    continue
+                module.eval()
+                for param in module.parameters():
+                    param.requires_grad_(False)
+            _logger.info('[ACE-FCN-LMC] Frozen ACE encoder + compressor + fusion for global-head stage.')
+
     def _validate_resume_lmc_config(self, checkpoint_config):
         if not isinstance(checkpoint_config, dict):
             raise ValueError("Resume checkpoint is missing lmc_config.")
@@ -4552,10 +5319,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "geo_bias_crpb_per_head", "pe_normalize_input", "lmc_compressor_pe_scale_mode",
             "lmc_fusion_geometry_mode", "lmc_fusion_key_geo_init", "lmc_fusion_refinement_mode",
             "lmc_fusion_cascade_layers", "lmc_fusion_assembly_mode", "lmc_fusion_assembly_gamma_init",
-            "ace_g_fusion_in_s2", "backbone_feature_dim", "encoder_feature_dim", "memory_feature_dim",
-            "scale_token_dim", "memory_path", "model_backend", "glace_encoder_path", "glace_feat_name",
+            "ace_g_fusion_in_s2", "lmc_fusion_target", "requested_lmc_fusion_target",
+            "effective_lmc_fusion_target", "fusion_query_dim", "local_residual_mode",
+            "local_residual_alpha", "local_residual_alpha_init", "local_residual_alpha_max",
+            "local_residual_alpha_warmup_steps", "backbone_feature_dim", "encoder_feature_dim", "memory_feature_dim",
+            "scale_token_dim", "memory_path", "model_backend", "ace_encoder_path", "ace_lmc_global_head_mode",
+            "ace_lmc_local_checkpoint_path", "ace_lmc_freeze_local_stack", "ace_lmc_final_head_dim",
+            "glace_encoder_path", "glace_init_head_path", "glace_feat_name",
             "glace_global_feat_dim", "glace_head_channels", "glace_mlp_ratio", "glace_fusion_query",
             "glace_residual_mode", "glace_residual_gate_init", "glace_residual_global_dim", "glace_head_freeze_iters", "glace_residual_lr_ratio",
+            "glace_antiregression_weight", "glace_antiregression_margin_px", "glace_antiregression_max_px", "glace_pixel_diag_interval",
+            "glace_freeze_base_network", "glace_freeze_encoder", "glace_freeze_head",
         ]
         mismatches = []
         missing = []
@@ -4620,6 +5394,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             adapter_state = checkpoint.get('glace_residual_adapter_state_dict')
             if adapter_state is not None:
                 self.glace_residual_adapter.load_state_dict(adapter_state, strict=True)
+        if self.local_residual_mode == 'learned_alpha':
+            gate_state = checkpoint.get('local_residual_gate_state_dict')
+            if gate_state is None or 'local_residual_alpha_logit' not in gate_state:
+                raise ValueError("Resume checkpoint is missing local_residual_gate_state_dict for learned_alpha.")
+            with torch.no_grad():
+                self.local_residual_alpha_logit.copy_(gate_state['local_residual_alpha_logit'].to(self.device, dtype=torch.float32))
 
         start_iter = int(getattr(self.options, "resume_best_iter", 0))
         if start_iter <= 0:
@@ -4647,6 +5427,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self.iteration,
         )
 
+    def _iteration_eval_hypotheses(self):
+        return int(getattr(self.options, 'iteration_eval_hypotheses', 64))
+
+    def _iteration_eval_seed(self):
+        seed = getattr(self.options, 'iteration_eval_seed', None)
+        if seed is None:
+            seed = getattr(self.options, 'eval_dsacstar_seed', 1305)
+        return int(seed)
+
     def _write_fresh_train_header(self):
         with open(self.step_log_path, 'w', encoding='utf-8') as f:
             f.write("Timestamp   Iter      Step  Stage               Loss       PxErr          LR    3D_Med  Mode        \n")
@@ -4658,6 +5447,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         with open(self.eval_log_path, 'w', encoding='utf-8') as f:
             f.write("# Iteration evaluation log (aligns with post_train_eval.txt fields)\n")
             f.write(f"best_metric={self.best_metric}, keep_best_only={self.keep_best_only}\n")
+            f.write(
+                f"eval_type=iteration,hypotheses={self._iteration_eval_hypotheses()},"
+                f"seed={self._iteration_eval_seed()},"
+                f"deterministic={bool(getattr(self.options, 'eval_deterministic', False))},"
+                f"dsacstar_seed_per_frame={bool(getattr(self.options, 'eval_dsacstar_seed_per_frame', True))}\n"
+            )
             f.write(
                 "# Each iter: median_rotation_deg, median_translation_cm, acc25/10/5/2/1cm%% "
                 "same as post_train_eval; avg_time_ms=per-frame infer\n"
@@ -4732,12 +5527,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             wai_repo_root=getattr(self.options, 'wai_repo_root', None),
             wai_image_modality=getattr(self.options, 'wai_image_modality', 'image'),
             dinov2_path=self.options.dinov2_path,
+            ace_encoder_path=getattr(self.options, 'ace_encoder_path', None),
+            glace_root=getattr(self.options, 'glace_root', None),
+            glace_feat_name=getattr(self.options, 'glace_feat_name', 'features.npy'),
             device=eval_device,
             image_resolution=self.options.image_resolution,
             session=session,
-            hypotheses=64,
+            hypotheses=self._iteration_eval_hypotheses(),
             eval_deterministic=getattr(self.options, 'eval_deterministic', False),
-            dsacstar_seed=getattr(self.options, 'eval_dsacstar_seed', 1305),
+            dsacstar_seed=self._iteration_eval_seed(),
             dsacstar_seed_per_frame=getattr(self.options, 'eval_dsacstar_seed_per_frame', True),
             eval_num_workers=getattr(self.options, 'eval_num_workers', 6),
             threshold=10,
@@ -4942,11 +5740,21 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             _logger.info(f"{'='*60}")
 
             # --- Stage 1 ---
-            s1_steps = self.lmc_warmup_steps if it == 0 else self.lmc_train_steps
-            _logger.info(f"[S1] Training compressor for {s1_steps} steps")
-            if self.s1_use_buffer:
-                self._prepare_s1_buffer_for_iteration(it)
-            self._train_compressor_steps(it, s1_steps)
+            skip_s1_for_frozen_ace_global = (
+                self._uses_ace_lmc_global_head()
+                and bool(getattr(self.options, 'ace_lmc_freeze_local_stack', True))
+            )
+            if skip_s1_for_frozen_ace_global:
+                _logger.info(
+                    "[S1] Skipping compressor/fusion updates for ACE-FCN global-head stage; "
+                    "using frozen stage-1 local LMC stack."
+                )
+            else:
+                s1_steps = self.lmc_warmup_steps if it == 0 else self.lmc_train_steps
+                _logger.info(f"[S1] Training compressor for {s1_steps} steps")
+                if self.s1_use_buffer:
+                    self._prepare_s1_buffer_for_iteration(it)
+                self._train_compressor_steps(it, s1_steps)
 
             # S1 NaN guard: if compressor weights are all NaN (fp16 overflow / unstable S1),
             # skip S2 for this iteration to avoid wasting time with all-NaN features.
@@ -5060,6 +5868,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 self.best_iter, start_iter + 1, self.lmc_iterations,
             )
 
+        # ACE-G S2 may optionally run fusion on the fly during training.
         ace_g_fusion_in_s2 = getattr(self.options, 'ace_g_fusion_in_s2', False)
         ace_g_cross_iter_eval = getattr(self.options, 'ace_g_cross_iter_eval', False)
         _logger.info("[ACE-G] R2 (fusion trainable in S2): %s", ace_g_fusion_in_s2)
@@ -5077,13 +5886,23 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             _logger.info(f"{'='*60}")
 
             # --- Stage 1: train compressor + fusion + head (same as iterative) ---
-            s1_steps = self.lmc_warmup_steps if it == 0 else self.lmc_train_steps
-            _logger.info(f"[S1] Training compressor for {s1_steps} steps")
-            if self.s1_use_buffer:
-                s1_last_use_final = getattr(self.options, 's1_last_iter_use_final_buffer', False)
-                s1_buf_size = self.buffer_size_final if (is_last and s1_last_use_final) else None
-                self._prepare_s1_buffer_for_iteration(it, buffer_size_override=s1_buf_size)
-            self._train_compressor_steps(it, s1_steps)
+            skip_s1_for_frozen_ace_global = (
+                self._uses_ace_lmc_global_head()
+                and bool(getattr(self.options, 'ace_lmc_freeze_local_stack', True))
+            )
+            if skip_s1_for_frozen_ace_global:
+                _logger.info(
+                    "[S1] Skipping compressor/fusion updates for ACE-FCN global-head stage; "
+                    "using frozen stage-1 local LMC stack."
+                )
+            else:
+                s1_steps = self.lmc_warmup_steps if it == 0 else self.lmc_train_steps
+                _logger.info(f"[S1] Training compressor for {s1_steps} steps")
+                if self.s1_use_buffer:
+                    s1_last_use_final = getattr(self.options, 's1_last_iter_use_final_buffer', False)
+                    s1_buf_size = self.buffer_size_final if (is_last and s1_last_use_final) else None
+                    self._prepare_s1_buffer_for_iteration(it, buffer_size_override=s1_buf_size)
+                self._train_compressor_steps(it, s1_steps)
 
             # S1 NaN guard
             _s1_nan = any(
@@ -5342,6 +6161,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
         img_idx_b1 = img_idx_b1[:batch_size] if img_idx_b1 is not None else None
         head_features_bC = self._mix_glace_decoder_features(None, features_bC, stage_tag="S2")
+        head_features_bC = self._append_ace_lmc_global_to_features(head_features_bC, img_idx_b1, stage_tag="S2")
         features_bCHW = head_features_bC.view(1, h, w, head_features_bC.shape[1]).permute(0, 3, 1, 2)
 
         if self.repro_step_mode == "global_monotonic":
@@ -5482,19 +6302,32 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             step_eff = max(0, self.global_s2_step - rewind)
             step_eff = min(step_eff, self.repro_loss.total_iterations - 1)
 
+        ace_g_fusion_in_s2 = getattr(self.options, 'ace_g_fusion_in_s2', False)
         with autocast("cuda", enabled=self.options.use_half):
             # --- ACE-G core: apply fusion on-the-fly in S2 ---
-            ace_g_fusion_in_s2 = getattr(self.options, 'ace_g_fusion_in_s2', False)
             if ace_g_fusion_in_s2:
                 # R2 path: fusion is trainable with slow LR
-                fused_bCHW = self._fuse_features(features_bCHW, self._s2_compressor_out, stage_tag="S2-G")
+                fused_bCHW, base_for_residual_bCHW = self._fuse_lmc_features_for_head(
+                    features_bCHW,
+                    self._s2_compressor_out,
+                    stage_tag="S2-G",
+                )
             else:
                 # R1 path: fusion frozen (default)
                 with torch.no_grad():
-                    fused_bCHW = self._fuse_features(features_bCHW, self._s2_compressor_out, stage_tag="S2-G")
-            fused_features_bC = fused_bCHW.permute(0, 2, 3, 1).reshape(-1, channels)
+                    fused_bCHW, base_for_residual_bCHW = self._fuse_lmc_features_for_head(
+                        features_bCHW,
+                        self._s2_compressor_out,
+                        stage_tag="S2-G",
+                    )
+            fused_features_bC = fused_bCHW.permute(0, 2, 3, 1).reshape(-1, fused_bCHW.shape[1])
             base_features_bC = features_bCHW.permute(0, 2, 3, 1).reshape(-1, channels)
-            head_features_bC = self._mix_glace_decoder_features(base_features_bC, fused_features_bC, stage_tag="S2-G")
+            if base_for_residual_bCHW is not None:
+                base_for_residual_bC = base_for_residual_bCHW.permute(0, 2, 3, 1).reshape(-1, base_for_residual_bCHW.shape[1])
+                head_features_bC = self._mix_glace_decoder_features(base_for_residual_bC, fused_features_bC, stage_tag="S2-G")
+            else:
+                head_features_bC = fused_features_bC
+            head_features_bC = self._append_ace_lmc_global_to_features(head_features_bC, img_idx_b1, stage_tag="S2-G")
             head_features_bCHW = head_features_bC.view(1, h, w, head_features_bC.shape[1]).permute(0, 3, 1, 2)
             pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(head_features_bCHW)
         pred_scene_coords_b3HW = self._recover_pred_scene_to_training_world(pred_scene_coords_b3HW)
@@ -5521,6 +6354,92 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         reprojection_error_b1 = contract["reprojection_error_l1"]
         valid_mask_b1 = contract["valid_mask"]
 
+        glace_pixel_diag = self._compute_glace_base_vs_fused_pixel_diag(
+            features_bCHW=features_bCHW,
+            fused_reprojection_error_b1=reprojection_error_b1,
+            target_px_b2=target_px_b2,
+            gt_inv_poses_b34=gt_inv_poses_b34,
+            Ks_b33=Ks_b33,
+            invKs_b33=invKs_b33,
+            step_eff=step_eff,
+            normalizer=batch_size,
+        )
+        self._log_glace_pixel_diag(glace_pixel_diag)
+
+        glace_delta_ratio = None
+        glace_delta_stats_scope = None
+        glace_residual_gain = None
+        glace_guard_loss = pred_scene_coords_b31.new_tensor(0.0)
+        glace_guard_px = None
+        glace_base_px = None
+        if self._is_glace_backend():
+            base_local, head_local, glace_delta_stats_scope = self._select_glace_delta_local_features(
+                base_features_bC,
+                head_features_bC,
+            )
+            base_local = base_local.float()
+            head_local = head_local.float()
+            glace_delta_ratio = float(
+                (head_local - base_local).norm().detach().cpu().item()
+                / max(base_local.norm().detach().cpu().item(), 1e-6)
+            )
+            if not getattr(self, '_logged_glace_delta_stats_scope', False):
+                _logger.info(
+                    "[GLACE-LMC] delta stats scope=%s base_dim=%d head_dim=%d ratio=%.6f",
+                    glace_delta_stats_scope,
+                    int(base_local.shape[1]),
+                    int(head_local.shape[1]),
+                    glace_delta_ratio,
+                )
+                self._logged_glace_delta_stats_scope = True
+            if getattr(self, 'glace_residual_adapter', None) is not None:
+                glace_residual_gain = float(
+                    self.glace_residual_adapter.residual_gain().detach().float().cpu().item()
+                )
+
+        guard_weight = float(getattr(self, 'glace_antiregression_weight', 0.0) or 0.0) if self._is_glace_backend() else 0.0
+        # Guard loss is computed against a frozen GLACE reference, not the
+        # current trainable path, so regressions are visible immediately.
+        if guard_weight > 0.0:
+            with torch.no_grad():
+                with autocast("cuda", enabled=self.options.use_half):
+                    reference_regressor = getattr(self, "glace_reference_regressor", None)
+                    if reference_regressor is None:
+                        reference_regressor = self.regressor
+                    base_pred_b3HW = reference_regressor.get_scene_coordinates(features_bCHW)
+                base_pred_b3HW = self._recover_pred_scene_to_training_world(base_pred_b3HW)
+                base_pred_b31 = base_pred_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
+                base_contract = self._compute_reprojection_invalid_loss_contract(
+                    base_pred_b31,
+                    target_px_b2,
+                    gt_inv_poses_b34,
+                    Ks_b33,
+                    invKs_b33,
+                    step_eff=step_eff,
+                    normalizer=batch_size,
+                    invalid_max_delta=self._loss_invalid_max_delta,
+                    invalid_posinf=0.0,
+                    invalid_neginf=0.0,
+                )
+            fused_err = reprojection_error_b1.float().flatten()
+            base_err = base_contract["reprojection_error_l1"].detach().float().flatten()
+            base_valid = base_contract["valid_mask"].detach().flatten().bool()
+            guard_mask = torch.isfinite(fused_err) & torch.isfinite(base_err) & base_valid
+            if guard_mask.any():
+                margin = float(getattr(self, 'glace_antiregression_margin_px', 0.25))
+                max_px = float(getattr(self, 'glace_antiregression_max_px', 100.0))
+                guard_terms = Fnn.relu(fused_err[guard_mask] - base_err[guard_mask] - margin)
+                if max_px > 0.0:
+                    guard_terms = guard_terms.clamp(max=max_px)
+                raw_guard = guard_terms.mean()
+                glace_guard_loss = raw_guard * guard_weight
+                loss = loss + glace_guard_loss
+                glace_guard_px = float(raw_guard.detach().cpu().item())
+                glace_base_px = float(base_err[guard_mask].mean().detach().cpu().item())
+            else:
+                glace_guard_px = 0.0
+                glace_base_px = -1.0
+
         loss_is_finite = bool(torch.isfinite(loss).all().item())
         loss_for_log = float(loss.item()) if loss_is_finite else -1.0
         if not loss_is_finite:
@@ -5540,6 +6459,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 if ace_g_fusion_in_s2:
                     params_to_clip += list(self.fusion.parameters())
                     params_to_clip += list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())
+                    params_to_clip += self._local_residual_gate_params()
                 torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=self._s2_grad_clip_max_norm)
             self.scaler.step(self.optimizer_head)
             self.scaler.update()
@@ -5558,6 +6478,21 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 px_err_finite = float('nan')
                 px_err_for_log = -1.0
             lr = float(self.optimizer_head.param_groups[0]["lr"])
+            # Emit compact GLACE diagnostics so you can spot drift without
+            # opening the tensor path.
+            glace_diag_suffix = ""
+            if self._is_glace_backend():
+                glace_diag_suffix = (
+                    f", gGain={glace_residual_gain if glace_residual_gain is not None else -1.0:.4f}"
+                    f", dRatio={glace_delta_ratio if glace_delta_ratio is not None else -1.0:.5f}"
+                    f", dScope={glace_delta_stats_scope or 'n/a'}"
+                )
+                if float(getattr(self, 'glace_antiregression_weight', 0.0) or 0.0) > 0.0:
+                    glace_diag_suffix += (
+                        f", guardPx={glace_guard_px if glace_guard_px is not None else -1.0:.3f}"
+                        f", basePx={glace_base_px if glace_base_px is not None else -1.0:.2f}"
+                        f", guardLoss={float(glace_guard_loss.detach().cpu().item()):.4f}"
+                    )
             self._append_step_log(
                 iter_idx=self.current_lmc_iter,
                 step=self.iteration,
@@ -5569,7 +6504,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 med3d=-1.0,
             )
             _logger.info(
-                'Iteration: {:6d} | S2-G global={:6d} local={:6d} step_eff={:.0f} | Epoch {:03d}|{:03d}, Loss: {:.4f}, Valid: {:.1f}%, pxErr: {:.2f}, naninf: {:d}, Time: {:.2f}s'.format(
+                'Iteration: {:6d} | S2-G global={:6d} local={:6d} step_eff={:.0f} | Epoch {:03d}|{:03d}, Loss: {:.4f}, Valid: {:.1f}%, pxErr: {:.2f}, naninf: {:d}{}, Time: {:.2f}s'.format(
                     self.iteration,
                     self.global_s2_step,
                     self.local_s2_step,
@@ -5580,6 +6515,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     fraction_valid * 100,
                     px_err_finite if math.isfinite(px_err_finite) else -1.0,
                     pxerr_naninf_count,
+                    glace_diag_suffix,
                     time_since_start,
                 )
             )
@@ -5607,6 +6543,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         }
         if self._is_glace_backend() and getattr(self, 'glace_residual_adapter', None) is not None:
             checkpoint['glace_residual_adapter_state_dict'] = self.glace_residual_adapter.state_dict()
+        if self.local_residual_mode == 'learned_alpha':
+            checkpoint['local_residual_gate_state_dict'] = {
+                'local_residual_alpha_logit': self.local_residual_alpha_logit.detach().float().cpu(),
+            }
         torch.save(checkpoint, output_path)
         _logger.info(f"Saved LMC checkpoint to: {output_path}")
 
@@ -5640,4 +6580,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             config["final_lmc_fusion_assembly_gamma"] = float(fusion_gamma.detach().float().cpu().item())
         if self._is_glace_backend() and getattr(self, 'glace_residual_adapter', None) is not None:
             config['final_glace_residual_gain'] = float(self.glace_residual_adapter.residual_gain().detach().float().cpu().item())
+        if self._is_glace_backend():
+            config['final_local_residual_alpha'] = self._current_local_residual_alpha_value()
+            if self.local_residual_mode == 'learned_alpha':
+                config['final_local_residual_alpha_logit'] = float(self.local_residual_alpha_logit.detach().float().cpu().item())
+        if self._is_glace_backend() and isinstance(getattr(self, '_last_glace_pixel_diag', None), dict):
+            config['last_glace_pixel_diag'] = dict(self._last_glace_pixel_diag)
         return config
