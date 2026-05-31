@@ -175,6 +175,15 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         help='ace_fcn_lmc/glace_concat 第二阶段是否冻结 ACE encoder、compressor、fusion，只训练最终 head。',
     )
     parser.add_argument(
+        '--ace_lmc_allow_mismatched_memory',
+        type=_strtobool,
+        default=False,
+        help=(
+            '仅用于消融：允许 ace_fcn_lmc 使用非 ace_fcn feature_source 的 memory '
+            '（如 MapAnything/DINO/BSE memory）。默认 False，防止误跑 feature-space mismatch。'
+        ),
+    )
+    parser.add_argument(
         '--glace_root',
         type=Path,
         default=Path('/home/xwh/project/glace'),

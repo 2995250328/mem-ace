@@ -560,6 +560,14 @@ def load_memory_features(
             "scene_center_ref_norm": scene_center_ref_norm,
             "scene_center_contract": scene_center_contract,
             "scene_center_contract_space": scene_center_contract_space,
+            "feature_source": payload.get("feature_source"),
+            "encoder_path": payload.get("encoder_path"),
+            "output_subsample": payload.get("output_subsample"),
+            "coord_source": payload.get("coord_source"),
+            "coord_frame": payload.get("coord_frame"),
+            "pooling_mode": payload.get("pooling_mode"),
+            "sampling_mode": payload.get("sampling_mode"),
+            "sanity_report": payload.get("sanity_report"),
         }
 
     # === Pooled format detection ===
@@ -735,6 +743,14 @@ def load_memory_features(
             "scene_center_ref_norm": safe_to_device("scene_center_ref_norm"),
             "scene_center_contract": safe_to_device("scene_center_contract"),
             "scene_center_contract_space": payload.get("scene_center_contract_space"),
+            "feature_source": payload.get("feature_source"),
+            "encoder_path": payload.get("encoder_path"),
+            "output_subsample": payload.get("output_subsample"),
+            "coord_source": payload.get("coord_source"),
+            "coord_frame": payload.get("coord_frame"),
+            "pooling_mode": payload.get("pooling_mode"),
+            "sampling_mode": payload.get("sampling_mode"),
+            "sanity_report": payload.get("sanity_report"),
         }
     if "intermediate" in payload or "final" in payload:
         raise ValueError(

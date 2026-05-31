@@ -1172,6 +1172,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         param = getattr(self, "local_residual_alpha_logit", None)
         return [param] if isinstance(param, torch.nn.Parameter) else []
 
+    def _glace_residual_adapter_params(self):
+        adapter = getattr(self, "glace_residual_adapter", None)
+        return list(adapter.parameters()) if isinstance(adapter, torch.nn.Module) else []
+
     def _log_glace_lmc_config_diagnostics(self):
         if not self._is_glace_backend():
             return
@@ -1921,6 +1925,44 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         N_mem = self.memory_dict["pooled_points"].shape[1]
         pooled_features_dim = self.memory_dict["pooled_features"].shape[-1]
         _logger.info("[LMC] Memory loaded: %d points, pooled_features_dim=%d", N_mem, pooled_features_dim)
+        ace_lmc_allow_mismatched_memory = bool(getattr(options, 'ace_lmc_allow_mismatched_memory', False))
+        if self._is_ace_fcn_backend():
+            feature_source = str(bank_data.get("feature_source") or "unknown")
+            output_subsample_meta = bank_data.get("output_subsample", bank_data.get("patch_stride", None))
+            coord_source = str(bank_data.get("coord_source") or "unknown")
+            if not ace_lmc_allow_mismatched_memory:
+                if feature_source != "ace_fcn":
+                    raise ValueError(
+                        "[ACE-FCN-LMC] memory feature_source must be 'ace_fcn'. "
+                        f"Got {feature_source!r}. Extract a matching memory with "
+                        "ace_dinov2_lmc.memory_extraction.extract_memory_ace_fcn, or pass "
+                        "--ace_lmc_allow_mismatched_memory True for the explicit MapAnything/DINO/BSE ablation."
+                    )
+                if int(pooled_features_dim) != 512:
+                    raise ValueError(f"[ACE-FCN-LMC] expected pooled_features dim=512, got {pooled_features_dim}.")
+                if output_subsample_meta is not None and int(float(output_subsample_meta)) != 8:
+                    raise ValueError(
+                        f"[ACE-FCN-LMC] expected memory output_subsample/patch_stride=8, got {output_subsample_meta!r}."
+                    )
+                sanity = bank_data.get("sanity_report")
+                if isinstance(sanity, dict) and sanity.get("hard_pass") is False:
+                    raise ValueError(f"[ACE-FCN-LMC] memory sanity_report hard_pass=False: {sanity.get('hard_fail_reasons')}")
+                _logger.info(
+                    "[ACE-FCN-LMC] Memory contract OK: feature_source=%s dim=%d stride=%s coord_source=%s",
+                    feature_source,
+                    int(pooled_features_dim),
+                    output_subsample_meta,
+                    coord_source,
+                )
+            else:
+                _logger.warning(
+                    "[ACE-FCN-LMC] MISMATCHED MEMORY ABLATION enabled: query_source=ace_fcn memory_feature_source=%s dim=%d stride=%s coord_source=%s. "
+                    "This run is expected to test feature-space mismatch, not the main ACE-FCN memory path.",
+                    feature_source,
+                    int(pooled_features_dim),
+                    output_subsample_meta,
+                    coord_source,
+                )
 
         # --- LMC config (same as map-anything train_ace: num_layers from layers_idx, feature_dim per layer) ---
         requested_lmc_mode = getattr(options, 'lmc_mode', 'global')
@@ -2372,6 +2414,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'ace_lmc_global_head_mode': self._ace_lmc_global_head_mode() if self._is_ace_fcn_backend() else 'none',
             'ace_lmc_local_checkpoint_path': str(getattr(options, 'ace_lmc_local_checkpoint_path', '') or ''),
             'ace_lmc_freeze_local_stack': bool(getattr(options, 'ace_lmc_freeze_local_stack', True)),
+            'ace_lmc_allow_mismatched_memory': bool(getattr(options, 'ace_lmc_allow_mismatched_memory', False)),
+            'ace_lmc_memory_feature_source': str(bank_data.get('feature_source') or 'unknown'),
+            'ace_lmc_memory_output_subsample': bank_data.get('output_subsample', bank_data.get('patch_stride', None)),
+            'ace_lmc_memory_coord_source': str(bank_data.get('coord_source') or 'unknown'),
             'ace_lmc_final_head_dim': int(getattr(self.regressor, 'ace_lmc_final_head_dim', backbone_feature_dim)),
             'data_backend': str(getattr(options, 'data_backend', 'ace')),
             'wai_repo_root': str(getattr(options, 'wai_repo_root', '')),
@@ -3155,7 +3201,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         params = (
             list(self.compressor.parameters()) +
             list(self.fusion.parameters()) +
-            list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters()) +
+            self._glace_residual_adapter_params() +
             self._local_residual_gate_params() +
             list(self.regressor.heads.parameters())
         )
@@ -4394,7 +4440,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         s1_param_groups = [
             {'name': 'compressor', 'params': self.compressor.parameters()},
-            {'name': 'fusion_residual', 'params': list(self.fusion.parameters()) + list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())},
+            {'name': 'fusion_residual', 'params': list(self.fusion.parameters()) + self._glace_residual_adapter_params()},
         ]
         gate_params = self._local_residual_gate_params()
         if gate_params:
@@ -4558,7 +4604,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             torch.nn.utils.clip_grad_norm_(
                 list(self.compressor.parameters()) +
                 list(self.fusion.parameters()) +
-                list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters()) +
+                self._glace_residual_adapter_params() +
                 list(self.regressor.heads.parameters()),
                 max_norm=1.0
             )
@@ -4667,7 +4713,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         s1_param_groups = [
             {'name': 'compressor', 'params': self.compressor.parameters()},
-            {'name': 'fusion_residual', 'params': list(self.fusion.parameters()) + list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())},
+            {'name': 'fusion_residual', 'params': list(self.fusion.parameters()) + self._glace_residual_adapter_params()},
         ]
         gate_params = self._local_residual_gate_params()
         if gate_params:
@@ -4958,7 +5004,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             torch.nn.utils.clip_grad_norm_(
                 list(self.compressor.parameters()) +
                 list(self.fusion.parameters()) +
-                list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters()) +
+                self._glace_residual_adapter_params() +
                 list(self.regressor.heads.parameters()),
                 max_norm=1.0
             )
@@ -5104,7 +5150,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 max_lrs.append(head_lr)
             s2_param_groups.append({'name': 'fusion', 'params': list(self.fusion.parameters()), 'lr': fusion_lr})
             max_lrs.append(fusion_lr)
-            adapter_params = list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())
+            adapter_params = self._glace_residual_adapter_params()
             if adapter_params:
                 s2_param_groups.append({'name': 'residual_adapter', 'params': adapter_params, 'lr': residual_lr})
                 max_lrs.append(residual_lr)
@@ -5195,7 +5241,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 max_lrs.append(head_lr)
             polish_param_groups.append({'name': 'fusion', 'params': list(self.fusion.parameters()), 'lr': fusion_lr})
             max_lrs.append(fusion_lr)
-            adapter_params = list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())
+            adapter_params = self._glace_residual_adapter_params()
             if adapter_params:
                 polish_param_groups.append({'name': 'residual_adapter', 'params': adapter_params, 'lr': residual_lr})
                 max_lrs.append(residual_lr)
@@ -5324,7 +5370,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "local_residual_alpha", "local_residual_alpha_init", "local_residual_alpha_max",
             "local_residual_alpha_warmup_steps", "backbone_feature_dim", "encoder_feature_dim", "memory_feature_dim",
             "scale_token_dim", "memory_path", "model_backend", "ace_encoder_path", "ace_lmc_global_head_mode",
-            "ace_lmc_local_checkpoint_path", "ace_lmc_freeze_local_stack", "ace_lmc_final_head_dim",
+            "ace_lmc_local_checkpoint_path", "ace_lmc_freeze_local_stack", "ace_lmc_allow_mismatched_memory",
+            "ace_lmc_memory_feature_source", "ace_lmc_memory_output_subsample", "ace_lmc_memory_coord_source", "ace_lmc_final_head_dim",
             "glace_encoder_path", "glace_init_head_path", "glace_feat_name",
             "glace_global_feat_dim", "glace_head_channels", "glace_mlp_ratio", "glace_fusion_query",
             "glace_residual_mode", "glace_residual_gate_init", "glace_residual_global_dim", "glace_head_freeze_iters", "glace_residual_lr_ratio",
@@ -5745,6 +5792,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 and bool(getattr(self.options, 'ace_lmc_freeze_local_stack', True))
             )
             if skip_s1_for_frozen_ace_global:
+                s1_steps = 0
                 _logger.info(
                     "[S1] Skipping compressor/fusion updates for ACE-FCN global-head stage; "
                     "using frozen stage-1 local LMC stack."
@@ -5891,6 +5939,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 and bool(getattr(self.options, 'ace_lmc_freeze_local_stack', True))
             )
             if skip_s1_for_frozen_ace_global:
+                s1_steps = 0
                 _logger.info(
                     "[S1] Skipping compressor/fusion updates for ACE-FCN global-head stage; "
                     "using frozen stage-1 local LMC stack."
@@ -6458,7 +6507,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 params_to_clip = list(self.regressor.heads.parameters())
                 if ace_g_fusion_in_s2:
                     params_to_clip += list(self.fusion.parameters())
-                    params_to_clip += list(getattr(self, 'glace_residual_adapter', torch.nn.Module()).parameters())
+                    params_to_clip += self._glace_residual_adapter_params()
                     params_to_clip += self._local_residual_gate_params()
                 torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=self._s2_grad_clip_max_norm)
             self.scaler.step(self.optimizer_head)
