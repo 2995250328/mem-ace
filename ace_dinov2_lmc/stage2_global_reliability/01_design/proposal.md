@@ -1,0 +1,23 @@
+# Title: Reliability-Controlled Global Conditioning for ACE-FCN-LMC Stage2
+
+## 1. Problem Formulation
+Given a Wayspots scene with training images \(I_i\), camera poses/intrinsics, sparse coordinate supervision, and extracted ACE-FCN memory \(M\), Stage1 learns a local ACE-FCN-LMC coordinate predictor \(f_L(I, M) \rightarrow X\). Stage2 adds an image-level GLACE global feature \(g_i\) to produce \(f_{LG}(I, M, g_i) \rightarrow X\). The objective is to improve pose relocalization while bounding degradation relative to Stage1:
+\[
+\min_\theta \; L_{reproj}(f_{LG}) + \lambda_c L_{cons}(f_{LG}, f_L) + \lambda_g R(gate/global)
+\]
+where the reliability mechanism should allow useful global cues for scenes like Bears while suppressing harmful global cues for scenes like SquareBench.
+
+## 2. Literature Landscape & Motivation
+Scene coordinate regression methods such as DSAC*/ACE rely on dense local image evidence and RANSAC, making them robust when local geometry is sufficient. Feature-conditioned or scene-memory methods add broader context, but global descriptors can encode scene-level priors that are not uniformly reliable across scenes. Mixture-of-experts, residual adapters, and knowledge-distillation consistency losses address a similar failure mode: new context should improve predictions only when it is trustworthy. The current Stage2 experiments expose this gap directly: a scalar gate upper bound helps SquareBench only when very small, but Bears needs stronger global injection. Therefore, global conditioning requires reliability control, not one fixed scalar gate.
+
+## 3. Design Space & Selected Architecture
+Alternative A is per-scene validation selection of `global_gate_max`. It is simple and cheap, but it cannot adapt per image and risks overfitting to a small validation split. Alternative B is adaptive/residual global conditioning with Stage1 consistency. It is slightly more complex but directly addresses negative transfer by making Stage2 a conservative residual over a known local predictor. The selected first architecture is: keep the existing Stage2 global concat path, add a Stage1 teacher prediction for sampled training points or feature maps, add a consistency loss weighted by local confidence/error, and replace raw global concat with a zero-initialized residual/adaptive gate branch where possible. The first implementation should be minimal: consistency loss plus bounded gate/residual regularization before adding a full dual-head design.
+
+## 4. Evaluation & Validation Plan
+Primary scenes: `wayspots_bears` and `wayspots_squarebench`. Metrics: median rotation/translation error, Acc50/5deg, Acc25/5deg, Acc10/5deg, Acc5/5deg, with the existing post-train seeds and hypotheses. Baselines: Stage1 local, raw Stage2 concat, bounded scalar gates max=0.01 and max=0.1, zero global, random global. Ablations: consistency weight, residual/global regularization, adaptive gate type, zero-init vs non-zero-init, and checkpoint selection metric. Success criteria: SquareBench Stage2 should remain within a small margin of Stage1 local Acc5, while Bears should approach raw Stage2 Acc5 without collapsing SquareBench.
+
+## 5. Expected Failure Modes & Engineering Risks
+Consistency loss can over-constrain Stage2 and block real global improvements on Bears. Adaptive gates may learn shortcuts if trained only from reprojection loss. Per-image reliability may need validation labels unavailable during training. Eval must exactly mirror training-side gate/residual logic, otherwise checkpoint results become misleading. Stage2 checkpoint saving must include all new gate/residual state and semantic config fields.
+
+## 6. Reuse Plan
+Reuse `../options_dinov2_lmc.py` for new CLI flags and to preserve existing gate flags. Reuse `../trainer_dinov2_lmc.py` for global feature mode, gate initialization, Stage2 optimizer membership, local/global feature concatenation, consistency loss insertion, and checkpoint serialization. Reuse `../test_ace_dinov2_lmc.py` for eval-time reconstruction of the same gate/residual behavior. Reuse `../scripts/run_squarebench_stage2_global_gate_matrix.sh` for Bears/SquareBench quick variants. Reuse `../scripts/summarize_wayspots_ace_fcn_lmc_suite.py` for reporting. `../memory_extraction/extract_memory_ace_fcn.py` and `../ace_fcn_lmc/ace_network_ace.py` define the Stage1 memory and local feature contracts and should not be changed unless required by validation.

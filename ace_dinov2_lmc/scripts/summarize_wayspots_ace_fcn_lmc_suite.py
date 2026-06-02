@@ -69,6 +69,12 @@ def _find_latest_post_train_eval_any(roots: list[Path]) -> Path | None:
     return max(matches, key=lambda p: (p.stat().st_mtime, str(p)))
 
 
+def _seed_pose_logs_for_post_train_eval(path: Path) -> list[Path]:
+    if not re.match(r"post_train_eval(?:_.*)?\.txt$", path.name):
+        return []
+    return sorted(path.parent.glob("poses_*_post_train_seed*.txt"))
+
+
 def _stage_roots(suite_root: Path, stage_dirname: str, scene: str) -> list[Path]:
     roots = [suite_root / stage_dirname / "extracted" / scene / "dino_ace_lmc_ace_g"]
     for stage_dir in sorted(suite_root.glob(f"{stage_dirname}*")):
@@ -78,6 +84,43 @@ def _stage_roots(suite_root: Path, stage_dirname: str, scene: str) -> list[Path]
         if candidate.exists():
             roots.append(candidate)
     return roots
+
+
+def _accuracy_from_pose_log(path: Path, *, max_cm: float, max_deg: float) -> float:
+    rot_deg: list[float] = []
+    trans_cm: list[float] = []
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 11:
+                continue
+            try:
+                rot_deg.append(float(parts[-3]))
+                trans_cm.append(float(parts[-2]) * 100.0)
+            except ValueError:
+                continue
+    if not rot_deg:
+        return float("nan")
+
+    import numpy as np
+
+    r = np.asarray(rot_deg, dtype=np.float64)
+    t = np.asarray(trans_cm, dtype=np.float64)
+    return float(((r < max_deg) & (t < max_cm)).mean() * 100.0)
+
+
+def _post_train_accuracy_from_seed_pose_logs(path: Path, *, max_cm: float, max_deg: float) -> float:
+    values = [
+        _accuracy_from_pose_log(seed_path, max_cm=max_cm, max_deg=max_deg)
+        for seed_path in _seed_pose_logs_for_post_train_eval(path)
+    ]
+    values = [value for value in values if not math.isnan(value)]
+    if not values:
+        return float("nan")
+
+    import numpy as np
+
+    return float(np.median(np.asarray(values, dtype=np.float64)))
 
 
 def _parse_post_train_eval(path: Path) -> dict[str, float | int | str]:
@@ -94,7 +137,7 @@ def _parse_post_train_eval(path: Path) -> dict[str, float | int | str]:
             "frames": int(kv.get("total_frames", 0) or 0),
             "median_deg": float(kv["median_rotation_deg"]),
             "median_cm": float(kv["median_translation_cm"]),
-            "50cm_5deg": float("nan"),
+            "50cm_5deg": _post_train_accuracy_from_seed_pose_logs(path, max_cm=50.0, max_deg=5.0),
             "25cm_5deg": float(kv["accuracy_25cm5deg_pct"]),
             "10cm_5deg": float(kv["accuracy_10cm5deg_pct"]),
             "5cm_5deg": float(kv["accuracy_5cm5deg_pct"]),
@@ -119,7 +162,7 @@ def _parse_post_train_eval(path: Path) -> dict[str, float | int | str]:
         "frames": int(frames_match.group(1)) if frames_match else 0,
         "median_deg": float(metrics_match.group(1)),
         "median_cm": float(metrics_match.group(2)),
-        "50cm_5deg": float("nan"),  # not in post_train_eval format, will be nan
+        "50cm_5deg": _post_train_accuracy_from_seed_pose_logs(path, max_cm=50.0, max_deg=5.0),
         "25cm_5deg": float(metrics_match.group(3)),
         "10cm_5deg": float(metrics_match.group(4)),
         "5cm_5deg": float(metrics_match.group(5)),

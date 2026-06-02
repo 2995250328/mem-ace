@@ -301,6 +301,15 @@ def run_evaluation_lmc(opt):
         head_state_dict = checkpoint
 
     ace_lmc_global_head_mode = str(lmc_config.get('ace_lmc_global_head_mode', 'none')) if is_lmc else 'none'
+    ace_lmc_global_feature_mode = str(lmc_config.get('ace_lmc_global_feature_mode', 'glace')) if is_lmc else 'glace'
+    ace_lmc_global_gate_raw = (
+        lmc_config.get('final_ace_lmc_global_gate', None)
+        if is_lmc else 1.0
+    )
+    if ace_lmc_global_gate_raw is None:
+        ace_lmc_global_gate_raw = lmc_config.get('ace_lmc_global_gate_init', 1.0)
+    ace_lmc_global_gate_eval = float(ace_lmc_global_gate_raw)
+    ace_lmc_random_global_seed = int(lmc_config.get('ace_lmc_random_global_seed', 20260531)) if is_lmc else 20260531
     if model_backend != 'ace_fcn_lmc' and ace_lmc_global_head_mode != 'none':
         raise ValueError('ace_lmc_global_head_mode is only valid for model_backend=ace_fcn_lmc.')
     output_subsample = 8 if model_backend == 'ace_fcn_lmc' else 14
@@ -618,6 +627,30 @@ def run_evaluation_lmc(opt):
     if compressor is not None and compressor_out_cached is not None:
         _logger.info("[LMC] Using pre-computed compressed memory for all %d test images (no per-frame compression)", len(testset))
 
+    ace_lmc_eval_random_global_cache = {}
+
+    def _apply_ace_lmc_eval_global_policy(global_feat_BC):
+        if model_backend != 'ace_fcn_lmc' or ace_lmc_global_head_mode != 'glace_concat':
+            return global_feat_BC
+        mode = ace_lmc_global_feature_mode
+        if mode == 'glace':
+            out = global_feat_BC
+        elif mode == 'zero':
+            out = torch.zeros_like(global_feat_BC)
+        elif mode == 'random':
+            key = (int(global_feat_BC.shape[1]), str(global_feat_BC.device), str(global_feat_BC.dtype))
+            if key not in ace_lmc_eval_random_global_cache:
+                gen = torch.Generator(device='cpu').manual_seed(ace_lmc_random_global_seed)
+                random_vec = torch.randn((global_feat_BC.shape[1],), generator=gen, dtype=torch.float32)
+                ace_lmc_eval_random_global_cache[key] = random_vec.to(
+                    device=global_feat_BC.device,
+                    dtype=global_feat_BC.dtype,
+                ).view(1, -1)
+            out = ace_lmc_eval_random_global_cache[key].expand_as(global_feat_BC)
+        else:
+            raise ValueError(f"Unsupported ace_lmc_global_feature_mode={mode!r}")
+        return out * torch.tensor(ace_lmc_global_gate_eval, device=global_feat_BC.device, dtype=global_feat_BC.dtype)
+
     avg_batch_time = 0
     num_batches = 0
     rErrs, tErrs = [], []
@@ -740,6 +773,7 @@ def run_evaluation_lmc(opt):
                         raise ValueError('[Eval] ace_fcn_lmc/glace_concat requires global features in the dataset batch.')
                     if global_feat_BC.dtype != features.dtype:
                         global_feat_BC = global_feat_BC.to(dtype=features.dtype)
+                    global_feat_BC = _apply_ace_lmc_eval_global_policy(global_feat_BC)
                     head_features = torch.cat(
                         (
                             global_feat_BC[..., None, None].expand(-1, -1, features.shape[2], features.shape[3]),
@@ -884,6 +918,11 @@ def run_evaluation_lmc(opt):
             "ace_lmc_global_head_mode": lmc_config.get("ace_lmc_global_head_mode"),
             "ace_lmc_local_checkpoint_path": lmc_config.get("ace_lmc_local_checkpoint_path"),
             "ace_lmc_freeze_local_stack": lmc_config.get("ace_lmc_freeze_local_stack"),
+            "ace_lmc_global_feature_mode": lmc_config.get("ace_lmc_global_feature_mode"),
+            "ace_lmc_global_gate_init": lmc_config.get("ace_lmc_global_gate_init"),
+            "ace_lmc_global_gate_learnable": lmc_config.get("ace_lmc_global_gate_learnable"),
+            "ace_lmc_global_gate_max": lmc_config.get("ace_lmc_global_gate_max"),
+            "final_ace_lmc_global_gate": lmc_config.get("final_ace_lmc_global_gate"),
             "ace_lmc_final_head_dim": lmc_config.get("ace_lmc_final_head_dim"),
             "glace_global_feat_dim": lmc_config.get("glace_global_feat_dim"),
             "lmc_key_slice_idx": lmc_config.get("lmc_key_slice_idx"),

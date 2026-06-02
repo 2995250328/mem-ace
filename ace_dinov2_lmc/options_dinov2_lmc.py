@@ -169,6 +169,41 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         help='ace_fcn_lmc 第二阶段 global head 训练时加载的第一阶段 local LMC checkpoint。',
     )
     parser.add_argument(
+        '--ace_lmc_global_feature_mode',
+        type=str,
+        default='glace',
+        choices=['glace', 'zero', 'random'],
+        help=(
+            'ace_fcn_lmc/glace_concat 第二阶段的 global feature 内容：'
+            'glace=使用真实 GLACE feature；zero=置零，仅测试 head 容量；'
+            'random=固定随机向量，测试非语义 global 通道扰动。'
+        ),
+    )
+    parser.add_argument(
+        '--ace_lmc_global_gate_init',
+        type=float,
+        default=1.0,
+        help='ace_fcn_lmc/glace_concat 拼接前 global feature 的标量 gate 初值；旧行为为 1.0，保守 Stage2 建议 0.0 或 0.01。',
+    )
+    parser.add_argument(
+        '--ace_lmc_global_gate_learnable',
+        type=_strtobool,
+        default=False,
+        help='是否把 ace_lmc_global_gate 作为可学习标量加入 Stage2 optimizer。',
+    )
+    parser.add_argument(
+        '--ace_lmc_global_gate_max',
+        type=float,
+        default=0.0,
+        help='learnable global gate 的上界；>0 时使用 sigmoid(raw)*max 约束，0 表示旧的无界标量。',
+    )
+    parser.add_argument(
+        '--ace_lmc_random_global_seed',
+        type=int,
+        default=20260531,
+        help='ace_lmc_global_feature_mode=random 时固定随机 global 向量的种子。',
+    )
+    parser.add_argument(
         '--ace_lmc_freeze_local_stack',
         type=_strtobool,
         default=True,
@@ -1542,6 +1577,87 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
             '每轮常规 S2 训练后追加的低学习率精修 epoch 数。'
             ' 默认 0 表示关闭；用于诊断 late-iter 低 LR refinement 是否可前移。'
         ),
+    )
+    parser.add_argument(
+        '--use_relative_depth_loss',
+        type=_strtobool,
+        default=False,
+        help='启用相对深度蒸馏 loss。默认关闭，不影响现有训练。',
+    )
+    parser.add_argument(
+        '--relative_depth_apply_to',
+        type=str,
+        default='stage2',
+        choices=['stage2', 'stage2_g', 'all'],
+        help='相对深度 loss 作用阶段；当前实现面向 S2/S2-G sampled buffer。',
+    )
+    parser.add_argument(
+        '--relative_depth_teacher',
+        type=str,
+        default='depth_anything_v2_online',
+        choices=['depth_anything_v2_online'],
+        help='相对深度 teacher 类型。首版支持在线 Depth Anything V2。',
+    )
+    parser.add_argument(
+        '--relative_depth_teacher_encoder',
+        type=str,
+        default='vitb',
+        choices=['vits', 'vitb', 'vitl', 'vitg'],
+        help='Depth Anything V2 encoder 规格。',
+    )
+    parser.add_argument(
+        '--relative_depth_teacher_checkpoint',
+        type=Path,
+        default=None,
+        help='Depth Anything V2 teacher checkpoint，例如 depth_anything_v2_vitb.pth。',
+    )
+    parser.add_argument(
+        '--relative_depth_teacher_input_size',
+        type=int,
+        default=518,
+        help='Depth Anything V2 infer_image 的输入尺寸。',
+    )
+    parser.add_argument(
+        '--relative_depth_loss_weight',
+        type=float,
+        default=0.05,
+        help='相对深度 loss 的任务级权重。',
+    )
+    parser.add_argument(
+        '--relative_depth_start_ratio',
+        type=float,
+        default=0.3,
+        help='S2 进度达到该比例后才逐步打开相对深度 loss。0 表示立即启用。',
+    )
+    parser.add_argument(
+        '--relative_depth_pair_weight',
+        type=float,
+        default=0.5,
+        help='sampled pairwise relative-depth 项在相对深度 loss 内部的权重。',
+    )
+    parser.add_argument(
+        '--relative_depth_max_samples',
+        type=int,
+        default=1024,
+        help='每张图用于相对深度 loss 的最大采样点数。',
+    )
+    parser.add_argument(
+        '--relative_depth_max_pairs',
+        type=int,
+        default=4096,
+        help='每张图用于 pairwise relative-depth 的最大随机点对数。',
+    )
+    parser.add_argument(
+        '--relative_depth_min_points',
+        type=int,
+        default=16,
+        help='单张图少于该采样点数时跳过相对深度 loss。',
+    )
+    parser.add_argument(
+        '--relative_depth_teacher_cache_size',
+        type=int,
+        default=256,
+        help='在线 teacher depth 的 CPU LRU cache 图像数；0 表示不缓存。',
     )
     parser.add_argument(
         '--s2_polish_head_lr',
