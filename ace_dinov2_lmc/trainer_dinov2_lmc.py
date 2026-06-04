@@ -35,6 +35,8 @@ from trainer_dinov2 import TrainerACEDINOv2, set_seed
 from ace_compressor import GeoLMC
 from ace_fusion import LMCFeatureFusion
 from ace_loss import ReproLoss
+from ace_lmc_global_film import ACEGlobalFiLMHead
+from ace_lmc_global_residual import ACEGlobalResidualHead
 from ace_network_ace import RegressorACE
 from dataset_ace_fcn_lmc import CamLocDatasetACEFCNLMC
 from relative_depth_distillation import RelativeDepthDistiller
@@ -774,7 +776,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         return depth
 
     @staticmethod
-    def _sample_patch_depth_nearest_valid(depth: np.ndarray, stride: int, coords_h: int, coords_w: int):
+    def _sample_patch_depth_nearest_valid(
+        depth: np.ndarray,
+        stride: int,
+        coords_h: int,
+        coords_w: int,
+        *,
+        depth_min: float = 1e-6,
+        depth_max: float = 1000.0,
+    ):
         """Return one representative valid depth pixel per patch, preferring the patch center."""
         patch_depth = np.zeros((coords_h, coords_w), dtype=np.float64)
         patch_px = np.zeros((coords_h, coords_w), dtype=np.float64)
@@ -793,7 +803,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 x1 = min((gx + 1) * stride, image_w)
 
                 center_depth = depth[cy, cx]
-                if np.isfinite(center_depth) and center_depth > 0.0 and center_depth <= 1000.0:
+                if np.isfinite(center_depth) and depth_min <= center_depth <= depth_max:
                     patch_depth[gy, gx] = center_depth
                     patch_px[gy, gx] = cx
                     patch_py[gy, gx] = cy
@@ -801,7 +811,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     continue
 
                 window = depth[y0:y1, x0:x1]
-                valid = np.isfinite(window) & (window > 0.0) & (window <= 1000.0)
+                valid = np.isfinite(window) & (window >= depth_min) & (window <= depth_max)
                 if not np.any(valid):
                     continue
                 yy, xx = np.where(valid)
@@ -824,6 +834,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         focal_length,
         centre_point,
         output_subsample=None,
+        depth_min: float = 1e-6,
+        depth_max: float = 1000.0,
     ) -> torch.Tensor:
         """Project resized metric depth to patch-level raw world scene coordinates."""
         image_h, image_w = image_hw
@@ -844,6 +856,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             stride,
             coords_h,
             coords_w,
+            depth_min=depth_min,
+            depth_max=depth_max,
         )
 
         coords = torch.zeros((3, coords_h, coords_w), dtype=torch.float32)
@@ -920,9 +934,22 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         used_frame_names = set()
         meta_pose_mat = np.stack([p for p, _ in meta_poses], axis=0)
 
-        for real_idx, pose_file in enumerate(dataset.pose_files):
-            ace_pose = np.loadtxt(pose_file).astype(np.float64)
-            ace_k = np.loadtxt(dataset.calibration_files[real_idx]).astype(np.float64)
+        rgb_files = list(getattr(dataset, "rgb_files", []))
+        calibration_files = list(getattr(dataset, "calibration_files", []))
+        pose_files = getattr(dataset, "pose_files", None)
+        pose_values = getattr(dataset, "pose_values", None)
+        pose_files = list(pose_files) if pose_files is not None else None
+
+        for real_idx in range(len(rgb_files)):
+            if real_idx >= len(calibration_files):
+                continue
+            if pose_files is not None and real_idx < len(pose_files):
+                ace_pose = np.loadtxt(pose_files[real_idx]).astype(np.float64)
+            elif pose_values is not None and real_idx < len(pose_values):
+                ace_pose = np.asarray(pose_values[real_idx], dtype=np.float64)
+            else:
+                continue
+            ace_k = np.loadtxt(calibration_files[real_idx]).astype(np.float64)
             if ace_pose.shape != (4, 4) or ace_k.shape != (3, 3):
                 continue
 
@@ -1085,6 +1112,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 focal_length=[float(intrinsics[0, 0]), float(intrinsics[1, 1])],
                 centre_point=[float(intrinsics[0, 2]), float(intrinsics[1, 2])],
                 output_subsample=int(getattr(self.regressor, 'OUTPUT_SUBSAMPLE', Regressor.OUTPUT_SUBSAMPLE)),
+                depth_min=float(getattr(self.options, 'c1_aux_depth_min', 1e-6)),
+                depth_max=float(getattr(self.options, 'c1_aux_depth_max', 1000.0)),
             )
             return image, image_mask, pose, pose_inv, intrinsics, intrinsics_inv, coords, rgb_path
 
@@ -1181,6 +1210,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 focal_length=focal_length,
                 centre_point=centre_point,
                 output_subsample=int(getattr(self.regressor, 'OUTPUT_SUBSAMPLE', Regressor.OUTPUT_SUBSAMPLE)),
+                depth_min=float(getattr(self.options, 'c1_aux_depth_min', 1e-6)),
+                depth_max=float(getattr(self.options, 'c1_aux_depth_max', 1000.0)),
             )
             item[6] = coords
             return tuple(item)
@@ -1208,8 +1239,21 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     def _ace_lmc_global_head_mode(self):
         return str(getattr(self.options, "ace_lmc_global_head_mode", "none"))
 
-    def _uses_ace_lmc_global_head(self):
+    def _uses_ace_lmc_concat_head(self):
         return bool(self._is_ace_fcn_backend() and self._ace_lmc_global_head_mode() == "glace_concat")
+
+    def _uses_ace_lmc_global_residual_head(self):
+        return bool(self._is_ace_fcn_backend() and self._ace_lmc_global_head_mode() == "glace_residual")
+
+    def _uses_ace_lmc_global_film_head(self):
+        return bool(self._is_ace_fcn_backend() and self._ace_lmc_global_head_mode() == "glace_film")
+
+    def _uses_ace_lmc_global_head(self):
+        return bool(
+            self._uses_ace_lmc_concat_head()
+            or self._uses_ace_lmc_global_residual_head()
+            or self._uses_ace_lmc_global_film_head()
+        )
 
     def _uses_image_global_features(self):
         return bool(self._is_glace_backend() or self._uses_ace_lmc_global_head())
@@ -1505,7 +1549,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     def _init_ace_lmc_global_gate(self):
         self.ace_lmc_global_gate = None
         self.ace_lmc_global_gate_value = float(getattr(self.options, "ace_lmc_global_gate_init", 1.0))
-        if not self._uses_ace_lmc_global_head():
+        if not self._uses_ace_lmc_global_head() or self._uses_ace_lmc_global_film_head():
             return
         if bool(getattr(self.options, "ace_lmc_global_gate_learnable", False)):
             gate_max = self._ace_lmc_global_gate_max()
@@ -1533,8 +1577,361 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         return float(self._current_ace_lmc_global_gate_tensor(device=self.device, dtype=torch.float32).detach().cpu().item())
 
     def _ace_lmc_global_gate_params(self):
+        if self._uses_ace_lmc_global_film_head():
+            return []
         param = getattr(self, "ace_lmc_global_gate", None)
         return [param] if isinstance(param, torch.nn.Parameter) else []
+
+    def _ace_lmc_global_gate_l1_weight(self):
+        if not self._uses_ace_lmc_global_head() or self._uses_ace_lmc_global_film_head():
+            return 0.0
+        return max(0.0, float(getattr(self.options, "ace_lmc_global_gate_l1_weight", 0.0) or 0.0))
+
+    def _compute_ace_lmc_global_gate_l1_loss(self):
+        weight = self._ace_lmc_global_gate_l1_weight()
+        if weight <= 0.0:
+            return torch.zeros((), device=self.device, dtype=torch.float32), {"enabled": False}
+        gate = self._current_ace_lmc_global_gate_tensor(device=self.device, dtype=torch.float32)
+        loss = gate.abs() * weight
+        return loss, {
+            "enabled": True,
+            "gate": float(gate.detach().cpu().item()),
+            "weight": float(weight),
+            "loss": float(loss.detach().cpu().item()),
+        }
+
+    @staticmethod
+    def _format_ace_lmc_global_gate_l1_stats(stats):
+        if not isinstance(stats, dict) or not stats.get("enabled", False):
+            return ""
+        return (
+            f", gScalar={float(stats.get('gate', 0.0)):.5f}"
+            f", gScalarL1={float(stats.get('loss', 0.0)):.6f}"
+        )
+
+    def _init_ace_lmc_global_residual_head(self):
+        self.ace_lmc_global_residual_head = None
+        if not self._uses_ace_lmc_global_residual_head():
+            return
+        local_dim = int(getattr(self.regressor, "ace_lmc_local_feature_dim", getattr(self.options, "ace_encoder_features", 512)))
+        global_dim = int(getattr(self, "glace_global_feat_dim", 0) or 0)
+        if global_dim <= 0:
+            raise ValueError("[ACE-FCN-LMC] glace_residual requires loaded global features.")
+        self.ace_lmc_global_residual_head = ACEGlobalResidualHead(
+            mean=self.dataset.mean_cam_center,
+            num_head_blocks=self.options.num_head_blocks,
+            in_channels=local_dim + global_dim,
+            gate_init=float(getattr(self.options, "ace_lmc_global_gate_init", 0.001)),
+            gate_max=float(getattr(self.options, "ace_lmc_global_gate_max", 0.1)),
+            delta_max_m=float(getattr(self.options, "ace_lmc_global_residual_delta_max_m", 1.0)),
+        ).to(self.device)
+        _logger.info(
+            "[ACE-FCN-LMC] Global residual head initialized: local_dim=%d global_dim=%d gate_init=%.6f gate_max=%.6f delta_max_m=%.3f gate_l1=%.6f.",
+            local_dim,
+            global_dim,
+            float(getattr(self.options, "ace_lmc_global_gate_init", 0.001)),
+            float(getattr(self.options, "ace_lmc_global_gate_max", 0.1)),
+            float(getattr(self.options, "ace_lmc_global_residual_delta_max_m", 1.0)),
+            float(getattr(self.options, "ace_lmc_global_residual_gate_l1_weight", 0.0) or 0.0),
+        )
+
+    def _ace_lmc_global_residual_params(self):
+        module = getattr(self, "ace_lmc_global_residual_head", None)
+        return list(module.parameters()) if module is not None else []
+
+    def _ace_lmc_global_residual_gate_l1_weight(self):
+        if not self._uses_ace_lmc_global_residual_head():
+            return 0.0
+        return max(0.0, float(getattr(self.options, "ace_lmc_global_residual_gate_l1_weight", 0.0) or 0.0))
+
+    def _ace_lmc_global_residual_bad_gate_weight(self):
+        if not self._uses_ace_lmc_global_residual_head():
+            return 0.0
+        return max(0.0, float(getattr(self.options, "ace_lmc_global_residual_bad_gate_weight", 0.0) or 0.0))
+
+    def _format_ace_lmc_global_residual_stats(self, stats):
+        if not isinstance(stats, dict) or not stats.get("enabled", False):
+            return ""
+        return (
+            f", gGate={float(stats.get('gate_mean', 0.0)):.5f}"
+            f", gGateMax={float(stats.get('gate_max', 0.0)):.5f}"
+            f", gDelta={float(stats.get('delta_l2', 0.0)):.5f}"
+            f", gStep={float(stats.get('gated_delta_l2', 0.0)):.5f}"
+            f", gL1={float(stats.get('gate_l1_loss', 0.0)):.5f}"
+        )
+
+    def _predict_ace_lmc_global_residual_coords(self, local_head_features_bC, img_idx_b1, h, w, *, stage_tag):
+        module = getattr(self, "ace_lmc_global_residual_head", None)
+        if module is None:
+            raise ValueError(f"[{stage_tag}] glace_residual mode requires ace_lmc_global_residual_head.")
+        local_BCHW = local_head_features_bC.view(1, h, w, local_head_features_bC.shape[1]).permute(0, 3, 1, 2)
+        global_bG = self._get_image_global_features(
+            img_idx_b1,
+            device=local_head_features_bC.device,
+            dtype=local_head_features_bC.dtype,
+        )
+        if global_bG.shape[0] != local_head_features_bC.shape[0]:
+            raise ValueError(
+                f"[{stage_tag}] Global/local row mismatch: global={tuple(global_bG.shape)} "
+                f"local={tuple(local_head_features_bC.shape)}"
+            )
+        global_BGHW = global_bG.view(1, h, w, global_bG.shape[1]).permute(0, 3, 1, 2)
+        residual_input_BCHW = torch.cat((global_BGHW, local_BCHW), dim=1)
+        base_head = self._ace_lmc_global_residual_base_head()
+        if base_head is None:
+            raise ValueError(f"[{stage_tag}] glace_residual mode requires a frozen Stage1 base head.")
+        with torch.no_grad():
+            local_pred_B3HW = base_head(local_BCHW)
+        pred_B3HW, gate_B1HW, _ = module(local_pred_B3HW, residual_input_BCHW)
+        gate_l1_weight = self._ace_lmc_global_residual_gate_l1_weight()
+        gate_l1_loss = gate_B1HW.float().mean() * gate_l1_weight if gate_l1_weight > 0.0 else gate_B1HW.new_zeros(())
+        stats = {"enabled": True, "gate_l1_loss": float(gate_l1_loss.detach().cpu().item())}
+        stats.update(getattr(module, "last_stats", {}) or {})
+        return pred_B3HW, gate_l1_loss, stats, gate_B1HW
+
+    def _format_ace_lmc_global_film_stats(self, stats):
+        if not isinstance(stats, dict) or not stats.get("enabled", False):
+            return ""
+        return (
+            f", filmGate={float(stats.get('gate', 0.0)):.5f}"
+            f", filmGamma={float(stats.get('gamma_abs', 0.0)):.5f}"
+            f", filmBeta={float(stats.get('beta_abs', 0.0)):.5f}"
+            f", filmStep={float(stats.get('step_abs', 0.0)):.5f}"
+        )
+
+    def _predict_ace_lmc_global_film_coords(self, local_head_features_bC, img_idx_b1, h, w, *, stage_tag):
+        if not self._uses_ace_lmc_global_film_head():
+            raise ValueError(f"[{stage_tag}] glace_film mode is not active.")
+        local_BCHW = local_head_features_bC.view(1, h, w, local_head_features_bC.shape[1]).permute(0, 3, 1, 2)
+        global_bG = self._get_image_global_features(
+            img_idx_b1,
+            device=local_head_features_bC.device,
+            dtype=local_head_features_bC.dtype,
+        )
+        if global_bG.shape[0] != local_head_features_bC.shape[0]:
+            raise ValueError(
+                f"[{stage_tag}] Global/local row mismatch: global={tuple(global_bG.shape)} "
+                f"local={tuple(local_head_features_bC.shape)}"
+            )
+        global_BC = global_bG.view(1, h, w, global_bG.shape[1])[:, 0, 0, :].contiguous()
+        pred_B3HW = self.regressor.heads(local_BCHW, global_BC)
+        return pred_B3HW, dict(getattr(self.regressor.heads, "last_stats", {}) or {})
+
+    def _ace_lmc_stage2_consistency_base_weight(self):
+        if not self._uses_ace_lmc_global_head():
+            return 0.0
+        return max(0.0, float(getattr(self.options, "ace_lmc_stage2_consistency_weight", 0.0) or 0.0))
+
+    def _ace_lmc_stage2_consistency_weight(self):
+        weight = self._ace_lmc_stage2_consistency_base_weight()
+        if weight <= 0.0:
+            return 0.0
+        warmup_steps = max(0, int(getattr(self.options, "ace_lmc_stage2_consistency_warmup_steps", 0) or 0))
+        if warmup_steps <= 0:
+            return weight
+        scale = min(1.0, max(0.0, float(getattr(self, "local_s2_step", 0)) / float(warmup_steps)))
+        return weight * scale
+
+    def _uses_ace_lmc_stage2_consistency(self):
+        return bool(self._ace_lmc_stage2_consistency_base_weight() > 0.0)
+
+    def _ace_lmc_stage2_guard_base_weight(self):
+        if not self._uses_ace_lmc_global_head():
+            return 0.0
+        return max(0.0, float(getattr(self.options, "ace_lmc_stage2_guard_weight", 0.0) or 0.0))
+
+    def _ace_lmc_stage2_guard_weight(self):
+        weight = self._ace_lmc_stage2_guard_base_weight()
+        if weight <= 0.0:
+            return 0.0
+        warmup_steps = max(0, int(getattr(self.options, "ace_lmc_stage2_guard_warmup_steps", 0) or 0))
+        if warmup_steps <= 0:
+            return weight
+        scale = min(1.0, max(0.0, float(getattr(self, "local_s2_step", 0)) / float(warmup_steps)))
+        return weight * scale
+
+    def _uses_ace_lmc_stage2_guard(self):
+        return bool(self._ace_lmc_stage2_guard_base_weight() > 0.0)
+
+    def _uses_ace_lmc_stage2_teacher(self):
+        return bool(
+            self._uses_ace_lmc_global_residual_head()
+            or self._uses_ace_lmc_stage2_consistency()
+            or self._uses_ace_lmc_stage2_guard()
+        )
+
+    def _ace_lmc_global_residual_base_head(self):
+        teacher_head = getattr(self, "ace_lmc_stage2_teacher_head", None)
+        if teacher_head is not None:
+            return teacher_head
+        return getattr(self.regressor, "heads", None)
+
+    def _predict_ace_lmc_stage2_teacher_coords(self, local_head_features_bC, reference_pred_scene_coords_b3HW):
+        teacher_head = getattr(self, "ace_lmc_stage2_teacher_head", None)
+        if teacher_head is None:
+            return None
+        if local_head_features_bC is None or local_head_features_bC.dim() != 2:
+            raise ValueError("Stage2 teacher expects local head features [N,C].")
+        if reference_pred_scene_coords_b3HW.dim() != 4 or reference_pred_scene_coords_b3HW.shape[0] != 1:
+            raise ValueError("Stage2 teacher currently expects packed single-grid predictions [1,3,H,W].")
+
+        _, _, H, W = reference_pred_scene_coords_b3HW.shape
+        N = H * W
+        if int(local_head_features_bC.shape[0]) != N:
+            raise ValueError(
+                f"Stage2 teacher feature/prediction mismatch: features={tuple(local_head_features_bC.shape)} HxW={H}x{W}."
+            )
+        local_BCHW = local_head_features_bC.view(1, H, W, local_head_features_bC.shape[1]).permute(0, 3, 1, 2)
+        with torch.no_grad():
+            with autocast("cuda", enabled=self.options.use_half):
+                teacher_pred_B3HW = teacher_head(local_BCHW)
+            teacher_pred_B3HW = self._recover_pred_scene_to_training_world(teacher_pred_B3HW).detach()
+        return teacher_pred_B3HW
+
+    def _compute_ace_lmc_stage2_consistency_loss(self, local_head_features_bC, student_pred_scene_coords_b3HW):
+        zero = student_pred_scene_coords_b3HW.new_zeros(())
+        stats = {"enabled": False, "loss": 0.0, "weight": 0.0, "points": 0}
+        weight = self._ace_lmc_stage2_consistency_weight()
+        if weight <= 0.0 or getattr(self, "ace_lmc_stage2_teacher_head", None) is None:
+            return zero, stats
+        teacher_pred_B3HW = self._predict_ace_lmc_stage2_teacher_coords(
+            local_head_features_bC,
+            student_pred_scene_coords_b3HW,
+        )
+        if teacher_pred_B3HW is None:
+            return zero, stats
+
+        _, _, H, W = student_pred_scene_coords_b3HW.shape
+        N = H * W
+        student_N3 = student_pred_scene_coords_b3HW.permute(0, 2, 3, 1).reshape(N, 3).float()
+        teacher_N3 = teacher_pred_B3HW.permute(0, 2, 3, 1).reshape(N, 3).to(
+            device=student_N3.device,
+            dtype=student_N3.dtype,
+        )
+        valid_N = torch.isfinite(student_N3).all(dim=1) & torch.isfinite(teacher_N3).all(dim=1)
+        if not valid_N.any():
+            return zero, {"enabled": True, "loss": 0.0, "weight": float(weight), "points": 0}
+
+        student_valid = student_N3[valid_N]
+        teacher_valid = teacher_N3[valid_N]
+        limit = int(getattr(self.options, "ace_lmc_stage2_consistency_sample_limit", 0) or 0)
+        if limit > 0 and student_valid.shape[0] > limit:
+            perm = torch.randperm(student_valid.shape[0], device=student_valid.device)[:limit]
+            student_valid = student_valid[perm]
+            teacher_valid = teacher_valid[perm]
+
+        loss_mode = str(getattr(self.options, "ace_lmc_stage2_consistency_loss", "smooth_l1")).lower()
+        if loss_mode == "l1":
+            raw_loss = Fnn.l1_loss(student_valid, teacher_valid)
+        elif loss_mode == "l2":
+            raw_loss = Fnn.mse_loss(student_valid, teacher_valid)
+        elif loss_mode == "smooth_l1":
+            raw_loss = Fnn.smooth_l1_loss(student_valid, teacher_valid)
+        else:
+            raise ValueError(f"Unsupported ace_lmc_stage2_consistency_loss={loss_mode!r}")
+        loss = raw_loss * float(weight)
+        return loss, {
+            "enabled": True,
+            "loss": float(raw_loss.detach().cpu().item()),
+            "weight": float(weight),
+            "points": int(student_valid.shape[0]),
+        }
+
+    def _compute_ace_lmc_stage2_reprojection_guard_loss(
+        self,
+        *,
+        local_head_features_bC,
+        student_pred_scene_coords_b3HW,
+        student_reprojection_error_N1,
+        target_px_N2,
+        gt_inv_poses_N34,
+        Ks_N33,
+        invKs_N33,
+        step_eff,
+        normalizer,
+        student_gate_B1HW=None,
+    ):
+        zero = student_pred_scene_coords_b3HW.new_zeros(())
+        stats = {"enabled": False, "loss": 0.0, "weight": 0.0, "points": 0, "teacher_px": -1.0, "bad_gate_loss": 0.0, "bad_gate_weight": 0.0}
+        weight = self._ace_lmc_stage2_guard_weight()
+        if weight <= 0.0 or getattr(self, "ace_lmc_stage2_teacher_head", None) is None:
+            return zero, stats
+        teacher_pred_B3HW = self._predict_ace_lmc_stage2_teacher_coords(
+            local_head_features_bC,
+            student_pred_scene_coords_b3HW,
+        )
+        if teacher_pred_B3HW is None:
+            return zero, stats
+
+        teacher_pred_N31 = teacher_pred_B3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
+        teacher_contract = self._compute_reprojection_invalid_loss_contract(
+            teacher_pred_N31,
+            target_px_N2,
+            gt_inv_poses_N34,
+            Ks_N33,
+            invKs_N33,
+            step_eff=step_eff,
+            normalizer=normalizer,
+            invalid_max_delta=self._loss_invalid_max_delta,
+            invalid_posinf=0.0,
+            invalid_neginf=0.0,
+        )
+        student_err = student_reprojection_error_N1.float().flatten()
+        teacher_err = teacher_contract["reprojection_error_l1"].detach().float().flatten()
+        teacher_valid = teacher_contract["valid_mask"].detach().flatten().bool()
+        guard_mask = torch.isfinite(student_err) & torch.isfinite(teacher_err) & teacher_valid
+        if not guard_mask.any():
+            return zero, {"enabled": True, "loss": 0.0, "weight": float(weight), "points": 0, "teacher_px": -1.0}
+
+        margin = max(0.0, float(getattr(self.options, "ace_lmc_stage2_guard_margin_px", 0.25) or 0.0))
+        max_px = float(getattr(self.options, "ace_lmc_stage2_guard_max_px", 100.0) or 0.0)
+        guard_terms = Fnn.relu(student_err[guard_mask] - teacher_err[guard_mask] - margin)
+        if max_px > 0.0:
+            guard_terms = guard_terms.clamp(max=max_px)
+        raw_guard = guard_terms.mean()
+        loss = raw_guard * float(weight)
+        bad_gate_weight = self._ace_lmc_global_residual_bad_gate_weight()
+        bad_gate_loss = raw_guard.new_zeros(())
+        if bad_gate_weight > 0.0 and student_gate_B1HW is not None:
+            gate_flat = student_gate_B1HW.float().flatten()
+            if gate_flat.shape[0] == student_err.shape[0]:
+                bad_gap = Fnn.relu(student_err[guard_mask].detach() - teacher_err[guard_mask] - margin)
+                if max_px > 0.0:
+                    bad_gap = bad_gap.clamp(max=max_px)
+                # Penalize opening the gate exactly where the global residual is worse than the local teacher.
+                bad_gate_loss = (gate_flat[guard_mask] * bad_gap).mean() * float(bad_gate_weight)
+                loss = loss + bad_gate_loss
+        return loss, {
+            "enabled": True,
+            "loss": float(raw_guard.detach().cpu().item()),
+            "weight": float(weight),
+            "points": int(guard_mask.sum().item()),
+            "teacher_px": float(teacher_err[guard_mask].mean().detach().cpu().item()),
+            "bad_gate_loss": float(bad_gate_loss.detach().cpu().item()),
+            "bad_gate_weight": float(bad_gate_weight),
+        }
+
+    @staticmethod
+    def _format_ace_lmc_stage2_consistency_stats(stats):
+        if not isinstance(stats, dict) or not stats.get("enabled", False):
+            return ""
+        return (
+            f", cons={float(stats.get('loss', 0.0)):.5f}"
+            f", consW={float(stats.get('weight', 0.0)):.4f}"
+            f", consN={int(stats.get('points', 0))}"
+        )
+
+    @staticmethod
+    def _format_ace_lmc_stage2_guard_stats(stats):
+        if not isinstance(stats, dict) or not stats.get("enabled", False):
+            return ""
+        return (
+            f", guardPx={float(stats.get('loss', 0.0)):.3f}"
+            f", guardW={float(stats.get('weight', 0.0)):.4f}"
+            f", guardN={int(stats.get('points', 0))}"
+            f", teacherPx={float(stats.get('teacher_px', -1.0)):.2f}"
+            f", badGate={float(stats.get('bad_gate_loss', 0.0)):.5f}"
+        )
 
     def _apply_ace_lmc_global_gate(self, global_features):
         if not self._uses_ace_lmc_global_head():
@@ -1548,7 +1945,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         return self._get_image_global_features(img_idx_B, device=device, dtype=dtype)
 
     def _append_ace_lmc_global_to_features(self, local_features_bC, img_idx_b1, *, stage_tag):
-        if not self._uses_ace_lmc_global_head():
+        if not self._uses_ace_lmc_concat_head():
             return local_features_bC
         global_bG = self._get_image_global_features(
             img_idx_b1,
@@ -1564,7 +1961,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         return torch.cat((global_bG, local_features_bC), dim=1)
 
     def _append_ace_lmc_global_to_feature_maps(self, local_BCHW, img_idx_B, *, stage_tag):
-        if not self._uses_ace_lmc_global_head():
+        if not self._uses_ace_lmc_concat_head():
             return local_BCHW
         if local_BCHW.dim() != 4:
             raise ValueError(f"[{stage_tag}] Expected local feature map [B,C,H,W], got {tuple(local_BCHW.shape)}.")
@@ -1771,7 +2168,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 num_encoder_features=encoder_dim,
                 freeze_backbone=self.options.freeze_backbone,
             )
-            if self._uses_ace_lmc_global_head():
+            if self._uses_ace_lmc_concat_head():
                 global_feat_dim = int(getattr(self.dataset, "global_feat_dim", 0))
                 if global_feat_dim <= 0:
                     raise ValueError("[ACE-FCN-LMC] glace_concat requires non-empty GLACE global features.")
@@ -1790,6 +2187,41 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     encoder_dim,
                     global_feat_dim,
                     final_head_dim,
+                )
+            elif self._uses_ace_lmc_global_residual_head():
+                global_feat_dim = int(getattr(self.dataset, "global_feat_dim", 0))
+                if global_feat_dim <= 0:
+                    raise ValueError("[ACE-FCN-LMC] glace_residual requires non-empty GLACE global features.")
+                regressor.ace_lmc_local_feature_dim = encoder_dim
+                regressor.ace_lmc_final_head_dim = encoder_dim
+                _logger.info(
+                    "Loaded ACE FCN encoder from %s and kept local Stage1 head for GLACE residual mode: local_dim=%d global_dim=%d",
+                    self.options.ace_encoder_path,
+                    encoder_dim,
+                    global_feat_dim,
+                )
+            elif self._uses_ace_lmc_global_film_head():
+                global_feat_dim = int(getattr(self.dataset, "global_feat_dim", 0))
+                if global_feat_dim <= 0:
+                    raise ValueError("[ACE-FCN-LMC] glace_film requires non-empty GLACE global features.")
+                regressor.heads = ACEGlobalFiLMHead(
+                    self.dataset.mean_cam_center,
+                    self.options.num_head_blocks,
+                    self.options.use_homogeneous,
+                    in_channels=encoder_dim,
+                    global_dim=global_feat_dim,
+                    gate_init=float(getattr(self.options, "ace_lmc_global_gate_init", 0.0)),
+                    gate_max=float(getattr(self.options, "ace_lmc_global_gate_max", 1.0)),
+                )
+                regressor.ace_lmc_local_feature_dim = encoder_dim
+                regressor.ace_lmc_final_head_dim = encoder_dim
+                _logger.info(
+                    "Loaded ACE FCN encoder from %s and created GLACE-FiLM head: local_dim=%d global_dim=%d gate_init=%.6f gate_max=%.6f",
+                    self.options.ace_encoder_path,
+                    encoder_dim,
+                    global_feat_dim,
+                    float(getattr(self.options, "ace_lmc_global_gate_init", 0.0)),
+                    float(getattr(self.options, "ace_lmc_global_gate_max", 1.0)),
                 )
             else:
                 _logger.info("Loaded ACE FCN encoder from: %s", self.options.ace_encoder_path)
@@ -1860,8 +2292,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         ace_lmc_global_head_mode = str(getattr(options, 'ace_lmc_global_head_mode', 'none'))
         if self.model_backend != 'ace_fcn_lmc' and ace_lmc_global_head_mode != 'none':
             raise ValueError('--ace_lmc_global_head_mode is only supported for model_backend=ace_fcn_lmc.')
-        if self.model_backend == 'ace_fcn_lmc' and ace_lmc_global_head_mode == 'glace_concat' and getattr(options, 'ace_lmc_local_checkpoint_path', None) is None:
-            raise ValueError('[ACE-FCN-LMC] glace_concat requires --ace_lmc_local_checkpoint_path from stage 1.')
+        if self.model_backend == 'ace_fcn_lmc' and ace_lmc_global_head_mode != 'none' and getattr(options, 'ace_lmc_local_checkpoint_path', None) is None:
+            raise ValueError('[ACE-FCN-LMC] Stage2 global modes require --ace_lmc_local_checkpoint_path from stage 1.')
         if self.model_backend == 'glace_lmc' and str(getattr(options, 'glace_freeze_encoder', True)).lower() in ('false', '0', 'no', 'off'):
             raise ValueError(
                 'glace_freeze_encoder=False is not supported yet: encoder params are not included in S1/S2 optimizers.'
@@ -1873,6 +2305,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.glace_global_feat_dim = 0
         self.ace_lmc_global_gate = None
         self.ace_lmc_global_gate_value = float(getattr(options, 'ace_lmc_global_gate_init', 1.0))
+        self.ace_lmc_global_residual_head = None
+        self.ace_lmc_stage2_teacher_head = None
         self.glace_residual_adapter = None
         self.glace_reference_regressor = None
         if self._is_glace_backend():
@@ -1936,10 +2370,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             )
             self.global_feats = self._prepare_ace_lmc_global_feature_bank(self.global_feats)
             self._init_ace_lmc_global_gate()
+            self._init_ace_lmc_global_residual_head()
             _logger.info(
-                '[ACE-FCN-LMC] Loaded %d GLACE global features with dim=%d for final head concat: mode=%s gate_init=%.6f gate_max=%.6f learnable=%s gate_current=%.6f.',
+                '[ACE-FCN-LMC] Loaded %d GLACE global features with dim=%d for final head mode=%s: feature_mode=%s gate_init=%.6f gate_max=%.6f learnable=%s gate_current=%.6f.',
                 int(self.global_feats.shape[0]),
                 self.glace_global_feat_dim,
+                self._ace_lmc_global_head_mode(),
                 self._ace_lmc_global_feature_mode(),
                 float(getattr(self.options, 'ace_lmc_global_gate_init', 1.0)),
                 self._ace_lmc_global_gate_max(),
@@ -2608,10 +3044,23 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'ace_lmc_local_checkpoint_path': str(getattr(options, 'ace_lmc_local_checkpoint_path', '') or ''),
             'ace_lmc_freeze_local_stack': bool(getattr(options, 'ace_lmc_freeze_local_stack', True)),
             'ace_lmc_global_feature_mode': str(getattr(options, 'ace_lmc_global_feature_mode', 'glace')),
+            'ace_lmc_global_feature_dim': int(getattr(self, 'glace_global_feat_dim', getattr(self.dataset, 'global_feat_dim', 0)) or 0),
             'ace_lmc_global_gate_init': float(getattr(options, 'ace_lmc_global_gate_init', 1.0)),
             'ace_lmc_global_gate_learnable': bool(getattr(options, 'ace_lmc_global_gate_learnable', False)),
             'ace_lmc_global_gate_max': float(getattr(options, 'ace_lmc_global_gate_max', 0.0)),
+            'ace_lmc_global_gate_l1_weight': float(getattr(options, 'ace_lmc_global_gate_l1_weight', 0.0)),
+            'ace_lmc_global_residual_gate_l1_weight': float(getattr(options, 'ace_lmc_global_residual_gate_l1_weight', 0.0)),
+            'ace_lmc_global_residual_delta_max_m': float(getattr(options, 'ace_lmc_global_residual_delta_max_m', 1.0)),
+            'ace_lmc_global_residual_bad_gate_weight': float(getattr(options, 'ace_lmc_global_residual_bad_gate_weight', 0.0)),
             'ace_lmc_random_global_seed': int(getattr(options, 'ace_lmc_random_global_seed', 20260531)),
+            'ace_lmc_stage2_consistency_weight': float(getattr(options, 'ace_lmc_stage2_consistency_weight', 0.0)),
+            'ace_lmc_stage2_consistency_loss': str(getattr(options, 'ace_lmc_stage2_consistency_loss', 'smooth_l1')),
+            'ace_lmc_stage2_consistency_warmup_steps': int(getattr(options, 'ace_lmc_stage2_consistency_warmup_steps', 0)),
+            'ace_lmc_stage2_consistency_sample_limit': int(getattr(options, 'ace_lmc_stage2_consistency_sample_limit', 0)),
+            'ace_lmc_stage2_guard_weight': float(getattr(options, 'ace_lmc_stage2_guard_weight', 0.0)),
+            'ace_lmc_stage2_guard_margin_px': float(getattr(options, 'ace_lmc_stage2_guard_margin_px', 0.25)),
+            'ace_lmc_stage2_guard_max_px': float(getattr(options, 'ace_lmc_stage2_guard_max_px', 100.0)),
+            'ace_lmc_stage2_guard_warmup_steps': int(getattr(options, 'ace_lmc_stage2_guard_warmup_steps', 0)),
             'final_ace_lmc_global_gate': None,
             'ace_lmc_allow_mismatched_memory': bool(getattr(options, 'ace_lmc_allow_mismatched_memory', False)),
             'ace_lmc_memory_feature_source': str(bank_data.get('feature_source') or 'unknown'),
@@ -5361,8 +5810,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             # S2 optimizer: compressor stays frozen. During GLACE warmup, the
             # original GLACE head is also frozen and only the memory plugin moves.
             s2_param_groups = []
-            if not freeze_glace_head:
+            if not freeze_glace_head and not self._uses_ace_lmc_global_residual_head():
                 s2_param_groups.append({'name': 'head', 'params': self.regressor.heads.parameters(), 'lr': head_lr})
+                max_lrs.append(head_lr)
+            residual_head_params = self._ace_lmc_global_residual_params()
+            if residual_head_params:
+                s2_param_groups.append({'name': 'ace_lmc_global_residual', 'params': residual_head_params, 'lr': head_lr})
                 max_lrs.append(head_lr)
             s2_param_groups.append({'name': 'fusion', 'params': list(self.fusion.parameters()), 'lr': fusion_lr})
             max_lrs.append(fusion_lr)
@@ -5384,7 +5837,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 freeze_glace_head, head_lr, fusion_lr, fusion_lr_ratio, residual_lr, residual_lr_ratio,
             )
         else:
-            s2_param_groups = [{'name': 'head', 'params': self.regressor.heads.parameters(), 'lr': head_lr}]
+            if self._uses_ace_lmc_global_residual_head():
+                s2_param_groups = [{'name': 'ace_lmc_global_residual', 'params': self._ace_lmc_global_residual_params(), 'lr': head_lr}]
+            else:
+                s2_param_groups = [{'name': 'head', 'params': self.regressor.heads.parameters(), 'lr': head_lr}]
             max_lrs = [head_lr]
             ace_lmc_global_gate_params = self._ace_lmc_global_gate_params()
             if ace_lmc_global_gate_params:
@@ -5545,7 +6001,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return
         checkpoint_path = getattr(self.options, 'ace_lmc_local_checkpoint_path', None)
         if checkpoint_path is None:
-            raise ValueError('[ACE-FCN-LMC] glace_concat requires --ace_lmc_local_checkpoint_path.')
+            raise ValueError('[ACE-FCN-LMC] Stage2 global modes require --ace_lmc_local_checkpoint_path.')
         checkpoint_path = Path(checkpoint_path)
         if not checkpoint_path.exists():
             raise FileNotFoundError(f'ACE-FCN local checkpoint not found: {checkpoint_path}')
@@ -5561,6 +6017,56 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             raise ValueError('Stage-2 --ace_lmc_local_checkpoint_path must point to a pure local stage-1 checkpoint.')
         self.compressor.load_state_dict(checkpoint['compressor_state_dict'], strict=True)
         self.fusion.load_state_dict(checkpoint['fusion_state_dict'], strict=True)
+        head_state = checkpoint.get('head_state_dict')
+        if self._uses_ace_lmc_global_residual_head():
+            if head_state is None:
+                raise ValueError('glace_residual Stage2 requires head_state_dict in the local Stage1 checkpoint.')
+            self.regressor.heads.load_state_dict(head_state, strict=True)
+            self.regressor.heads.eval()
+            for param in self.regressor.heads.parameters():
+                param.requires_grad_(False)
+            _logger.info('[ACE-FCN-LMC] Loaded and froze Stage1 local head as global-residual base.')
+        elif self._uses_ace_lmc_global_film_head():
+            if head_state is None:
+                raise ValueError('glace_film Stage2 requires head_state_dict in the local Stage1 checkpoint.')
+            missing, unexpected = self.regressor.heads.load_state_dict(head_state, strict=False)
+            unexpected = list(unexpected)
+            missing = list(missing)
+            bad_missing = [k for k in missing if not k.startswith('film.') and k != 'global_gate']
+            if unexpected or bad_missing:
+                raise ValueError(
+                    f'glace_film Stage2 could not initialize from Stage1 head: missing={missing} unexpected={unexpected}'
+                )
+            _logger.info('[ACE-FCN-LMC] Loaded Stage1 local head into GLACE-FiLM head (new FiLM params zero-init).')
+        if self._uses_ace_lmc_stage2_teacher():
+            if head_state is None:
+                raise ValueError('Stage2 local-teacher losses require head_state_dict in the local Stage1 checkpoint.')
+            teacher_in_dim = int(
+                checkpoint_config.get('ace_lmc_final_head_dim')
+                or checkpoint_config.get('encoder_feature_dim')
+                or getattr(self.options, 'ace_encoder_features', 512)
+            )
+            self.ace_lmc_stage2_teacher_head = Head(
+                self.dataset.mean_cam_center,
+                self.options.num_head_blocks,
+                self.options.use_homogeneous,
+                in_channels=teacher_in_dim,
+            ).to(self.device)
+            self.ace_lmc_stage2_teacher_head.load_state_dict(head_state, strict=True)
+            self.ace_lmc_stage2_teacher_head.eval()
+            for param in self.ace_lmc_stage2_teacher_head.parameters():
+                param.requires_grad_(False)
+            _logger.info(
+                '[ACE-FCN-LMC] Stage2 local teacher enabled: cons_weight=%.4f guard_weight=%.4f guard_margin=%.3fpx loss=%s cons_warmup=%d guard_warmup=%d sample_limit=%d teacher_dim=%d.',
+                self._ace_lmc_stage2_consistency_base_weight(),
+                self._ace_lmc_stage2_guard_base_weight(),
+                float(getattr(self.options, 'ace_lmc_stage2_guard_margin_px', 0.25)),
+                str(getattr(self.options, 'ace_lmc_stage2_consistency_loss', 'smooth_l1')),
+                int(getattr(self.options, 'ace_lmc_stage2_consistency_warmup_steps', 0)),
+                int(getattr(self.options, 'ace_lmc_stage2_guard_warmup_steps', 0)),
+                int(getattr(self.options, 'ace_lmc_stage2_consistency_sample_limit', 0)),
+                teacher_in_dim,
+            )
         self.lmc_config['ace_lmc_local_checkpoint_path'] = str(checkpoint_path)
         _logger.info('[ACE-FCN-LMC] Loaded stage-1 compressor/fusion from %s', checkpoint_path)
 
@@ -5596,7 +6102,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "local_residual_alpha_warmup_steps", "backbone_feature_dim", "encoder_feature_dim", "memory_feature_dim",
             "scale_token_dim", "memory_path", "model_backend", "ace_encoder_path", "ace_lmc_global_head_mode",
             "ace_lmc_local_checkpoint_path", "ace_lmc_freeze_local_stack", "ace_lmc_global_feature_mode",
-            "ace_lmc_global_gate_init", "ace_lmc_global_gate_learnable", "ace_lmc_global_gate_max", "ace_lmc_random_global_seed",
+            "ace_lmc_global_gate_init", "ace_lmc_global_gate_learnable", "ace_lmc_global_gate_max", "ace_lmc_global_gate_l1_weight",
+            "ace_lmc_global_residual_gate_l1_weight", "ace_lmc_global_residual_delta_max_m",
+            "ace_lmc_global_residual_bad_gate_weight", "ace_lmc_random_global_seed",
+            "ace_lmc_stage2_consistency_weight", "ace_lmc_stage2_consistency_loss",
+            "ace_lmc_stage2_consistency_warmup_steps", "ace_lmc_stage2_consistency_sample_limit",
+            "ace_lmc_stage2_guard_weight", "ace_lmc_stage2_guard_margin_px",
+            "ace_lmc_stage2_guard_max_px", "ace_lmc_stage2_guard_warmup_steps",
             "ace_lmc_allow_mismatched_memory",
             "ace_lmc_memory_feature_source", "ace_lmc_memory_output_subsample", "ace_lmc_memory_coord_source", "ace_lmc_final_head_dim",
             "glace_encoder_path", "glace_init_head_path", "glace_feat_name",
@@ -5680,6 +6192,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 raise ValueError("Resume checkpoint is missing ace_lmc_global_gate_state_dict for learnable ACE-LMC global gate.")
             with torch.no_grad():
                 self.ace_lmc_global_gate.copy_(gate_state['ace_lmc_global_gate'].to(self.device, dtype=torch.float32))
+        if self._uses_ace_lmc_global_residual_head():
+            residual_state = checkpoint.get('ace_lmc_global_residual_state_dict')
+            if residual_state is None:
+                raise ValueError("Resume checkpoint is missing ace_lmc_global_residual_state_dict for glace_residual.")
+            self.ace_lmc_global_residual_head.load_state_dict(residual_state, strict=True)
 
         start_iter = int(getattr(self.options, "resume_best_iter", 0))
         if start_iter <= 0:
@@ -6443,7 +6960,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
         img_idx_b1 = img_idx_b1[:batch_size] if img_idx_b1 is not None else None
         head_features_bC = self._mix_glace_decoder_features(None, features_bC, stage_tag="S2")
-        head_features_bC = self._append_ace_lmc_global_to_features(head_features_bC, img_idx_b1, stage_tag="S2")
+        local_head_features_bC = head_features_bC
+        global_residual_loss = head_features_bC.new_zeros(())
+        global_residual_stats = {"enabled": False}
+        global_film_stats = {"enabled": False}
+        global_gate_l1_stats = {"enabled": False}
+        global_residual_gate_B1HW = None
+        if self._uses_ace_lmc_concat_head():
+            head_features_bC = self._append_ace_lmc_global_to_features(head_features_bC, img_idx_b1, stage_tag="S2")
         features_bCHW = head_features_bC.view(1, h, w, head_features_bC.shape[1]).permute(0, 3, 1, 2)
 
         if self.repro_step_mode == "global_monotonic":
@@ -6459,7 +6983,24 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             step_eff = min(step_eff, self.repro_loss.total_iterations - 1)
 
         with autocast("cuda", enabled=self.options.use_half):
-            pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(features_bCHW)
+            if self._uses_ace_lmc_global_residual_head():
+                pred_scene_coords_b3HW, global_residual_loss, global_residual_stats, global_residual_gate_B1HW = self._predict_ace_lmc_global_residual_coords(
+                    local_head_features_bC,
+                    img_idx_b1,
+                    h,
+                    w,
+                    stage_tag="S2",
+                )
+            elif self._uses_ace_lmc_global_film_head():
+                pred_scene_coords_b3HW, global_film_stats = self._predict_ace_lmc_global_film_coords(
+                    local_head_features_bC,
+                    img_idx_b1,
+                    h,
+                    w,
+                    stage_tag="S2",
+                )
+            else:
+                pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(features_bCHW)
         pred_scene_coords_b3HW = self._recover_pred_scene_to_training_world(pred_scene_coords_b3HW)
 
         pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
@@ -6475,7 +7016,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             invalid_posinf=0.0,
             invalid_neginf=0.0,
         )
-        loss = contract["loss"]
+        loss = contract["loss"] + global_residual_loss
+        global_gate_l1_loss, global_gate_l1_stats = self._compute_ace_lmc_global_gate_l1_loss()
+        loss = loss + global_gate_l1_loss
         loss = loss + self._compute_c1_aux_ref_loss(
             pred_scene_coords_b3HW,
             gt_scene_coords_world_b3,
@@ -6489,7 +7032,25 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             img_idx_N=img_idx_b1,
         )
         loss = loss + relative_depth_loss
+        consistency_loss, consistency_stats = self._compute_ace_lmc_stage2_consistency_loss(
+            local_head_features_bC=local_head_features_bC,
+            student_pred_scene_coords_b3HW=pred_scene_coords_b3HW,
+        )
+        loss = loss + consistency_loss
         reprojection_error_b1 = contract["reprojection_error_l1"]
+        guard_loss, guard_stats = self._compute_ace_lmc_stage2_reprojection_guard_loss(
+            local_head_features_bC=local_head_features_bC,
+            student_pred_scene_coords_b3HW=pred_scene_coords_b3HW,
+            student_reprojection_error_N1=reprojection_error_b1,
+            target_px_N2=target_px_b2,
+            gt_inv_poses_N34=gt_inv_poses_b34,
+            Ks_N33=Ks_b33,
+            invKs_N33=invKs_b33,
+            step_eff=step_eff,
+            normalizer=batch_size,
+            student_gate_B1HW=global_residual_gate_B1HW,
+        )
+        loss = loss + guard_loss
         valid_mask_b1 = contract["valid_mask"]
 
         # Guard NaN/Inf: truly skip optimizer/scheduler updates to avoid consuming LR schedule.
@@ -6502,13 +7063,26 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 "S2 step %d: non-finite loss (valid_frac=%.2f), skipping optimizer/scheduler step.",
                 self.iteration, float(valid_mask_b1.sum() / batch_size),
             )
+        elif not bool(getattr(loss, "requires_grad", False)):
+            self.optimizer_head.zero_grad(set_to_none=True)
+            if not getattr(self, "_logged_s2_no_grad_identity", False):
+                _logger.info(
+                    "S2 step %d: finite no-grad loss; treating as frozen identity sanity step without optimizer update.",
+                    self.iteration,
+                )
+                self._logged_s2_no_grad_identity = True
+            self._s2_update_applied_last = True
         else:
             self.optimizer_head.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
             # FIX: gradient clipping (same as S1) to prevent NaN divergence from large gradients.
             if self._s2_grad_clip_max_norm > 0:
                 self.scaler.unscale_(self.optimizer_head)
-                params_to_clip = list(self.regressor.heads.parameters()) + self._ace_lmc_global_gate_params()
+                params_to_clip = (
+                    list(self.regressor.heads.parameters())
+                    + self._ace_lmc_global_residual_params()
+                    + self._ace_lmc_global_gate_params()
+                )
                 torch.nn.utils.clip_grad_norm_(
                     params_to_clip,
                     max_norm=self._s2_grad_clip_max_norm,
@@ -6553,7 +7127,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     fraction_valid * 100,
                     px_err_finite if math.isfinite(px_err_finite) else -1.0,
                     pxerr_naninf_count,
-                    self._format_relative_depth_stats(relative_depth_stats),
+                    self._format_relative_depth_stats(relative_depth_stats) + self._format_ace_lmc_global_residual_stats(global_residual_stats) + self._format_ace_lmc_global_film_stats(global_film_stats) + self._format_ace_lmc_global_gate_l1_stats(global_gate_l1_stats) + self._format_ace_lmc_stage2_consistency_stats(consistency_stats) + self._format_ace_lmc_stage2_guard_stats(guard_stats),
                     time_since_start,
                 )
             )
@@ -6619,9 +7193,33 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 head_features_bC = self._mix_glace_decoder_features(base_for_residual_bC, fused_features_bC, stage_tag="S2-G")
             else:
                 head_features_bC = fused_features_bC
-            head_features_bC = self._append_ace_lmc_global_to_features(head_features_bC, img_idx_b1, stage_tag="S2-G")
-            head_features_bCHW = head_features_bC.view(1, h, w, head_features_bC.shape[1]).permute(0, 3, 1, 2)
-            pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(head_features_bCHW)
+            local_head_features_bC = head_features_bC
+            global_residual_loss = head_features_bC.new_zeros(())
+            global_residual_stats = {"enabled": False}
+            global_film_stats = {"enabled": False}
+            global_gate_l1_stats = {"enabled": False}
+            global_residual_gate_B1HW = None
+            if self._uses_ace_lmc_global_residual_head():
+                pred_scene_coords_b3HW, global_residual_loss, global_residual_stats, global_residual_gate_B1HW = self._predict_ace_lmc_global_residual_coords(
+                    local_head_features_bC,
+                    img_idx_b1,
+                    h,
+                    w,
+                    stage_tag="S2-G",
+                )
+            elif self._uses_ace_lmc_global_film_head():
+                pred_scene_coords_b3HW, global_film_stats = self._predict_ace_lmc_global_film_coords(
+                    local_head_features_bC,
+                    img_idx_b1,
+                    h,
+                    w,
+                    stage_tag="S2-G",
+                )
+            else:
+                if self._uses_ace_lmc_concat_head():
+                    head_features_bC = self._append_ace_lmc_global_to_features(head_features_bC, img_idx_b1, stage_tag="S2-G")
+                head_features_bCHW = head_features_bC.view(1, h, w, head_features_bC.shape[1]).permute(0, 3, 1, 2)
+                pred_scene_coords_b3HW = self.regressor.get_scene_coordinates(head_features_bCHW)
         pred_scene_coords_b3HW = self._recover_pred_scene_to_training_world(pred_scene_coords_b3HW)
 
         pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
@@ -6638,6 +7236,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             invalid_neginf=0.0,
         )
         loss = contract["loss"]
+        global_gate_l1_loss, global_gate_l1_stats = self._compute_ace_lmc_global_gate_l1_loss()
+        loss = loss + global_gate_l1_loss
         loss = loss + self._compute_c1_aux_ref_loss(
             pred_scene_coords_b3HW,
             gt_scene_coords_world_b3,
@@ -6651,7 +7251,25 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             img_idx_N=img_idx_b1,
         )
         loss = loss + relative_depth_loss
+        consistency_loss, consistency_stats = self._compute_ace_lmc_stage2_consistency_loss(
+            local_head_features_bC=local_head_features_bC,
+            student_pred_scene_coords_b3HW=pred_scene_coords_b3HW,
+        )
+        loss = loss + consistency_loss
         reprojection_error_b1 = contract["reprojection_error_l1"]
+        guard_loss, guard_stats = self._compute_ace_lmc_stage2_reprojection_guard_loss(
+            local_head_features_bC=local_head_features_bC,
+            student_pred_scene_coords_b3HW=pred_scene_coords_b3HW,
+            student_reprojection_error_N1=reprojection_error_b1,
+            target_px_N2=target_px_b2,
+            gt_inv_poses_N34=gt_inv_poses_b34,
+            Ks_N33=Ks_b33,
+            invKs_N33=invKs_b33,
+            step_eff=step_eff,
+            normalizer=batch_size,
+            student_gate_B1HW=global_residual_gate_B1HW,
+        )
+        loss = loss + guard_loss
         valid_mask_b1 = contract["valid_mask"]
 
         glace_pixel_diag = self._compute_glace_base_vs_fused_pixel_diag(
@@ -6749,13 +7367,22 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 "S2-G step %d: non-finite loss (valid_frac=%.2f), skipping optimizer/scheduler step.",
                 self.iteration, float(valid_mask_b1.sum() / batch_size),
             )
+        elif not bool(getattr(loss, "requires_grad", False)):
+            self.optimizer_head.zero_grad(set_to_none=True)
+            if not getattr(self, "_logged_s2g_no_grad_identity", False):
+                _logger.info(
+                    "S2-G step %d: finite no-grad loss; treating as frozen identity sanity step without optimizer update.",
+                    self.iteration,
+                )
+                self._logged_s2g_no_grad_identity = True
+            self._s2_update_applied_last = True
         else:
             self.optimizer_head.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
             # FIX: gradient clipping (same as S1) to prevent NaN divergence from large gradients.
             if self._s2_grad_clip_max_norm > 0:
                 self.scaler.unscale_(self.optimizer_head)
-                params_to_clip = list(self.regressor.heads.parameters())
+                params_to_clip = list(self.regressor.heads.parameters()) + self._ace_lmc_global_residual_params()
                 if ace_g_fusion_in_s2:
                     params_to_clip += list(self.fusion.parameters())
                     params_to_clip += self._glace_residual_adapter_params()
@@ -6795,6 +7422,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         f", guardLoss={float(glace_guard_loss.detach().cpu().item()):.4f}"
                     )
             glace_diag_suffix += self._format_relative_depth_stats(relative_depth_stats)
+            glace_diag_suffix += self._format_ace_lmc_global_residual_stats(global_residual_stats)
+            glace_diag_suffix += self._format_ace_lmc_global_film_stats(global_film_stats)
+            glace_diag_suffix += self._format_ace_lmc_global_gate_l1_stats(global_gate_l1_stats)
+            glace_diag_suffix += self._format_ace_lmc_stage2_consistency_stats(consistency_stats)
+            glace_diag_suffix += self._format_ace_lmc_stage2_guard_stats(guard_stats)
             self._append_step_log(
                 iter_idx=self.current_lmc_iter,
                 step=self.iteration,
@@ -6853,6 +7485,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             checkpoint['ace_lmc_global_gate_state_dict'] = {
                 'ace_lmc_global_gate': self.ace_lmc_global_gate.detach().float().cpu(),
             }
+        if self._uses_ace_lmc_global_residual_head() and getattr(self, 'ace_lmc_global_residual_head', None) is not None:
+            checkpoint['ace_lmc_global_residual_state_dict'] = self.ace_lmc_global_residual_head.state_dict()
+            base_head = self._ace_lmc_global_residual_base_head()
+            if base_head is not None:
+                checkpoint['ace_lmc_global_residual_base_head_state_dict'] = {
+                    k: v.detach().half().cpu() for k, v in base_head.state_dict().items()
+                }
         torch.save(checkpoint, output_path)
         _logger.info(f"Saved LMC checkpoint to: {output_path}")
 
@@ -6890,8 +7529,20 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             config['final_local_residual_alpha'] = self._current_local_residual_alpha_value()
             if self.local_residual_mode == 'learned_alpha':
                 config['final_local_residual_alpha_logit'] = float(self.local_residual_alpha_logit.detach().float().cpu().item())
-        if self._uses_ace_lmc_global_head():
+        if self._uses_ace_lmc_global_film_head() and hasattr(self.regressor.heads, 'gate_value'):
+            config['final_ace_lmc_global_gate'] = float(self.regressor.heads.gate_value())
+            stats = getattr(self.regressor.heads, 'last_stats', {}) or {}
+            config['final_ace_lmc_global_film_gamma_abs'] = stats.get('gamma_abs')
+            config['final_ace_lmc_global_film_beta_abs'] = stats.get('beta_abs')
+            config['final_ace_lmc_global_film_step_abs'] = stats.get('step_abs')
+        elif self._uses_ace_lmc_global_head():
             config['final_ace_lmc_global_gate'] = self._current_ace_lmc_global_gate_value()
+        if self._uses_ace_lmc_global_residual_head() and getattr(self, 'ace_lmc_global_residual_head', None) is not None:
+            stats = getattr(self.ace_lmc_global_residual_head, 'last_stats', {}) or {}
+            config['final_ace_lmc_global_residual_gate_mean'] = stats.get('gate_mean')
+            config['final_ace_lmc_global_residual_gate_max'] = stats.get('gate_max')
+            config['final_ace_lmc_global_residual_delta_l2'] = stats.get('delta_l2')
+            config['final_ace_lmc_global_residual_gated_delta_l2'] = stats.get('gated_delta_l2')
         if self._is_glace_backend() and isinstance(getattr(self, '_last_glace_pixel_diag', None), dict):
             config['last_glace_pixel_diag'] = dict(self._last_glace_pixel_diag)
         return config

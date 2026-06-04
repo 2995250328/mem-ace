@@ -3834,6 +3834,7 @@ class ACEDatasetWithDepth:
     def __init__(self, base_dataset):
         self.base_dataset = base_dataset
         self.dataset_root = Path(base_dataset.rgb_files[0].parent.parent)
+        self._fallback_depth_shape = self._infer_fallback_depth_shape()
 
     @staticmethod
     def _depth_candidates(rgb_file: Path, dataset_root: Path) -> list[Path]:
@@ -3847,6 +3848,15 @@ class ACEDatasetWithDepth:
             f"{stem}.depth.png",
             f"{stem}.rendered.depth.png",
         ]
+        # Indoor6 ACE-style RGBs are often named "003537.jpg", while the
+        # COLMAP-derived WAI depth files are named "image-003537.npz".
+        if stem.isdigit():
+            names.extend([
+                f"image-{stem}.npz",
+                f"image-{stem}.npy",
+                f"image-{stem}.png",
+                f"image-{stem}.depth.png",
+            ])
         if stem.endswith(".color"):
             base = stem[: -len(".color")]
             names.extend([
@@ -3880,6 +3890,20 @@ class ACEDatasetWithDepth:
             depth = np.squeeze(depth)
         return np.where(np.isfinite(depth), depth, 0.0).astype(np.float32, copy=False)
 
+    def _infer_fallback_depth_shape(self) -> tuple[int, int]:
+        """Use existing raw depth dimensions for missing-depth zero fallbacks."""
+        for rgb_file in self.base_dataset.rgb_files:
+            depth_file = next((p for p in self._depth_candidates(rgb_file, self.dataset_root) if p.exists()), None)
+            if depth_file is None:
+                continue
+            depth = self._load_depth(depth_file)
+            if depth.ndim == 2 and depth.shape[0] > 0 and depth.shape[1] > 0:
+                return int(depth.shape[0]), int(depth.shape[1])
+        return (
+            int(self.base_dataset.image_height),
+            int(getattr(self.base_dataset, "image_width", self.base_dataset.image_height)),
+        )
+
     def __len__(self):
         return len(self.base_dataset)
 
@@ -3891,9 +3915,7 @@ class ACEDatasetWithDepth:
         if depth_file is not None:
             depth = self._load_depth(depth_file)
         else:
-            depth = np.zeros((self.base_dataset.image_height,
-                            data[0].shape[2] if data[0].ndim == 3 else data[0].shape[1]),
-                           dtype=np.float32)
+            depth = np.zeros(self._fallback_depth_shape, dtype=np.float32)
 
         return {
             'img': data[0],

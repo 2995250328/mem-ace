@@ -820,8 +820,18 @@ def preflight_memory_features(
                 divisible,
                 f"pooled_features dim={feature_dim} {'is' if divisible else 'is not'} divisible by len(layers_idx)={len(layers_idx)}.",
             )
-        if str(layers_idx[-1]) != "final":
-            _record(False, f"layers_idx last entry is {layers_idx[-1]!r}, expected 'final' from extractor contract.")
+        final_layer_name = str(layers_idx[-1])
+        feature_source = str(bank_data.get("feature_source") or "")
+        allowed_final_layers = {"final"}
+        if feature_source == "glace_encoder" or final_layer_name == "glace_encoder":
+            allowed_final_layers.add("glace_encoder")
+        if feature_source == "ace_fcn" or final_layer_name == "ace_fcn":
+            allowed_final_layers.add("ace_fcn")
+        if final_layer_name not in allowed_final_layers:
+            _record(
+                False,
+                f"layers_idx last entry is {layers_idx[-1]!r}, expected one of {sorted(allowed_final_layers)!r} from extractor contract.",
+            )
     else:
         _record(False, "layers_idx is missing/empty; trainer will fallback to default num_layers=4.")
 

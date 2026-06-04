@@ -41,6 +41,8 @@ from dataset_dinov2 import CamLocDatasetDINOv2
 from dataset_wai_dinov2 import CamLocDatasetWAIDINOv2
 from ace_network_ace import RegressorACE
 from dataset_ace_fcn_lmc import CamLocDatasetACEFCNLMC
+from ace_lmc_global_film import ACEGlobalFiLMHead
+from ace_lmc_global_residual import ACEGlobalResidualHead
 from glace_backend import (
     GLACEDecoderFeatureResidualAdapter,
     build_glace_camloc_dataset,
@@ -350,6 +352,24 @@ def run_evaluation_lmc(opt):
             freeze_backbone=True,
         )
         network.heads = Head(torch.zeros((3,)), pattern_count, use_homogeneous, in_channels=in_channels)
+        if ace_lmc_global_head_mode == 'glace_film':
+            global_dim = int(lmc_config.get('glace_global_feat_dim', lmc_config.get('ace_lmc_global_feature_dim', 0)) or 0)
+            if global_dim <= 0:
+                global_dim = int(lmc_config.get('ace_lmc_final_head_dim', 0)) - local_dim
+            if global_dim <= 0:
+                raise ValueError('[Eval] glace_film checkpoint is missing global feature dimension.')
+            network.heads = ACEGlobalFiLMHead(
+                torch.zeros((3,)),
+                pattern_count,
+                use_homogeneous,
+                in_channels=in_channels,
+                global_dim=global_dim,
+                gate_init=float(lmc_config.get('ace_lmc_global_gate_init', 0.0)),
+                gate_max=float(lmc_config.get('ace_lmc_global_gate_max', 1.0)),
+            )
+        if ace_lmc_global_head_mode == 'glace_residual' and checkpoint.get('ace_lmc_global_residual_base_head_state_dict') is not None:
+            head_state_dict = checkpoint['ace_lmc_global_residual_base_head_state_dict']
+            _logger.info('[Eval] glace_residual: using stored Stage1 base head for local prediction.')
         network.heads.load_state_dict(head_state_dict)
         network.ace_lmc_local_feature_dim = local_dim
         network.ace_lmc_final_head_dim = in_channels
@@ -372,6 +392,28 @@ def run_evaluation_lmc(opt):
     compressor = None
     fusion = None
     glace_residual_adapter = None
+    ace_lmc_global_residual_head = None
+    if model_backend == 'ace_fcn_lmc' and ace_lmc_global_head_mode == 'glace_residual':
+        residual_state = checkpoint.get('ace_lmc_global_residual_state_dict')
+        if residual_state is None:
+            raise ValueError('[Eval] glace_residual checkpoint is missing ace_lmc_global_residual_state_dict.')
+        residual_blocks = sum(1 for key in residual_state.keys() if re.match(r'^delta_head\.\d+c0\.weight$', key))
+        residual_in_channels = int(residual_state['gate.weight'].shape[1])
+        ace_lmc_global_residual_head = ACEGlobalResidualHead(
+            mean=torch.zeros((3,)),
+            num_head_blocks=residual_blocks,
+            in_channels=residual_in_channels,
+            gate_init=float(lmc_config.get('ace_lmc_global_gate_init', 0.001)),
+            gate_max=float(lmc_config.get('ace_lmc_global_gate_max', 0.1)),
+            delta_max_m=float(lmc_config.get('ace_lmc_global_residual_delta_max_m', 1.0)),
+        ).to(device)
+        ace_lmc_global_residual_head.load_state_dict(residual_state, strict=True)
+        ace_lmc_global_residual_head.eval()
+        _logger.info(
+            '[Eval] Loaded ACE-LMC global residual head: in_channels=%d blocks=%d gate_max=%.6f delta_max_m=%.3f.',
+            residual_in_channels, residual_blocks, float(lmc_config.get('ace_lmc_global_gate_max', 0.1)),
+            float(lmc_config.get('ace_lmc_global_residual_delta_max_m', 1.0)),
+        )
     memory_dict = None
     bank_data = None
     reference_eval_state = {"enabled": False, "contract_mode": "C0", "output_space": "points_world"}
@@ -594,7 +636,7 @@ def run_evaluation_lmc(opt):
             aug_scale_min=1.0,
             image_height=image_resolution,
             use_half=False,
-            feat_name=feat_name if ace_lmc_global_head_mode == 'glace_concat' else None,
+            feat_name=feat_name if ace_lmc_global_head_mode in ('glace_concat', 'glace_residual', 'glace_film') else None,
         )
     else:
         testset = CamLocDatasetDINOv2(
@@ -630,7 +672,7 @@ def run_evaluation_lmc(opt):
     ace_lmc_eval_random_global_cache = {}
 
     def _apply_ace_lmc_eval_global_policy(global_feat_BC):
-        if model_backend != 'ace_fcn_lmc' or ace_lmc_global_head_mode != 'glace_concat':
+        if model_backend != 'ace_fcn_lmc' or ace_lmc_global_head_mode not in ('glace_concat', 'glace_residual', 'glace_film'):
             return global_feat_BC
         mode = ace_lmc_global_feature_mode
         if mode == 'glace':
@@ -649,6 +691,8 @@ def run_evaluation_lmc(opt):
             out = ace_lmc_eval_random_global_cache[key].expand_as(global_feat_BC)
         else:
             raise ValueError(f"Unsupported ace_lmc_global_feature_mode={mode!r}")
+        if ace_lmc_global_head_mode in ('glace_residual', 'glace_film'):
+            return out
         return out * torch.tensor(ace_lmc_global_gate_eval, device=global_feat_BC.device, dtype=global_feat_BC.dtype)
 
     avg_batch_time = 0
@@ -660,7 +704,7 @@ def run_evaluation_lmc(opt):
 
     with torch.no_grad():
         for batch in testset_loader:
-            if model_backend == 'glace_lmc' or (model_backend == 'ace_fcn_lmc' and ace_lmc_global_head_mode == 'glace_concat'):
+            if model_backend == 'glace_lmc' or (model_backend == 'ace_fcn_lmc' and ace_lmc_global_head_mode in ('glace_concat', 'glace_residual', 'glace_film')):
                 image_B1HW, _, gt_pose_B44, _, intrinsics_B33, _, _, filenames, global_feat_BC, _ = batch
                 global_feat_BC = global_feat_BC.to(device, non_blocking=True)
             else:
@@ -768,6 +812,7 @@ def run_evaluation_lmc(opt):
                         mixed_bC = glace_residual_adapter(base_bC, cand_bC)
                         features = mixed_bC.view(B, H, W, C).permute(0, 3, 1, 2)
                     head_features = features
+                    scene_coordinates_B3HW = network.get_scene_coordinates(head_features)
                 elif model_backend == 'ace_fcn_lmc' and ace_lmc_global_head_mode == 'glace_concat':
                     if global_feat_BC is None:
                         raise ValueError('[Eval] ace_fcn_lmc/glace_concat requires global features in the dataset batch.')
@@ -781,9 +826,34 @@ def run_evaluation_lmc(opt):
                         ),
                         dim=1,
                     )
+                    scene_coordinates_B3HW = network.get_scene_coordinates(head_features)
+                elif model_backend == 'ace_fcn_lmc' and ace_lmc_global_head_mode == 'glace_film':
+                    if global_feat_BC is None:
+                        raise ValueError('[Eval] ace_fcn_lmc/glace_film requires global features in the dataset batch.')
+                    if global_feat_BC.dtype != features.dtype:
+                        global_feat_BC = global_feat_BC.to(dtype=features.dtype)
+                    global_feat_BC = _apply_ace_lmc_eval_global_policy(global_feat_BC)
+                    scene_coordinates_B3HW = network.heads(features, global_feat_BC)
+                elif model_backend == 'ace_fcn_lmc' and ace_lmc_global_head_mode == 'glace_residual':
+                    if global_feat_BC is None:
+                        raise ValueError('[Eval] ace_fcn_lmc/glace_residual requires global features in the dataset batch.')
+                    if ace_lmc_global_residual_head is None:
+                        raise ValueError('[Eval] glace_residual mode requires loaded residual head.')
+                    if global_feat_BC.dtype != features.dtype:
+                        global_feat_BC = global_feat_BC.to(dtype=features.dtype)
+                    global_feat_BC = _apply_ace_lmc_eval_global_policy(global_feat_BC)
+                    local_pred = network.get_scene_coordinates(features)
+                    residual_input = torch.cat(
+                        (
+                            global_feat_BC[..., None, None].expand(-1, -1, features.shape[2], features.shape[3]),
+                            features,
+                        ),
+                        dim=1,
+                    )
+                    scene_coordinates_B3HW, _, _ = ace_lmc_global_residual_head(local_pred, residual_input)
                 else:
                     head_features = features
-                scene_coordinates_B3HW = network.get_scene_coordinates(head_features)
+                    scene_coordinates_B3HW = network.get_scene_coordinates(head_features)
 
             scene_coordinates_B3HW = scene_coordinates_B3HW.float().cpu()
 
@@ -922,7 +992,12 @@ def run_evaluation_lmc(opt):
             "ace_lmc_global_gate_init": lmc_config.get("ace_lmc_global_gate_init"),
             "ace_lmc_global_gate_learnable": lmc_config.get("ace_lmc_global_gate_learnable"),
             "ace_lmc_global_gate_max": lmc_config.get("ace_lmc_global_gate_max"),
+            "ace_lmc_global_residual_gate_l1_weight": lmc_config.get("ace_lmc_global_residual_gate_l1_weight"),
+            "ace_lmc_global_residual_delta_max_m": lmc_config.get("ace_lmc_global_residual_delta_max_m"),
             "final_ace_lmc_global_gate": lmc_config.get("final_ace_lmc_global_gate"),
+            "final_ace_lmc_global_residual_gate_mean": lmc_config.get("final_ace_lmc_global_residual_gate_mean"),
+            "final_ace_lmc_global_residual_gate_max": lmc_config.get("final_ace_lmc_global_residual_gate_max"),
+            "final_ace_lmc_global_residual_gated_delta_l2": lmc_config.get("final_ace_lmc_global_residual_gated_delta_l2"),
             "ace_lmc_final_head_dim": lmc_config.get("ace_lmc_final_head_dim"),
             "glace_global_feat_dim": lmc_config.get("glace_global_feat_dim"),
             "lmc_key_slice_idx": lmc_config.get("lmc_key_slice_idx"),

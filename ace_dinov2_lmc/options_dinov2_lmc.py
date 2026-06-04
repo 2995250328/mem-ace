@@ -159,8 +159,13 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--ace_lmc_global_head_mode',
         type=str,
         default='none',
-        choices=['none', 'glace_concat'],
-        help='ace_fcn_lmc 后端最终 head 输入模式：none=纯 ACE local LMC；glace_concat=拼接 GLACE image-level global feature。',
+        choices=['none', 'glace_concat', 'glace_residual', 'glace_film'],
+        help=(
+            'ace_fcn_lmc 后端最终 head 输入模式：none=纯 ACE local LMC；'
+            'glace_concat=拼接 GLACE image-level global feature；'
+            'glace_residual=冻结 Stage1 local head，仅学习 gated global coordinate residual；'
+            'glace_film=Stage1 head 初始化的 feature-level FiLM global conditioning。'
+        ),
     )
     parser.add_argument(
         '--ace_lmc_local_checkpoint_path',
@@ -183,7 +188,7 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--ace_lmc_global_gate_init',
         type=float,
         default=1.0,
-        help='ace_fcn_lmc/glace_concat 拼接前 global feature 的标量 gate 初值；旧行为为 1.0，保守 Stage2 建议 0.0 或 0.01。',
+        help='ace_fcn_lmc global gate 初值；glace_concat 表示拼接前缩放，glace_film 表示 hidden FiLM 强度。',
     )
     parser.add_argument(
         '--ace_lmc_global_gate_learnable',
@@ -198,10 +203,83 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         help='learnable global gate 的上界；>0 时使用 sigmoid(raw)*max 约束，0 表示旧的无界标量。',
     )
     parser.add_argument(
+        '--ace_lmc_global_gate_l1_weight',
+        type=float,
+        default=0.0,
+        help='learnable ACE-LMC global scalar gate 的 L1 正则权重；用于统一协议下自动抑制无效 global，默认 0 关闭。',
+    )
+    parser.add_argument(
+        '--ace_lmc_global_residual_gate_l1_weight',
+        type=float,
+        default=0.0,
+        help='glace_residual 模式下 per-pixel global gate 的 L1 稀疏正则权重；默认 0 关闭。',
+    )
+    parser.add_argument(
+        '--ace_lmc_global_residual_delta_max_m',
+        type=float,
+        default=1.0,
+        help='glace_residual 模式下坐标残差 tanh 上界，单位米；>0 时 delta=tanh(raw)*max，避免 unbounded residual 发散。',
+    )
+    parser.add_argument(
+        '--ace_lmc_global_residual_bad_gate_weight',
+        type=float,
+        default=0.0,
+        help='glace_residual 模式下，当 student reprojection 比 Stage1 teacher 差时对 gate 的额外惩罚权重；默认 0 关闭。',
+    )
+    parser.add_argument(
         '--ace_lmc_random_global_seed',
         type=int,
         default=20260531,
         help='ace_lmc_global_feature_mode=random 时固定随机 global 向量的种子。',
+    )
+    parser.add_argument(
+        '--ace_lmc_stage2_consistency_weight',
+        type=float,
+        default=0.0,
+        help='ACE-FCN-LMC/glace_concat Stage2 对 frozen Stage1 local head 的坐标一致性损失权重；默认 0 关闭。',
+    )
+    parser.add_argument(
+        '--ace_lmc_stage2_consistency_loss',
+        type=str,
+        default='smooth_l1',
+        choices=['l1', 'smooth_l1', 'l2'],
+        help='ACE-FCN-LMC Stage2 local-teacher consistency loss 类型。',
+    )
+    parser.add_argument(
+        '--ace_lmc_stage2_consistency_warmup_steps',
+        type=int,
+        default=0,
+        help='Stage2 consistency loss 线性 warmup 步数；0 表示从第一步使用完整权重。',
+    )
+    parser.add_argument(
+        '--ace_lmc_stage2_consistency_sample_limit',
+        type=int,
+        default=0,
+        help='每个 S2 batch 用于 consistency 的最大采样点数；0 表示使用全部 sampled points。',
+    )
+    parser.add_argument(
+        '--ace_lmc_stage2_guard_weight',
+        type=float,
+        default=0.0,
+        help='ACE-FCN-LMC/glace_concat Stage2 teacher reprojection anti-regression guard 权重；默认 0 关闭。',
+    )
+    parser.add_argument(
+        '--ace_lmc_stage2_guard_margin_px',
+        type=float,
+        default=0.25,
+        help='Stage2 guard 的像素误差 margin；student 比 Stage1 teacher 差超过该值才惩罚。',
+    )
+    parser.add_argument(
+        '--ace_lmc_stage2_guard_max_px',
+        type=float,
+        default=100.0,
+        help='Stage2 guard 单点惩罚上限，防止异常点主导；<=0 表示不截断。',
+    )
+    parser.add_argument(
+        '--ace_lmc_stage2_guard_warmup_steps',
+        type=int,
+        default=0,
+        help='Stage2 guard loss 线性 warmup 步数；0 表示从第一步使用完整权重。',
     )
     parser.add_argument(
         '--ace_lmc_freeze_local_stack',
@@ -804,6 +882,18 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
             'C1 aux_ref/valid sampling 自动查找或 scene 根目录下使用的 WAI 深度子目录。'
             'RIO10 稀疏深度使用 sparse_depth；Wayspots LMC 推荐 sparse_depth_sampling_sp。'
         ),
+    )
+    parser.add_argument(
+        '--c1_aux_depth_min',
+        type=float,
+        default=1e-6,
+        help='C1 aux depth 转 scene coordinates 前的最小有效深度，默认保持原行为。',
+    )
+    parser.add_argument(
+        '--c1_aux_depth_max',
+        type=float,
+        default=1000.0,
+        help='C1 aux depth 转 scene coordinates 前的最大有效深度；Indoor6 COLMAP 外点可设为 20-30m。',
     )
     parser.add_argument(
         '--c1_aux_ref_sample_ratio',

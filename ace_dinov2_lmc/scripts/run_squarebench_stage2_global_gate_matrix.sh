@@ -18,7 +18,9 @@ MATRIX_SUBDIR="${MATRIX_SUBDIR:-stage2_global_gate_matrix_squarebench}"
 MEMORY_DIRNAME="${MEMORY_DIRNAME:-memory}"
 STAGE1_SUBDIR="${STAGE1_SUBDIR:-stage1_local_ace_memory_it12}"
 GPUS_STR="${GPUS_STR:-0 1}"
-VARIANTS_STR="${VARIANTS_STR:-zero_g1 random_g1 glace_g0_learn glace_g001_learn}"
+VARIANTS_STR="${VARIANTS_STR:-glace_concat_gate_unified}"
+CONSISTENCY_LOSS="${CONSISTENCY_LOSS:-smooth_l1}"
+CONSISTENCY_SAMPLE_LIMIT="${CONSISTENCY_SAMPLE_LIMIT:-0}"
 DRY_RUN="${DRY_RUN:-false}"
 SKIP_EXISTING="${SKIP_EXISTING:-true}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-true}"
@@ -82,23 +84,35 @@ log_status() {
 variant_config() {
   local variant="$1"
   case "${variant}" in
-    zero_g1) echo "zero 1.0 False 0.0" ;;
-    random_g1) echo "random 1.0 False 0.0" ;;
-    glace_g0_learn) echo "glace 0.0 True 0.0" ;;
-    glace_g001_learn) echo "glace 0.01 True 0.0" ;;
-    glace_g001_max001_learn) echo "glace 0.001 True 0.01" ;;
-    glace_g001_max01_learn) echo "glace 0.01 True 0.1" ;;
-    glace_g01_learn) echo "glace 0.1 True 0.0" ;;
-    glace_g1_legacy) echo "glace 1.0 False 0.0" ;;
+    zero_g1) echo "glace_concat zero 1.0 False 0.0 0.0 0.0 0 0.0 0.25 100.0 0 0.0 1.0 0.0" ;;
+    random_g1) echo "glace_concat random 1.0 False 0.0 0.0 0.0 0 0.0 0.25 100.0 0 0.0 1.0 0.0" ;;
+    glace_g0_learn) echo "glace_concat glace 0.0 True 0.0 0.0 0.0 0 0.0 0.25 100.0 0 0.0 1.0 0.0" ;;
+    glace_g001_learn) echo "glace_concat glace 0.01 True 0.0 0.0 0.0 0 0.0 0.25 100.0 0 0.0 1.0 0.0" ;;
+    glace_g001_max001_learn) echo "glace_concat glace 0.001 True 0.01 0.0 0.0 0 0.0 0.25 100.0 0 0.0 1.0 0.0" ;;
+    glace_g001_max01_learn) echo "glace_concat glace 0.01 True 0.1 0.0 0.0 0 0.0 0.25 100.0 0 0.0 1.0 0.0" ;;
+    glace_concat_gate_unified) echo "glace_concat glace 0.01 True 0.1 0.001 0.0 0 0.0 0.25 100.0 0 0.0 1.0 0.0" ;;
+    glace_g001_max01_cons01) echo "glace_concat glace 0.01 True 0.1 0.0 0.1 100 0.0 0.25 100.0 0 0.0 1.0 0.0" ;;
+    glace_g001_max01_cons1) echo "glace_concat glace 0.01 True 0.1 0.0 1.0 100 0.0 0.25 100.0 0 0.0 1.0 0.0" ;;
+    glace_g001_max001_cons01) echo "glace_concat glace 0.001 True 0.01 0.0 0.1 100 0.0 0.25 100.0 0 0.0 1.0 0.0" ;;
+    glace_g001_max01_guard01) echo "glace_concat glace 0.01 True 0.1 0.0 0.0 0 0.1 0.25 100.0 100 0.0 1.0 0.0" ;;
+    glace_g001_max01_guard1) echo "glace_concat glace 0.01 True 0.1 0.0 0.0 0 1.0 0.25 100.0 100 0.0 1.0 0.0" ;;
+    glace_g001_max001_guard01) echo "glace_concat glace 0.001 True 0.01 0.0 0.0 0 0.1 0.25 100.0 100 0.0 1.0 0.0" ;;
+    glace_g01_learn) echo "glace_concat glace 0.1 True 0.0 0.0 0.0 0 0.0 0.25 100.0 0 0.0 1.0 0.0" ;;
+    glace_g1_legacy) echo "glace_concat glace 1.0 False 0.0 0.0 0.0 0 0.0 0.25 100.0 0 0.0 1.0 0.0" ;;
+    glace_residual_identity) echo "glace_residual glace 0.0 False 0.0 0.0 0.0 0 0.0 0.25 100.0 0 0.0 0.0 0.0" ;;
+    glace_residual_unified) echo "glace_residual glace 0.001 False 0.1 0.0 0.0 0 1.0 0.25 100.0 100 0.01 0.5 10.0" ;;
+    glace_film_unified) echo "glace_film glace 1.0 False 0.0 0.0 0.0 0 0.0 0.25 100.0 0 0.0 0.0 0.0" ;;
+    zero_film) echo "glace_film zero 1.0 False 0.0 0.0 0.0 0 0.0 0.25 100.0 0 0.0 0.0 0.0" ;;
+    random_film) echo "glace_film random 1.0 False 0.0 0.0 0.0 0 0.0 0.25 100.0 0 0.0 0.0 0.0" ;;
     *) echo "ERROR unknown variant ${variant}" >&2; return 2 ;;
   esac
 }
 
 run_variant() {
   local variant="$1" gpu="$2"
-  local cfg mode gate learnable gate_max
+  local cfg head_mode mode gate learnable gate_max gate_l1 cons_weight cons_warmup guard_weight guard_margin guard_max guard_warmup residual_gate_l1 residual_delta_max_m residual_bad_gate_weight
   cfg="$(variant_config "${variant}")" || return 2
-  read -r mode gate learnable gate_max <<< "${cfg}"
+  read -r head_mode mode gate learnable gate_max gate_l1 cons_weight cons_warmup guard_weight guard_margin guard_max guard_warmup residual_gate_l1 residual_delta_max_m residual_bad_gate_weight <<< "${cfg}"
   local variant_root="${RUN_ROOT}/${variant}"
   local log_file="${variant_root}/train.log"
   local output_suffix="ace_fcn_glace_global_stage2_${variant}.pt"
@@ -121,14 +135,26 @@ run_variant() {
     --memory_path "${MEMORY_PATH}"
     --use_scale_token False
     --ace_encoder_path "${ACE_ENCODER_PATH}"
-    --ace_lmc_global_head_mode glace_concat
+    --ace_lmc_global_head_mode "${head_mode}"
     --ace_lmc_local_checkpoint_path "${STAGE1_CHECKPOINT}"
     --ace_lmc_freeze_local_stack True
     --ace_lmc_global_feature_mode "${mode}"
     --ace_lmc_global_gate_init "${gate}"
     --ace_lmc_global_gate_learnable "${learnable}"
     --ace_lmc_global_gate_max "${gate_max}"
+    --ace_lmc_global_gate_l1_weight "${gate_l1}"
     --ace_lmc_random_global_seed "${RANDOM_GLOBAL_SEED}"
+    --ace_lmc_global_residual_gate_l1_weight "${residual_gate_l1}"
+    --ace_lmc_global_residual_delta_max_m "${residual_delta_max_m}"
+    --ace_lmc_global_residual_bad_gate_weight "${residual_bad_gate_weight}"
+    --ace_lmc_stage2_consistency_weight "${cons_weight}"
+    --ace_lmc_stage2_consistency_loss "${CONSISTENCY_LOSS}"
+    --ace_lmc_stage2_consistency_warmup_steps "${cons_warmup}"
+    --ace_lmc_stage2_consistency_sample_limit "${CONSISTENCY_SAMPLE_LIMIT}"
+    --ace_lmc_stage2_guard_weight "${guard_weight}"
+    --ace_lmc_stage2_guard_margin_px "${guard_margin}"
+    --ace_lmc_stage2_guard_max_px "${guard_max}"
+    --ace_lmc_stage2_guard_warmup_steps "${guard_warmup}"
     --glace_feat_name "${GLACE_FEAT_NAME}"
     --device "cuda:${gpu}"
     --post_train_eval_device "cuda:${gpu}"
@@ -159,7 +185,7 @@ run_variant() {
   )
 
   {
-    printf "[%s] %s variant=%s gpu=%s mode=%s gate=%s gate_max=%s learnable=%s\n" "$(date)" "${SCENE}" "${variant}" "${gpu}" "${mode}" "${gate}" "${gate_max}" "${learnable}"
+    printf "[%s] %s variant=%s gpu=%s mode=%s gate=%s gate_max=%s gate_l1=%s learnable=%s cons=%s cons_warmup=%s guard=%s guard_margin=%s guard_warmup=%s\n" "$(date)" "${SCENE}" "${variant}" "${gpu}" "${mode}" "${gate}" "${gate_max}" "${gate_l1}" "${learnable}" "${cons_weight}" "${cons_warmup}" "${guard_weight}" "${guard_margin}" "${guard_warmup}"
     printf "Stage1: %s\n" "${STAGE1_CHECKPOINT}"
     print_cmd "${cmd[@]}"
   } | tee -a "${log_file}"

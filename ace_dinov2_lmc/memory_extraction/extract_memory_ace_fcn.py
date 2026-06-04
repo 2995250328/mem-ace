@@ -76,6 +76,16 @@ def _depth_key(path: Path) -> str:
     return stem
 
 
+def _depth_keys(path: Path) -> list[str]:
+    key = _depth_key(path)
+    keys = [key]
+    # Indoor6 ACE RGB files are named like "003537.jpg", while the
+    # COLMAP-derived depth files in WAI-style folders use "image-003537.npz".
+    if key.startswith("image-") and key[len("image-"):].isdigit():
+        keys.append(key[len("image-"):])
+    return keys
+
+
 def _build_depth_path_map(depth_dir: Path):
     depth_dir = Path(depth_dir)
     if not depth_dir.exists():
@@ -83,7 +93,8 @@ def _build_depth_path_map(depth_dir: Path):
     paths = [p for p in depth_dir.iterdir() if p.is_file()]
     out = {}
     for path in paths:
-        out[_depth_key(path)] = path
+        for key in _depth_keys(path):
+            out[key] = path
     if not out:
         raise FileNotFoundError(f"depth_dir contains no files: {depth_dir}")
     return out
@@ -107,7 +118,15 @@ def _load_depth(path: Path) -> np.ndarray:
     return np.where(np.isfinite(depth), depth, 0.0)
 
 
-def _sample_patch_depth_nearest_valid(depth: np.ndarray, stride: int, coords_h: int, coords_w: int):
+def _sample_patch_depth_nearest_valid(
+    depth: np.ndarray,
+    stride: int,
+    coords_h: int,
+    coords_w: int,
+    *,
+    depth_min: float,
+    depth_max: float,
+):
     patch_depth = np.zeros((coords_h, coords_w), dtype=np.float64)
     patch_px = np.zeros((coords_h, coords_w), dtype=np.float64)
     patch_py = np.zeros((coords_h, coords_w), dtype=np.float64)
@@ -123,14 +142,14 @@ def _sample_patch_depth_nearest_valid(depth: np.ndarray, stride: int, coords_h: 
             x0 = gx * stride
             x1 = min((gx + 1) * stride, image_w)
             center_depth = depth[cy, cx]
-            if np.isfinite(center_depth) and center_depth > 0.0 and center_depth <= 1000.0:
+            if np.isfinite(center_depth) and depth_min <= center_depth <= depth_max:
                 patch_depth[gy, gx] = center_depth
                 patch_px[gy, gx] = cx
                 patch_py[gy, gx] = cy
                 patch_valid[gy, gx] = True
                 continue
             window = depth[y0:y1, x0:x1]
-            valid = np.isfinite(window) & (window > 0.0) & (window <= 1000.0)
+            valid = np.isfinite(window) & (window >= depth_min) & (window <= depth_max)
             if not np.any(valid):
                 continue
             yy, xx = np.where(valid)
@@ -146,13 +165,29 @@ def _sample_patch_depth_nearest_valid(depth: np.ndarray, stride: int, coords_h: 
     return patch_depth, patch_px, patch_py, patch_valid
 
 
-def _depth_to_patch_scene_coords(depth: np.ndarray, pose_c2w: torch.Tensor, intrinsics: torch.Tensor, image_hw, stride: int):
+def _depth_to_patch_scene_coords(
+    depth: np.ndarray,
+    pose_c2w: torch.Tensor,
+    intrinsics: torch.Tensor,
+    image_hw,
+    stride: int,
+    *,
+    depth_min: float,
+    depth_max: float,
+):
     image_h, image_w = image_hw
     if tuple(depth.shape) != (image_h, image_w):
         depth = resize(depth, (image_h, image_w), order=0, preserve_range=True, anti_aliasing=False)
     coords_h = math.ceil(image_h / stride)
     coords_w = math.ceil(image_w / stride)
-    depth_patch, px, py, valid = _sample_patch_depth_nearest_valid(depth, stride, coords_h, coords_w)
+    depth_patch, px, py, valid = _sample_patch_depth_nearest_valid(
+        depth,
+        stride,
+        coords_h,
+        coords_w,
+        depth_min=depth_min,
+        depth_max=depth_max,
+    )
     coords = torch.zeros((3, coords_h, coords_w), dtype=torch.float32)
     if not np.any(valid):
         return coords
@@ -294,8 +329,10 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--image_resolution", type=int, default=512)
     parser.add_argument("--samples_per_image", type=int, default=1024, help="Valid stride-8 patches sampled per image; <=0 keeps all.")
-    parser.add_argument("--coord_source", type=str, default="depth_gt", choices=["depth_gt", "sparse_depth"], help="Coordinate source recorded in metadata.")
+    parser.add_argument("--coord_source", type=str, default="depth_gt", choices=["depth_gt", "sparse_depth", "colmap_depth"], help="Coordinate source recorded in metadata.")
     parser.add_argument("--depth_dir", type=Path, default=None, help="Depth directory. Defaults to <scene>/train/depth for depth_gt.")
+    parser.add_argument("--depth_min", type=float, default=1e-6, help="Minimum valid metric depth for memory extraction.")
+    parser.add_argument("--depth_max", type=float, default=1000.0, help="Maximum valid metric depth for memory extraction.")
     parser.add_argument("--voxel_size", type=float, default=0.05)
     parser.add_argument("--max_points", type=int, default=300000)
     parser.add_argument("--num_head_blocks", type=int, default=4)
@@ -359,6 +396,8 @@ def main():
             image = image.to(device, non_blocking=True).float()
             filename = filenames[0] if isinstance(filenames, (list, tuple)) else filenames
             rgb_stem = Path(str(filename)).stem
+            all_poses.append(pose[0].float().cpu())
+            all_intrinsics.append(intrinsics[0].float().cpu())
             depth_path = depth_paths.get(rgb_stem)
             if depth_path is None:
                 skipped += 1
@@ -370,6 +409,8 @@ def main():
                 intrinsics[0],
                 image_hw=(int(image.shape[-2]), int(image.shape[-1])),
                 stride=int(regressor.OUTPUT_SUBSAMPLE),
+                depth_min=float(args.depth_min),
+                depth_max=float(args.depth_max),
             ).unsqueeze(0)
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 features = regressor.get_features(image).float().cpu()
@@ -395,8 +436,6 @@ def main():
             feature_chunks.append(feats)
             image_idx_chunks.append(img_idx)
             pixel_xy_chunks.append(pixel_xy)
-            all_poses.append(pose[0].float().cpu())
-            all_intrinsics.append(intrinsics[0].float().cpu())
             if (image_idx + 1) % 50 == 0:
                 _logger.info(
                     "Processed %d/%d images, raw_valid=%d, sampled=%d",
@@ -472,6 +511,8 @@ def main():
         "depth_dir": str(depth_dir),
         "coord_frame": "world",
         "normalization": "none",
+        "depth_min": float(args.depth_min),
+        "depth_max": float(args.depth_max),
         "pooling_mode": "voxel_mean" if float(args.voxel_size) > 0 else "none",
         "sampling_mode": "per_image_random_valid_patch",
         "samples_per_image": int(args.samples_per_image),
