@@ -744,6 +744,60 @@ def _build_resume_run_dir(args):
     args.overwrite_run_dir = False
     return 'resume', run_dir
 
+
+def _is_resume_request(args):
+    return (
+        getattr(args, 'resume_from_run_dir', None) is not None
+        or getattr(args, 'resume_checkpoint_path', None) is not None
+    )
+
+
+def _prepare_checkpoint_resume_args(args):
+    """Prepare non-destructive checkpoint resume into a fresh run directory."""
+    if getattr(args, 'resume_from_run_dir', None) is not None:
+        return
+    checkpoint_path = getattr(args, 'resume_checkpoint_path', None)
+    if checkpoint_path is None:
+        return
+
+    checkpoint_path = Path(checkpoint_path).resolve()
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"resume_checkpoint_path does not exist: {checkpoint_path}")
+
+    meta = None
+    meta_path = getattr(args, 'resume_meta_path', None)
+    meta_path = Path(meta_path).resolve() if meta_path is not None else checkpoint_path.parent / 'best_checkpoint_meta.json'
+    if meta_path.exists():
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        raw_meta_ckpt = meta.get('best_checkpoint_path')
+        if raw_meta_ckpt:
+            meta_ckpt = Path(raw_meta_ckpt)
+            if not meta_ckpt.is_absolute():
+                meta_ckpt = (meta_path.parent / meta_ckpt).resolve()
+            if meta_ckpt != checkpoint_path:
+                _logger.warning(
+                    '[Resume] meta best_checkpoint_path=%s differs from --resume_checkpoint_path=%s; using CLI checkpoint.',
+                    meta_ckpt,
+                    checkpoint_path,
+                )
+    else:
+        meta_path = None
+
+    if int(getattr(args, 'resume_best_iter', 0)) <= 0:
+        if not meta or 'best_iter' not in meta:
+            raise ValueError(
+                '--resume_checkpoint_path requires --resume_best_iter when no best_checkpoint_meta.json is available.'
+            )
+        args.resume_best_iter = int(meta['best_iter'])
+
+    if float(getattr(args, 'resume_best_score', -float('inf'))) == -float('inf') and meta:
+        args.resume_best_score = float(meta.get('best_score', -float('inf')))
+
+    args.resume_checkpoint_path = checkpoint_path
+    args.resume_meta_path = meta_path
+    args.resume_best_meta = meta
+
 # Run directory layout is intentionally hierarchical so experiment artifacts
 # and best checkpoints are easy to audit by dataset / scene / flow.
 def _build_run_dir(args):
@@ -841,8 +895,8 @@ def _attach_full_log_file_handler(run_dir):
 
 def _persist_run_metadata(args, run_dir):
     # Persist run metadata for reproducibility. Resume writes separate files so the original run contract remains intact.
-    config_name = "resume_config.json" if getattr(args, 'resume_from_run_dir', None) is not None else "run_config.json"
-    command_name = "resume_command.txt" if getattr(args, 'resume_from_run_dir', None) is not None else "run_command.txt"
+    config_name = "resume_config.json" if _is_resume_request(args) else "run_config.json"
+    command_name = "resume_command.txt" if _is_resume_request(args) else "run_command.txt"
     with open(run_dir / config_name, 'w', encoding='utf-8') as f:
         json.dump({k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, f, indent=2, ensure_ascii=False)
     with open(run_dir / command_name, 'w', encoding='utf-8') as f:
@@ -865,7 +919,9 @@ def _log_configuration_summary(args, output_layout, full_log_path):
         _logger.info("Output layout: hierarchical (dataset/scene/function/run_id)")
     elif output_layout == 'resume':
         _logger.info("Output layout: resume existing run_dir")
+    if getattr(args, 'resume_checkpoint_path', None) is not None:
         _logger.info("Resume ckpt  : %s", getattr(args, 'resume_checkpoint_path', None))
+        _logger.info("Resume meta  : %s", getattr(args, 'resume_meta_path', None))
         _logger.info("Resume best  : iter=%s score=%s", getattr(args, 'resume_best_iter', None), getattr(args, 'resume_best_score', None))
     _logger.info("Output       : %s", args.output_map)
     _logger.info("Full Log     : %s", full_log_path)
@@ -994,6 +1050,7 @@ def setup_experiment(args):
     _validate_args(args)
     _apply_baseline_contract(args)
     _apply_lmc_profile(args)
+    _prepare_checkpoint_resume_args(args)
     output_layout, run_dir = _build_run_dir(args)
     full_log_path = _attach_full_log_file_handler(run_dir)
     _persist_run_metadata(args, run_dir)

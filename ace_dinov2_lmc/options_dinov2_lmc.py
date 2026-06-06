@@ -129,6 +129,33 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        '--resume_checkpoint_path',
+        type=Path,
+        default=None,
+        help=(
+            '从指定 best checkpoint 恢复模型权重，但按当前 experiment/run_name 写入新的 run_dir。'
+            '需要提供 --resume_best_iter，或让脚本从 checkpoint 同目录的 best_checkpoint_meta.json 读取。'
+        ),
+    )
+    parser.add_argument(
+        '--resume_meta_path',
+        type=Path,
+        default=None,
+        help='与 --resume_checkpoint_path 搭配使用的 best_checkpoint_meta.json；None 时默认查找 checkpoint 同目录。',
+    )
+    parser.add_argument(
+        '--resume_best_iter',
+        type=int,
+        default=0,
+        help='--resume_checkpoint_path 对应的已完成 best iteration，后续从 best_iter+1 继续。',
+    )
+    parser.add_argument(
+        '--resume_best_score',
+        type=float,
+        default=-float('inf'),
+        help='--resume_checkpoint_path 对应的 best score；用于续训时避免低分覆盖旧 best。',
+    )
+    parser.add_argument(
         '--resume_strict_config',
         type=_strtobool,
         default=True,
@@ -1658,6 +1685,24 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
             ' 设为 0 表示禁用裁剪（不推荐，等同于旧行为）。'
             ' 默认 1000.0 对室内外场景均适用。'
         ),
+    )
+    parser.add_argument(
+        '--s2_nan_guard',
+        type=_strtobool,
+        default=True,
+        help='S2/S2-G 中连续出现全 batch NaN/0-valid 时提前终止当前训练，保留已有 best checkpoint。',
+    )
+    parser.add_argument(
+        '--s2_nan_guard_patience',
+        type=int,
+        default=2,
+        help='触发 S2 NaN guard 需要连续异常 batch 的数量。',
+    )
+    parser.add_argument(
+        '--s2_nan_guard_naninf_ratio',
+        type=float,
+        default=0.99,
+        help='当 pxErr 非有限比例达到该阈值时，将该 batch 视为发散。',
     )
     parser.add_argument(
         '--s2_polish_epochs',

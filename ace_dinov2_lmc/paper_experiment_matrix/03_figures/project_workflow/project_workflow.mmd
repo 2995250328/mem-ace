@@ -1,0 +1,82 @@
+flowchart LR
+  %% Paper-facing workflow for GLACE + GeoLMC Memory research.
+  %% This is a research/project workflow figure, not the model architecture figure.
+
+  subgraph OS["Open-source figure workflow"]
+    OS1["Open-source diagram workflow"]
+    OS2["PaperBanana-style staged figure process"]
+    OS3["GPT-Image2 / visual-skills prompt structure"]
+    OS4["Mermaid / Excalidraw editable draft"]
+    OS1 --> OS2 --> OS3 --> OS4
+  end
+
+  subgraph Design["Project-specific method design"]
+    Spec["Project-specific method spec"]
+    Method["GLACE + GeoLMC Memory"]
+    Mem["Scene memory / map codes"]
+    S1["Stage 1 local memory path"]
+    S2["Stage 2 GLACE concat/global head"]
+    Solver["DSAC* pose solving"]
+    Spec --> Method
+    Method --> Mem
+    Method --> S1 --> S2 --> Solver
+  end
+
+  subgraph Drafts["Figure preparation"]
+    Struct["Editable structural draft"]
+    Prompt["Image2 reference prompt"]
+    Ref["Generated reference figure"]
+    Vector["Vector cleanup / manual verification"]
+    Struct --> Prompt --> Ref --> Vector
+  end
+
+  subgraph Experiments["Experiment matrix"]
+    Indoor6["Indoor6 validation"]
+    Wayspots["Wayspots validation"]
+    Baseline["GLACE baseline comparison"]
+    Dino["DINOv2 ACE-G context"]
+    Tokens["Token-count ablation"]
+  end
+
+  subgraph Debug["Stability triage"]
+    MemoryCheck["Memory sanity checks"]
+    Divergence["Divergence / NaN checks"]
+    Resume["Resume + big-buffer training"]
+    LowLR["Low-LR retry / OOM tracking"]
+    MemoryCheck --> Divergence --> Resume --> LowLR
+  end
+
+  subgraph Report["Paper reporting"]
+    Aggregate["Result aggregation"]
+    Tables["Paper figures and tables"]
+    Narrative["Final paper narrative"]
+    Aggregate --> Tables --> Narrative
+  end
+
+  OS4 --> Spec
+  Spec --> Struct
+  Method --> Struct
+  S2 --> Indoor6
+  S2 --> Wayspots
+  Method --> Baseline
+  Method --> Dino
+  Mem --> Tokens
+  Indoor6 --> Aggregate
+  Wayspots --> Aggregate
+  Baseline --> Aggregate
+  Dino --> Aggregate
+  Tokens --> Aggregate
+  Debug --> Aggregate
+  Vector --> Tables
+
+  classDef os fill:#f1f3f5,stroke:#68707a,color:#172033;
+  classDef design fill:#e8f1ff,stroke:#2f5f9f,color:#172033;
+  classDef exp fill:#eaf7ee,stroke:#2f7d4f,color:#172033;
+  classDef debug fill:#fff0f0,stroke:#bd4b4b,color:#172033;
+  classDef report fill:#fff1df,stroke:#b46b1b,color:#172033;
+
+  class OS1,OS2,OS3,OS4 os;
+  class Spec,Method,Mem,S1,S2,Solver,Struct,Prompt,Ref,Vector design;
+  class Indoor6,Wayspots,Baseline,Dino,Tokens exp;
+  class MemoryCheck,Divergence,Resume,LowLR debug;
+  class Aggregate,Tables,Narrative report;

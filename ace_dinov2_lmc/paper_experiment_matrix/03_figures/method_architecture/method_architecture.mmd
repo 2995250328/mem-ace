@@ -1,0 +1,57 @@
+flowchart LR
+  %% GLACE + GeoLMC Memory method overview.
+  %% Render as a structural draft first; use the generated layout as a reference for image2.
+
+  subgraph Offline["Offline Scene Memory Construction"]
+    TrainImgs["Training RGB-D / Sparse-Depth Images"]
+    MemExtract["Memory Extraction"]
+    SceneMem["Scene Memory / Map Codes<br/>K compact scene tokens"]
+    TrainImgs --> MemExtract --> SceneMem
+  end
+
+  subgraph Query["Query Image Feature Extraction"]
+    QueryImg["Query Image"]
+    Encoder["ACE / GLACE Encoder"]
+    LocalFeat["Dense Local Features"]
+    GlobalDesc["GLACE Global Descriptor"]
+    QueryImg --> Encoder
+    Encoder --> LocalFeat
+    Encoder --> GlobalDesc
+  end
+
+  subgraph Memory["GeoLMC Memory Conditioning"]
+    Compressor["GeoLMC Compressor<br/>geometry-aware token compression"]
+    Fusion["Memory-to-Image Fusion<br/>compressed memory + dense features"]
+    SceneMem --> Compressor
+    Compressor --> Fusion
+    LocalFeat --> Fusion
+  end
+
+  subgraph Heads["Coordinate Regression and Pose Solving"]
+    LocalHead["Local ACE Coordinate Head"]
+    GlobalHead["Stage-2 GLACE Concatenation Head"]
+    Coords["Refined Scene Coordinates"]
+    Solver["DSAC* / RANSAC Pose Solver"]
+    Pose["6-DoF Camera Pose"]
+    Fusion --> LocalHead
+    LocalHead --> GlobalHead
+    GlobalDesc --> GlobalHead
+    GlobalHead --> Coords --> Solver --> Pose
+  end
+
+  subgraph Train["Two-stage Training"]
+    S1["Stage 1: local ACE + GeoLMC memory path"]
+    S2["Stage 2: freeze local stack + train GLACE concat/global head"]
+    Best["Best checkpoint selected by pose accuracy"]
+    S1 --> S2 --> Best
+  end
+
+  classDef image fill:#e8f1ff,stroke:#2f5f9f,color:#172033;
+  classDef memory fill:#eaf7ee,stroke:#2f7d4f,color:#172033;
+  classDef output fill:#fff1df,stroke:#b46b1b,color:#172033;
+  classDef train fill:#f4f4f4,stroke:#777,color:#172033;
+
+  class TrainImgs,QueryImg,Encoder,LocalFeat,GlobalDesc image;
+  class MemExtract,SceneMem,Compressor,Fusion memory;
+  class LocalHead,GlobalHead,Coords,Solver,Pose output;
+  class S1,S2,Best train;

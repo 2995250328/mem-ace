@@ -3280,6 +3280,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         # S2 stability options (see options_dinov2_lmc.py for docs)
         self._loss_invalid_max_delta = float(getattr(options, 'loss_invalid_max_delta', 1000.0))
         self._s2_grad_clip_max_norm = float(getattr(options, 's2_grad_clip_max_norm', 1.0))
+        self._s2_nan_guard_enabled = bool(getattr(options, 's2_nan_guard', True))
+        self._s2_nan_guard_patience = max(1, int(getattr(options, 's2_nan_guard_patience', 2)))
+        self._s2_nan_guard_naninf_ratio = min(1.0, max(0.0, float(getattr(options, 's2_nan_guard_naninf_ratio', 0.99))))
+        self._s2_nan_guard_bad_steps = 0
+        self._s2_abort_current_iteration = False
+        self._abort_lmc_training = False
         self.relative_depth_distiller = None
         self._relative_depth_warned_no_img_idx = False
         self._relative_depth_warned_nonfinite = False
@@ -6214,6 +6220,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.best_eval = getattr(self.options, "resume_best_meta", None)
         self.iteration = self._estimate_resume_iteration_counter(start_iter)
         self._resume_active = True
+
+        output_path = Path(self.options.output_map).resolve()
+        if output_path != checkpoint_path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            self.save_model(output_path)
+            if self.best_score > -float('inf'):
+                self._write_best_checkpoint_meta(self.best_iter, self.best_score, self.best_eval)
+            _logger.info(
+                "[Resume] Materialized initial best checkpoint for new run: %s",
+                output_path,
+            )
+
         _logger.info(
             "[Resume] Loaded best checkpoint %s | best_iter=%d | best_score=%.4f | continuing at iter %d/%d | iteration_counter=%d",
             checkpoint_path,
@@ -6595,9 +6613,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 torch.cuda.empty_cache()
 
             self._setup_s2_optimizer_and_schedule(it, is_last)
+            self._reset_s2_nan_guard()
             _logger.info(f"[S2] Training head for {self.options.epochs} epochs")
             for self.epoch in range(self.options.epochs):
                 self.run_epoch()
+                if bool(getattr(self, '_s2_abort_current_iteration', False)):
+                    break
+            if bool(getattr(self, '_s2_abort_current_iteration', False)):
+                _logger.error(
+                    "[S2] Iteration %d aborted by NaN guard before checkpoint/eval; keeping previous best.",
+                    it + 1,
+                )
+                break
 
             # --- Iteration checkpoint + eval ---
             iter_ckpt = self.options.output_map.parent / f"{self.options.output_map.stem}.iter_{it+1:02d}.tmp.pt"
@@ -6796,11 +6823,21 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
             # 4. Build S2 optimizer/schedule (includes fusion params if R2)
             self._setup_s2_optimizer_and_schedule(it, is_last)
+            self._reset_s2_nan_guard()
 
             # 5. Train head (with on-the-fly fusion via run_epoch routing)
             _logger.info(f"[S2-G] Training head for {self.options.epochs} epochs")
             for self.epoch in range(self.options.epochs):
                 self.run_epoch()
+                if bool(getattr(self, '_s2_abort_current_iteration', False)):
+                    break
+            if bool(getattr(self, '_s2_abort_current_iteration', False)):
+                self._s2_compressor_out = None
+                _logger.error(
+                    "[S2-G] Iteration %d aborted by NaN guard before checkpoint/eval; keeping previous best.",
+                    it + 1,
+                )
+                break
             self._run_s2_polish_phase(it)
 
             # Clean up cached compressor output
@@ -6887,12 +6924,42 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     # Override: run_epoch / training_step (S2: head-only, step_eff for ReproLoss)
     # ------------------------------------------------------------------
 
+    def _reset_s2_nan_guard(self):
+        self._s2_nan_guard_bad_steps = 0
+        self._s2_abort_current_iteration = False
+
+    def _update_s2_nan_guard(self, stage_tag, fraction_valid, pxerr_naninf_count, batch_size):
+        if not bool(getattr(self, '_s2_nan_guard_enabled', True)):
+            return
+        batch_size = max(1, int(batch_size))
+        naninf_ratio = float(pxerr_naninf_count) / float(batch_size)
+        bad_batch = (float(fraction_valid) <= 0.0) or (naninf_ratio >= self._s2_nan_guard_naninf_ratio)
+        if bad_batch:
+            self._s2_nan_guard_bad_steps += 1
+        else:
+            self._s2_nan_guard_bad_steps = 0
+        if self._s2_nan_guard_bad_steps >= self._s2_nan_guard_patience:
+            self._s2_abort_current_iteration = True
+            self._abort_lmc_training = True
+            _logger.error(
+                "[%s] NaN guard triggered at step=%d: consecutive_bad=%d, valid=%.2f%%, naninf=%d/%d. "
+                "Stopping before checkpoint/eval and keeping previous best checkpoint.",
+                stage_tag,
+                self.iteration,
+                self._s2_nan_guard_bad_steps,
+                float(fraction_valid) * 100.0,
+                int(pxerr_naninf_count),
+                batch_size,
+            )
+
     def run_epoch(self):
         """Use actual buffer size (e.g. buffer_size_final on last iter); step iteration and S2 counters.
         When buffer is on CPU (buffer_on_cpu=True), each batch is moved to GPU here to avoid OOM.
         """
         if not self.use_lmc or self.optimizer_head is None:
             return super().run_epoch()
+        if bool(getattr(self, '_abort_lmc_training', False)):
+            return
         torch.backends.cudnn.benchmark = True
         buf = self.training_buffer
         schema_name = self._buffer_schema_name("raw_buffer") if self.lmc_flow == 'ace_g' else self._buffer_schema_name("fused_buffer")
@@ -6932,6 +6999,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 _to_dev(buf['gt_scene_coords_valid'][random_batch_indices]),
                 img_idx_batch,
             )
+            if bool(getattr(self, '_s2_abort_current_iteration', False)):
+                break
             if not bool(getattr(self, "_s2_update_applied_last", True)):
                 continue
             self.iteration += 1
@@ -7091,6 +7160,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self.scaler.update()
             self.scheduler_head.step()
             self._s2_update_applied_last = True
+
+        fraction_valid = float(valid_mask_b1.sum().item() / max(1, batch_size))
+        finite_pxerr = torch.isfinite(reprojection_error_b1)
+        pxerr_naninf_count = int((~finite_pxerr).sum().item())
+        self._update_s2_nan_guard("S2", fraction_valid, pxerr_naninf_count, batch_size)
 
         if self.iteration % self.iterations_output == 0:
             time_since_start = time.time() - self.training_start
@@ -7393,6 +7467,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self.scaler.update()
             self.scheduler_head.step()
             self._s2_update_applied_last = True
+
+        fraction_valid = float(valid_mask_b1.sum().item() / max(1, batch_size))
+        finite_pxerr = torch.isfinite(reprojection_error_b1)
+        pxerr_naninf_count = int((~finite_pxerr).sum().item())
+        self._update_s2_nan_guard("S2-G", fraction_valid, pxerr_naninf_count, batch_size)
 
         if self.iteration % self.iterations_output == 0:
             time_since_start = time.time() - self.training_start
