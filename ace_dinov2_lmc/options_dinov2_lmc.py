@@ -1024,7 +1024,30 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--lmc_visibility_front_ratio_threshold',
         type=float,
         default=0.85,
-        help='触发自动回退的前方可见性阈值（mean front ratio）。',
+        help='兼容旧配置字段；当前自动路由默认使用 lmc_visibility_route_score_threshold。',
+    )
+    parser.add_argument(
+        '--lmc_visibility_route_metric',
+        type=str,
+        default='gvcs',
+        choices=['gvcs', 'legacy_mean'],
+        help=(
+            'Global/local 自动路由指标。gvcs 使用当前 median-low-pose 分数；'
+            'legacy_mean 严格复现旧版 mean_front_ratio 与 '
+            'lmc_visibility_front_ratio_threshold 的比较。'
+        ),
+    )
+    parser.add_argument(
+        '--lmc_visibility_low_pose_front_ratio_threshold',
+        type=float,
+        default=0.30,
+        help='定义低可见 pose 的 front-ratio 阈值；低于该值的 pose 计入 low-pose fraction。',
+    )
+    parser.add_argument(
+        '--lmc_visibility_route_score_threshold',
+        type=float,
+        default=0.20,
+        help='Global/local 自动路由分数阈值；GVCS=median_front_ratio-low_pose_fraction，低于该值回退。',
     )
     parser.add_argument(
         '--lmc_visibility_fallback_mode',
@@ -1329,8 +1352,8 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--lmc_fusion_refinement_mode',
         type=str,
         default='single',
-        choices=['single', 'cascade_internal'],
-        help='Fusion refinement 模式。single=旧行为；cascade_internal=Step15 C1 内部级联 fusion residual。',
+        choices=['single', 'cascade_internal', 'progressive_reread', 'adapter_ffn'],
+        help='Fusion refinement 模式。single=旧行为；cascade_internal=Step15 C1 内部级联 fusion residual；progressive_reread=二次 memory read；adapter_ffn=PMRF 参数量对照 FFN。',
     )
     parser.add_argument(
         '--lmc_fusion_cascade_layers',
@@ -1724,7 +1747,7 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=str,
         default='stage2',
         choices=['stage2', 'stage2_g', 'all'],
-        help='相对深度 loss 作用阶段；当前实现面向 S2/S2-G sampled buffer。',
+        help='相对深度 loss 作用阶段；监督来自独立完整图像 batch，不使用训练 buffer 深度。',
     )
     parser.add_argument(
         '--relative_depth_teacher',
@@ -1793,6 +1816,39 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=int,
         default=256,
         help='在线 teacher depth 的 CPU LRU cache 图像数；0 表示不缓存。',
+    )
+    parser.add_argument(
+        '--relative_depth_image_step_interval',
+        type=int,
+        default=10,
+        help='每隔多少个 S2 buffer step 加入一次图像级相对深度监督；必须大于 0。',
+    )
+    parser.add_argument(
+        '--relative_depth_image_batch_size',
+        type=int,
+        default=1,
+        help='图像级相对深度辅助 batch 大小；ACE 可变宽图像建议保持 1。',
+    )
+    parser.add_argument(
+        '--relative_depth_only_steps',
+        type=int,
+        default=0,
+        help=(
+            '从 resume checkpoint 额外续训的相对深度-only update 数。'
+            '大于 0 时跳过常规 LMC S1/S2，只使用图像级相对深度 loss。'
+        ),
+    )
+    parser.add_argument(
+        '--relative_depth_only_lr',
+        type=float,
+        default=1e-5,
+        help='relative_depth_only 阶段的固定学习率。',
+    )
+    parser.add_argument(
+        '--relative_depth_only_train_fusion',
+        type=_strtobool,
+        default=True,
+        help='relative_depth_only 阶段是否同时更新 fusion/residual adapter；False 时只更新 head/global-head 参数。',
     )
     parser.add_argument(
         '--s2_polish_head_lr',

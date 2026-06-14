@@ -1,0 +1,29 @@
+\section{Experiments}
+
+\subsection{Protocol}
+
+We evaluate camera relocalization using median rotation error in degrees, median translation error in centimeters, and threshold accuracies. \acctwentyfive{}, \accten{}, and \accfive{} denote the percentages of test frames below the corresponding pose-error thresholds. Unless otherwise specified, the paper-safe Indoor6 source uses post-training multi-seed median evaluation and selects checkpoints by \accfive{}. Exact hypotheses, thresholds, split definitions, and seed lists must be reported in the final camera-ready version.
+
+\subsection{Indoor6 Main Comparison}
+
+Table~\ref{tab:indoor6_main_comparison} reports the current Indoor6 comparison across ACE, DINO-ACE, GLACE, ACE-G variants, and two LMC-based variants. \textbf{Ours (ACE-FCN + ACE memory + GLACE)} applies latent memory conditioning to the ACE-FCN/GLACE pipeline, while \textbf{Ours (DINOv2 + MapAnything memory)} is the main paper-facing Indoor6 result selected from the current result envelope.
+
+\input{tables/indoor6_main_comparison}
+
+\subsection{Wayspots Main Comparison}
+
+Table~\ref{tab:wayspots_acc10_acc50} reports the current Wayspots comparison using Acc@10cm/5$^\circ$ and Acc@50cm/5$^\circ$. MAREPO-S is evaluated from the downloaded official weights on all ten scenes. ACE-G25 is evaluated with the official 25-minute configuration, using a CPU-resident feature buffer to avoid GPU-memory overflow while preserving the original 8M-buffer and 51.2k-batch setting.
+
+\input{tables/wayspots_partial}
+
+Table~\ref{tab:wayspots_acc5_selected} reports the stricter Acc@5cm/5$^\circ$ metric on all eight valid Wayspots scenes for which the current ACE, GLACE, Stage1, Stage2, ACE-G25, and MAREPO-S runs are available. We use this metric because it is more sensitive to precise pose refinement than Acc@10cm/5$^\circ$ or Acc@50cm/5$^\circ$: Stage2 improves the valid-scene mean by 6.6 points over ACE and 7.2 points over GLACE; ACE-G25 and MAREPO-S obtain 29.1 and 29.6 valid-scene means under the same strict threshold, respectively. Square Bench uses the tuned FiLM Stage2 result rather than the raw global-concat sweep.
+
+\input{tables/wayspots_acc5_selected}
+
+\subsection{Ablations and Missing Experiments}
+
+For Wayspots, the remaining method-side experiments are: a Square-Bench-safe Stage2 token sweep using FiLM or reliability-gated fusion, a local/global routing ablation using the current scene statistics, memory controls with zero/random/shuffled memory, and a final single-policy Stage2 run so that the paper table does not mix tuned SQ with raw-concat K sweeps. For Indoor6, the remaining experiments are: finishing the selected DINOv2+MapAnything-memory configuration on all scenes, validating the local-vs-global selection rule on Scene 5 and Scene 2a, sweeping latent-token count $K$ on the main Indoor6 setting, and testing the image-level relative-depth consistency loss as an auxiliary objective rather than a buffer-only supervision signal.
+
+Across both datasets, the final paper needs a compact efficiency table reporting token count, memory size, training time, evaluation latency, and peak GPU memory. Cambridge, APR+LMC, and ACE-G+LMC should remain explicit extensions until their baseline contracts and evaluation scripts are stable.
+
+\input{tables/placeholder_ablation_plan}

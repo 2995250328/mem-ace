@@ -17,4 +17,5 @@ Project-local deep learning / vision skills:
 - `ace-memory-extraction-workflow`
 - `ace-training-command-composer`
 - `ace-result-aggregation`
+- `ace-paper-writing-workflow` <!-- updated 2026-06-07: project-specific manuscript writing workflow -->
 - `ace-scene-runbook`

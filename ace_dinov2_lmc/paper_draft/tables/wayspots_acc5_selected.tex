@@ -1,0 +1,24 @@
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4.3pt}
+\renewcommand{\arraystretch}{1.08}
+\caption{Strict-pose accuracy on the valid Wayspots scenes. Results are Acc@5cm/5$^\circ$ over all valid scenes with completed ACE, GLACE, Stage1, Stage2, ACE-G, and MAREPO-S runs. The middle columns report the Stage2 gain over ACE and GLACE. Stage2 uses the paper-facing tuned FiLM result for Square Bench.}
+\label{tab:wayspots_acc5_selected}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccc@{}}
+\toprule
+Scene & ACE & GLACE & Stage1 & Stage2 & $\Delta$ACE & $\Delta$GLACE & ACE-G & MAREPO-S \\
+\midrule
+Bears & 73.3 & 77.1 & 79.8 & \textbf{84.7} & +11.4 & +7.6 & 70.5 & 58.5 \\
+Cubes & 45.2 & 39.7 & 51.5 & \textbf{63.0} & +17.8 & +23.3 & 10.3 & 25.6 \\
+Inscription & 21.3 & 20.7 & 26.0 & \textbf{26.1} & +4.8 & +5.4 & 22.9 & 10.3 \\
+Lawn & 30.9 & 35.9 & 30.6 & \textbf{39.4} & +8.5 & +3.5 & 9.7 & 18.0 \\
+Map & 35.8 & 38.0 & 37.2 & \textbf{39.8} & +4.0 & +1.8 & 27.8 & 27.6 \\
+Square Bench & 52.2 & 42.6 & \textbf{53.6} & 51.6 & -0.6 & +9.0 & 2.6 & 42.1 \\
+Tendrils & 6.9 & 6.0 & 9.0 & 12.6 & +5.7 & +6.6 & \textbf{21.7} & 3.3 \\
+The Rock & 75.3 & 76.1 & \textbf{77.7} & 76.8 & +1.6 & +0.7 & 67.0 & 51.7 \\
+\midrule
+Average & 42.6 & 42.0 & 45.6 & \textbf{49.2} & +6.6 & +7.2 & 29.1 & 29.6 \\
+\bottomrule
+\end{tabular*}
+\end{table*}

@@ -1,10 +1,9 @@
-"""Relative-depth distillation for sampled ACE scene-coordinate training.
+"""Relative-depth distillation for ACE scene-coordinate training.
 
-The S2/S2-G LMC trainers operate on sampled buffer points rather than full
-image grids. This module therefore computes relative-depth supervision per
-image from sampled pixels: teacher depth is queried at each sample's pixel
-coordinate, and the student depth is the predicted scene coordinate projected to
-camera-space z.
+The primary path supervises a full image-grid prediction independently from
+the sampled ACE training buffer. Student depth is camera-space z recovered from
+the predicted scene-coordinate map; the frozen teacher supplies relative depth
+for the same image.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -124,8 +124,137 @@ class SampledRelativeDepthLoss(nn.Module):
         }
 
 
+class ImageRelativeDepthLoss(nn.Module):
+    """Scale/shift-invariant relative-depth loss on complete image grids."""
+
+    def __init__(
+        self,
+        *,
+        pair_weight: float = 0.5,
+        max_samples: int = 1024,
+        max_pairs: int = 4096,
+        min_points: int = 16,
+        depth_min: float = 1e-3,
+        depth_max: float = 1000.0,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.pair_weight = float(pair_weight)
+        self.max_samples = int(max_samples)
+        self.max_pairs = int(max_pairs)
+        self.min_points = int(min_points)
+        self.depth_min = float(depth_min)
+        self.depth_max = float(depth_max)
+        self.eps = float(eps)
+
+    def _normalize(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        center = values.median()
+        scale = (values - center).abs().mean().clamp_min(self.eps)
+        return (values - center) / scale, center, scale
+
+    def forward(
+        self,
+        student_depth_BHW: torch.Tensor,
+        teacher_depth_BHW: torch.Tensor,
+        valid_mask_BHW: torch.Tensor,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        losses = []
+        ssi_values = []
+        grad_values = []
+        pair_values = []
+        valid_points = 0
+
+        for student_hw, teacher_hw, mask_hw in zip(
+            student_depth_BHW.float(),
+            teacher_depth_BHW.detach().float(),
+            valid_mask_BHW.bool(),
+        ):
+            valid = (
+                mask_hw
+                & torch.isfinite(student_hw)
+                & torch.isfinite(teacher_hw)
+                & (student_hw > self.depth_min)
+                & (student_hw < self.depth_max)
+                & (teacher_hw > self.eps)
+            )
+            count = int(valid.sum().item())
+            if count < self.min_points:
+                continue
+
+            student_vec = student_hw[valid]
+            teacher_vec = teacher_hw[valid]
+            student_n, student_center, student_scale = self._normalize(student_vec)
+            teacher_n, teacher_center, teacher_scale = self._normalize(teacher_vec)
+
+            # Depth Anything predicts relative proximity (larger means nearer),
+            # while camera-space z grows with distance.
+            student_rel = -student_n
+            ssi_loss = F.smooth_l1_loss(student_rel, teacher_n, beta=0.5)
+
+            student_map = -(student_hw - student_center) / student_scale
+            teacher_map = (teacher_hw - teacher_center) / teacher_scale
+            valid_x = valid[:, 1:] & valid[:, :-1]
+            valid_y = valid[1:, :] & valid[:-1, :]
+            grad_terms = []
+            if bool(valid_x.any().item()):
+                grad_terms.append(
+                    (student_map[:, 1:] - student_map[:, :-1]
+                     - teacher_map[:, 1:] + teacher_map[:, :-1]).abs()[valid_x].mean()
+                )
+            if bool(valid_y.any().item()):
+                grad_terms.append(
+                    (student_map[1:, :] - student_map[:-1, :]
+                     - teacher_map[1:, :] + teacher_map[:-1, :]).abs()[valid_y].mean()
+                )
+            grad_loss = torch.stack(grad_terms).mean() if grad_terms else student_vec.new_zeros(())
+
+            pair_loss = student_vec.new_zeros(())
+            if self.pair_weight > 0.0 and self.max_pairs > 0:
+                coords = torch.nonzero(valid, as_tuple=False)
+                if coords.shape[0] > self.max_samples:
+                    perm = torch.randperm(coords.shape[0], device=coords.device, generator=generator)[:self.max_samples]
+                    coords = coords[perm]
+                n = int(coords.shape[0])
+                if n >= 2:
+                    pair_count = min(self.max_pairs, n * (n - 1))
+                    idx_a = torch.randint(0, n, (pair_count,), device=coords.device, generator=generator)
+                    idx_b = torch.randint(0, n, (pair_count,), device=coords.device, generator=generator)
+                    keep = idx_a != idx_b
+                    if bool(keep.any().item()):
+                        idx_a = idx_a[keep]
+                        idx_b = idx_b[keep]
+                        ys, xs = coords[:, 0], coords[:, 1]
+                        student_samples = student_map[ys, xs]
+                        teacher_samples = teacher_map[ys, xs]
+                        pair_loss = F.smooth_l1_loss(
+                            student_samples[idx_a] - student_samples[idx_b],
+                            teacher_samples[idx_a] - teacher_samples[idx_b],
+                            beta=0.5,
+                        )
+
+            image_loss = (1.0 - self.pair_weight) * (ssi_loss + grad_loss) + self.pair_weight * pair_loss
+            losses.append(image_loss)
+            valid_points += count
+            ssi_values.append(float(ssi_loss.detach().cpu().item()))
+            grad_values.append(float(grad_loss.detach().cpu().item()))
+            pair_values.append(float(pair_loss.detach().cpu().item()))
+
+        if not losses:
+            zero = student_depth_BHW.new_zeros(())
+            return zero, {"valid_points": 0.0, "groups": 0.0, "ssi": 0.0, "grad": 0.0, "pair": 0.0}
+        loss = torch.stack(losses).mean()
+        return loss, {
+            "valid_points": float(valid_points),
+            "groups": float(len(losses)),
+            "ssi": float(np.mean(ssi_values)),
+            "grad": float(np.mean(grad_values)),
+            "pair": float(np.mean(pair_values)),
+        }
+
+
 class RelativeDepthDistiller(nn.Module):
-    """Teacher-depth provider plus sampled relative-depth loss."""
+    """Teacher-depth provider plus image-level relative-depth loss."""
 
     def __init__(
         self,
@@ -156,6 +285,14 @@ class RelativeDepthDistiller(nn.Module):
         self.cache_size = max(0, int(cache_size))
         self._depth_cache: OrderedDict[int, torch.Tensor] = OrderedDict()
         self.loss_fn = SampledRelativeDepthLoss(
+            pair_weight=pair_weight,
+            max_samples=max_samples,
+            max_pairs=max_pairs,
+            min_points=min_points,
+            depth_min=depth_min,
+            depth_max=depth_max,
+        )
+        self.image_loss_fn = ImageRelativeDepthLoss(
             pair_weight=pair_weight,
             max_samples=max_samples,
             max_pairs=max_pairs,
@@ -259,6 +396,50 @@ class RelativeDepthDistiller(nn.Module):
             align_corners=True,
         )
         return sampled.view(-1)
+
+    def forward_image(
+        self,
+        *,
+        student_depth_BHW: torch.Tensor,
+        valid_mask_B1HW: torch.Tensor,
+        img_idx_B: torch.Tensor,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        B, H, W = student_depth_BHW.shape
+        teacher_depths = []
+        teacher_valid = []
+        missing = 0
+        for image_idx_tensor in img_idx_B.detach().view(-1).cpu():
+            depth_hw = self._load_teacher_depth(int(image_idx_tensor.item()))
+            if depth_hw is None:
+                teacher_depths.append(student_depth_BHW.new_zeros((H, W)))
+                teacher_valid.append(student_depth_BHW.new_zeros((H, W), dtype=torch.bool))
+                missing += 1
+                continue
+            resized = F.interpolate(
+                depth_hw.view(1, 1, *depth_hw.shape[-2:]),
+                size=(H, W),
+                mode="bilinear",
+                align_corners=True,
+            )[0, 0]
+            teacher_depths.append(resized)
+            teacher_valid.append(torch.isfinite(resized) & (resized > 0))
+
+        teacher_BHW = torch.stack(teacher_depths, dim=0)
+        valid_BHW = valid_mask_B1HW.bool().view(B, H, W) & torch.stack(teacher_valid, dim=0)
+        loss, stats = self.image_loss_fn(
+            student_depth_BHW,
+            teacher_BHW,
+            valid_BHW,
+            generator=generator,
+        )
+        stats = dict(stats)
+        stats.update({
+            "enabled": 1.0,
+            "missing_images": float(missing),
+            "loss_raw": float(loss.detach().cpu().item()),
+        })
+        return loss, stats
 
     def forward(
         self,

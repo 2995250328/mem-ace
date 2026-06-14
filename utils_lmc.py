@@ -134,6 +134,7 @@ def estimate_memory_front_visibility(
     pooled_points: torch.Tensor,
     all_poses: torch.Tensor,
     max_points: int = 4096,
+    low_pose_front_ratio_threshold: float = 0.30,
 ) -> Dict[str, float] | None:
     """Estimate how many memory points lie in front of cameras (z>0 in camera frame)."""
     if pooled_points is None or all_poses is None:
@@ -158,7 +159,9 @@ def estimate_memory_front_visibility(
 
     n_pts = pts.shape[0]
     if n_pts > max_points:
-        perm = torch.randperm(n_pts)[:max_points]
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(0)
+        perm = torch.randperm(n_pts, generator=generator)[:max_points]
         pts = pts[perm]
         n_pts = pts.shape[0]
 
@@ -175,11 +178,17 @@ def estimate_memory_front_visibility(
 
     if len(ratios) == 0:
         return None
+    ratio_tensor = torch.tensor(ratios)
+    low_pose_fraction = float((ratio_tensor < low_pose_front_ratio_threshold).float().mean().item())
+    median_front_ratio = float(ratio_tensor.median().item())
     return {
         "mean_front_ratio": float(sum(ratios) / len(ratios)),
         "min_front_ratio": float(min(ratios)),
-        "median_front_ratio": float(torch.tensor(ratios).median().item()),
+        "median_front_ratio": median_front_ratio,
         "max_front_ratio": float(max(ratios)),
+        "low_pose_front_ratio_threshold": float(low_pose_front_ratio_threshold),
+        "low_pose_front_ratio_fraction": low_pose_fraction,
+        "global_visibility_route_score": median_front_ratio - low_pose_fraction,
         "num_points_sampled": int(n_pts),
         "num_poses": int(len(ratios)),
     }

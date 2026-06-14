@@ -50,6 +50,9 @@ MEMORY_NUM_WORKERS="${MEMORY_NUM_WORKERS:-2}"
 
 LMC_ITERATIONS="${LMC_ITERATIONS:-12}"
 NUM_LATENT_TOKENS="${NUM_LATENT_TOKENS:-64}"
+LMC_FUSION_REFINEMENT_MODE="${LMC_FUSION_REFINEMENT_MODE:-single}"
+LMC_FUSION_CASCADE_LAYERS="${LMC_FUSION_CASCADE_LAYERS:-4}"
+LMC_FUSION_ASSEMBLY_GAMMA_INIT="${LMC_FUSION_ASSEMBLY_GAMMA_INIT:-0.0}"
 IMAGE_RESOLUTION="${IMAGE_RESOLUTION:-512}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 TRAINING_BUFFER_SIZE="${TRAINING_BUFFER_SIZE:-2800000}"
@@ -212,6 +215,9 @@ run_stage1() {
       --experiment_subdir "${STAGE1_SUBDIR}" \
       --lmc_iterations "${LMC_ITERATIONS}" \
       --num_latent_tokens "${NUM_LATENT_TOKENS}" \
+      --lmc_fusion_refinement_mode "${LMC_FUSION_REFINEMENT_MODE}" \
+      --lmc_fusion_cascade_layers "${LMC_FUSION_CASCADE_LAYERS}" \
+      --lmc_fusion_assembly_gamma_init "${LMC_FUSION_ASSEMBLY_GAMMA_INIT}" \
       --ace_g_fusion_in_s2 True \
       --ace_g_cross_iter_eval True \
       --s1_use_buffer True \
@@ -282,6 +288,9 @@ run_stage2() {
       --experiment_subdir "${STAGE2_SUBDIR}" \
       --lmc_iterations "${LMC_ITERATIONS}" \
       --num_latent_tokens "${NUM_LATENT_TOKENS}" \
+      --lmc_fusion_refinement_mode "${LMC_FUSION_REFINEMENT_MODE}" \
+      --lmc_fusion_cascade_layers "${LMC_FUSION_CASCADE_LAYERS}" \
+      --lmc_fusion_assembly_gamma_init "${LMC_FUSION_ASSEMBLY_GAMMA_INIT}" \
       --ace_g_fusion_in_s2 True \
       --ace_g_cross_iter_eval True \
       --s1_use_buffer True \

@@ -11,6 +11,8 @@ Two training modes:
 
 ## File Structure
 
+<!-- updated 2026-06-07: added paper draft source directory -->
+
 All implementation files live in this directory:
 
 | File | Role |
@@ -19,6 +21,7 @@ All implementation files live in this directory:
 | `test_ace_dinov2_lmc.py` | Evaluation script |
 | `options_dinov2_lmc.py` | Full CLI argument parser |
 | `trainer_dinov2_lmc.py` | `TrainerACEDINOv2LMC` two-stage trainer |
+| `paper_draft/` | AAAI-style LaTeX manuscript source draft with evidence-first result tables and experiment placeholders |
 
 Shared root-level dependencies (accessed via `sys.path`):
 

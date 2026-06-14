@@ -42,6 +42,8 @@ conda activate ace
 
 **All the following commands in this file need to run in the `ace` environment.**
 
+[Updated: Depth/Full checkpoint path and depth-loss logic, 2026-06-10] The ACE Depth training/evaluation files were restored from the confirmed reference implementation while keeping local runtime paths and environment compatibility: Depth Anything V2 checkpoints at `/data/xwh/checkpoints/depth_anything_v2_{vits,vitb,vitl,vitg}.pth`, SuperPoint weights at `/data/xwh/SuperPointPretrainedNetwork/superpoint_v1.pth`, and reference-style Depth eval uses `torch.amp.autocast`. ACE Full also expects the local SegFormer sky estimator checkpoint at `/data/xwh/checkpoints/segformer_b0`. The relative-depth auxiliary loss now remains differentiable via `torch.log(...)`, and predicted-depth normalization uses a median absolute deviation denominator to avoid zero signed-mean scaling.
+
 The ACE network predicts dense 3D scene coordinates associated to the pixels of the input images.
 In order to estimate the 6DoF camera poses, it relies on the RANSAC implementation of the DSAC* paper (Brachmann and
 Rother, TPAMI 2021), which is written in C++.

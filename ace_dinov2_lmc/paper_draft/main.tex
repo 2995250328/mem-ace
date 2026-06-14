@@ -1,0 +1,50 @@
+\documentclass[letterpaper]{article}
+
+% AAAI source skeleton for ACE-DINOv2-LMC.
+% Place the official AAAI style file in this directory if available.
+\IfFileExists{aaai26.sty}{\usepackage{aaai26}}{%
+\IfFileExists{aaai25.sty}{\usepackage{aaai25}}{%
+\IfFileExists{aaai.sty}{\usepackage{aaai}}{}}}
+
+\usepackage{times}
+\usepackage{helvet}
+\usepackage{courier}
+\usepackage[hyphens]{url}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{microtype}
+\usepackage{caption}
+
+\newcommand{\method}{Latent Memory Conditioning}
+\newcommand{\shortmethod}{LMC}
+\newcommand{\gvcs}{GVCS}
+\newcommand{\accfive}{Acc5}
+\newcommand{\accten}{Acc10}
+\newcommand{\acctwentyfive}{Acc25}
+\newcommand{\todoexp}[1]{\textcolor{red}{[TODO: #1]}}
+
+\title{Latent Memory Conditioning for Plug-in Scene Representation in Visual Relocalization}
+
+\author{Anonymous Authors}
+\affiliations{Anonymous Institution}
+
+\begin{document}
+\maketitle
+
+\input{sections/abstract}
+\input{sections/introduction}
+\input{sections/related_work}
+\input{sections/method}
+\input{sections/experiments}
+\input{sections/discussion}
+\input{sections/conclusion}
+
+\bibliographystyle{aaai}
+\bibliography{references}
+
+\end{document}

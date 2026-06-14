@@ -1,0 +1,19 @@
+\section{Related Work}
+
+\paragraph{Scene coordinate regression.}
+Scene coordinate regression predicts a 3D scene coordinate for each image location and then estimates camera pose using 2D--3D correspondences. ACE demonstrated that this family of methods can train scene-specific coordinate regressors efficiently from posed RGB images, making SCR a practical baseline for rapid visual relocalization~\cite{brachmann2023ace}. Our work builds on this view but focuses on the representation interface: instead of only changing the regressor, we study how compact scene memory can condition different SCR-style backbones.
+
+\paragraph{Scene-specific map representations.}
+ACE-G separates scene-specific map representation from query-side regression by using map codes and query pre-training~\cite{bruns2025aceg}. This motivates a broader question of how a relocalization model should store reusable scene information. \shortmethod{} is complementary to this direction. It compresses external or backbone-aligned memory into latent tokens and injects those tokens as conditioning signals, rather than requiring a dense map-code representation to be consumed directly. The planned ACE-G+LMC experiment will test this relationship more directly.
+
+\paragraph{Global-local coordinate encoding.}
+GLACE introduces global-local accelerated coordinate encoding and shows that global scene context can improve coordinate regression in suitable settings~\cite{wang2024glace}. Our experiments support the usefulness of GLACE-style global cues in some scenes, but also show that global conditioning is scene-dependent. In particular, Wayspots Bears benefits from ACE-memory plus GLACE conditioning, whereas SquareBench exhibits negative transfer under raw global concatenation. This motivates explicit local/global configuration selection rather than unconditional global injection.
+
+\paragraph{Pose regression and map-relative localization.}
+Absolute pose regression methods directly regress camera pose from images, while map-relative pose regression conditions pose estimation on a scene-specific map representation~\cite{chen2024marepo}. This line of work suggests that compact scene memory could be useful beyond SCR. In the current paper, our main evidence remains SCR-based; APR+LMC is reserved as a generality experiment to test whether the latent memory interface can condition map-relative pose regressors.
+
+\paragraph{Sampling and training policies.}
+FocusTune studies how focus-guided sampling affects visual localization training~\cite{nguyen2023focustune}. This is orthogonal to \shortmethod{}. Sampling policies determine which observations receive more training emphasis, whereas \shortmethod{} changes how scene memory is represented and injected into the relocalization model. Combining learned sampling with compact latent memory is a possible future direction but is not required for the current method.
+
+\paragraph{Foundation features and geometry-aware memory.}
+DINOv2 provides strong generic visual features, and MapAnything-style geometry-aware features can provide rich scene memory. In our Indoor6 setting, these sources are not treated as the paper's sole contribution. Instead, they serve as memory and backbone components that expose the role of latent memory compression and conditioning in a relocalization pipeline.

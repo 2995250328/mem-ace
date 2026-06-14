@@ -13,174 +13,214 @@ from depth_anything_v2.dpt import DepthAnythingV2
 
 _logger = logging.getLogger(__name__)
 
-
 class RelativeDepthLoss(nn.Module):
-    def __init__(self, weight, max_samples=3000):
-        """
-        Args:
-            weight: Weight balancing pair_loss vs ssi/grad loss.
-            max_samples: Maximum number of pixels to sample for pairwise loss to prevent OOM.
-        """
+    def __init__(self,weight):
         super().__init__()
         self.weight = weight
-        self.max_samples = max_samples  # Limit for sampling
-
-        # Register buffers to avoid device mismatch issues
+        # 初始化Sobel梯度算子
+        self.sobel_x = nn.Conv2d(1, 1, kernel_size=3, padding=1, bias=False)
+        self.sobel_y = nn.Conv2d(1, 1, kernel_size=3, padding=1, bias=False)
+        sobel_kernel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_kernel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+        self.sobel_x.weight.data = sobel_kernel_x.view(1, 1, 3, 3)
+        self.sobel_y.weight.data = sobel_kernel_y.view(1, 1, 3, 3)
+        
+        # 注册缓存参数
         self.register_buffer('alpha', None)
         self.register_buffer('beta', None)
+        self.register_buffer('pred_aligned', None)
+
+    def edge_aware_smooth_loss(img, disp):
+        """
+        计算边缘感知的平滑损失。
+
+        Args:
+            img (torch.Tensor): 输入的RGB图像，形状为 (B, 3, H, W)，B是批量大小。
+            disp (torch.Tensor): 预测的视差或深度图，形状为 (B, 1, H, W)。
+
+        Returns:
+            torch.Tensor: 一个标量（0维张量），代表该批次的平均损失。
+        """
+        
+        # 1. 计算图像和视差图的梯度
+        # 使用与Sobel算子等效的卷积核来计算x和y方向的梯度
+        grad_disp_x = torch.abs(disp[:, :, :, :-1] - disp[:, :, :, 1:])
+        grad_disp_y = torch.abs(disp[:, :, :-1, :] - disp[:, :, 1:, :])
+
+        grad_img_x = torch.mean(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:]), 1, keepdim=True)
+        grad_img_y = torch.mean(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :]), 1, keepdim=True)
+
+        # 2. 计算权重
+        # 图像梯度越大的地方（边缘），权重越小
+        weight_x = torch.exp(-grad_img_x)
+        weight_y = torch.exp(-grad_img_y)
+
+        # 3. 计算加权后的平滑度损失
+        # 将深度/视差图的梯度乘以相应的权重
+        # 注意：这里的grad_disp和weight的尺寸需要对齐
+        # 我们需要裁剪掉梯度计算中无法覆盖的最后一行/列
+        smoothness_x = grad_disp_x * weight_x[:, :, :, :-1]
+        smoothness_y = grad_disp_y * weight_y[:, :, :-1, :]
+        
+        # 4. 返回所有像素损失的平均值
+        return torch.mean(smoothness_x) + torch.mean(smoothness_y)
 
     def compute_scale_shift(self, pred, target, mask):
         """
-        Compute scale (alpha) and shift (beta) using Least Squares.
-        Input shapes are flattened vectors of valid pixels.
+        计算尺度和平移参数
+        参数:
+            pred: 预测深度图 (H x W)
+            target: GT 深度图 (H x W)
+            mask: 有效区域掩码 (H x W)
+        返回:
+            alpha: 尺度参数
+            beta: 平移参数
         """
-        # Ensure inputs are 1D vectors
-        if pred.numel() == 0:
+        # 获取有效区域
+        valid_idx = mask > 0
+        if not valid_idx.any():
             return torch.tensor(1.0, device=pred.device), torch.tensor(0.0, device=pred.device)
 
-        # A: [N, 2], b: [N, 1]
-        A = torch.stack([pred, torch.ones_like(pred)], dim=1)
-        b = target.unsqueeze(1)
+        d_pred = pred[valid_idx]
+        d_gt = target[valid_idx]
 
-        # Solve Ax = b
-        try:
-            x = torch.linalg.lstsq(A, b).solution
-            alpha, beta = x[:2, 0]
-        except Exception:
-            # Fallback if Singular Matrix
-            alpha = torch.tensor(1.0, device=pred.device)
-            beta = torch.tensor(0.0, device=pred.device)
+        # 计算尺度和平移参数
+        A = torch.stack([d_pred, torch.ones_like(d_pred)], dim=1)  # Nx2
+        x = torch.linalg.lstsq(A, d_gt.unsqueeze(1)).solution  # [2,1]
+        alpha, beta = x[:2, 0]
 
         return alpha, beta
 
     def apply_scale_shift(self, pred, alpha, beta):
+        """
+        应用尺度和平移变换
+        参数:
+            pred: 预测深度图 (H x W)
+            alpha: 尺度参数
+            beta: 平移参数
+        返回:
+            变换后的深度图 (H x W)
+        """
         return alpha * pred + beta
 
     def compute_gradient(self, img):
+        """
+        计算图像梯度
+        参数:
+            img: 输入图像 (H x W)
+        返回:
+            D_dx: x方向梯度 (H x W)
+            D_dy: y方向梯度 (H x W)
+        """
+        # 计算梯度
         D_dy = torch.zeros_like(img)
         D_dx = torch.zeros_like(img)
+        
+        # y方向梯度
         D_dy[:-1, :] = img[1:, :] - img[:-1, :]
+        # x方向梯度
         D_dx[:, :-1] = img[:, 1:] - img[:, :-1]
+        
         return D_dx, D_dy
 
     def gradient_matching_loss(self, pred, target, mask):
+        """
+        计算梯度匹配损失
+        参数:
+            pred: 预测深度图 (H x W)
+            target: GT 深度图 (H x W)
+            mask: 有效区域掩码 (H x W)
+        返回:
+            梯度匹配损失
+        """
+        # 计算梯度
         pred_dx, pred_dy = self.compute_gradient(pred)
         target_dx, target_dy = self.compute_gradient(target)
 
-        # Apply mask
-        loss_x = torch.abs(pred_dx - target_dx) * mask
-        loss_y = torch.abs(pred_dy - target_dy) * mask
+        # 应用掩码
+        pred_dx = pred_dx * mask
+        pred_dy = pred_dy * mask
+        target_dx = target_dx * mask
+        target_dy = target_dy * mask
 
-        return (loss_x.sum() + loss_y.sum()) / (mask.sum() + 1e-5) / 2.0
+        # 计算损失
+        loss_x = torch.abs(pred_dx - target_dx)
+        loss_y = torch.abs(pred_dy - target_dy)
 
-    def compute_pairwise_diff_sampled(self, pred_sample, gt_sample, coords_sample, alpha, beta):
+        return (loss_x.mean() + loss_y.mean()) / 2.0
+
+    def compute_pairwise_diff(self, depth1, depth2, mask, alpha,beta):
         """
-        Compute pairwise depth difference matrix on SAMPLED points.
-        Args:
-            pred_sample: [S] Sampled predicted depth
-            gt_sample: [S] Sampled GT depth
-            coords_sample: [S, 2] (y, x) coordinates of sampled points
-            alpha: Scalar
-            beta: Scalar
+        计算成对像素深度差矩阵
+        参数:
+            depth1: 深度图1 (H x W)
+            depth2: 深度图2 (H x W)
+            mask: 有效像素掩膜 (H x W)
+            alpha: 尺度参数
+            beta: 平移参数
+        返回:
+            diff_matrix: 成对差异矩阵
+            valid_mask: 有效掩码
         """
-        # 1. Align prediction
-        pred_aligned = alpha * pred_sample + beta
-
-        # 2. Compute depth differences
-        # diff_pred[i, j] = pred[i] - pred[j]
-        diff_pred = pred_aligned.unsqueeze(1) - pred_aligned.unsqueeze(0)  # [S, S]
-        diff_gt = gt_sample.unsqueeze(1) - gt_sample.unsqueeze(0)  # [S, S]
-
-        diff = diff_pred - diff_gt
-
-        # 3. Compute spatial distances (Euclidean)
-        # coords_sample is [S, 2]
-        # dist[i, j] = || coord[i] - coord[j] ||
+        H, W = depth1.shape        
+        # 应用尺度和平移变换
+        depth1_aligned = alpha * depth1 + beta
+        H, W = depth1_aligned.shape
+        flat_depth1 = depth1_aligned.view(-1)  # [HW]
+        flat_depth2 = depth2.view(-1)
+        flat_mask = mask.reshape(-1)
+        
+        # 计算元素间差值
+        diff1 = flat_depth1.unsqueeze(1) - flat_depth1.unsqueeze(0)  # [HW,HW]
+        diff2 = flat_depth2.unsqueeze(1) - flat_depth2.unsqueeze(0)  # [HW,HW]
+        diff = diff1-diff2
+        
+        # 将掩码转换为布尔类型后再进行位运算
+        valid_mask = (flat_mask.unsqueeze(1) > 0) & (flat_mask.unsqueeze(0) > 0)  # 有效对掩膜
+        
+        # 空间距离归一化
+        coord = torch.stack(torch.meshgrid(
+            torch.arange(H), torch.arange(W), indexing='ij'
+        ), -1).float().to(depth1.device)
+        coord = coord.view(-1, 2)  # [HW,2]
         spatial_dist = torch.norm(
-            coords_sample.unsqueeze(1) - coords_sample.unsqueeze(0),
+            coord.unsqueeze(1) - coord.unsqueeze(0), 
             dim=-1
-        ) + 1.0  # Add 1.0 to avoid large division, or 1e-3 as before
+        ) + 1e-3  # [HW,HW]
+        spatial_dist = spatial_dist.view(H*W,H*W)
+        
+        return diff / spatial_dist, valid_mask
 
-        # 4. Normalize diff by spatial distance
-        return diff / spatial_dist
-
-    def forward(self, pred_depth, gt_depth, valid_mask, image=None):
+    def forward(self, pred_depth, gt_depth, valid_mask, image):
         """
-        Args:
-            pred_depth: (H, W) or (B, H, W)
-            gt_depth: (H, W) or (B, H, W)
-            valid_mask: (H, W) or (B, H, W)
-        """
-        # Ensure inputs are 2D (H, W) for simplicity, or handle Batch dim
-        # This implementation assumes single image input for simplicity as per original code context,
-        # but robust to Batch dimension if flattened correctly.
-
-        # 1. Masking and Flattening
-        valid_idx = torch.nonzero(valid_mask)  # Indices of valid pixels [N_valid, 2 or 3]
-        num_valid = valid_idx.shape[0]
-
-        if num_valid == 0:
-            return torch.tensor(0.0, device=pred_depth.device, requires_grad=True)
-
-        # Extract values at valid indices
-        if pred_depth.dim() == 3:  # (B, H, W)
-            pred_vec = pred_depth[valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2]]
-            gt_vec = gt_depth[valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2]]
-        else:  # (H, W)
-            pred_vec = pred_depth[valid_idx[:, 0], valid_idx[:, 1]]
-            gt_vec = gt_depth[valid_idx[:, 0], valid_idx[:, 1]]
-
-        # --- Part 1: SSI Loss & Gradient Loss (Calculated on ALL valid pixels) ---
-
-        # 1.1 Compute Scale & Shift globally
-        alpha, beta = self.compute_scale_shift(pred_vec, gt_vec, None)
-
-        # 1.2 SSI Loss
-        pred_aligned_vec = self.apply_scale_shift(pred_vec, alpha, beta)
-        ssi_loss = torch.mean((pred_aligned_vec - gt_vec) ** 2)
-
-        # 1.3 Gradient Loss (Needs 2D structure, so we compute on full image with mask)
+        前向计算总损失
+        参数:
+            pred_depth: 预测深度图 (H x W)
+            gt_depth: 真值深度图 (H x W)
+            valid_mask: 有效区域掩码 (H x W)
+            image: 原始图像
+        返回:
+            total_loss: 总损失值
+        """       
+        # 计算尺度和平移参数
+        alpha, beta = self.compute_scale_shift(pred_depth, gt_depth, valid_mask)
+        
+        # 计算对齐后的预测深度图
+        pred_aligned = self.apply_scale_shift(pred_depth, alpha, beta)
+        
+        # 尺度和平移不变性损失
+        ssi_loss = ((pred_aligned - gt_depth) ** 2 * valid_mask).sum() / (valid_mask.sum() + 1e-5)
+        
+        # 梯度匹配损失
         grad_loss = self.gradient_matching_loss(pred_depth, gt_depth, valid_mask)
-
-        # --- Part 2: Pairwise Loss (Calculated on SAMPLED pixels to prevent OOM) ---
-        if num_valid > self.max_samples:
-            # Random sampling
-            perm = torch.randperm(num_valid, device=pred_depth.device)[:self.max_samples]
-            sample_idx = valid_idx[perm]
-
-            # Extract sampled values
-            if pred_depth.dim() == 3:
-                # If (B, H, W), coords are (b, y, x). We need spatial coords (y, x) for distance
-                coords_vec = sample_idx[:, 1:].float()
-                pred_sample = pred_depth[sample_idx[:, 0], sample_idx[:, 1], sample_idx[:, 2]]
-                gt_sample = gt_depth[sample_idx[:, 0], sample_idx[:, 1], sample_idx[:, 2]]
-            else:
-                coords_vec = sample_idx.float()  # (y, x)
-                pred_sample = pred_depth[sample_idx[:, 0], sample_idx[:, 1]]
-                gt_sample = gt_depth[sample_idx[:, 0], sample_idx[:, 1]]
-
-        else:
-            # Use all pixels if count is small
-            if pred_depth.dim() == 3:
-                coords_vec = valid_idx[:, 1:].float()
-            else:
-                coords_vec = valid_idx.float()
-            pred_sample = pred_vec
-            gt_sample = gt_vec
-
-        # Compute Pairwise Diff Matrix (Size is max S*S, e.g. 3000*3000 approx 36MB)
-        pair_diff_matrix = self.compute_pairwise_diff_sampled(
-            pred_sample, gt_sample, coords_vec, alpha, beta
-        )
-
-        # Pair loss is the mean of absolute differences
-        pair_loss = torch.mean(torch.abs(pair_diff_matrix))
-
-        # --- Combine Losses ---
-        total_loss = (1 - self.weight) * (ssi_loss + grad_loss) + self.weight * pair_loss
-
+        
+        # 成对相对差异损失
+        pair_diff, pair_mask = self.compute_pairwise_diff(pred_depth, gt_depth, valid_mask,alpha, beta)
+        pair_loss = (pair_diff.abs() * pair_mask).sum() / math.sqrt(pair_mask.sum()+1e-5)
+        
+        # 总损失组合
+        total_loss = (1-self.weight)*(ssi_loss + grad_loss) + self.weight*pair_loss
         return torch.log(total_loss + 1)
-
 def find_neighbors_with_confidence(coords, H, W, patch_size, include_diagonal=8):
     """
     Find neighbors for a 3D coordinate tensor with confidence values, filter duplicates

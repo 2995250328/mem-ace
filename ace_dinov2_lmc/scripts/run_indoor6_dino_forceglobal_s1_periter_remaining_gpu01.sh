@@ -3,7 +3,7 @@
 #
 # This script runs the five non-scene2a Indoor6 scenes with the same core
 # configuration as the current best scene2a run:
-#   K64, it28, res518, buf2.56M/final7.68M, bs10240, spi384,
+#   K${NUM_LATENT_TOKENS:-64}, it28, res518, buf2.56M/final7.68M, bs10240, spi384,
 #   ACE-G fusion in S2, forceglobal, and S1 loss step mode per_iter.
 #
 # Run from the parent project root:
@@ -37,6 +37,10 @@ BUFFER_ON_CPU="${BUFFER_ON_CPU:-false}"
 BUFFER_ON_CPU_FINAL="${BUFFER_ON_CPU_FINAL:-true}"
 POST_TRAIN_SEEDS_STR="${POST_TRAIN_SEEDS_STR:-1305 2026 4242 7777 9001}"
 POST_TRAIN_HYPOTHESES="${POST_TRAIN_HYPOTHESES:-256}"
+NUM_LATENT_TOKENS="${NUM_LATENT_TOKENS:-64}"
+LMC_MODE="${LMC_MODE:-global}"
+LMC_AUTO_MODE_BY_VISIBILITY="${LMC_AUTO_MODE_BY_VISIBILITY:-False}"
+S1_LOSS_STEP_MODE="${S1_LOSS_STEP_MODE:-per_iter}"
 EVAL_EACH_ITERATION="${EVAL_EACH_ITERATION:-true}"
 EVAL_AFTER_TRAIN="${EVAL_AFTER_TRAIN:-true}"
 RESUME_EXISTING="${RESUME_EXISTING:-true}"
@@ -66,6 +70,9 @@ memory_path_for_scene() {
   case "$1" in
     scene1)
       echo "${MEMORY_SCENE1:-${REPO_ROOT}/memory_extraction/04_evaluation/memory_extract/scene1/40v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate4_prepair8_sor_gm_l2/20260508_104337/memory_bse.pt}"
+      ;;
+    scene2a)
+      echo "${MEMORY_SCENE2A:-${REPO_ROOT}/memory_extraction/04_evaluation/memory_extract/scene2a/40v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate4_prepair8_sor_gm_l2/20260508_104337/memory_bse.pt}"
       ;;
     scene3)
       echo "${MEMORY_SCENE3:-${REPO_ROOT}/memory_extraction/04_evaluation/memory_extract/scene3/40v_v0.05_bilinear_bse_ut0.02_noaug_asb_adaptive_pool1.0_rgate4_prepair8_sor_gm_l2/20260508_104704/memory_bse.pt}"
@@ -185,7 +192,7 @@ run_scene() {
   memory_path="$(memory_path_for_scene "$scene")"
   local log_file="${LOG_ROOT}/train_${scene}_gpu${gpu}.log"
   local result_file="${RESULT_ROOT}/train_${scene}.txt"
-  local output_name="${scene}_forceglobal_periter_full_$(date +%Y%m%d_%H%M%S).pt"
+  local output_name="${scene}_forceglobal_periter_K${NUM_LATENT_TOKENS}_$(date +%Y%m%d_%H%M%S).pt"
 
   require_scene_inputs "$scene" "$memory_path"
   if bool_true "$RESUME_EXISTING" && result_is_ok "$result_file"; then
@@ -235,14 +242,14 @@ run_scene() {
     --ace_g_fusion_lr_ratio 0.01 \
     --ace_g_cross_iter_eval True \
     --pe_normalize_input False \
-    --lmc_mode global \
+    --lmc_mode "$LMC_MODE" \
     --lmc_fps_start_policy farthest_from_center \
-    --lmc_auto_mode_by_visibility False \
+    --lmc_auto_mode_by_visibility "$LMC_AUTO_MODE_BY_VISIBILITY" \
     --lmc_visibility_front_ratio_threshold 0.85 \
     --lmc_visibility_fallback_mode local \
     --lmc_visibility_sample_points 4096 \
     --lmc_key_slice_idx 2 \
-    --num_latent_tokens 64 \
+    --num_latent_tokens "$NUM_LATENT_TOKENS" \
     --num_attn_layers 4 \
     --s1_batch_size 16 \
     --s1_use_buffer True \
@@ -258,7 +265,7 @@ run_scene() {
     --s1_early_stop_rel_improve 0.01 \
     --s1_early_stop_ema_beta 0.9 \
     --s1_loss_mode sample_per_image \
-    --s1_loss_step_mode per_iter \
+    --s1_loss_step_mode "$S1_LOSS_STEP_MODE" \
     --s1_full_map_max_points 0 \
     --s1_empty_cache_interval 30 \
     --training_buffer_size "$TRAINING_BUFFER_SIZE" \
@@ -362,7 +369,7 @@ main() {
   log "Experiment subdir: ${EXPERIMENT_SUBDIR}"
   log "Scenes          : ${SCENES[*]}"
   log "GPUs            : ${GPUS[*]}"
-  log "Config          : K64 it28 res518 buf=${TRAINING_BUFFER_SIZE}/${BUFFER_SIZE_FINAL} bs=${TRAIN_BATCH_SIZE} spi=384 forceglobal s1_per_iter"
+  log "Config          : K${NUM_LATENT_TOKENS} it28 res518 buf=${TRAINING_BUFFER_SIZE}/${BUFFER_SIZE_FINAL} bs=${TRAIN_BATCH_SIZE} spi=384 mode=${LMC_MODE} auto_visibility=${LMC_AUTO_MODE_BY_VISIBILITY} s1_step=${S1_LOSS_STEP_MODE}"
   log "Dry run         : ${DRY_RUN}"
   printf 'scene\tgpu\trun_dir\tbest_file\n' > "$TRAIN_MANIFEST"
 

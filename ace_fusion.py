@@ -24,6 +24,7 @@ class LMCFusionBlock(nn.Module):
                  fusion_scene_scale=1.0,
                  fusion_key_geo_init=0.0):
         super().__init__()
+        self.feature_dim = feature_dim
         self.num_heads = num_heads
         self.scale = (feature_dim // num_heads) ** -0.5
         if fusion_geometry_mode not in self.VALID_GEOMETRY_MODES:
@@ -106,23 +107,9 @@ class LMCFusionBlock(nn.Module):
                 stats.update(extra_stats)
             return stats
 
-    def forward(self, query_feats, memory_z, memory_p, scene_center,
-                return_stats=False, stats_max_pixels=4096):
-        """
-        Args:
-            query_feats:  (B, N_q, C)  image features
-            memory_z:     (B, K, C)    latent features from compressor
-            memory_p:     (B, K, 3)    latent 3D coordinates
-            scene_center: (B, 3)
-        Returns:
-            fused features (B, N_q, C)
-        """
-        B, N_q, C = query_feats.shape
-        K = memory_z.shape[1]
-
-        residual = query_feats
-
-        q = self.q_proj(query_feats)
+    def encode_memory(self, memory_z, memory_p, scene_center):
+        """Encode memory features and geometry into shared attention keys/values."""
+        B, K, _ = memory_z.shape
 
         centered_p = memory_p - scene_center.unsqueeze(1)
         if self.fusion_geometry_mode == "value_only_raw":
@@ -137,14 +124,20 @@ class LMCFusionBlock(nn.Module):
         if self.fusion_geometry_mode == "geokey_norm":
             k_input = memory_z + self.key_geo_scale.to(dtype=memory_z.dtype) * pe_mem
         k = self.k_proj(k_input)
+        v = self.v_proj(memory_z + pe_mem)
 
-        v_input = memory_z + pe_mem
-        v = self.v_proj(v_input)
-
-        head_dim = C // self.num_heads
-        q = q.reshape(B, N_q, self.num_heads, head_dim).transpose(1, 2)
+        head_dim = self.feature_dim // self.num_heads
         k = k.reshape(B, K, self.num_heads, head_dim).transpose(1, 2)
         v = v.reshape(B, K, self.num_heads, head_dim).transpose(1, 2)
+        return k, v, pe_input
+
+    def read_memory(self, query_feats, k, v):
+        """Read pre-encoded memory keys/values with the supplied query features."""
+        B, N_q, C = query_feats.shape
+        head_dim = C // self.num_heads
+
+        q = self.q_proj(query_feats)
+        q = q.reshape(B, N_q, self.num_heads, head_dim).transpose(1, 2)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn_soft = attn.softmax(dim=-1)
@@ -152,9 +145,28 @@ class LMCFusionBlock(nn.Module):
 
         out = (attn @ v).transpose(1, 2).reshape(B, N_q, C)
         out = self.out_proj(out)
+        return out, attn_soft
 
-        x = self.norm1(residual + out)
+    def fuse_encoded_memory(self, query_feats, k, v):
+        """Fuse query features with pre-encoded memory keys/values."""
+        out, attn_soft = self.read_memory(query_feats, k, v)
+        x = self.norm1(query_feats + out)
         x = self.norm2(x + self.ffn(x))
+        return x, out, attn_soft
+
+    def forward(self, query_feats, memory_z, memory_p, scene_center,
+                return_stats=False, stats_max_pixels=4096):
+        """
+        Args:
+            query_feats:  (B, N_q, C)  image features
+            memory_z:     (B, K, C)    latent features from compressor
+            memory_p:     (B, K, 3)    latent 3D coordinates
+            scene_center: (B, 3)
+        Returns:
+            fused features (B, N_q, C)
+        """
+        k, v, pe_input = self.encode_memory(memory_z, memory_p, scene_center)
+        x, out, attn_soft = self.fuse_encoded_memory(query_feats, k, v)
         if return_stats:
             with torch.no_grad():
                 pe_eval = pe_input.detach().float()
@@ -184,13 +196,63 @@ class LMCFusionBlock(nn.Module):
         return x
 
 
+class LMCProgressiveRereadBlock(nn.Module):
+    """A lightweight second query pass over already encoded memory tokens."""
+
+    def __init__(self, feature_dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        if feature_dim % num_heads != 0:
+            raise ValueError("feature_dim must be divisible by num_heads.")
+        self.feature_dim = feature_dim
+        self.num_heads = num_heads
+        self.scale = (feature_dim // num_heads) ** -0.5
+        self.query_norm = nn.LayerNorm(feature_dim)
+        self.q_proj = nn.Linear(feature_dim, feature_dim)
+        self.out_proj = nn.Linear(feature_dim, feature_dim)
+        self.attn_drop = nn.Dropout(dropout)
+        self.output_norm = nn.LayerNorm(feature_dim)
+
+    def forward(self, query_feats, k, v):
+        B, N_q, C = query_feats.shape
+        head_dim = C // self.num_heads
+        q = self.q_proj(self.query_norm(query_feats))
+        q = q.reshape(B, N_q, self.num_heads, head_dim).transpose(1, 2)
+
+        attn_soft = ((q @ k.transpose(-2, -1)) * self.scale).softmax(dim=-1)
+        attn = self.attn_drop(attn_soft)
+        delta = (attn @ v).transpose(1, 2).reshape(B, N_q, C)
+        delta = self.out_proj(delta)
+        fused = self.output_norm(query_feats + delta)
+        return fused, delta, attn_soft
+
+
+class LMCAdapterFFNBlock(nn.Module):
+    """Parameter-matched FFN control for progressive reread experiments."""
+
+    def __init__(self, feature_dim, dropout=0.1):
+        super().__init__()
+        self.input_norm = nn.LayerNorm(feature_dim)
+        self.adapter = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(feature_dim, feature_dim),
+        )
+        self.output_norm = nn.LayerNorm(feature_dim)
+
+    def forward(self, query_feats):
+        delta = self.adapter(self.input_norm(query_feats))
+        fused = self.output_norm(query_feats + delta)
+        return fused, delta
+
+
 class LMCFeatureFusion(nn.Module):
     """
     Main Fusion Module.
     Adapts to 'local', 'global', 'hierarchical', or 'learned' modes.
     """
 
-    VALID_REFINEMENT_MODES = {"single", "cascade_internal"}
+    VALID_REFINEMENT_MODES = {"single", "cascade_internal", "progressive_reread", "adapter_ffn"}
     VALID_ASSEMBLY_MODES = {"concat_mlp"}
 
     def __init__(self, feature_dim=1024, mode='global', num_heads=8,
@@ -220,7 +282,7 @@ class LMCFeatureFusion(nn.Module):
         if self.fusion_cascade_layers < 1:
             raise ValueError("fusion_cascade_layers must be >= 1.")
         if mode == 'hierarchical' and self.fusion_refinement_mode != "single":
-            raise ValueError("cascade_internal fusion refinement is only supported for non-hierarchical LMC modes.")
+            raise ValueError("Fusion refinement is only supported for non-hierarchical LMC modes.")
 
         block_kwargs = dict(
             feature_dim=feature_dim,
@@ -238,6 +300,16 @@ class LMCFeatureFusion(nn.Module):
             self.fusion_fine = LMCFusionBlock(**block_kwargs)
         else:
             self.fusion_single = LMCFusionBlock(**block_kwargs)
+            self.progressive_reread = (
+                LMCProgressiveRereadBlock(feature_dim, num_heads=num_heads, dropout=dropout)
+                if self.fusion_refinement_mode == "progressive_reread"
+                else None
+            )
+            self.adapter_ffn = (
+                LMCAdapterFFNBlock(feature_dim, dropout=dropout)
+                if self.fusion_refinement_mode == "adapter_ffn"
+                else None
+            )
             if self.fusion_refinement_mode == "cascade_internal" and self.fusion_cascade_layers > 1:
                 cascade_kwargs = dict(block_kwargs)
                 cascade_kwargs["query_feature_dim"] = feature_dim
@@ -271,6 +343,67 @@ class LMCFeatureFusion(nn.Module):
 
     def _forward_single_or_cascade(self, query_feats, latent_z, latent_p, scene_center,
                                    return_stats=False, stats_max_pixels=4096):
+        if self.fusion_refinement_mode == "progressive_reread":
+            k, v, pe_input = self.fusion_single.encode_memory(latent_z, latent_p, scene_center)
+            anchor_feats, first_delta, first_attn = self.fusion_single.fuse_encoded_memory(
+                query_feats, k, v
+            )
+            fused, reread_delta, reread_attn = self.progressive_reread(anchor_feats, k, v)
+            if not return_stats:
+                return fused
+
+            pe_eval = pe_input.detach().float()
+            stats = self.fusion_single._summarize_attention(
+                first_attn,
+                query_feats,
+                first_delta,
+                anchor_feats,
+                max_pixels=stats_max_pixels,
+                extra_stats={
+                    "fusion_geometry_mode": self.fusion_single.fusion_geometry_mode,
+                    "fusion_scene_scale": float(
+                        self.fusion_single.fusion_scene_scale.detach().cpu().item()
+                    ),
+                    "key_geo_scale": float(
+                        getattr(
+                            self.fusion_single,
+                            "key_geo_scale",
+                            torch.tensor(0.0, device=pe_input.device),
+                        ).detach().float().cpu().item()
+                    ),
+                    "memory_p_norm_std": float(pe_eval.std(unbiased=False).item()),
+                    "memory_p_norm_absmax": float(pe_eval.abs().max().item()),
+                    "memory_p_norm_finite": bool(torch.isfinite(pe_eval).all().item()),
+                },
+            )
+            reread_stats = self.fusion_single._summarize_attention(
+                reread_attn,
+                anchor_feats,
+                reread_delta,
+                fused,
+                max_pixels=stats_max_pixels,
+            )
+            stats.update(self._prefix_stats("reread_", reread_stats))
+            with torch.no_grad():
+                stats.update({
+                    "fusion_refinement_mode": self.fusion_refinement_mode,
+                    "fusion_cascade_layers": 2,
+                    "reread_delta_norm": float(
+                        reread_delta.detach().float().norm(dim=-1).mean().item()
+                    ),
+                    "anchor_reread_cosine": float(
+                        F.cosine_similarity(
+                            anchor_feats.detach().float(),
+                            fused.detach().float(),
+                            dim=-1,
+                        ).mean().item()
+                    ),
+                    "fused_feature_norm": float(
+                        fused.detach().float().norm(dim=-1).mean().item()
+                    ),
+                })
+            return fused, stats
+
         first_out = self.fusion_single(
             query_feats,
             latent_z,
@@ -284,6 +417,31 @@ class LMCFeatureFusion(nn.Module):
         else:
             anchor_feats = first_out
             stats = None
+
+        if self.fusion_refinement_mode == "adapter_ffn":
+            fused, adapter_delta = self.adapter_ffn(anchor_feats)
+            if return_stats:
+                stats = dict(stats)
+                with torch.no_grad():
+                    stats.update({
+                        "fusion_refinement_mode": self.fusion_refinement_mode,
+                        "fusion_cascade_layers": 2,
+                        "adapter_delta_norm": float(
+                            adapter_delta.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "anchor_adapter_cosine": float(
+                            F.cosine_similarity(
+                                anchor_feats.detach().float(),
+                                fused.detach().float(),
+                                dim=-1,
+                            ).mean().item()
+                        ),
+                        "fused_feature_norm": float(
+                            fused.detach().float().norm(dim=-1).mean().item()
+                        ),
+                    })
+                return fused, stats
+            return fused
 
         if self.fusion_refinement_mode != "cascade_internal" or len(self.fusion_cascade) == 0:
             if return_stats:

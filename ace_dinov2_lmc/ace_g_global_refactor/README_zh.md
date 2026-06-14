@@ -39,9 +39,13 @@ ace_dinov2_lmc/ace_g_global_refactor/
   绝对路径：`/home/xwh/project/ace_depth/ace_dinov2_lmc/ace_g_global_refactor/LONG_TERM_RESEARCH_PLAN.md`
 - [COMPARE_CPE_B1_scene2a_20260518.md](./COMPARE_CPE_B1_scene2a_20260518.md)
   绝对路径：`/home/xwh/project/ace_depth/ace_dinov2_lmc/ace_g_global_refactor/COMPARE_CPE_B1_scene2a_20260518.md`
+- [SFM_TRACK_GUIDED_MULTI_VIEW_SUPERVISION_ZH.md](./SFM_TRACK_GUIDED_MULTI_VIEW_SUPERVISION_ZH.md)
+  绝对路径：`/home/xwh/project/ace_depth/ace_dinov2_lmc/ace_g_global_refactor/SFM_TRACK_GUIDED_MULTI_VIEW_SUPERVISION_ZH.md`
 
 ### 当前最重要的路线文件
 
+- [SFM_TRACK_GUIDED_MULTI_VIEW_SUPERVISION_ZH.md](./SFM_TRACK_GUIDED_MULTI_VIEW_SUPERVISION_ZH.md)
+  绝对路径：`/home/xwh/project/ace_depth/ace_dinov2_lmc/ace_g_global_refactor/SFM_TRACK_GUIDED_MULTI_VIEW_SUPERVISION_ZH.md`
 - [steps/15_pointrope_and_multilevel_fusion_roadmap.md](./steps/15_pointrope_and_multilevel_fusion_roadmap.md)
   绝对路径：`/home/xwh/project/ace_depth/ace_dinov2_lmc/ace_g_global_refactor/steps/15_pointrope_and_multilevel_fusion_roadmap.md`
 - [steps/16_large_scene_multi_memory_reference_frame_plan.md](./steps/16_large_scene_multi_memory_reference_frame_plan.md)

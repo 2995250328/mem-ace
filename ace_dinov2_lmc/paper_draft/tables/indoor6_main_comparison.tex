@@ -1,0 +1,84 @@
+\begin{table*}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{1.7pt}
+\renewcommand{\arraystretch}{1.08}
+\caption{SCR results on Indoor6. Each cell reports \acctwentyfive{} / median translation error in cm / median rotation error in degrees. Best results are bolded and second-best results are italicized. \textbf{Ours (DINOv2 + MapAnything memory)} is the main paper-facing method, while \textbf{Ours (ACE-FCN + ACE memory + GLACE)} applies the same latent-memory idea to the ACE-FCN/GLACE pipeline.}
+\label{tab:indoor6_main_comparison}
+\providecommand{\best}[1]{\textbf{#1}}
+\providecommand{\second}[1]{\textit{#1}}
+\providecommand{\cellres}[3]{#1/#2/#3}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lccccccc@{}}
+\toprule
+Method
+& Scene 1
+& Scene 2a
+& Scene 3
+& Scene 4a
+& Scene 5
+& Scene 6
+& Avg. \\
+\midrule
+ACE
+& \cellres{52}{17.7}{2.4}
+& \cellres{86}{8.0}{0.8}
+& \cellres{66}{9.0}{1.6}
+& \cellres{94}{4.6}{0.9}
+& \cellres{51}{21.6}{4.0}
+& \cellres{70}{5.2}{0.9}
+& \cellres{70}{11.0}{1.8} \\
+DINO-ACE
+& \cellres{90}{5.4}{0.9}
+& \cellres{97}{5.2}{0.6}
+& \cellres{91}{6.0}{1.2}
+& \cellres{96}{4.7}{1.2}
+& \cellres{89}{7.5}{1.2}
+& \cellres{85}{4.8}{1.0}
+& \cellres{91}{5.6}{1.0} \\
+GLACE
+& \cellres{90}{3.8}{0.7}
+& \cellres{\best{100}}{3.9}{\second{0.4}}
+& \cellres{93}{\second{2.9}}{\second{0.6}}
+& \cellres{\second{99}}{\best{2.3}}{\best{0.5}}
+& \cellres{79}{6.1}{0.9}
+& \cellres{\best{97}}{\second{2.1}}{\best{0.4}}
+& \cellres{93}{3.5}{\second{0.6}} \\
+Ours (ACE-FCN + ACE memory + GLACE)
+& \cellres{93}{3.6}{\second{0.6}}
+& \cellres{\best{100}}{3.7}{\second{0.4}}
+& \cellres{\second{96}}{\best{2.8}}{\best{0.5}}
+& \cellres{\best{100}}{\best{2.3}}{\best{0.5}}
+& \cellres{81}{6.0}{1.0}
+& \cellres{\second{96}}{\best{1.9}}{\best{0.4}}
+& \cellres{94}{3.4}{\second{0.6}} \\
+ACE-G5
+& \cellres{94}{4.3}{0.7}
+& \cellres{98}{4.8}{\second{0.4}}
+& \cellres{\second{96}}{4.7}{0.9}
+& \cellres{98}{3.7}{0.9}
+& \cellres{93}{5.9}{1.0}
+& \cellres{92}{3.9}{0.8}
+& \cellres{95}{4.5}{0.8} \\
+ACE-G25
+& \cellres{\second{96}}{3.5}{\second{0.6}}
+& \cellres{98}{3.9}{\second{0.4}}
+& \cellres{\best{98}}{3.8}{0.8}
+& \cellres{\second{99}}{3.2}{0.8}
+& \cellres{\second{97}}{\second{5.1}}{\second{0.8}}
+& \cellres{91}{2.7}{0.6}
+& \cellres{96}{3.7}{0.7} \\
+\midrule
+Ours (DINOv2 + MapAnything memory)
+& \cellres{\best{97}}{\best{2.6}}{\best{0.5}}
+& \cellres{\best{100}}{\best{2.6}}{\best{0.3}}
+& \cellres{\best{98}}{\second{2.9}}{\second{0.6}}
+& \cellres{\best{100}}{\best{2.3}}{\second{0.6}}
+& \cellres{\best{98}}{\best{3.4}}{\best{0.6}}
+& \cellres{95}{2.2}{\second{0.5}}
+& \cellres{\best{98}}{\best{2.7}}{\best{0.5}} \\
+\bottomrule
+\end{tabular*}
+\vspace{2pt}
+\footnotesize
+Accuracies are rounded to the nearest integer, and median errors are rounded to one decimal. Ours (DINOv2 + MapAnything memory) corresponds to the rounded New result envelope; Ours (ACE-FCN + ACE memory + GLACE) corresponds to the GLACE-LMC setting.
+\end{table*}

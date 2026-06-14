@@ -471,6 +471,33 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return None
         return Path(rgb_files[image_idx])
 
+    def _resolve_batch_image_indices(self, raw_img_idx, *, device=None) -> Optional[torch.Tensor]:
+        if raw_img_idx is None:
+            return None
+        if torch.is_tensor(raw_img_idx):
+            return raw_img_idx.to(device or self.device, non_blocking=True).long()
+        if not hasattr(self, "_image_path_to_dataset_index"):
+            rgb_files = list(getattr(self.dataset, "rgb_files", []) or [])
+            self._image_path_to_dataset_index = {str(Path(path)): int(i) for i, path in enumerate(rgb_files)}
+        mapping = self._image_path_to_dataset_index
+        if isinstance(raw_img_idx, (str, Path)):
+            raw_items = [raw_img_idx]
+        else:
+            raw_items = list(raw_img_idx)
+        indices = []
+        missing = []
+        for item in raw_items:
+            key = str(Path(item))
+            idx = mapping.get(key)
+            if idx is None:
+                missing.append(key)
+            else:
+                indices.append(idx)
+        if missing:
+            preview = ", ".join(missing[:3])
+            raise ValueError(f"[Buffer] could not map image path(s) to dataset indices: {preview}")
+        return torch.tensor(indices, dtype=torch.int64, device=device or self.device)
+
     def _init_relative_depth_distiller(self) -> None:
         if not bool(getattr(self.options, "use_relative_depth_loss", False)):
             return
@@ -517,45 +544,176 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         ramp = min(1.0, max(0.0, (phase - start_ratio) / max(1e-6, 1.0 - start_ratio)))
         return base_weight * ramp
 
-    def _compute_relative_depth_loss(
-        self,
-        *,
-        stage_tag: str,
-        pred_scene_coords_N31: torch.Tensor,
-        target_px_N2: torch.Tensor,
-        gt_inv_poses_N34: torch.Tensor,
-        img_idx_N: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, Dict[str, float]]:
-        zero = pred_scene_coords_N31.new_zeros(())
+    def _build_relative_depth_image_dataloader(self):
+        effective_batch = max(1, int(getattr(self.options, "relative_depth_image_batch_size", 1)))
+        if self._is_ace_fcn_backend() and effective_batch != 1:
+            _logger.info("[RelDepth] Forcing image batch size to 1 for variable-width ACE images.")
+            effective_batch = 1
+        buffer_image_width = getattr(self.options, "buffer_image_width", None)
+        if buffer_image_width is None:
+            buffer_image_width = (self.options.image_resolution * 4 // 3 + 13) // 14 * 14
+        depth_dataset = self._build_train_dataset(
+            image_width=buffer_image_width,
+            augment=False,
+            aug_rotation=0,
+            aug_scale_max=1.0,
+            aug_scale_min=1.0,
+        )
+        batch_sampler = sampler.BatchSampler(
+            sampler.RandomSampler(depth_dataset, generator=self.batch_generator),
+            batch_size=effective_batch,
+            drop_last=False,
+        )
+        return DataLoader(
+            dataset=depth_dataset,
+            batch_sampler=batch_sampler,
+            generator=self.loader_generator,
+            pin_memory=True,
+            num_workers=self.num_data_loader_workers,
+            persistent_workers=self.num_data_loader_workers > 0,
+        )
+
+    def _next_relative_depth_image_batch(self, stage_tag: str):
         if self.relative_depth_distiller is None or not self._relative_depth_enabled_for_stage(stage_tag):
+            return None
+        if self._relative_depth_weight() <= 0.0:
+            return None
+        interval = int(getattr(self.options, "relative_depth_image_step_interval", 10))
+        if interval <= 0:
+            raise ValueError("--relative_depth_image_step_interval must be > 0.")
+        if (int(self.local_s2_step) + 1) % interval != 0:
+            return None
+        if self._relative_depth_image_loader is None:
+            self._relative_depth_image_loader = self._build_relative_depth_image_dataloader()
+            self._relative_depth_image_iterator = iter(self._relative_depth_image_loader)
+            _logger.info(
+                "[RelDepth] image-level supervision active: stage=%s interval=%d batch=%d",
+                stage_tag,
+                interval,
+                int(getattr(self.options, "relative_depth_image_batch_size", 1)),
+            )
+        try:
+            return next(self._relative_depth_image_iterator)
+        except StopIteration:
+            self._relative_depth_image_iterator = iter(self._relative_depth_image_loader)
+            return next(self._relative_depth_image_iterator)
+
+    def _compute_image_relative_depth_loss(self, *, stage_tag: str, image_batch):
+        param = next(self.regressor.heads.parameters())
+        zero = param.new_zeros(())
+        if image_batch is None:
             return zero, {"enabled": 0.0, "weight": 0.0, "loss_raw": 0.0}
         weight = self._relative_depth_weight()
         if weight <= 0.0:
             return zero, {"enabled": 1.0, "weight": 0.0, "loss_raw": 0.0}
-        if img_idx_N is None:
-            if not self._relative_depth_warned_no_img_idx:
-                _logger.warning(
-                    "[RelDepth] %s has no img_idx in the S2 buffer; relative depth loss is skipped. "
-                    "Use a data path that stores image indices, e.g. ACE-FCN global/head-conditioning runs.",
-                    stage_tag,
+
+        image_BCHW, image_mask_B1HW, _, gt_pose_inv_B44, *_ = image_batch
+        raw_img_idx = image_batch[-1]
+        image_BCHW = image_BCHW.to(self.device, non_blocking=True)
+        image_mask_B1HW = image_mask_B1HW.to(self.device, non_blocking=True)
+        gt_pose_inv_B44 = gt_pose_inv_B44.to(self.device, non_blocking=True).float()
+        img_idx_B = self._resolve_batch_image_indices(raw_img_idx, device=self.device)
+        if img_idx_B is None:
+            raise ValueError("[RelDepth] image-level batch is missing image identity/path metadata.")
+        if image_BCHW.dtype == torch.float16:
+            image_BCHW = image_BCHW.float()
+        gt_pose_inv_B34 = gt_pose_inv_B44[:, :3, :] if gt_pose_inv_B44.shape[1] == 4 else gt_pose_inv_B44
+
+        with autocast("cuda", enabled=self.options.use_half):
+            with torch.no_grad():
+                local_features_BCHW = self.regressor.get_features(image_BCHW)
+            if self._is_glace_backend():
+                raw_features_BCHW = self._build_glace_decoder_feature_maps(
+                    local_features_BCHW,
+                    img_idx_B,
+                    stage_tag=f"{stage_tag}-RelDepth",
                 )
-                self._relative_depth_warned_no_img_idx = True
-            return zero, {"enabled": 1.0, "weight": weight, "loss_raw": 0.0, "groups": 0.0}
-        raw_loss, stats = self.relative_depth_distiller(
-            pred_scene_coords_N31=pred_scene_coords_N31,
-            target_px_N2=target_px_N2,
-            gt_inv_poses_N34=gt_inv_poses_N34,
-            img_idx_N=img_idx_N,
+            else:
+                raw_features_BCHW = local_features_BCHW
+
+            compressor_out = self._s2_compressor_out
+            if compressor_out is None:
+                compressor_out = self._compress_memory()
+            if stage_tag == "S2-G" and not bool(getattr(self.options, "ace_g_fusion_in_s2", False)):
+                with torch.no_grad():
+                    fused_BCHW, base_BCHW = self._fuse_lmc_features_for_head(
+                        raw_features_BCHW,
+                        compressor_out,
+                        stage_tag=f"{stage_tag}-RelDepth",
+                    )
+            else:
+                fused_BCHW, base_BCHW = self._fuse_lmc_features_for_head(
+                    raw_features_BCHW,
+                    compressor_out,
+                    stage_tag=f"{stage_tag}-RelDepth",
+                )
+            head_features_BCHW = self._mix_glace_decoder_feature_maps(
+                base_BCHW,
+                fused_BCHW,
+                stage_tag=f"{stage_tag}-RelDepth",
+            )
+            B, C, H, W = head_features_BCHW.shape
+            head_features_bC = head_features_BCHW.permute(0, 2, 3, 1).reshape(B * H * W, C)
+            if self._uses_ace_lmc_global_residual_head():
+                pred_scene_B3HW, _, _, _ = self._predict_ace_lmc_global_residual_coords(
+                    head_features_bC,
+                    img_idx_B[:, None].expand(B, H * W).reshape(-1),
+                    H,
+                    W,
+                    stage_tag=f"{stage_tag}-RelDepth",
+                )
+            elif self._uses_ace_lmc_global_film_head():
+                pred_scene_B3HW, _ = self._predict_ace_lmc_global_film_coords(
+                    head_features_bC,
+                    img_idx_B[:, None].expand(B, H * W).reshape(-1),
+                    H,
+                    W,
+                    stage_tag=f"{stage_tag}-RelDepth",
+                )
+            else:
+                if self._uses_ace_lmc_concat_head():
+                    head_features_BCHW = self._append_ace_lmc_global_to_feature_maps(
+                        head_features_BCHW,
+                        img_idx_B,
+                        stage_tag=f"{stage_tag}-RelDepth",
+                    )
+                pred_scene_B3HW = self.regressor.get_scene_coordinates(head_features_BCHW)
+
+        pred_scene_B3HW = self._recover_pred_scene_to_training_world(pred_scene_B3HW).float()
+        pred_scene_N31 = pred_scene_B3HW.permute(0, 2, 3, 1).reshape(B * H * W, 3, 1)
+        gt_pose_inv_N34 = gt_pose_inv_B34[:, None, None].expand(B, H, W, 3, 4).reshape(B * H * W, 3, 4)
+        pred_cam_N31 = torch.bmm(gt_pose_inv_N34, to_homogeneous(pred_scene_N31))
+        student_depth_BHW = pred_cam_N31[:, 2, 0].view(B, H, W)
+        valid_mask_B1HW = TF.resize(
+            image_mask_B1HW.float(),
+            [H, W],
+            interpolation=TF.InterpolationMode.NEAREST,
+        ).bool()
+        raw_loss, stats = self.relative_depth_distiller.forward_image(
+            student_depth_BHW=student_depth_BHW,
+            valid_mask_B1HW=valid_mask_B1HW,
+            img_idx_B=img_idx_B,
             generator=self._training_generator_cuda,
         )
         stats = dict(stats)
         stats["weight"] = float(weight)
         if not bool(torch.isfinite(raw_loss).all().item()):
             if not self._relative_depth_warned_nonfinite:
-                _logger.warning("[RelDepth] non-finite raw loss at %s; skipped for this step.", stage_tag)
+                _logger.warning("[RelDepth] non-finite image loss at %s; skipped.", stage_tag)
                 self._relative_depth_warned_nonfinite = True
             stats["loss_raw"] = -1.0
             return zero, stats
+        if not self._relative_depth_logged_active and float(stats.get("groups", 0.0)) > 0.0:
+            _logger.info(
+                "[RelDepth] image-level active at %s: raw=%.6f weight=%.6f valid_points=%d images=%d missing=%d",
+                stage_tag,
+                float(stats.get("loss_raw", 0.0)),
+                float(weight),
+                int(float(stats.get("valid_points", 0.0))),
+                int(float(stats.get("groups", 0.0))),
+                int(float(stats.get("missing_images", 0.0))),
+            )
+            self._relative_depth_logged_active = True
         return raw_loss * weight, stats
 
     @staticmethod
@@ -1258,6 +1416,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     def _uses_image_global_features(self):
         return bool(self._is_glace_backend() or self._uses_ace_lmc_global_head())
 
+    def _needs_image_indices_in_buffer(self):
+        return self._uses_image_global_features()
+
     def _glace_head_freeze_active(self, iteration_idx):
         if not self._is_glace_backend():
             return False
@@ -1493,7 +1654,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         )
 
     def _buffer_schema_name(self, base_name):
-        if self._uses_image_global_features():
+        if self._needs_image_indices_in_buffer():
             return f"{base_name}_glace"
         return base_name
 
@@ -2596,40 +2757,59 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         # --- LMC config (same as map-anything train_ace: num_layers from layers_idx, feature_dim per layer) ---
         requested_lmc_mode = getattr(options, 'lmc_mode', 'global')
         lmc_mode = requested_lmc_mode
+        low_pose_thr = float(getattr(options, "lmc_visibility_low_pose_front_ratio_threshold", 0.30))
         vis_stats = estimate_memory_front_visibility(
             bank_data["pooled_points"],
             bank_data.get("all_poses"),
             max_points=int(getattr(options, "lmc_visibility_sample_points", 4096)),
+            low_pose_front_ratio_threshold=low_pose_thr,
         )
         self.memory_visibility_stats = vis_stats
         if vis_stats is not None:
             _logger.info(
-                "[LMC] Memory front-visibility: mean=%.3f, median=%.3f, min=%.3f, max=%.3f "
-                "(sampled_points=%d, poses=%d)",
+                "[LMC] Memory front-visibility: mean=%.3f, median=%.3f, min=%.3f, max=%.3f, "
+                "low_pose(<%.2f)=%.3f, route_score=%.3f (sampled_points=%d, poses=%d)",
                 vis_stats["mean_front_ratio"],
                 vis_stats["median_front_ratio"],
                 vis_stats["min_front_ratio"],
                 vis_stats["max_front_ratio"],
+                vis_stats["low_pose_front_ratio_threshold"],
+                vis_stats["low_pose_front_ratio_fraction"],
+                vis_stats["global_visibility_route_score"],
                 vis_stats["num_points_sampled"],
                 vis_stats["num_poses"],
             )
         auto_mode = bool(getattr(options, "lmc_auto_mode_by_visibility", False))
         fallback_mode = str(getattr(options, "lmc_visibility_fallback_mode", "local"))
-        vis_thr = float(getattr(options, "lmc_visibility_front_ratio_threshold", 0.85))
-        if (
-            auto_mode
-            and requested_lmc_mode == "global"
-            and fallback_mode in ("local", "hierarchical")
-            and vis_stats is not None
-            and vis_stats["mean_front_ratio"] < vis_thr
-        ):
+        route_metric = str(getattr(options, "lmc_visibility_route_metric", "gvcs") or "gvcs").lower()
+        route_score_thr = float(getattr(options, "lmc_visibility_route_score_threshold", 0.20))
+        legacy_mean_thr = float(getattr(options, "lmc_visibility_front_ratio_threshold", 0.85))
+        should_fallback = False
+        fallback_msg = ""
+        if auto_mode and requested_lmc_mode == "global" and fallback_mode in ("local", "hierarchical") and vis_stats is not None:
+            if route_metric == "legacy_mean":
+                should_fallback = vis_stats["mean_front_ratio"] < legacy_mean_thr
+                fallback_msg = (
+                    "mean_front_ratio=%.3f < %.3f. Switching lmc_mode: %s -> %s"
+                    % (vis_stats["mean_front_ratio"], legacy_mean_thr, requested_lmc_mode, fallback_mode)
+                )
+            else:
+                should_fallback = vis_stats["global_visibility_route_score"] < route_score_thr
+                fallback_msg = (
+                    "visibility_route_score=%.3f < %.3f "
+                    "(median_front_ratio=%.3f, low_pose_fraction=%.3f at front_ratio<%.2f). "
+                    "Switching lmc_mode: %s -> %s"
+                    % (
+                        vis_stats["global_visibility_route_score"], route_score_thr,
+                        vis_stats["median_front_ratio"], vis_stats["low_pose_front_ratio_fraction"],
+                        vis_stats["low_pose_front_ratio_threshold"], requested_lmc_mode, fallback_mode,
+                    )
+                )
+        if should_fallback:
             _logger.warning(
-                "[LMC] Global mode auto-fallback triggered: mean_front_ratio=%.3f < %.3f. "
-                "Switching lmc_mode: %s -> %s",
-                vis_stats["mean_front_ratio"],
-                vis_thr,
-                requested_lmc_mode,
-                fallback_mode,
+                "[LMC] Global mode auto-fallback triggered (%s): %s",
+                route_metric,
+                fallback_msg,
             )
             lmc_mode = fallback_mode
         num_latent_tokens = getattr(options, 'num_latent_tokens', 64)
@@ -2912,7 +3092,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             raise ValueError(f"Unsupported lmc_fusion_geometry_mode={lmc_fusion_geometry_mode!r}")
         lmc_fusion_key_geo_init = float(getattr(options, 'lmc_fusion_key_geo_init', 0.0))
         lmc_fusion_refinement_mode = str(getattr(options, 'lmc_fusion_refinement_mode', 'single'))
-        if lmc_fusion_refinement_mode not in ('single', 'cascade_internal'):
+        if lmc_fusion_refinement_mode not in ('single', 'cascade_internal', 'progressive_reread', 'adapter_ffn'):
             raise ValueError(f"Unsupported lmc_fusion_refinement_mode={lmc_fusion_refinement_mode!r}")
         lmc_fusion_cascade_layers = int(getattr(options, 'lmc_fusion_cascade_layers', 4))
         if lmc_fusion_cascade_layers < 1:
@@ -2921,8 +3101,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if lmc_fusion_assembly_mode not in ('concat_mlp',):
             raise ValueError(f"Unsupported lmc_fusion_assembly_mode={lmc_fusion_assembly_mode!r}")
         lmc_fusion_assembly_gamma_init = float(getattr(options, 'lmc_fusion_assembly_gamma_init', 0.0))
-        if lmc_fusion_refinement_mode == 'cascade_internal' and lmc_mode == 'hierarchical':
-            raise ValueError('cascade_internal fusion refinement is only supported for non-hierarchical LMC modes.')
+        if lmc_fusion_refinement_mode != 'single' and lmc_mode == 'hierarchical':
+            raise ValueError('Fusion refinement is only supported for non-hierarchical LMC modes.')
         needs_scene_scale = (
             lmc_fusion_geometry_mode != 'value_only_raw'
             or compressor_pe_scale_mode == 'scene_scale'
@@ -2953,6 +3133,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'requested_lmc_mode': requested_lmc_mode,
             'effective_lmc_mode': lmc_mode,
             'lmc_auto_mode_by_visibility': bool(getattr(options, 'lmc_auto_mode_by_visibility', False)),
+            'lmc_visibility_route_metric': str(getattr(options, 'lmc_visibility_route_metric', 'gvcs')),
+            'lmc_visibility_route_score_threshold': float(getattr(options, 'lmc_visibility_route_score_threshold', 0.20)),
+            'lmc_visibility_front_ratio_threshold': float(getattr(options, 'lmc_visibility_front_ratio_threshold', 0.85)),
             'num_latent_tokens': num_latent_tokens,
             'num_fine': num_fine,
             'num_coarse': num_coarse,
@@ -3113,6 +3296,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'relative_depth_max_samples': int(getattr(self.options, 'relative_depth_max_samples', 1024)),
             'relative_depth_max_pairs': int(getattr(self.options, 'relative_depth_max_pairs', 4096)),
             'relative_depth_min_points': int(getattr(self.options, 'relative_depth_min_points', 16)),
+            'relative_depth_image_step_interval': int(getattr(self.options, 'relative_depth_image_step_interval', 10)),
+            'relative_depth_image_batch_size': int(getattr(self.options, 'relative_depth_image_batch_size', 1)),
             'memory_has_points_ref': self.memory_contract_info['has_points_ref'],
             'memory_has_points_ref_norm': self.memory_contract_info['has_points_ref_norm'],
             'memory_has_scene_center_world': self.memory_contract_info['has_scene_center_world'],
@@ -3289,6 +3474,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.relative_depth_distiller = None
         self._relative_depth_warned_no_img_idx = False
         self._relative_depth_warned_nonfinite = False
+        self._relative_depth_logged_active = False
+        self._relative_depth_image_loader = None
+        self._relative_depth_image_iterator = None
         self._init_relative_depth_distiller()
 
         self._load_ace_lmc_local_checkpoint_if_requested()
@@ -3675,7 +3863,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'gt_scene_coords_world': torch.empty((effective_size, 3), dtype=torch.float32, device=buffer_device),
             'gt_scene_coords_valid': torch.empty((effective_size, 1), dtype=torch.bool, device=buffer_device),
         }
-        if self._uses_image_global_features():
+        if self._needs_image_indices_in_buffer():
             self.training_buffer['img_idx'] = torch.empty((effective_size,), dtype=torch.int64, device=buffer_device)
 
         regressor_mode_snapshot = self._capture_module_training_modes(
@@ -3708,7 +3896,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 for batch in training_dataloader:
                     image_BCHW, image_mask_B1HW, _, gt_pose_inv_B44, intrinsics_B33, intrinsics_inv_B33, *_ = batch
                     img_idx_B = None
-                    if self._uses_image_global_features():
+                    if self._needs_image_indices_in_buffer():
                         img_idx_B = batch[-1]
                     coords_B3HW = self._extract_gt_scene_coords_from_batch(batch, image_BCHW=image_BCHW)
 
@@ -3735,7 +3923,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     if self._is_glace_backend():
                         if img_idx_B is None:
                             raise ValueError('[Buffer] GLACE backend batch is missing img_idx.')
-                        img_idx_B = img_idx_B.to(self.device, non_blocking=True).long()
+                        img_idx_B = self._resolve_batch_image_indices(img_idx_B, device=self.device)
                         features_BCHW = self._build_glace_decoder_feature_maps(
                             local_features_BCHW,
                             img_idx_B,
@@ -3745,7 +3933,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         if self._uses_image_global_features() and img_idx_B is None:
                             raise ValueError('[Buffer] image-global backend batch is missing img_idx.')
                         if img_idx_B is not None:
-                            img_idx_B = img_idx_B.to(self.device, non_blocking=True).long()
+                            img_idx_B = self._resolve_batch_image_indices(img_idx_B, device=self.device)
                         features_BCHW = local_features_BCHW
 
                     B, C, H, W = features_BCHW.shape
@@ -3784,7 +3972,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         'gt_scene_coords_world': normalize_shape(coords_B3HW),
                         'gt_scene_coords_valid': normalize_shape(coords_valid_B1HW),
                     }
-                    if self._uses_image_global_features():
+                    if self._needs_image_indices_in_buffer():
+                        if img_idx_B is None:
+                            raise ValueError('[Buffer] image-global run requires img_idx but batch is missing it.')
                         batch_data['img_idx'] = img_idx_B.unsqueeze(1).expand(B, H * W).reshape(-1)
 
                     image_mask_B1HW = image_mask_B1HW.float()
@@ -6207,10 +6397,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         start_iter = int(getattr(self.options, "resume_best_iter", 0))
         if start_iter <= 0:
             raise ValueError(f"Invalid resume_best_iter={start_iter}; expected a 1-based completed best iteration.")
-        if start_iter >= int(self.lmc_iterations):
+        relative_depth_only = int(getattr(self.options, "relative_depth_only_steps", 0) or 0) > 0
+        if start_iter >= int(self.lmc_iterations) and not relative_depth_only:
             raise ValueError(
                 f"Resume best_iter={start_iter} leaves no remaining LMC iterations "
                 f"for lmc_iterations={self.lmc_iterations}. Increase --lmc_iterations to continue."
+            )
+        if start_iter >= int(self.lmc_iterations) and relative_depth_only:
+            _logger.info(
+                "[Resume] best_iter=%d reaches lmc_iterations=%d; allowed because relative_depth_only_steps=%d.",
+                start_iter,
+                int(self.lmc_iterations),
+                int(getattr(self.options, "relative_depth_only_steps", 0) or 0),
             )
 
         self.resume_start_iter = start_iter
@@ -6893,12 +7091,192 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         )
         _logger.info("Logs: %s | %s | %s", self.step_log_path, self.training_log_path, self.eval_log_path)
 
+    def _train_relative_depth_only(self):
+        """Fine-tune a resumed checkpoint using only image-level relative depth."""
+        steps = int(getattr(self.options, "relative_depth_only_steps", 0) or 0)
+        if steps <= 0:
+            raise ValueError("relative_depth_only_steps must be > 0.")
+        if not self._resume_enabled():
+            raise ValueError("relative_depth_only training requires --resume_checkpoint_path or --resume_from_run_dir.")
+        if self.relative_depth_distiller is None:
+            raise ValueError("relative_depth_only training requires --use_relative_depth_loss True.")
+        lr = float(getattr(self.options, "relative_depth_only_lr", 1e-5) or 0.0)
+        if lr <= 0.0:
+            raise ValueError("relative_depth_only_lr must be > 0.")
+
+        self.training_start = time.time()
+        self._write_train_header()
+        self._set_compressor_trainable(False)
+        self.compressor.eval()
+        self.regressor.encoder.eval()
+        for param in self.regressor.encoder.parameters():
+            param.requires_grad_(False)
+
+        train_fusion = bool(getattr(self.options, "relative_depth_only_train_fusion", True))
+        train_fusion = train_fusion and self.lmc_flow == "ace_g"
+        for param in self.fusion.parameters():
+            param.requires_grad_(train_fusion)
+        self.fusion.train(train_fusion)
+
+        head_params = []
+        if self._uses_ace_lmc_global_residual_head():
+            head_params.extend(self._ace_lmc_global_residual_params())
+            for param in self.regressor.heads.parameters():
+                param.requires_grad_(False)
+        else:
+            for param in self.regressor.heads.parameters():
+                param.requires_grad_(True)
+            self.regressor.heads.train()
+            head_params.extend(self.regressor.heads.parameters())
+
+        aux_params = []
+        if train_fusion:
+            aux_params.extend(self.fusion.parameters())
+            aux_params.extend(self._glace_residual_adapter_params())
+            aux_params.extend(self._local_residual_gate_params())
+        aux_params.extend(self._ace_lmc_global_gate_params())
+
+        seen = set()
+        param_groups = []
+        for name, params in (("head", head_params), ("fusion", aux_params)):
+            unique = []
+            for param in params:
+                if param is None or not param.requires_grad or id(param) in seen:
+                    continue
+                seen.add(id(param))
+                unique.append(param)
+            if unique:
+                param_groups.append({"name": name, "params": unique, "lr": lr})
+        if not param_groups:
+            raise RuntimeError("relative_depth_only optimizer has no trainable parameters.")
+
+        optimizer = optim.AdamW(param_groups, lr=lr)
+        self.optimizer_head = optimizer
+        self.scheduler_head = None
+        self.steps_per_s2_phase = steps
+        self.local_s2_step = 0
+        self.current_lmc_iter = int(getattr(self, "resume_start_iter", 0))
+        self._s2_compressor_out = self._compress_memory()
+        self._relative_depth_image_loader = self._build_relative_depth_image_dataloader()
+        self._relative_depth_image_iterator = iter(self._relative_depth_image_loader)
+        stage_tag = "S2-G" if self.lmc_flow == "ace_g" else "S2"
+        log_interval = max(1, min(50, int(getattr(self, "iterations_output", 10))))
+        updates = 0
+        skipped = 0
+        last_stats = None
+
+        _logger.info(
+            "[RelDepth-Only] steps=%d lr=%.2e train_fusion=%s start_ratio=%.3f weight=%.4f stage=%s",
+            steps,
+            lr,
+            train_fusion,
+            float(getattr(self.options, "relative_depth_start_ratio", 0.0) or 0.0),
+            float(getattr(self.options, "relative_depth_loss_weight", 0.0) or 0.0),
+            stage_tag,
+        )
+        self._log_optimizer_groups("RelDepth-Only", optimizer)
+
+        try:
+            for step in range(steps):
+                self.local_s2_step = step
+                try:
+                    image_batch = next(self._relative_depth_image_iterator)
+                except StopIteration:
+                    self._relative_depth_image_iterator = iter(self._relative_depth_image_loader)
+                    image_batch = next(self._relative_depth_image_iterator)
+
+                loss, stats = self._compute_image_relative_depth_loss(
+                    stage_tag=stage_tag,
+                    image_batch=image_batch,
+                )
+                last_stats = stats
+                if not bool(torch.isfinite(loss).all().item()) or not bool(getattr(loss, "requires_grad", False)):
+                    optimizer.zero_grad(set_to_none=True)
+                    skipped += 1
+                    continue
+
+                optimizer.zero_grad(set_to_none=True)
+                self.scaler.scale(loss).backward()
+                if self._s2_grad_clip_max_norm > 0:
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        [param for group in optimizer.param_groups for param in group["params"]],
+                        max_norm=self._s2_grad_clip_max_norm,
+                    )
+                self.scaler.step(optimizer)
+                self.scaler.update()
+                updates += 1
+                self.iteration += 1
+
+                if updates == 1 or updates % log_interval == 0 or step + 1 == steps:
+                    _logger.info(
+                        "[RelDepth-Only] step=%d/%d updates=%d loss=%.6f%s",
+                        step + 1,
+                        steps,
+                        updates,
+                        float(loss.detach().cpu().item()),
+                        self._format_relative_depth_stats(stats),
+                    )
+        finally:
+            self._s2_compressor_out = None
+
+        candidate_path = self.options.output_map.parent / f"{self.options.output_map.stem}.relative_depth_only.pt"
+        self.save_model(candidate_path)
+        result_meta = {
+            "source_checkpoint": str(self.resume_checkpoint_path),
+            "candidate_checkpoint": str(candidate_path),
+            "steps": steps,
+            "updates": updates,
+            "skipped": skipped,
+            "learning_rate": lr,
+            "train_fusion": train_fusion,
+            "last_stats": last_stats,
+        }
+        try:
+            eval_result = self._evaluate_checkpoint(
+                candidate_path,
+                int(getattr(self, "resume_start_iter", 0)),
+                eval_stage="reldepth_only",
+            )
+            score = self._score_eval(eval_result)
+            result_meta["score"] = score
+            result_meta["eval"] = eval_result
+            if score > self.best_score:
+                import shutil
+
+                shutil.copy2(candidate_path, self.options.output_map)
+                self.best_score = score
+                self.best_iter = int(getattr(self, "resume_start_iter", 0)) + 1
+                self.best_eval = eval_result
+                self._write_best_checkpoint_meta(self.best_iter, score, eval_result)
+                result_meta["promoted_to_best"] = True
+            else:
+                result_meta["promoted_to_best"] = False
+        except Exception as exc:
+            _logger.warning("[RelDepth-Only] candidate evaluation failed: %s", exc, exc_info=True)
+            result_meta["evaluation_error"] = str(exc)
+
+        result_path = self.options.output_map.parent / "relative_depth_only_meta.json"
+        with open(result_path, "w", encoding="utf-8") as handle:
+            json.dump(result_meta, handle, indent=2, ensure_ascii=False)
+        self._free_training_gpu_memory()
+        _logger.info(
+            "[RelDepth-Only] done updates=%d skipped=%d candidate=%s meta=%s",
+            updates,
+            skipped,
+            candidate_path,
+            result_path,
+        )
+
     def train(self):
         """Route to the appropriate training flow."""
         if not self.use_lmc:
             if self.vanilla_iterations <= 1:
                 return super().train()
             return self._train_vanilla_iterations()
+
+        if int(getattr(self.options, "relative_depth_only_steps", 0) or 0) > 0:
+            return self._train_relative_depth_only()
 
         _logger.info("[LMC] Training flow: %s", self.lmc_flow)
         if self.lmc_flow == 'iterative':
@@ -6989,6 +7367,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 return out
             step_fn = self._training_step_ace_g if self.lmc_flow == 'ace_g' else self.training_step
             img_idx_batch = _to_dev(buf['img_idx'][random_batch_indices]) if 'img_idx' in buf else None
+            stage_tag = "S2-G" if self.lmc_flow == 'ace_g' else "S2"
+            relative_depth_image_batch = self._next_relative_depth_image_batch(stage_tag)
             step_fn(
                 _to_dev(buf['features'][random_batch_indices]),
                 _to_dev(buf['target_px'][random_batch_indices]),
@@ -6998,6 +7378,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 _to_dev(buf['gt_scene_coords_world'][random_batch_indices]),
                 _to_dev(buf['gt_scene_coords_valid'][random_batch_indices]),
                 img_idx_batch,
+                relative_depth_image_batch,
             )
             if bool(getattr(self, '_s2_abort_current_iteration', False)):
                 break
@@ -7007,7 +7388,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self.global_s2_step += 1
             self.local_s2_step += 1
 
-    def training_step(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None, img_idx_b1=None):
+    def training_step(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None, img_idx_b1=None, relative_depth_image_batch=None):
         """When LMC S2: use step_eff for ReproLoss and head-only optimizer/scheduler."""
         if not self.use_lmc or self.optimizer_head is None:
             return super().training_step(features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33)
@@ -7093,12 +7474,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             gt_scene_coords_world_b3,
             gt_scene_coords_valid_b1,
         )
-        relative_depth_loss, relative_depth_stats = self._compute_relative_depth_loss(
+        relative_depth_loss, relative_depth_stats = self._compute_image_relative_depth_loss(
             stage_tag="S2",
-            pred_scene_coords_N31=pred_scene_coords_b31,
-            target_px_N2=target_px_b2,
-            gt_inv_poses_N34=gt_inv_poses_b34,
-            img_idx_N=img_idx_b1,
+            image_batch=relative_depth_image_batch,
         )
         loss = loss + relative_depth_loss
         consistency_loss, consistency_stats = self._compute_ace_lmc_stage2_consistency_loss(
@@ -7207,7 +7585,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             )
         return loss
 
-    def _training_step_ace_g(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None, img_idx_b1=None):
+    def _training_step_ace_g(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None, img_idx_b1=None, relative_depth_image_batch=None):
         """ACE-G S2 training step: apply fusion on-the-fly then head.
 
         Key difference from training_step(): raw backbone features are fused
@@ -7317,12 +7695,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             gt_scene_coords_world_b3,
             gt_scene_coords_valid_b1,
         )
-        relative_depth_loss, relative_depth_stats = self._compute_relative_depth_loss(
+        relative_depth_loss, relative_depth_stats = self._compute_image_relative_depth_loss(
             stage_tag="S2-G",
-            pred_scene_coords_N31=pred_scene_coords_b31,
-            target_px_N2=target_px_b2,
-            gt_inv_poses_N34=gt_inv_poses_b34,
-            img_idx_N=img_idx_b1,
+            image_batch=relative_depth_image_batch,
         )
         loss = loss + relative_depth_loss
         consistency_loss, consistency_stats = self._compute_ace_lmc_stage2_consistency_loss(

@@ -29,6 +29,10 @@ This file is a guide to the planning corpus. It is **not** the source-of-truth e
   Absolute path: `/home/xwh/project/ace_depth/ace_dinov2_lmc/ace_g_global_refactor/PLAN_CN.md`
 - [EXPERIMENT_REFERENCE.md](./EXPERIMENT_REFERENCE.md)
   Absolute path: `/home/xwh/project/ace_depth/ace_dinov2_lmc/ace_g_global_refactor/EXPERIMENT_REFERENCE.md`
+- [PROGRESSIVE_MEMORY_REREADING_FUSION_PLAN_ZH.md](./PROGRESSIVE_MEMORY_REREADING_FUSION_PLAN_ZH.md) <!-- updated 2026-06-13: revised fusion-effectiveness direction -->
+  Absolute path: `/home/xwh/project/ace_depth/ace_dinov2_lmc/ace_g_global_refactor/PROGRESSIVE_MEMORY_REREADING_FUSION_PLAN_ZH.md`
+- [SFM_TRACK_GUIDED_MULTI_VIEW_SUPERVISION_ZH.md](./SFM_TRACK_GUIDED_MULTI_VIEW_SUPERVISION_ZH.md)
+  Absolute path: `/home/xwh/project/ace_depth/ace_dinov2_lmc/ace_g_global_refactor/SFM_TRACK_GUIDED_MULTI_VIEW_SUPERVISION_ZH.md`
 - [LONG_TERM_RESEARCH_PLAN.md](./LONG_TERM_RESEARCH_PLAN.md)
   Absolute path: `/home/xwh/project/ace_depth/ace_dinov2_lmc/ace_g_global_refactor/LONG_TERM_RESEARCH_PLAN.md`
 - [COMPARE_CPE_B1_scene2a_20260518.md](./COMPARE_CPE_B1_scene2a_20260518.md)
@@ -65,12 +69,16 @@ Open:
 
 1. `ace_g_global_refactor/PLAN.md`
 2. `ace_g_global_refactor/EXPERIMENT_REFERENCE.md`
-3. `ace_g_global_refactor/steps/15_pointrope_and_multilevel_fusion_roadmap.md`
+3. `ace_g_global_refactor/PROGRESSIVE_MEMORY_REREADING_FUSION_PLAN_ZH.md`
+4. `ace_g_global_refactor/SFM_TRACK_GUIDED_MULTI_VIEW_SUPERVISION_ZH.md`
+5. `ace_g_global_refactor/steps/15_pointrope_and_multilevel_fusion_roadmap.md`
 
 This gives you:
 
 - the high-level problem map,
 - the accepted baseline and rejected directions,
+- the current PMRF structural direction,
+- the standalone STGS supervision contract,
 - the current near-term roadmap.
 
 ### B. You want to launch or judge a new experiment
@@ -149,6 +157,47 @@ Use it when:
 - you need current reference metrics like FGPI-4090.
 
 This should be the first stop before any new experiment proposal.
+
+### `ace_g_global_refactor/thinking.md` <!-- updated 2026-06-12: PMRF/G-PMRF handoff evaluation -->
+
+Role:
+
+- the handoff evaluation for PMRF / G-PMRF,
+- the source for why PMRF-v1 is not yet an established contribution,
+- the source for mandatory Single / PMRF-v1 / parameter-matched FFN controls and diagnostics before any G-PMRF implementation.
+
+Use it when:
+
+- judging whether PMRF/G-PMRF should continue,
+- handing off the PMRF/G-PMRF design to another conversation,
+- avoiding premature gates, guards, STGS, adaptive sigma/lambda, or coordinate-anchor residuals before the basic controls pass.
+
+### `ace_g_global_refactor/PROGRESSIVE_MEMORY_REREADING_FUSION_PLAN_ZH.md`
+
+Role:
+
+- the older Chinese structural-method plan for Progressive Memory Re-reading Fusion (PMRF),
+- useful background for the PMRF idea but no longer the decision authority,
+- superseded for current handoff purposes by `thinking.md`.
+
+Use it when:
+
+- reading the original PMRF design context in Chinese,
+- comparing the older PMRF plan against the current evaluation in `thinking.md`.
+
+### `ace_g_global_refactor/SFM_TRACK_GUIDED_MULTI_VIEW_SUPERVISION_ZH.md`
+
+Role:
+
+- the standalone supervision-side STGS contract,
+- the source for Xu/SeqACE comparison, sparse XYZ loss, cross-view reprojection loss, and track package schema,
+- the current plan for train-only SfM-track supervision without test-time sequence input.
+
+Use it when:
+
+- exporting train-only SfM tracks,
+- adding XYZ or cross-view supervision,
+- planning PMRF x STGS complementarity experiments.
 
 ### `ace_g_global_refactor/LONG_TERM_RESEARCH_PLAN.md`
 

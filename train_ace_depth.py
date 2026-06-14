@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 # Copyright © Niantic, Inc. 2022.
-import sys
-import os
+
 import argparse
+import logging
+import os
+from distutils.util import strtobool
+from pathlib import Path
+
 pre_parser = argparse.ArgumentParser(add_help=False)
-pre_parser.add_argument('--device', type=str, default='cuda:3', help='device')
+pre_parser.add_argument('--device', type=str, default='cuda:0', help='device')
 pre_args, _ = pre_parser.parse_known_args()
 if 'cuda' in pre_args.device and ':' in pre_args.device:
     gpu_id = pre_args.device.split(':')[-1]
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+    os.environ['CUDA_VISIBLE_DEVICES'] = gpu_id
     print(f"Info: Set CUDA_VISIBLE_DEVICES = {gpu_id} (Physical GPU)")
-else:
-    pass
-import argparse
-import logging
-from distutils.util import strtobool
-from pathlib import Path
 
 from ace_trainer_depth import TrainerACE
 
@@ -35,6 +33,9 @@ if __name__ == '__main__':
 
     parser.add_argument('scene', type=Path,
                         help='path to a scene in the dataset folder, e.g. "datasets/Cambridge_GreatCourt"')
+
+    parser.add_argument('output_map_file', type=Path,
+                        help='target file for the trained network')
     
     parser.add_argument('output_map_depth', type=Path,
                         help='target file for the trained network')
@@ -42,14 +43,10 @@ if __name__ == '__main__':
     parser.add_argument('--encoder_path', type=Path, default=Path(__file__).parent / "ace_encoder_pretrained.pt",
                         help='file containing pre-trained encoder weights')
 
-    parser.add_argument('--device', type=str, default='cuda:3',
-                        help='device')
+    parser.add_argument('--device', type=str, default='cuda:0', help='GPU device to use, e.g. cuda:0')
 
-    parser.add_argument('--num_head_blocks', type=int, default=8,
+    parser.add_argument('--num_head_blocks', type=int, default=4,
                         help='depth of the regression head, defines the map size')
-
-    parser.add_argument('--sp_ratio', type=int, default=0.7,
-                        help='Proportion of SP sampling points')
 
     parser.add_argument('--learning_rate_min', type=float, default=0.0005,
                         help='lowest learning rate of 1 cycle scheduler')
@@ -57,10 +54,10 @@ if __name__ == '__main__':
     parser.add_argument('--learning_rate_max', type=float, default=0.005,
                         help='highest learning rate of 1 cycle scheduler')
 
-    parser.add_argument('--training_buffer_size', type=int, default=160000,
+    parser.add_argument('--training_buffer_size', type=int, default=8000000,
                         help='number of patches in the training buffer')
     
-    parser.add_argument('--onebuffer', type=int, default=160000,
+    parser.add_argument('--onebuffer', type=int, default=8000000,
                         help='number of patches in the one training buffer')
 
     parser.add_argument('--samples_per_image', type=int, default=1024,
@@ -69,7 +66,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=5120,
                         help='number of patches for each parameter update (has to be a multiple of 512)')
 
-    parser.add_argument('--epochs', type=int, default=28,
+    parser.add_argument('--epochs', type=int, default=16,
                         help='number of runs through the training buffer')
 
     parser.add_argument('--repro_loss_hard_clamp', type=int, default=1000,
@@ -142,7 +139,7 @@ if __name__ == '__main__':
                         help='zoom out of the scene by moving render camera backwards, in meters')
     
     # Params for the superpoint. 
-    parser.add_argument('--weights_path', type=str, default='superpoint_v1.pth',
+    parser.add_argument('--weights_path', type=str, default='/data/xwh/SuperPointPretrainedNetwork/superpoint_v1.pth',
       help='Path to pretrained weights file (default: superpoint_v1.pth).')
     
     parser.add_argument('--nms_dist', type=int, default=4,
