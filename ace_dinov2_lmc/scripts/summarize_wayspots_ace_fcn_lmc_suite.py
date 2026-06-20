@@ -69,6 +69,16 @@ def _find_latest_post_train_eval_any(roots: list[Path]) -> Path | None:
     return max(matches, key=lambda p: (p.stat().st_mtime, str(p)))
 
 
+
+def _safe_float(value: str | None) -> float:
+    if value is None:
+        return float("nan")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def _seed_pose_logs_for_post_train_eval(path: Path) -> list[Path]:
     if not re.match(r"post_train_eval(?:_.*)?\.txt$", path.name):
         return []
@@ -227,6 +237,138 @@ def _summarize_pose_error_log(path: Path) -> dict[str, float | int | str]:
     return out
 
 
+
+def _parse_eval_summary(path: Path) -> dict[str, float | int | str]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    kv: dict[str, str] = {}
+    for line in text.splitlines():
+        if "\t" not in line:
+            continue
+        key, value = line.split("\t", 1)
+        kv[key.strip()] = value.strip()
+    if "median_rotation_deg" not in kv:
+        raise ValueError(f"Could not parse eval summary from {path}")
+    return {
+        "status": "ok",
+        "frames": int(kv.get("total_frames", 0) or 0),
+        "median_deg": _safe_float(kv.get("median_rotation_deg")),
+        "median_cm": _safe_float(kv.get("median_translation_cm")),
+        "50cm_5deg": float("nan"),
+        "25cm_5deg": _safe_float(kv.get("accuracy_25cm5deg_pct")),
+        "10cm_5deg": _safe_float(kv.get("accuracy_10cm5deg_pct")),
+        "5cm_5deg": _safe_float(kv.get("accuracy_5cm5deg_pct")),
+        "2cm_2deg": _safe_float(kv.get("accuracy_2cm2deg_pct")),
+        "1cm_1deg": _safe_float(kv.get("accuracy_1cm1deg_pct")),
+    }
+
+
+def _parse_post_train_seed_runs(path: Path) -> list[dict[str, float | int | str]]:
+    rows = _read_tsv_rows(path)
+    out: list[dict[str, float | int | str]] = []
+    for row in rows:
+        if not row or row.get("seed", "").startswith("#"):
+            continue
+        out.append(
+            {
+                "status": "ok",
+                "frames": int(row.get("total_frames", 0) or 0),
+                "median_deg": _safe_float(row.get("median_rErr")),
+                "median_cm": _safe_float(row.get("median_tErr")),
+                "50cm_5deg": float("nan"),
+                "25cm_5deg": _safe_float(row.get("pct25_5")),
+                "10cm_5deg": _safe_float(row.get("pct10_5")),
+                "5cm_5deg": _safe_float(row.get("pct5")),
+                "2cm_2deg": _safe_float(row.get("pct2")),
+                "1cm_1deg": _safe_float(row.get("pct1")),
+                "source_suffix": f"seed={row.get('seed', '')}",
+            }
+        )
+    return out
+
+
+def _candidate_label(path: Path, metrics: dict[str, float | int | str]) -> str:
+    suffix = metrics.get("source_suffix")
+    return f"{path}{('#' + str(suffix)) if suffix else ''}"
+
+
+def _metric_candidates(roots: list[Path]) -> list[tuple[Path, dict[str, float | int | str]]]:
+    candidates: list[tuple[Path, dict[str, float | int | str]]] = []
+    seen: set[str] = set()
+
+    def add(path: Path, metrics: dict[str, float | int | str]) -> None:
+        key = _candidate_label(path, metrics)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append((path, metrics))
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.glob("**/poses_*.txt")):
+            metrics = _summarize_pose_error_log(path)
+            if metrics.get("status") == "ok":
+                add(path, metrics)
+        for path in sorted(root.glob("**/eval_summary_*.txt")):
+            try:
+                add(path, _parse_eval_summary(path))
+            except ValueError:
+                continue
+        for path in sorted(root.glob("**/post_train_eval*.txt")):
+            if path.name == "post_train_eval_seed_runs.txt":
+                for metrics in _parse_post_train_seed_runs(path):
+                    add(path, metrics)
+                continue
+            try:
+                add(path, _parse_post_train_eval(path))
+            except ValueError:
+                continue
+    return candidates
+
+
+def _metricwise_best(roots: list[Path]) -> tuple[dict[str, float | int | str], dict[str, str], Path | None]:
+    candidates = _metric_candidates(roots)
+    if not candidates:
+        return _missing_metrics("missing"), {}, None
+
+    metrics = _missing_metrics("ok")
+    metrics["frames"] = max(int(item.get("frames", 0) or 0) for _, item in candidates)
+    sources: dict[str, str] = {}
+
+    def valid(value: object) -> bool:
+        return isinstance(value, (int, float)) and not math.isnan(float(value))
+
+    for key, _ in THRESHOLDS:
+        best_value = float("nan")
+        best_source = ""
+        for path, item in candidates:
+            value = item.get(key)
+            if not valid(value):
+                continue
+            if math.isnan(best_value) or float(value) > best_value:
+                best_value = float(value)
+                best_source = _candidate_label(path, item)
+        metrics[key] = best_value
+        sources[key] = best_source
+
+    for key in ("median_deg", "median_cm"):
+        best_value = float("nan")
+        best_source = ""
+        for path, item in candidates:
+            value = item.get(key)
+            if not valid(value):
+                continue
+            if math.isnan(best_value) or float(value) < best_value:
+                best_value = float(value)
+                best_source = _candidate_label(path, item)
+        metrics[key] = best_value
+        sources[key] = best_source
+
+    primary_source = sources.get("5cm_5deg") or sources.get("10cm_5deg") or sources.get("median_cm") or ""
+    primary_path = Path(primary_source.split("#", 1)[0]) if primary_source else None
+    return metrics, sources, primary_path
+
+
 def _read_memory_sanity(path: Path) -> dict[str, str]:
     if not path.exists():
         return {
@@ -260,6 +402,7 @@ def _row(
     memory_pooled_points: str = "",
     memory_cosine_margin: str = "",
     memory_nn3d_ratio: str = "",
+    metric_sources: dict[str, str] | None = None,
 ) -> dict[str, str]:
     return {
         "scene": scene,
@@ -283,6 +426,14 @@ def _row(
         "memory_cosine_margin": memory_cosine_margin,
         "memory_nn3d_ratio": memory_nn3d_ratio,
         "output": str(source_path) if source_path is not None else "",
+        "source_50cm_5deg": (metric_sources or {}).get("50cm_5deg", ""),
+        "source_25cm_5deg": (metric_sources or {}).get("25cm_5deg", ""),
+        "source_10cm_5deg": (metric_sources or {}).get("10cm_5deg", ""),
+        "source_5cm_5deg": (metric_sources or {}).get("5cm_5deg", ""),
+        "source_2cm_2deg": (metric_sources or {}).get("2cm_2deg", ""),
+        "source_1cm_1deg": (metric_sources or {}).get("1cm_1deg", ""),
+        "source_median_deg": (metric_sources or {}).get("median_deg", ""),
+        "source_median_cm": (metric_sources or {}).get("median_cm", ""),
     }
 
 
@@ -327,28 +478,30 @@ def summarize(
         memory_path = suite_root / memory_dirname / scene / "memory_ace_fcn_sparse_sp_r4.pt"
         sanity = _read_memory_sanity(memory_path.with_suffix(memory_path.suffix + ".sanity.json"))
 
-        stage1_eval = _find_latest_post_train_eval_any(_stage_roots(suite_root, stage1_dirname, scene))
+        stage1_metrics, stage1_sources, stage1_eval = _metricwise_best(_stage_roots(suite_root, stage1_dirname, scene))
         rows.append(
             _row(
                 scene=scene,
                 method="ace_fcn_stage1",
                 source_path=stage1_eval,
-                metrics=_parse_post_train_eval(stage1_eval) if stage1_eval else _missing_metrics("missing"),
+                metrics=stage1_metrics,
                 memory_feature_space="ace_fcn",
                 global_head="none",
+                metric_sources=stage1_sources,
                 **sanity,
             )
         )
 
-        stage2_eval = _find_latest_post_train_eval_any(_stage_roots(suite_root, stage2_dirname, scene))
+        stage2_metrics, stage2_sources, stage2_eval = _metricwise_best(_stage_roots(suite_root, stage2_dirname, scene))
         rows.append(
             _row(
                 scene=scene,
                 method="ace_fcn_stage2_glace_concat",
                 source_path=stage2_eval,
-                metrics=_parse_post_train_eval(stage2_eval) if stage2_eval else _missing_metrics("missing"),
+                metrics=stage2_metrics,
                 memory_feature_space="ace_fcn",
                 global_head="glace_concat",
+                metric_sources=stage2_sources,
                 **sanity,
             )
         )
@@ -379,6 +532,14 @@ def write_outputs(rows: list[dict[str, str]], suite_root: Path) -> None:
         "memory_cosine_margin",
         "memory_nn3d_ratio",
         "output",
+        "source_50cm_5deg",
+        "source_25cm_5deg",
+        "source_10cm_5deg",
+        "source_5cm_5deg",
+        "source_2cm_2deg",
+        "source_1cm_1deg",
+        "source_median_deg",
+        "source_median_cm",
     ]
     with (suite_root / "summary.tsv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields, delimiter="	")

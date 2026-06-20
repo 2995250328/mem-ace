@@ -59,8 +59,6 @@ LMC_FUSION_REREAD_GATE_INIT="${LMC_FUSION_REREAD_GATE_INIT:-0.0}"
 LMC_FUSION_REREAD_POST_NORM="${LMC_FUSION_REREAD_POST_NORM:-True}"
 LMC_FUSION_REREAD_TRUST_REGION_RATIO="${LMC_FUSION_REREAD_TRUST_REGION_RATIO:-0.0}"
 LMC_FUSION_REREAD_TEMPERATURE="${LMC_FUSION_REREAD_TEMPERATURE:-1.0}"
-LMC_FUSION_REREAD_COMMON_SCALE="${LMC_FUSION_REREAD_COMMON_SCALE:-1.0}"
-LMC_FUSION_REREAD_EFFECTIVE_RATIO_CAP="${LMC_FUSION_REREAD_EFFECTIVE_RATIO_CAP:-0.0}"
 LMC_FUSION_REREAD_GEO_LAMBDA="${LMC_FUSION_REREAD_GEO_LAMBDA:-1.0}"
 LMC_FUSION_REREAD_GEO_SIGMA="${LMC_FUSION_REREAD_GEO_SIGMA:-1.0}"
 LMC_FUSION_REREAD_GEO_SIGMA_MODE="${LMC_FUSION_REREAD_GEO_SIGMA_MODE:-fixed}"
@@ -78,9 +76,7 @@ EVAL_DSACSTAR_SEED="${EVAL_DSACSTAR_SEED:-1305}"
 EVAL_DSACSTAR_SEED_PER_FRAME="${EVAL_DSACSTAR_SEED_PER_FRAME:-True}"
 ITERATION_EVAL_SEED="${ITERATION_EVAL_SEED:-1305}"
 OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
-OMP_DYNAMIC="${OMP_DYNAMIC:-FALSE}"
 export OMP_NUM_THREADS
-export OMP_DYNAMIC
 IMAGE_RESOLUTION="${IMAGE_RESOLUTION:-512}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 TRAINING_BUFFER_SIZE="${TRAINING_BUFFER_SIZE:-2800000}"
@@ -252,8 +248,6 @@ run_stage1() {
       --lmc_fusion_reread_post_norm "${LMC_FUSION_REREAD_POST_NORM}" \
       --lmc_fusion_reread_trust_region_ratio "${LMC_FUSION_REREAD_TRUST_REGION_RATIO}" \
       --lmc_fusion_reread_temperature "${LMC_FUSION_REREAD_TEMPERATURE}" \
-      --lmc_fusion_reread_common_scale "${LMC_FUSION_REREAD_COMMON_SCALE}" \
-      --lmc_fusion_reread_effective_ratio_cap "${LMC_FUSION_REREAD_EFFECTIVE_RATIO_CAP}" \
       --lmc_fusion_reread_geo_lambda "${LMC_FUSION_REREAD_GEO_LAMBDA}" \
       --lmc_fusion_reread_geo_sigma "${LMC_FUSION_REREAD_GEO_SIGMA}" \
       --lmc_fusion_reread_geo_sigma_mode "${LMC_FUSION_REREAD_GEO_SIGMA_MODE}" \
@@ -349,8 +343,6 @@ run_stage2() {
       --lmc_fusion_reread_post_norm "${LMC_FUSION_REREAD_POST_NORM}" \
       --lmc_fusion_reread_trust_region_ratio "${LMC_FUSION_REREAD_TRUST_REGION_RATIO}" \
       --lmc_fusion_reread_temperature "${LMC_FUSION_REREAD_TEMPERATURE}" \
-      --lmc_fusion_reread_common_scale "${LMC_FUSION_REREAD_COMMON_SCALE}" \
-      --lmc_fusion_reread_effective_ratio_cap "${LMC_FUSION_REREAD_EFFECTIVE_RATIO_CAP}" \
       --lmc_fusion_reread_geo_lambda "${LMC_FUSION_REREAD_GEO_LAMBDA}" \
       --lmc_fusion_reread_geo_sigma "${LMC_FUSION_REREAD_GEO_SIGMA}" \
       --lmc_fusion_reread_geo_sigma_mode "${LMC_FUSION_REREAD_GEO_SIGMA_MODE}" \

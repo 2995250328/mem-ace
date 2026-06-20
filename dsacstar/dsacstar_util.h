@@ -156,8 +156,13 @@ namespace dsacstar
 		// sample hypotheses
 		#pragma omp parallel for
 		for(unsigned h = 0; h < hypotheses.size(); h++)
-		for(unsigned t = 0; t < maxTries; t++)
 		{
+			const bool deterministic = ThreadRand::useDeterministicStreams();
+			std::mt19937 hypothesisGenerator(ThreadRand::getSeed() + h);
+			std::uniform_int_distribution<int> sampleX(0, imW - 1);
+			std::uniform_int_distribution<int> sampleY(0, imH - 1);
+			for(unsigned t = 0; t < maxTries; t++)
+			{
 			int batchIdx = 0; // only batch size=1 supported atm
 
 			std::vector<cv::Point2f> projections;
@@ -168,8 +173,8 @@ namespace dsacstar
 			for(int j = 0; j < 4; j++)
 			{
 				// 2D location in the subsampled image
-				int x = irand(0, imW);
-				int y = irand(0, imH);
+				int x = deterministic ? sampleX(hypothesisGenerator) : irand(0, imW);
+				int y = deterministic ? sampleY(hypothesisGenerator) : irand(0, imH);
 
 				// 2D location in the original RGB image
 				imgPts[h].push_back(sampling(y, x)); 
@@ -216,8 +221,9 @@ namespace dsacstar
 			if(foundOutlier)
 				continue;
 			else
-				break;			
-		}		
+				break;
+			}
+		}
 	}
 
 //	/**

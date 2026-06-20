@@ -158,19 +158,19 @@ Use it when:
 
 This should be the first stop before any new experiment proposal.
 
-### `ace_g_global_refactor/thinking.md` <!-- updated 2026-06-12: PMRF/G-PMRF handoff evaluation -->
+### `ace_g_global_refactor/thinking.md` <!-- updated 2026-06-16: weak-residual FFN control and G-PMRF-lite handoff -->
 
 Role:
 
-- the handoff evaluation for PMRF / G-PMRF,
-- the source for why PMRF-v1 is not yet an established contribution,
-- the source for mandatory Single / PMRF-v1 / parameter-matched FFN controls and diagnostics before any G-PMRF implementation.
+- the handoff evaluation for PMRF / G-PMRF-lite,
+- the source for why alpha/gate sweeps should stop and `post_norm=True` is excluded,
+- the source for mandatory Weak-Residual PMRF vs weak-residual parameter-matched FFN control and A1/A2 geometry-shift diagnostics.
 
 Use it when:
 
-- judging whether PMRF/G-PMRF should continue,
-- handing off the PMRF/G-PMRF design to another conversation,
-- avoiding premature gates, guards, STGS, adaptive sigma/lambda, or coordinate-anchor residuals before the basic controls pass.
+- judging whether PMRF/G-PMRF-lite should continue,
+- handing off the PMRF design to another conversation,
+- avoiding premature teacher guards, routing losses, hard top-k, STGS coupling, or full `Head(H1)` geometry before the FFN control and geometry diagnostics pass.
 
 ### `ace_g_global_refactor/PROGRESSIVE_MEMORY_REREADING_FUSION_PLAN_ZH.md`
 
@@ -185,19 +185,19 @@ Use it when:
 - reading the original PMRF design context in Chinese,
 - comparing the older PMRF plan against the current evaluation in `thinking.md`.
 
-### `ace_g_global_refactor/SFM_TRACK_GUIDED_MULTI_VIEW_SUPERVISION_ZH.md`
+### `ace_g_global_refactor/SFM_TRACK_GUIDED_MULTI_VIEW_SUPERVISION_ZH.md` <!-- updated 2026-06-16: patch-support aligned SeqACE-style COLMAP keyframe-channel inter-frame ACE loss -->
 
 Role:
 
-- the standalone supervision-side STGS contract,
-- the source for Xu/SeqACE comparison, sparse XYZ loss, cross-view reprojection loss, and track package schema,
-- the current plan for train-only SfM-track supervision without test-time sequence input.
+- the supervision-side design for COLMAP-keyframe inter-frame ACE loss,
+- the source for adapting SeqACE's keyframe channel using COLMAP global tracks,
+- the current plan for reusing existing sparse-depth-guided sampling while adding train-only, patch-support-aligned keyframe-channel metadata.
 
 Use it when:
 
-- exporting train-only SfM tracks,
-- adding XYZ or cross-view supervision,
-- planning PMRF x STGS complementarity experiments.
+- adding `target_px2 / pose2 / K2 / track_flag / alignment_weight` style buffer metadata,
+- implementing inter-frame ACE reprojection loss without test-time sequence input,
+- auditing COLMAP point3D tracks as keyframe-channel providers rather than as simple sparse XYZ supervision.
 
 ### `ace_g_global_refactor/LONG_TERM_RESEARCH_PLAN.md`
 

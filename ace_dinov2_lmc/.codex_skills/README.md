@@ -18,3 +18,5 @@ Project-local deep learning / vision skills:
 - `ace-training-command-composer`
 - `ace-result-aggregation`
 - `ace-scene-runbook`
+- `lmc-experiment-standard-workflow`
+- `ace-lmc-environment-fastpath`

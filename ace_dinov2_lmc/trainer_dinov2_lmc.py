@@ -3092,7 +3092,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             raise ValueError(f"Unsupported lmc_fusion_geometry_mode={lmc_fusion_geometry_mode!r}")
         lmc_fusion_key_geo_init = float(getattr(options, 'lmc_fusion_key_geo_init', 0.0))
         lmc_fusion_refinement_mode = str(getattr(options, 'lmc_fusion_refinement_mode', 'single'))
-        if lmc_fusion_refinement_mode not in ('single', 'cascade_internal', 'progressive_reread', 'adapter_ffn'):
+        if lmc_fusion_refinement_mode not in ('single', 'cascade_internal', 'progressive_reread', 'centered_reread', 'geometry_reread_lite', 'adapter_ffn', 'weak_residual_ffn'):
             raise ValueError(f"Unsupported lmc_fusion_refinement_mode={lmc_fusion_refinement_mode!r}")
         lmc_fusion_cascade_layers = int(getattr(options, 'lmc_fusion_cascade_layers', 4))
         if lmc_fusion_cascade_layers < 1:
@@ -3101,6 +3101,58 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if lmc_fusion_assembly_mode not in ('concat_mlp',):
             raise ValueError(f"Unsupported lmc_fusion_assembly_mode={lmc_fusion_assembly_mode!r}")
         lmc_fusion_assembly_gamma_init = float(getattr(options, 'lmc_fusion_assembly_gamma_init', 0.0))
+        lmc_fusion_reread_delta_alpha = float(getattr(options, 'lmc_fusion_reread_delta_alpha', 1.0))
+        if lmc_fusion_reread_delta_alpha < 0.0:
+            raise ValueError(
+                f"lmc_fusion_reread_delta_alpha must be >= 0, got {lmc_fusion_reread_delta_alpha}"
+            )
+        lmc_fusion_reread_scalar_gate = bool(getattr(options, 'lmc_fusion_reread_scalar_gate', False))
+        lmc_fusion_reread_gate_init = float(getattr(options, 'lmc_fusion_reread_gate_init', 0.0))
+        lmc_fusion_reread_post_norm = bool(getattr(options, 'lmc_fusion_reread_post_norm', True))
+        lmc_fusion_reread_trust_region_ratio = float(getattr(options, 'lmc_fusion_reread_trust_region_ratio', 0.0))
+        lmc_fusion_reread_temperature = float(getattr(options, 'lmc_fusion_reread_temperature', 1.0))
+        lmc_fusion_reread_common_scale = float(getattr(options, 'lmc_fusion_reread_common_scale', 1.0))
+        lmc_fusion_reread_effective_ratio_cap = float(
+            getattr(options, 'lmc_fusion_reread_effective_ratio_cap', 0.0)
+        )
+        lmc_fusion_reread_geo_lambda = float(getattr(options, 'lmc_fusion_reread_geo_lambda', 1.0))
+        lmc_fusion_reread_geo_sigma = float(getattr(options, 'lmc_fusion_reread_geo_sigma', 1.0))
+        lmc_fusion_reread_geo_sigma_mode = str(getattr(options, 'lmc_fusion_reread_geo_sigma_mode', 'fixed'))
+        lmc_fusion_reread_geo_sigma_beta = float(getattr(options, 'lmc_fusion_reread_geo_sigma_beta', 1.0))
+        lmc_fusion_reread_geo_sigma_min = float(getattr(options, 'lmc_fusion_reread_geo_sigma_min', 0.5))
+        if lmc_fusion_reread_trust_region_ratio < 0.0:
+            raise ValueError(
+                f"lmc_fusion_reread_trust_region_ratio must be >= 0, got {lmc_fusion_reread_trust_region_ratio}"
+            )
+        if lmc_fusion_reread_temperature <= 0.0:
+            raise ValueError(
+                f"lmc_fusion_reread_temperature must be > 0, got {lmc_fusion_reread_temperature}"
+            )
+        if lmc_fusion_reread_common_scale < 0.0:
+            raise ValueError(
+                f"lmc_fusion_reread_common_scale must be >= 0, got {lmc_fusion_reread_common_scale}"
+            )
+        if lmc_fusion_reread_effective_ratio_cap < 0.0:
+            raise ValueError(
+                "lmc_fusion_reread_effective_ratio_cap must be >= 0, got "
+                f"{lmc_fusion_reread_effective_ratio_cap}"
+            )
+        if lmc_fusion_reread_geo_lambda < 0.0:
+            raise ValueError(f"lmc_fusion_reread_geo_lambda must be >= 0, got {lmc_fusion_reread_geo_lambda}")
+        if lmc_fusion_reread_geo_sigma <= 0.0:
+            raise ValueError(f"lmc_fusion_reread_geo_sigma must be > 0, got {lmc_fusion_reread_geo_sigma}")
+        if lmc_fusion_reread_geo_sigma_mode not in ('fixed', 'adaptive_spread'):
+            raise ValueError(
+                f"lmc_fusion_reread_geo_sigma_mode must be fixed or adaptive_spread, got {lmc_fusion_reread_geo_sigma_mode}"
+            )
+        if lmc_fusion_reread_geo_sigma_beta <= 0.0:
+            raise ValueError(
+                f"lmc_fusion_reread_geo_sigma_beta must be > 0, got {lmc_fusion_reread_geo_sigma_beta}"
+            )
+        if lmc_fusion_reread_geo_sigma_min <= 0.0:
+            raise ValueError(
+                f"lmc_fusion_reread_geo_sigma_min must be > 0, got {lmc_fusion_reread_geo_sigma_min}"
+            )
         if lmc_fusion_refinement_mode != 'single' and lmc_mode == 'hierarchical':
             raise ValueError('Fusion refinement is only supported for non-hierarchical LMC modes.')
         needs_scene_scale = (
@@ -3119,11 +3171,24 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             lmc_fusion_key_geo_init,
         )
         _logger.info(
-            "[LMC-Fusion] refinement_mode=%s cascade_layers=%d assembly_mode=%s gamma_init=%.6f",
+            "[LMC-Fusion] refinement_mode=%s cascade_layers=%d assembly_mode=%s gamma_init=%.6f reread_alpha=%.6f scalar_gate=%s gate_init=%.6f post_norm=%s trust_ratio=%.6f temperature=%.6f common_scale=%.6f effective_ratio_cap=%.6f geo_lambda=%.6f geo_sigma=%.6f geo_sigma_mode=%s geo_sigma_beta=%.6f geo_sigma_min=%.6f",
             lmc_fusion_refinement_mode,
             lmc_fusion_cascade_layers,
             lmc_fusion_assembly_mode,
             lmc_fusion_assembly_gamma_init,
+            lmc_fusion_reread_delta_alpha,
+            lmc_fusion_reread_scalar_gate,
+            lmc_fusion_reread_gate_init,
+            lmc_fusion_reread_post_norm,
+            lmc_fusion_reread_trust_region_ratio,
+            lmc_fusion_reread_temperature,
+            lmc_fusion_reread_common_scale,
+            lmc_fusion_reread_effective_ratio_cap,
+            lmc_fusion_reread_geo_lambda,
+            lmc_fusion_reread_geo_sigma,
+            lmc_fusion_reread_geo_sigma_mode,
+            lmc_fusion_reread_geo_sigma_beta,
+            lmc_fusion_reread_geo_sigma_min,
         )
 
         self.lmc_config = {
@@ -3205,6 +3270,21 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'lmc_fusion_assembly_mode': lmc_fusion_assembly_mode,
             'lmc_fusion_assembly_gamma_init': lmc_fusion_assembly_gamma_init,
             'final_lmc_fusion_assembly_gamma': None,
+            'lmc_fusion_reread_delta_alpha': lmc_fusion_reread_delta_alpha,
+            'lmc_fusion_reread_scalar_gate': lmc_fusion_reread_scalar_gate,
+            'lmc_fusion_reread_gate_init': lmc_fusion_reread_gate_init,
+            'lmc_fusion_reread_post_norm': lmc_fusion_reread_post_norm,
+            'lmc_fusion_reread_trust_region_ratio': lmc_fusion_reread_trust_region_ratio,
+            'lmc_fusion_reread_temperature': lmc_fusion_reread_temperature,
+            'lmc_fusion_reread_common_scale': lmc_fusion_reread_common_scale,
+            'lmc_fusion_reread_effective_ratio_cap': lmc_fusion_reread_effective_ratio_cap,
+            'lmc_fusion_reread_geo_lambda': lmc_fusion_reread_geo_lambda,
+            'lmc_fusion_reread_geo_sigma': lmc_fusion_reread_geo_sigma,
+            'lmc_fusion_reread_geo_sigma_mode': lmc_fusion_reread_geo_sigma_mode,
+            'lmc_fusion_reread_geo_sigma_beta': lmc_fusion_reread_geo_sigma_beta,
+            'lmc_fusion_reread_geo_sigma_min': lmc_fusion_reread_geo_sigma_min,
+            'final_lmc_fusion_reread_gate': None,
+            'final_lmc_fusion_reread_gate_logit': None,
             'ace_g_fusion_in_s2': bool(getattr(options, 'ace_g_fusion_in_s2', False)),
             'lmc_fusion_target': effective_lmc_fusion_target,
             'requested_lmc_fusion_target': requested_lmc_fusion_target,
@@ -3380,6 +3460,19 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             fusion_cascade_layers=lmc_fusion_cascade_layers,
             fusion_assembly_mode=lmc_fusion_assembly_mode,
             fusion_assembly_gamma_init=lmc_fusion_assembly_gamma_init,
+            fusion_reread_delta_alpha=lmc_fusion_reread_delta_alpha,
+            fusion_reread_scalar_gate=lmc_fusion_reread_scalar_gate,
+            fusion_reread_gate_init=lmc_fusion_reread_gate_init,
+            fusion_reread_post_norm=lmc_fusion_reread_post_norm,
+            fusion_reread_trust_region_ratio=lmc_fusion_reread_trust_region_ratio,
+            fusion_reread_temperature=lmc_fusion_reread_temperature,
+            fusion_reread_common_scale=lmc_fusion_reread_common_scale,
+            fusion_reread_effective_ratio_cap=lmc_fusion_reread_effective_ratio_cap,
+            fusion_reread_geo_lambda=lmc_fusion_reread_geo_lambda,
+            fusion_reread_geo_sigma=lmc_fusion_reread_geo_sigma,
+            fusion_reread_geo_sigma_mode=lmc_fusion_reread_geo_sigma_mode,
+            fusion_reread_geo_sigma_beta=lmc_fusion_reread_geo_sigma_beta,
+            fusion_reread_geo_sigma_min=lmc_fusion_reread_geo_sigma_min,
         ).to(self.device)
 
         # --- LMC training params ---
@@ -4446,6 +4539,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "lmc_fusion_cascade_layers",
             "lmc_fusion_assembly_mode",
             "lmc_fusion_assembly_gamma_init",
+            "lmc_fusion_reread_delta_alpha",
+            "lmc_fusion_reread_scalar_gate",
+            "lmc_fusion_reread_gate_init",
+            "lmc_fusion_reread_post_norm",
+            "lmc_fusion_reread_trust_region_ratio",
+            "lmc_fusion_reread_temperature",
+            "lmc_fusion_reread_common_scale", "lmc_fusion_reread_effective_ratio_cap",
+            "lmc_fusion_reread_geo_lambda",
+            "lmc_fusion_reread_geo_sigma",
+            "lmc_fusion_reread_geo_sigma_mode",
+            "lmc_fusion_reread_geo_sigma_beta",
+            "lmc_fusion_reread_geo_sigma_min",
             "local_residual_mode",
             "local_residual_alpha",
             "local_residual_alpha_init",
@@ -4490,6 +4595,28 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         meta["ace_g_fusion_in_s2"] = bool(getattr(self.options, "ace_g_fusion_in_s2", False))
         return meta
 
+    @staticmethod
+    def _format_lmc_runtime_extra_stats(stats: Dict[str, Any]) -> str:
+        base_keys = {
+            "attn_entropy_mean", "attn_entropy_p10", "attn_entropy_p50", "attn_entropy_p90",
+            "effective_token_count", "avg_max_attention", "token_usage_min", "token_usage_max",
+            "token_usage_top5", "raw_feature_norm", "attention_out_norm", "fused_feature_norm",
+            "num_queries_used", "num_tokens", "fusion_geometry_mode", "fusion_scene_scale",
+            "key_geo_scale", "memory_p_norm_std", "memory_p_norm_absmax", "memory_p_norm_finite",
+        }
+        fields = []
+        for key in sorted(k for k in stats.keys() if k not in base_keys):
+            value = stats.get(key)
+            if isinstance(value, bool):
+                fields.append(f"{key}={value}")
+            elif isinstance(value, int):
+                fields.append(f"{key}={value}")
+            elif isinstance(value, float):
+                fields.append(f"{key}={value:.6f}")
+            elif isinstance(value, str):
+                fields.append(f"{key}={value}")
+        return " ".join(fields)
+
     def _should_log_runtime_stats(self):
         if not bool(getattr(self, "lmc_log_runtime_stats", False)):
             return False
@@ -4503,12 +4630,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return
         top5 = stats.get("token_usage_top5", [])
         top5_str = ",".join(f"{float(v):.4f}" for v in top5)
+        extra_str = self._format_lmc_runtime_extra_stats(stats)
         _logger.info(
             "[LMC-Runtime][%s] call=%d entropy_mean=%.4f p10=%.4f p50=%.4f p90=%.4f "
             "effective_tokens=%.2f avg_max=%.4f usage_min=%.5f usage_max=%.5f top5=[%s] "
             "raw_norm=%.4f attn_out_norm=%.4f fused_norm=%.4f queries=%d tokens=%d "
             "fusion_mode=%s scene_scale=%.6f key_geo_scale=%.6f p_norm_std=%.4f "
-            "p_norm_absmax=%.4f p_norm_finite=%s",
+            "p_norm_absmax=%.4f p_norm_finite=%s extra={%s}",
             stage_tag,
             int(getattr(self, "_lmc_runtime_stats_calls", 0)),
             float(stats.get("attn_entropy_mean", 0.0)),
@@ -4531,6 +4659,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             float(stats.get("memory_p_norm_std", 0.0)),
             float(stats.get("memory_p_norm_absmax", 0.0)),
             str(stats.get("memory_p_norm_finite", "n/a")),
+            extra_str,
         )
 
     def _log_compressor_runtime_stats(self, compressor_out, stage_tag: str):
@@ -6292,6 +6421,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "geo_bias_crpb_per_head", "pe_normalize_input", "lmc_compressor_pe_scale_mode",
             "lmc_fusion_geometry_mode", "lmc_fusion_key_geo_init", "lmc_fusion_refinement_mode",
             "lmc_fusion_cascade_layers", "lmc_fusion_assembly_mode", "lmc_fusion_assembly_gamma_init",
+            "lmc_fusion_reread_delta_alpha", "lmc_fusion_reread_scalar_gate", "lmc_fusion_reread_gate_init",
+            "lmc_fusion_reread_post_norm", "lmc_fusion_reread_trust_region_ratio", "lmc_fusion_reread_temperature",
+            "lmc_fusion_reread_common_scale", "lmc_fusion_reread_effective_ratio_cap",
+            "lmc_fusion_reread_geo_lambda", "lmc_fusion_reread_geo_sigma",
+            "lmc_fusion_reread_geo_sigma_mode", "lmc_fusion_reread_geo_sigma_beta", "lmc_fusion_reread_geo_sigma_min",
             "ace_g_fusion_in_s2", "lmc_fusion_target", "requested_lmc_fusion_target",
             "effective_lmc_fusion_target", "fusion_query_dim", "local_residual_mode",
             "local_residual_alpha", "local_residual_alpha_init", "local_residual_alpha_max",
@@ -7977,6 +8111,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         fusion_gamma = getattr(self.fusion, "fusion_assembly_gamma", None)
         if fusion_gamma is not None:
             config["final_lmc_fusion_assembly_gamma"] = float(fusion_gamma.detach().float().cpu().item())
+        reread_gate_logit = getattr(self.fusion, "fusion_reread_gate_logit", None)
+        if reread_gate_logit is not None:
+            reread_gate_logit_value = float(reread_gate_logit.detach().float().cpu().item())
+            config["final_lmc_fusion_reread_gate_logit"] = reread_gate_logit_value
+            config["final_lmc_fusion_reread_gate"] = float(torch.sigmoid(
+                reread_gate_logit.detach().float().cpu()
+            ).item())
         if self._is_glace_backend() and getattr(self, 'glace_residual_adapter', None) is not None:
             config['final_glace_residual_gain'] = float(self.glace_residual_adapter.residual_gain().detach().float().cpu().item())
         if self._is_glace_backend():

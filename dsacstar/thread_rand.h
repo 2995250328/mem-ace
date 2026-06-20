@@ -81,6 +81,8 @@ public:
    * @return void
    */
   static void forceInit(unsigned seed);
+  static bool useDeterministicStreams();
+  static unsigned getSeed();
   
   /**
    * @brief List of random number generators. One for each thread.
@@ -104,7 +106,9 @@ private:
   /**
    * @brief True if the class has been initialized already
    */
-  static bool initialised;  
+  static bool initialised;
+  static bool deterministicStreams;
+  static unsigned currentSeed;
 };
 
 /**

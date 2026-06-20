@@ -3,11 +3,32 @@
 
 std::vector<std::mt19937> ThreadRand::generators;
 bool ThreadRand::initialised = false;
+bool ThreadRand::deterministicStreams = false;
+unsigned ThreadRand::currentSeed = 1305;
 
 void ThreadRand::forceInit(unsigned seed)
 {
-    initialised = false;
-    init(seed);
+    #pragma omp critical
+    {
+        unsigned nThreads = omp_get_max_threads();
+        currentSeed = seed;
+        deterministicStreams = true;
+        generators.clear();
+        generators.reserve(nThreads);
+        for(unsigned i = 0; i < nThreads; i++)
+            generators.emplace_back(i + seed);
+        initialised = true;
+    }
+}
+
+bool ThreadRand::useDeterministicStreams()
+{
+    return deterministicStreams;
+}
+
+unsigned ThreadRand::getSeed()
+{
+    return currentSeed;
 }
 
 void ThreadRand::init(unsigned seed)
@@ -17,6 +38,8 @@ void ThreadRand::init(unsigned seed)
 	if(!initialised)
 	{
 	    unsigned nThreads = omp_get_max_threads();
+	    currentSeed = seed;
+	    deterministicStreams = false;
 	    
 	    for(unsigned i = 0; i < nThreads; i++)
 	    {    

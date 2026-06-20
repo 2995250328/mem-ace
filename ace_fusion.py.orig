@@ -303,9 +303,7 @@ class LMCFeatureFusion(nn.Module):
                  fusion_reread_geo_sigma_beta=1.0,
                  fusion_reread_geo_sigma_min=0.5,
                  fusion_reread_trust_region_ratio=0.0,
-                 fusion_reread_temperature=1.0,
-                 fusion_reread_common_scale=1.0,
-                 fusion_reread_effective_ratio_cap=0.0):
+                 fusion_reread_temperature=1.0):
         super().__init__()
         self.mode = mode
         self.feature_dim = feature_dim
@@ -323,8 +321,6 @@ class LMCFeatureFusion(nn.Module):
         self.fusion_reread_geo_sigma_min = float(fusion_reread_geo_sigma_min)
         self.fusion_reread_trust_region_ratio = float(fusion_reread_trust_region_ratio)
         self.fusion_reread_temperature = float(fusion_reread_temperature)
-        self.fusion_reread_common_scale = float(fusion_reread_common_scale)
-        self.fusion_reread_effective_ratio_cap = float(fusion_reread_effective_ratio_cap)
 
         if self.fusion_refinement_mode not in self.VALID_REFINEMENT_MODES:
             raise ValueError(
@@ -354,10 +350,6 @@ class LMCFeatureFusion(nn.Module):
             raise ValueError("fusion_reread_trust_region_ratio must be >= 0.")
         if self.fusion_reread_temperature <= 0.0:
             raise ValueError("fusion_reread_temperature must be > 0.")
-        if self.fusion_reread_common_scale < 0.0:
-            raise ValueError("fusion_reread_common_scale must be >= 0.")
-        if self.fusion_reread_effective_ratio_cap < 0.0:
-            raise ValueError("fusion_reread_effective_ratio_cap must be >= 0.")
         if mode == 'hierarchical' and self.fusion_refinement_mode != "single":
             raise ValueError("Fusion refinement is only supported for non-hierarchical LMC modes.")
 
@@ -525,9 +517,7 @@ class LMCFeatureFusion(nn.Module):
 
     def _forward_single_or_cascade(self, query_feats, latent_z, latent_p, scene_center,
                                    return_stats=False, stats_max_pixels=4096):
-        if self.fusion_refinement_mode in (
-            "progressive_reread", "centered_reread", "geometry_reread_lite"
-        ):
+        if self.fusion_refinement_mode in ("progressive_reread", "geometry_reread_lite"):
             k, v, pe_input = self.fusion_single.encode_memory(latent_z, latent_p, scene_center)
             anchor_feats, first_delta, first_attn = self.fusion_single.fuse_encoded_memory(
                 query_feats, k, v
@@ -548,9 +538,6 @@ class LMCFeatureFusion(nn.Module):
                 k,
                 v,
                 attention_bias=reread_attention_bias,
-                reference_attn=(
-                    first_attn if self.fusion_refinement_mode == "centered_reread" else None
-                ),
             )
             reread_gate = None
             reread_effective_scale = reread_delta.new_tensor(float(self.fusion_reread_delta_alpha))
@@ -562,13 +549,6 @@ class LMCFeatureFusion(nn.Module):
                 reread_effective_scale = reread_effective_scale * reread_gate
 
             reread_update_delta = reread_delta
-            if self.fusion_reread_common_scale != 1.0:
-                common_delta = reread_update_delta.mean(dim=1, keepdim=True)
-                reread_update_delta = (
-                    reread_update_delta
-                    - common_delta
-                    + float(self.fusion_reread_common_scale) * common_delta
-                )
             trust_scale = None
             raw_delta_ratio = None
             if self.fusion_reread_trust_region_ratio > 0.0:
@@ -582,28 +562,7 @@ class LMCFeatureFusion(nn.Module):
                     trust_scale = trust_scale.to(device=reread_delta.device, dtype=reread_delta.dtype)
                 reread_update_delta = reread_delta * trust_scale
 
-            reread_effective_update = reread_effective_scale * reread_update_delta
-            effective_ratio_scale = None
-            if self.fusion_reread_effective_ratio_cap > 0.0:
-                eps = 1e-8
-                with torch.no_grad():
-                    anchor_norm = anchor_feats.detach().float().norm(dim=-1, keepdim=True)
-                effective_update_norm = reread_effective_update.float().norm(
-                    dim=-1, keepdim=True
-                )
-                effective_ratio = effective_update_norm / anchor_norm.clamp(min=eps)
-                image_mean_ratio = effective_ratio.mean(dim=1, keepdim=True)
-                effective_ratio_scale = (
-                    float(self.fusion_reread_effective_ratio_cap)
-                    / image_mean_ratio.clamp(min=eps)
-                ).clamp(max=1.0)
-                effective_ratio_scale = effective_ratio_scale.to(
-                    device=reread_effective_update.device,
-                    dtype=reread_effective_update.dtype,
-                )
-                reread_effective_update = reread_effective_update * effective_ratio_scale
-
-            fused = anchor_feats + reread_effective_update
+            fused = anchor_feats + reread_effective_scale * reread_update_delta
             if self.fusion_reread_post_norm:
                 fused = self.progressive_reread.output_norm(fused)
             if not return_stats:
@@ -653,57 +612,7 @@ class LMCFeatureFusion(nn.Module):
                     "reread_delta_alpha": float(self.fusion_reread_delta_alpha),
                     "reread_scalar_gate": bool(self.fusion_reread_scalar_gate),
                     "reread_post_norm": bool(self.fusion_reread_post_norm),
-                    "reread_centered_context": self.fusion_refinement_mode == "centered_reread",
                     "reread_temperature": float(self.fusion_reread_temperature),
-                    "reread_common_scale": float(self.fusion_reread_common_scale),
-                    "reread_effective_ratio_cap": float(
-                        self.fusion_reread_effective_ratio_cap
-                    ),
-                    "reread_effective_ratio_scale_mean": float(
-                        effective_ratio_scale.detach().float().mean().item()
-                        if effective_ratio_scale is not None else 1.0
-                    ),
-                    "reread_effective_ratio_clamp_fraction": float(
-                        (effective_ratio_scale.detach().float() < 0.999).float().mean().item()
-                        if effective_ratio_scale is not None else 0.0
-                    ),
-                    "reread_effective_ratio_raw_mean": float(
-                        (
-                            (reread_effective_scale * reread_update_delta).detach().float()
-                            .norm(dim=-1)
-                            / anchor_feats.detach().float().norm(dim=-1).clamp(min=1e-8)
-                        ).mean().item()
-                    ),
-                    "reread_effective_ratio_raw_p90": float(
-                        torch.quantile(
-                            (
-                                (reread_effective_scale * reread_update_delta).detach().float()
-                                .norm(dim=-1)
-                                / anchor_feats.detach().float().norm(dim=-1).clamp(min=1e-8)
-                            ).flatten(),
-                            0.90,
-                        ).item()
-                    ),
-                    "reread_effective_ratio_applied_mean": float(
-                        (
-                            reread_effective_update.detach().float().norm(dim=-1)
-                            / anchor_feats.detach().float().norm(dim=-1).clamp(min=1e-8)
-                        ).mean().item()
-                    ),
-                    "reread_effective_ratio_applied_p90": float(
-                        torch.quantile(
-                            (
-                                reread_effective_update.detach().float().norm(dim=-1)
-                                / anchor_feats.detach().float().norm(dim=-1).clamp(min=1e-8)
-                            ).flatten(),
-                            0.90,
-                        ).item()
-                    ),
-                    "reread_effective_update_common_ratio": float(
-                        reread_effective_update.detach().float().mean(dim=1).norm(dim=-1).mean().div(
-                            reread_effective_update.detach().float().norm(dim=-1).mean().clamp(min=1e-8)
-                        ).item()
-                    ),
                     "reread_trust_region_ratio": float(self.fusion_reread_trust_region_ratio),
                     "reread_trust_region_scale_mean": float(
                         trust_scale.detach().float().mean().item()
@@ -723,11 +632,6 @@ class LMCFeatureFusion(nn.Module):
                     ),
                     "reread_update_delta_norm": float(
                         reread_update_delta.detach().float().norm(dim=-1).mean().item()
-                    ),
-                    "reread_update_delta_common_ratio": float(
-                        reread_update_delta.detach().float().mean(dim=1).norm(dim=-1).mean().div(
-                            reread_update_delta.detach().float().norm(dim=-1).mean().clamp(min=1e-8)
-                        ).item()
                     ),
                     "reread_geo_lambda": float(
                         self.fusion_reread_geo_lambda
@@ -761,20 +665,6 @@ class LMCFeatureFusion(nn.Module):
                     ),
                     "reread_delta_norm": float(
                         reread_delta.detach().float().norm(dim=-1).mean().item()
-                    ),
-                    "reread_delta_patch_mean_norm": float(
-                        reread_delta.detach().float().mean(dim=1).norm(dim=-1).mean().item()
-                    ),
-                    "reread_delta_patch_std_norm": float(
-                        (
-                            reread_delta.detach().float()
-                            - reread_delta.detach().float().mean(dim=1, keepdim=True)
-                        ).norm(dim=-1).mean().item()
-                    ),
-                    "reread_delta_common_ratio": float(
-                        reread_delta.detach().float().mean(dim=1).norm(dim=-1).mean().div(
-                            reread_delta.detach().float().norm(dim=-1).mean().clamp(min=1e-8)
-                        ).item()
                     ),
                     "anchor_reread_cosine": float(
                         F.cosine_similarity(

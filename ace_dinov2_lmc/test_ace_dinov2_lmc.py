@@ -210,17 +210,40 @@ def _is_lmc_checkpoint(checkpoint):
     return isinstance(checkpoint, dict) and 'lmc_config' in checkpoint
 
 
+def _format_lmc_runtime_extra_stats(stats: Dict[str, Any]) -> str:
+    base_keys = {
+        "attn_entropy_mean", "attn_entropy_p10", "attn_entropy_p50", "attn_entropy_p90",
+        "effective_token_count", "avg_max_attention", "token_usage_min", "token_usage_max",
+        "token_usage_top5", "raw_feature_norm", "attention_out_norm", "fused_feature_norm",
+        "num_queries_used", "num_tokens", "fusion_geometry_mode", "fusion_scene_scale",
+        "key_geo_scale", "memory_p_norm_std", "memory_p_norm_absmax", "memory_p_norm_finite",
+    }
+    fields = []
+    for key in sorted(k for k in stats.keys() if k not in base_keys):
+        value = stats.get(key)
+        if isinstance(value, bool):
+            fields.append(f"{key}={value}")
+        elif isinstance(value, int):
+            fields.append(f"{key}={value}")
+        elif isinstance(value, float):
+            fields.append(f"{key}={value:.6f}")
+        elif isinstance(value, str):
+            fields.append(f"{key}={value}")
+    return " ".join(fields)
+
+
 def _log_fusion_runtime_stats(stage_tag: str, call_idx: int, stats: Dict[str, Any]):
     if not stats:
         return
     top5 = stats.get("token_usage_top5", [])
     top5_str = ",".join(f"{float(v):.4f}" for v in top5)
+    extra_str = _format_lmc_runtime_extra_stats(stats)
     _logger.info(
         "[LMC-EvalRuntime][%s] call=%d entropy_mean=%.4f p10=%.4f p50=%.4f p90=%.4f "
         "effective_tokens=%.2f avg_max=%.4f usage_min=%.5f usage_max=%.5f top5=[%s] "
         "raw_norm=%.4f attn_out_norm=%.4f fused_norm=%.4f queries=%d tokens=%d "
         "fusion_mode=%s scene_scale=%.6f key_geo_scale=%.6f p_norm_std=%.4f "
-        "p_norm_absmax=%.4f p_norm_finite=%s",
+        "p_norm_absmax=%.4f p_norm_finite=%s extra={%s}",
         stage_tag,
         int(call_idx),
         float(stats.get("attn_entropy_mean", 0.0)),
@@ -243,6 +266,7 @@ def _log_fusion_runtime_stats(stage_tag: str, call_idx: int, stats: Dict[str, An
         float(stats.get("memory_p_norm_std", 0.0)),
         float(stats.get("memory_p_norm_absmax", 0.0)),
         str(stats.get("memory_p_norm_finite", "n/a")),
+        extra_str,
     )
 
 
@@ -526,6 +550,17 @@ def run_evaluation_lmc(opt):
             fusion_cascade_layers=lmc_config.get('lmc_fusion_cascade_layers', 4),
             fusion_assembly_mode=lmc_config.get('lmc_fusion_assembly_mode', 'concat_mlp'),
             fusion_assembly_gamma_init=lmc_config.get('lmc_fusion_assembly_gamma_init', 0.0),
+            fusion_reread_delta_alpha=lmc_config.get('lmc_fusion_reread_delta_alpha', 1.0),
+            fusion_reread_scalar_gate=lmc_config.get('lmc_fusion_reread_scalar_gate', False),
+            fusion_reread_gate_init=lmc_config.get('lmc_fusion_reread_gate_init', 0.0),
+            fusion_reread_post_norm=lmc_config.get('lmc_fusion_reread_post_norm', True),
+            fusion_reread_trust_region_ratio=lmc_config.get('lmc_fusion_reread_trust_region_ratio', 0.0),
+            fusion_reread_temperature=lmc_config.get('lmc_fusion_reread_temperature', 1.0),
+            fusion_reread_geo_lambda=lmc_config.get('lmc_fusion_reread_geo_lambda', 1.0),
+            fusion_reread_geo_sigma=lmc_config.get('lmc_fusion_reread_geo_sigma', 1.0),
+            fusion_reread_geo_sigma_mode=lmc_config.get('lmc_fusion_reread_geo_sigma_mode', 'fixed'),
+            fusion_reread_geo_sigma_beta=lmc_config.get('lmc_fusion_reread_geo_sigma_beta', 1.0),
+            fusion_reread_geo_sigma_min=lmc_config.get('lmc_fusion_reread_geo_sigma_min', 0.5),
         ).to(device)
         fusion.load_state_dict(checkpoint['fusion_state_dict'])
         fusion.eval()
@@ -1063,6 +1098,19 @@ def run_evaluation_lmc(opt):
             "lmc_fusion_assembly_mode": lmc_config.get("lmc_fusion_assembly_mode", "concat_mlp"),
             "lmc_fusion_assembly_gamma_init": lmc_config.get("lmc_fusion_assembly_gamma_init", 0.0),
             "final_lmc_fusion_assembly_gamma": lmc_config.get("final_lmc_fusion_assembly_gamma"),
+            "lmc_fusion_reread_delta_alpha": lmc_config.get("lmc_fusion_reread_delta_alpha", 1.0),
+            "lmc_fusion_reread_scalar_gate": lmc_config.get("lmc_fusion_reread_scalar_gate", False),
+            "lmc_fusion_reread_gate_init": lmc_config.get("lmc_fusion_reread_gate_init", 0.0),
+            "lmc_fusion_reread_post_norm": lmc_config.get("lmc_fusion_reread_post_norm", True),
+            "lmc_fusion_reread_trust_region_ratio": lmc_config.get("lmc_fusion_reread_trust_region_ratio", 0.0),
+            "lmc_fusion_reread_temperature": lmc_config.get("lmc_fusion_reread_temperature", 1.0),
+            "lmc_fusion_reread_geo_lambda": lmc_config.get("lmc_fusion_reread_geo_lambda", 1.0),
+            "lmc_fusion_reread_geo_sigma": lmc_config.get("lmc_fusion_reread_geo_sigma", 1.0),
+            "lmc_fusion_reread_geo_sigma_mode": lmc_config.get("lmc_fusion_reread_geo_sigma_mode", "fixed"),
+            "lmc_fusion_reread_geo_sigma_beta": lmc_config.get("lmc_fusion_reread_geo_sigma_beta", 1.0),
+            "lmc_fusion_reread_geo_sigma_min": lmc_config.get("lmc_fusion_reread_geo_sigma_min", 0.5),
+            "final_lmc_fusion_reread_gate": lmc_config.get("final_lmc_fusion_reread_gate"),
+            "final_lmc_fusion_reread_gate_logit": lmc_config.get("final_lmc_fusion_reread_gate_logit"),
             "local_residual_mode": lmc_config.get("local_residual_mode", "none"),
             "local_residual_alpha": lmc_config.get("local_residual_alpha", 1.0),
             "local_residual_alpha_init": lmc_config.get("local_residual_alpha_init", 0.001),

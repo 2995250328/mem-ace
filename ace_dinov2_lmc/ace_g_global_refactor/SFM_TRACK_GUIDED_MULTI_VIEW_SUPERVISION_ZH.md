@@ -1,724 +1,976 @@
-# SfM-Track Guided Multi-View Supervision
+# COLMAP-Keyframe Inter-Frame ACE Loss
 
-Updated: 2026-06-13
+Updated: 2026-06-15
 
-定位：本文档单独记录监督侧创新 **SfM-Track Guided Multi-View Supervision (STGS)**。它从原“双插件”总计划中拆出，专门描述稀疏深度 / SfM track / 多视图重投影监督的研究依据、方法边界、数据合同、实现计划和实验矩阵。
+定位：本文档记录监督侧创新 **COLMAP-Keyframe Inter-Frame ACE Loss**。它借鉴 Xu 等 2024 / SeqACE 的 sequence-based mapping 中的 keyframe channel 与 cross ACE loss，但不采用其重新匹配 pipeline，也不采用其测试时 sequence relocalization。
 
 核心结论：
 
-1. STGS 是训练期监督，不改变单图测试接口。
-2. 参考 Xu 等 2024 / SeqACE 的 sequence-based mapping，但不采用其测试时 sequence-based relocalization。
-3. 如果已有 COLMAP / SfM tracks，优先直接使用真实 track identity、3D 点和多帧观测，而不是重新跑 SuperPoint/LightGlue 或 optical flow。
-4. 第一版先做 metric XYZ sparse supervision，再做 cross-view reprojection；不要一开始同时加 relative-depth、temporal model、sequence inference 或新的 matcher。
+1. 本方向是 **训练期辅助监督**，推理期不需要 SfM、COLMAP、稀疏深度、track、keyframe 或序列输入。
+2. 主线不是简单的稀疏 3D 点 L2 / XYZ loss，而是 **SeqACE-style inter-frame ACE reprojection loss**。
+3. 本项目已有基于稀疏深度图的采样逻辑，因此不重新设计采样器；只为已有 sparse-depth-guided sampled patches 附加 COLMAP keyframe channel。
+4. COLMAP / SfM 的核心作用不是直接提供主监督 `P ≈ X_colmap`，而是提供全局 point3D track identity：
+   - anchor sparse-depth pixel 属于哪个 `point3D_id`；
+   - 同一 `point3D_id` 在哪些 train keyframes 中被观测；
+   - target keyframe pixel、pose、intrinsics 是什么。
+5. COLMAP 3D point `X_m^w` 只用于 keyframe 选择、几何过滤、invalid fallback 和 diagnostic；不作为 V1 主 loss。
+6. 必须显式处理 patch-support alignment：只有 COLMAP anchor observation 与当前训练 patch / feature cell 的代表位置足够对齐时，才启用 inter-frame ACE loss。neighbor-expanded sparse-depth samples 不能默认继承 seed point 的 keyframe channel。
 
-## 1. 为什么需要单独文档
+一句话方法：
 
-早期“双插件”总计划同时记录结构侧和监督侧机制。结构侧已经从 ZG-RMR/CIFA 调整为 PMRF；监督侧 STGS 仍然成立，但它的依据、数据合同和实现边界足够独立，继续塞在总文档里容易造成三个混淆：
+> 在已有 sparse-depth-guided sampling 选出的 anchor patch 中，仅对与 COLMAP observation 经过 patch-support alignment 检查的子集附加 SeqACE-style keyframe channel，并对同一个预测 scene coordinate 同时计算当前帧 ACE self-loss 和关键帧 inter-frame ACE loss。
 
-1. 把 **sequence supervision** 误读成测试时序列输入；
-2. 把 **稀疏深度**、**SfM XYZ**、**cross-view reprojection** 混为同一个 loss；
-3. 把 Xu/SeqACE 的工程实现直接搬过来，而不是利用本项目已有的 COLMAP track 资源。
+---
 
-本文档只维护监督侧合同。结构侧 PMRF 另见 `PROGRESSIVE_MEMORY_REREADING_FUSION_PLAN_ZH.md`。
+## 1. 为什么要重写这个设计
 
-## 2. 文献与代码检索结论
+旧 STGS 设计把第一阶段设为：
 
-### 2.1 ACE / DSAC* 背景
+```text
+L_xyz = || P_pred(anchor pixel) - X_colmap ||
+```
 
-[ACE](https://arxiv.org/abs/2305.14059) 将 SCR 拆成冻结的 scene-agnostic backbone 与 scene-specific MLP head，用 RGB+pose 和 reprojection loss 在几分钟内完成场景编码。它不需要训练期 3D model 或 depth，但也意味着几何主要来自隐式三角化。
+这个方向太朴素，容易被理解成“用额外 COLMAP 3D 点做稀疏坐标回归监督”。它没有充分利用 SeqACE 的关键思想：
 
-[DSAC*](https://arxiv.org/abs/2002.12324) 证明 RGB-only SCR 可以只用 pose 与可微 RANSAC / reprojection 学习场景坐标，但训练更慢，且单视角 reprojection 对射线方向上的深度约束弱。
+```text
+同一个 anchor prediction 同时解释当前帧观测和 keyframe 观测。
+```
 
-STGS 不替换 ACE/DSAC 的主监督，而是在已有 reprojection loss 旁边加入训练期稀疏、多视图的几何约束。
+SeqACE 的核心不是简单 3D 点监督，而是：
 
-### 2.2 Xu 等 2024 / SeqACE
+```text
+P_i^w = network(anchor image, anchor pixel)
 
-本地论文：
+self ACE loss:
+  project P_i^w to anchor frame -> anchor pixel
+
+cross ACE loss:
+  project the same P_i^w to keyframe -> matched keyframe pixel
+```
+
+本项目比 SeqACE 更适合这个思想，因为 memory 构建阶段已经有 COLMAP / SfM 结果。COLMAP track 提供的是全局几何验证过的多帧对应，而不是单纯 pairwise feature matches。
+
+因此，本设计的主线应该是：
+
+```text
+SeqACE keyframe channel
++ COLMAP point3D track identity
++ existing sparse-depth-guided sampling
+= COLMAP-Keyframe Inter-Frame ACE Loss
+```
+
+---
+
+## 2. 与 SeqACE 的关键对应关系
+
+本地参考论文：
 
 ```text
 /home/xwh/project/ace_depth/papers/Xu 等 - 2024 - An Efficient Scene Coordinate Encoding and Relocalization Method.pdf
 ```
 
-网页版本与代码：
-
-- paper: [arXiv 2412.06488](https://arxiv.org/abs/2412.06488)
-- official code: [sair-lab/SeqACE](https://github.com/sair-lab/SeqACE)
-
-论文的 sequence-based mapping 包含三部分：
-
-1. 用 keypoint detection / saliency 选择更稳定的训练 patches；
-2. 对每个 patch 保留 ACE 风格 self-loss，即当前帧 reprojection loss；
-3. 通过特征匹配把当前帧 patch 与 keyframe patch 关联，加入 cross-loss。
-
-其 self-loss 可概括为：
-
-\[
-L_{S,i} =
-\begin{cases}
-\tau(t)\tanh(e_\pi(p_i, P_i^w, T_{wc})/\tau(t)), & P_i^w \in V \\
-\lVert P_i^w - \bar P_i^w \rVert, & \text{otherwise}
-\end{cases}
-\]
-
-其中 \(\bar P_i^w\) 是用 fixed target depth 反投影得到的 invalid proxy target，\(\tau(t)\) 从大到小调度。
-
-其 cross-loss 是把当前预测点投影到 keyframe：
-
-\[
-L_{C,i} =
-\begin{cases}
-\tau(t)\tanh(e_\pi(p_{k,j}, P_i^w, T_{wk})/\tau(t)), & P_i^w \in V \\
-\lVert P_i^w - \bar P_{k,j}^w \rVert, & \text{otherwise}
-\end{cases}
-\]
-
-训练总损失：
-
-\[
-L = \frac{1}{N_b}\sum_i(L_{S,i}+\lambda L_{C,i}),
-\quad \lambda=0.5 \text{ for inlier matches, else } 0.
-\]
-
-官方代码细节：
-
-- `feature_matching_for_traing.py` 使用 SuperPoint + LightGlue 离线匹配，并用 fundamental matrix RANSAC 过滤；
-- keyframe 规则依赖匹配数量和平均视差；
-- `ace_trainer.py` 在 training buffer 中额外存 `target_px2`、`gt_poses_inv2`、`intrinsics2`、`track_flag`；
-- 训练时对同一预测 scene coordinate 分别算当前帧 loss 和 keyframe cross loss，cross 权重固定为 `0.5`。
-
-对本项目的启发：
-
-1. 可以借鉴 **训练期多视图约束**；
-2. 可以借鉴 **同一个 anchor prediction 投到另一个视图**，无需 target 图像 forward；
-3. 不必借鉴其 **重新匹配 pipeline**，因为 COLMAP/SfM tracks 已经给出更强的跨帧 identity；
-4. 不应借鉴其 **测试时 sequence mode**，因为当前论文主线需要保持单图 relocalization。
-
-### 2.3 Li 等 2018：angle-based reprojection 与 multi-view constraint
-
-[Scene Coordinate Regression with Angle-Based Reprojection Loss](https://arxiv.org/abs/1808.04999) 指出传统 reprojection loss 有退化，angle-based reprojection 可以缓解初始化依赖，并能利用 available multi-view constraints。
-
-对 STGS 的启发：
-
-- cross loss 可以考虑 pixel reprojection，也可以考虑 bearing/angular residual；
-- 第一版仍用 pixel reprojection，因为它和 ACE/SeqACE 的 `ReproLoss` 兼容；
-- 如果 pixel cross 对大尺度 / 大深度不稳定，第二版可以加入 angular cross ablation。
-
-### 2.4 FocusTune
-
-[FocusTune](https://arxiv.org/abs/2311.02872) 用 3D model 投影到训练图像，围绕关键几何区域采样，从而避免 ACE 均匀采样大量无效区域。
-
-对 STGS 的启发：
-
-- 稀疏 3D 点不仅可以提供 loss，也可以提供 training-point sampling prior；
-- 但第一版不要同时改采样策略和 loss，否则难以定位收益来源；
-- 若 XYZ loss 有正信号，后续可做 “track-aware sampling only” control。
-
-### 2.5 GLACE
-
-[GLACE](https://arxiv.org/abs/2406.04340) 的核心诊断是大场景中 SCR 需要同时具备跨视角不变性和相似区域可分性，纯隐式三角化在重复纹理下困难。
-
-对 STGS 的启发：
-
-- STGS 不是和 GLACE/PMRF 竞争，而是补充监督；
-- GLACE 类 global/local conditioning 改 feature representation，STGS 改训练约束；
-- 最终应做 2x2：结构增强开/关 x STGS 开/关。
-
-### 2.6 KFNet、DSM、HSCNet 等替代方向
-
-[KFNet](https://arxiv.org/abs/2003.10629) 和 [Dense Scene Matching](https://arxiv.org/abs/2103.16792) 都能利用 temporal / scene matching 信息提升定位，但它们会改变测试时输入或架构边界。[HSCNet](https://arxiv.org/abs/1909.06216) 用 coarse-to-fine 分类回归提升大场景鲁棒性，但会改变 head 与训练目标。
-
-这些方法适合长期对照，不适合 STGS v1：
-
-- KFNet：测试时序列与滤波状态，不符合单图推理边界；
-- DSM/SANet 路线：需要 scene matching / cost volume，不是 ACE head 的轻量插件；
-- HSCNet：需要区域分类层，改变 coordinate head contract；
-- D2S / sparse descriptor matching：更接近显式 map，不是当前 compact implicit map 叙事。
-
-## 3. 与 Xu/SeqACE 的逐项差异
-
-| 项目 | Xu/SeqACE | STGS v1 |
-|---|---|---|
-| 关联来源 | SuperPoint + LightGlue + F-matrix RANSAC | COLMAP / SfM track identity |
-| 3D 点 | 当前网络预测 + invalid proxy depth | 已三角化 `track_xyz_world` + 网络预测 |
-| anchor loss | ACE self reprojection | ACE 主 loss 保持不变，额外加 sparse XYZ |
-| cross loss | anchor prediction 投到 keyframe matched pixel | anchor prediction 投到同 track target observation |
-| target forward | 不需要 | 不需要 |
-| 测试时序列 | 提供 sequence-based relocalization | 明确不做 |
-| 数据依赖 | 离线匹配文件 | train-only track package |
-| 适用数据 | 连续序列更自然 | 任意有可靠 SfM tracks 的训练集 |
-
-核心替换：
+SeqACE sequence-based mapping 的相关字段可概括为：
 
 ```text
-SeqACE matched keyframe pixel
-  -> STGS target observation from same COLMAP point3D track
+target_px       # 当前帧 patch pixel
+gt_poses_inv    # 当前帧 pose
+intrinsics      # 当前帧 K
 
-SeqACE pseudo target from fixed depth
-  -> STGS metric target from triangulated XYZ
-
-SeqACE sequence assumption
-  -> STGS multi-view track assumption
+target_px2      # keyframe matched pixel
+gt_poses_inv2   # keyframe pose
+intrinsics2     # keyframe K
+track_flag      # 是否存在有效 cross match
 ```
 
-## 4. 方法定义
-
-给定 SfM track \(m\)：
-
-- \(X_m^w\)：该 track 的三维点，位于 ACE raw world 坐标；
-- \((i, u_i)\)：anchor 图像和该点在图像 \(i\) 中的观测；
-- \((j, u_j)\)：同一 track 在 target 图像 \(j\) 中的另一个观测；
-- \(S_i\)：网络对图像 \(i\) 输出的 scene-coordinate map；
-- \(K_j, T_{j,w}\)：target 图像的内参和 world-to-camera 变换。
-
-### 4.1 Sparse XYZ loss
-
-对 anchor 观测做双线性采样：
-
-\[
-P_i^w = \mathrm{Sample}(S_i, u_i).
-\]
-
-metric XYZ loss：
-
-\[
-L_{xyz} = \frac{1}{N}\sum_{(m,i)} \rho(P_i^w - X_m^w).
-\]
-
-V1 设置：
+训练时对同一个预测 `P_i^w` 计算：
 
 ```text
-rho = component-wise SmoothL1
-beta = 0.1 m
-coordinate_space = raw ACE world
-initial weight = 0.01
+L_self  = ACEReproLoss(P_i^w, target_px,  pose_i, K_i)
+L_cross = ACEReproLoss(P_i^w, target_px2, pose_j, K_j) if track_flag
 ```
 
-这个 loss 是最干净的第一步，因为它直接验证“稀疏真实 3D 监督是否能改善 coordinate head”，不引入 target camera 投影边界。
+本项目的替换关系：
 
-### 4.2 Cross-view reprojection loss
+| SeqACE | 本项目 |
+|---|---|
+| SuperPoint / LightGlue pairwise match | COLMAP / SfM global `point3D_id` track |
+| matched keyframe pixel `target_px2` | same COLMAP point 在 keyframe 中的 observation pixel |
+| feature matching confidence / F-matrix RANSAC | COLMAP reprojection error、track length、parallax、positive depth |
+| keypoint/saliency patch selection | 已有 sparse-depth-guided sampling |
+| invalid proxy from fixed target depth | optional COLMAP XYZ invalid fallback |
+| sequence-based test mode | 不采用，推理保持单图 |
 
-将 anchor prediction 投影到 target 观测图像：
-
-\[
-\hat u_j = \pi(K_j T_{j,w} P_i^w).
-\]
-
-cross loss：
-
-\[
-L_{cross} = \frac{1}{N_p}\sum_{(i,j)} \rho_\pi(\hat u_j - u_j).
-\]
-
-V1 设置：
+最重要的区别：
 
 ```text
-rho_pi = ACE/SeqACE-compatible dyntanh reprojection loss or SmoothL1 pixel loss
-initial weight = 0.0
-enable only after XYZ passes
-target image forward = never
+SeqACE 需要离线 feature matching 生成 keyframe channel；
+本项目可以从 COLMAP global tracks 直接生成 keyframe channel。
 ```
 
-cross loss 的意义不是再监督 target 图像，而是要求 anchor 图像预测出的 3D 点也能解释同一 track 在另一个视角的观测。
+---
 
-### 4.3 总损失
+## 3. 当前代码中已有的采样基础
 
-第一阶段：
+当前代码已经支持基于稀疏深度 / 有效 scene-coordinate 区域的 buffer sampling，不需要为本方向重新设计采样。
 
-\[
-L = L_{ACE} + \lambda_{xyz} L_{xyz}.
-\]
-
-第二阶段：
-
-\[
-L = L_{ACE} + \lambda_{xyz} L_{xyz} + \lambda_{cross} L_{cross}.
-\]
-
-不在第一版加入：
-
-- relative depth distillation；
-- saliency/keypoint auxiliary loss；
-- optical flow temporal consistency；
-- sequence inference loss；
-- routing / usage loss；
-- dense correspondence distillation。
-
-## 5. 数据合同
-
-STGS 读取一个独立的 train-only track package：
+相关参数位于：
 
 ```text
-<scene>/train/sfm_tracks_v1/
+ace_dinov2_lmc/options_dinov2_lmc.py
+```
+
+已有深度类型：
+
+```text
+--c1_aux_depth_kind gt_depth|colmap_depth|sparse_depth|sparse_depth_sampling_sp|sparse_depth_mapanything
+```
+
+已有采样相关参数包括：
+
+```text
+--buffer_sample_valid_coords
+--buffer_valid_coord_sample_ratio
+--buffer_valid_coord_neighbor_radius
+--buffer_valid_coord_neighbor_mode
+```
+
+相关实现位于：
+
+```text
+ace_dinov2_lmc/trainer_dinov2_lmc.py
+```
+
+核心函数：
+
+```text
+_expand_valid_coord_sampling_mask(...)
+_sample_buffer_indices(...)
+```
+
+它们已经能做到：
+
+```text
+1. 从 sparse depth / valid coord mask 得到有效 patch；
+2. 可选扩展到邻域 patch；
+3. 按比例优先采样这些有效位置；
+4. 剩余样本仍从普通 image mask 中随机采样。
+```
+
+因此，本文档不再设计新的 observation sampler、image-level dataloader 或 `max_obs_per_image` 采样流程。
+
+本设计只做一件事：
+
+> 对现有 sparse-depth-guided sampling 选中的 anchor patch，查表补充 keyframe channel 字段；但只有通过 patch-support alignment 检查的样本才真正启用 inter-frame ACE loss。
+
+---
+
+## 4. Patch-support alignment 风险与修正
+
+SeqACE-style cross loss 有一个容易被忽略的前提：
+
+```text
+训练 patch 代表的位置 == 跟踪 / 匹配 keypoint 代表的位置
+```
+
+如果这个前提不成立，cross loss 会把一个 patch center 的 scene coordinate 监督到另一个 keypoint 的对应像素上，产生系统性偏差。
+
+### 4.1 偏差来源
+
+#### 4.1.1 Anchor patch center 与 COLMAP observation 不对齐
+
+SCR 训练通常在 feature grid 上采样：
+
+```text
+feature cell / patch -> one predicted scene coordinate
+```
+
+这个 prediction 通常代表 feature cell center 或当前代码定义的 `target_px`。COLMAP observation 是 subpixel keypoint：
+
+```text
+u_colmap = (x, y)
+```
+
+如果：
+
+```text
+||u_colmap - u_patch_center|| > 0
+```
+
+那么 `P_patch^w` 代表的可能是 patch center，而不是 COLMAP keypoint。此时把 `P_patch^w` 投到 keyframe observation `u_j` 会产生 biased supervision。
+
+偏差量级不可忽视。近似：
+
+```text
+3D offset ≈ depth / focal * pixel_offset
+```
+
+例如 depth=5m、focal=500px、pixel_offset=4px 时，3D 偏差约 4cm；DINO stride 14 下若 offset 接近 7px，偏差可达约 7cm，足以影响 5cm / 2cm 阈值。
+
+#### 4.1.2 Matcher / COLMAP keypoint support 与训练 patch support 不一致
+
+SuperPoint/LightGlue/COLMAP keypoint 是局部关键点；ACE-FCN / DINO / GLACE 的 training patch 是 stride-based feature cell。即使 keypoint 落在某个 feature cell 中，它也不一定代表该 cell 的中心或完整 receptive field。
+
+因此不能把：
+
+```text
+keypoint match -> sampled training patch
+```
+
+无条件视为同一个监督对象。
+
+#### 4.1.3 Neighbor-expanded sparse-depth samples 不能继承 seed track
+
+当前 `_expand_valid_coord_sampling_mask(...)` 会把 sparse seed 扩展到邻域 patch 以改善采样覆盖。这对普通训练采样有用，但对 inter-frame ACE loss 危险。
+
+必须区分：
+
+```text
+valid-for-sampling:
+  sparse seed + neighbor-expanded ROI
+
+valid-for-inter-frame-loss:
+  true sparse seed only
+  + has point3D_id
+  + anchor observation aligned to patch representative point
+  + has valid keyframe target
+```
+
+neighbor-expanded samples 可以继续参与普通 ACE self-loss，但不能默认继承 seed point 的 COLMAP keyframe channel。
+
+### 4.2 对齐检查
+
+对每个候选 anchor observation，统一转换到训练模型使用的像素坐标系：
+
+```text
+u_colmap_original -> u_colmap_model
+u_patch_center_model = feature-cell representative point used by target_px
+```
+
+计算：
+
+```text
+alignment_error_px = ||u_colmap_model - u_patch_center_model||
+```
+
+启用条件：
+
+```text
+anchor_is_sparse_seed = True
+alignment_error_px <= align_threshold_px
+```
+
+建议初值：
+
+```text
+align_threshold_px = min(0.25 * feature_stride, 2.0 px)
+```
+
+更宽松版本可用：
+
+```text
+align_threshold_px = 0.5 * feature_stride
+```
+
+但高精度定位第一版应尽量保守。
+
+### 4.3 对齐权重
+
+除了 hard threshold，还建议对 cross loss 加 soft weight：
+
+```text
+w_align = exp(- alignment_error_px^2 / (2 * sigma_align^2))
+```
+
+最终：
+
+```text
+L_inter = w_align * track_flag * ACEReproLoss(project_j(P_i^w), u_j)
+```
+
+如果 alignment error 超阈值：
+
+```text
+track_flag = 0
+```
+
+### 4.4 Target 侧是否需要 patch 对齐
+
+V1 不要求 target observation 落在 target training patch center，因为 target image 不 forward，target side 只是 2D projection target。只要 target observation 是同一 COLMAP `point3D_id` 的几何验证观测，就可以作为 `u_j`。
+
+真正需要严格对齐的是 anchor 侧：
+
+```text
+P_i^w 是否真的代表 u_colmap_i 这个点？
+```
+
+### 4.5 相对 SeqACE 的改进点
+
+SeqACE 原版 keyframe loss 隐含 matched patch 与 training patch 对齐。对 stride-based SCR backbones，这可能引入 patch-support bias。
+
+本设计应明确作为改进：
+
+> 不盲目把 keyframe match 附加到训练 patch，而是利用 COLMAP observation 与训练 feature cell 的显式对齐检查，只在 anchor-side spatial support 一致时启用 inter-frame ACE loss，并按 alignment uncertainty 降权。
+
+---
+
+## 5. 方法定义
+
+### 5.1 Anchor sample
+
+当前训练 buffer 中已有 anchor sample：
+
+```text
+image i
+anchor pixel u_i
+gt pose/intrinsics: T_i, K_i
+network predicted scene coordinate: P_i^w
+```
+
+当前 ACE self-loss 已经约束：
+
+```text
+project(P_i^w, T_i, K_i) -> u_i
+```
+
+### 5.2 COLMAP keyframe channel
+
+如果 anchor pixel `u_i` 来自真实 sparse seed、与当前训练 patch 代表位置通过 patch-support alignment 检查，并且能找到对应的 COLMAP `point3D_id = m`，则使用同一 track 的另一个 train observation 构造 keyframe channel：
+
+```text
+target image j
+target pixel u_j
+pose/intrinsics: T_j, K_j
+alignment_weight = exp(-alignment_error_px^2 / (2 sigma_align^2))
+track_flag = 1
+```
+
+如果没有有效 target observation：
+
+```text
+track_flag = 0
+```
+
+### 5.3 Inter-frame ACE loss
+
+对同一个 anchor prediction `P_i^w`：
+
+```text
+u_hat_j = project(P_i^w, T_j, K_j)
+```
+
+计算：
+
+```text
+L_inter = ACEReproLoss(u_hat_j, u_j)
+```
+
+总 loss：
+
+```text
+L = L_self + lambda_if * track_flag * alignment_weight * L_inter
+```
+
+这里 `L_self` 仍是当前 ACE / LMC 主 loss。`L_inter` 只是附加的帧间 ACE 几何约束。
+
+### 5.4 为什么它能补单帧 reprojection 的弱点
+
+单帧 reprojection 只要求：
+
+```text
+P_i^w lies on anchor camera ray
+```
+
+帧间 ACE loss 要求：
+
+```text
+P_i^w lies on anchor ray
+and
+P_i^w also reprojects to target keyframe observation
+```
+
+这等价于用 COLMAP track 提供的另一个视角形成三角化式约束，可以加强沿视线方向的深度 / metric scale 监督。
+
+---
+
+## 6. COLMAP XYZ 的正确角色
+
+COLMAP 3D point `X_m^w` 不应作为 V1 主监督。
+
+不推荐主线：
+
+```text
+L_xyz = || P_i^w - X_m^w ||
+```
+
+原因：
+
+1. 这会把方法降级成 sparse 3D coordinate regression；
+2. 容易被质疑使用额外 3D 点监督；
+3. 不能体现 SeqACE 的 inter-frame ACE loss 思想；
+4. 可能过拟合 sparse keypoint 区域。
+
+推荐用途：
+
+### 6.1 Keyframe selection
+
+用 `X_m^w` 计算 anchor 与 target 之间的 parallax：
+
+```text
+ray_i = normalize(X_m^w - C_i)
+ray_j = normalize(X_m^w - C_j)
+parallax = arccos(ray_i dot ray_j)
+```
+
+选择合适 keyframe：
+
+```text
+parallax_min <= parallax <= parallax_max
+```
+
+### 6.2 Geometric filtering
+
+过滤：
+
+```text
+negative depth
+out-of-bound target pixel
+high COLMAP reprojection error
+short track
+train/test contamination
+bad image-name mapping
+```
+
+### 6.3 Invalid fallback
+
+SeqACE 对 invalid prediction 使用 proxy 3D target。本项目可以可选使用 COLMAP point 作为 invalid fallback：
+
+```text
+if prediction invalid and track_flag:
+    L_invalid += lambda_invalid_colmap * SmoothL1(P_i^w - X_m^w)
+```
+
+这只是 fallback，不是主监督。
+
+### 6.4 Diagnostics
+
+记录但不一定反传：
+
+```text
+||P_i^w - X_m^w||
+inter-frame reprojection error
+self reprojection error
+parallax distribution
+track length distribution
+```
+
+---
+
+## 7. Keyframe channel sidecar，而不是新 sampler
+
+由于采样已经存在，本方向只需要一个 sidecar，用于把 anchor sparse-depth pixel 映射到 keyframe channel。
+
+建议格式：
+
+```text
+<scene>/train/colmap_keyframe_channel_v1/
   manifest.json
-  tracks.npz
+  keyframe_channel.npz
 ```
 
-### 5.1 `manifest.json`
+### 7.1 `manifest.json`
 
 必需字段：
 
 ```text
-schema_version
+schema_version = colmap_keyframe_channel_v1
 scene_name
 split = train
 coordinate_space = ace_world
 source_type = known_pose_colmap | colmap | nvm
 source_model
+sparse_depth_kind = sparse_depth_sampling_sp | sparse_depth | colmap_depth
 image_root
-min_track_length
-max_reprojection_error_px
 num_images
-num_tracks
-num_observations
+num_anchor_observations
+num_keyframe_channels
 image_names
+parallax_min_deg
+parallax_max_deg
+max_reprojection_error_px
+min_track_length
+feature_stride
+align_threshold_px
+sigma_align_px
 ```
 
-原则：
-
-1. 默认拒绝非 train split；
-2. 不写入 test image name；
-3. 不写入 descriptor 或 RGB feature；
-4. 坐标系必须和 ACE 训练用 raw world 对齐。
-
-### 5.2 `tracks.npz`
-
-必需数组：
+强约束：
 
 ```text
-track_ids             int64    [T]
-track_xyz_world       float32  [T, 3]
-track_reproj_error    float32  [T]
-track_length          int32    [T]
-track_offsets         int64    [T + 1]
-
-obs_image_idx         int32    [O]
-obs_xy_original       float32  [O, 2]
-
-image_size_hw         int32    [I, 2]
-camera_K_original     float32  [I, 3, 3]
-camera_c2w_world      float32  [I, 4, 4]
-
-image_obs_offsets     int64    [I + 1]
-image_obs_indices     int64    [O]
+1. 只允许 train split；
+2. 不包含 test image；
+3. image_names 必须与 ACE/WAI train images 可审计对齐；
+4. 坐标系必须与训练 pose/world 坐标一致；
+5. sidecar 不负责采样，只负责 keyframe channel lookup。
 ```
 
-cross loss 需要额外数组：
+### 7.2 `keyframe_channel.npz`
+
+建议扁平字段：
 
 ```text
-pair_anchor_obs_idx   int64    [P]
-pair_target_obs_idx   int64    [P]
-pair_parallax_deg     float32  [P]
+anchor_image_idx      int32    [N]
+anchor_xy_original    float32  [N, 2]
+anchor_xy_model       float32  [N, 2]
+anchor_feature_yx     int32    [N, 2]
+anchor_patch_center_xy float32 [N, 2]
+anchor_alignment_error_px float32 [N]
+anchor_is_sparse_seed bool     [N]
+alignment_weight      float32  [N]
+
+point3D_id            int64    [N]
+target_image_idx      int32    [N]
+target_xy_original    float32  [N, 2]
+target_xy_model       float32  [N, 2]
+
+target_track_flag     bool     [N]
+track_flag            bool     [N]  # target_track_flag & anchor alignment gate
+parallax_deg          float32  [N]
+colmap_reproj_error   float32  [N]
+track_length          int32    [N]
+
+optional_track_xyz_world float32 [N, 3]
 ```
 
-### 5.3 过滤策略
+这里的 `anchor_xy` 必须能和当前 sparse-depth sampling 选中的 patch 对齐。`track_flag` 不是单纯“有 target observation”，而必须同时满足 anchor 是真实 sparse seed、anchor alignment error 低于阈值、target observation 通过几何过滤。
 
-V1 hard filters：
+如果当前 sparse depth `.npz` 没保留 `point3D_id`，则需要在 sparse depth generation 阶段或旁路 exporter 中补充 point id 到 sidecar。不要改采样策略本身。
+
+---
+
+## 8. Keyframe 选择策略
+
+对每个 anchor observation `(image_i, u_i, point3D_id=m)`，从同一 COLMAP track 的其他 train observations 中选择一个 target keyframe observation `(image_j, u_j)`。
+
+### 8.1 Hard filters
 
 ```text
-track length >= 4
-point reprojection error <= 2.0 px
-finite XYZ and pixel
-pixel inside source image
-image present in train RGB set
-positive depth in observing camera
+anchor_is_sparse_seed = true
+anchor_alignment_error_px <= align_threshold_px
+j != i
+image_j belongs to train split
+point has positive depth in image_j
+target pixel inside image_j
+COLMAP reprojection error <= threshold
+track length >= threshold
+parallax in [parallax_min, parallax_max]
 ```
 
-pair filters：
+建议初值：
 
 ```text
-anchor and target image must differ
-parallax in [2 deg, 60 deg]
-one target per anchor in V1
-prefer largest valid parallax below upper bound
-discard anchor without valid target
+min_track_length = 4
+max_reprojection_error_px = 2.0
+parallax_min_deg = 2.0
+parallax_max_deg = 45.0 or 60.0
+align_threshold_px = min(0.25 * feature_stride, 2.0)
+sigma_align_px = align_threshold_px
 ```
 
-## 6. 本仓库可复用代码
+### 8.2 Target selection rule
 
-已有稀疏深度 / COLMAP 相关代码：
+V1 不要采多个 target，也不要随机每步改变 target。为每个 anchor 固定选择一个 target，保证可复现。
+
+推荐规则：
 
 ```text
-tools/project_colmap_sparse_depth.py
-tools/wayspots_known_pose_sparse_depth.py
-tools/project_cambridge_nvm_sparse_depth.py
+在合法 target 中选择 parallax 最大但不超过 parallax_max 的 observation。
 ```
 
-这些脚本证明本仓库已经有：
+理由：
 
-1. ACE 格式的 RGB / pose / calibration 读取；
-2. COLMAP / NVM sparse point 解析；
-3. train split triangulation / projection；
-4. sparse depth `.npz` 生成。
+- 大 parallax 对 depth/scale 约束更强；
+- 上限避免遮挡和极端视角；
+- 固定选择便于 debug 和复现。
 
-但现有 sparse depth 文件不够 STGS 使用，因为它们丢掉了：
+可选 tie-breaker：
 
 ```text
-point3D_id
-track identity
-subpixel observation xy
-per-observation image id
-target pair
+1. lower COLMAP reprojection error;
+2. target frame has more shared tracks with anchor frame;
+3. smaller temporal distance if sequence order可靠。
 ```
 
-因此 STGS 需要新 exporter，不能复用 sparse depth `.npz` 作为 track package。
+---
 
-## 7. 数据集策略
+## 9. 训练接入方式
 
-### 7.1 Wayspots：V1 首选
+### 9.1 Buffer row 扩展
+
+当前 buffer row 已有：
+
+```text
+features
+target_px
+gt_pose_inv
+intrinsics
+...
+```
+
+新增可选字段：
+
+```text
+target_px2
+gt_pose_inv2
+intrinsics2
+track_flag
+inter_frame_weight
+alignment_weight
+anchor_alignment_error_px
+anchor_is_sparse_seed
+optional point3D_id
+optional colmap_xyz_world for diagnostics/fallback
+```
+
+这些字段仅在 `--use_colmap_keyframe_channel True` 时存在。
+
+### 9.2 不新增 image-level dataloader
+
+本设计不走：
+
+```text
+_build_sfm_track_dataloader()
+_next_sfm_track_batch()
+```
 
 原因：
 
-1. 已有 train-only known-pose triangulated model；
-2. image names 与 ACE train images 可以精确对齐；
-3. SquareBench 是已知 global conditioning failure case，适合验证监督是否能改善困难场景；
-4. track 数量足够支持稀疏监督和 cross pair sampling。
+1. 当前已有 sparse-depth-guided buffer sampling；
+2. SeqACE 的 keyframe channel 就是 buffer metadata；
+3. target image 不需要 forward；
+4. 只需要 target pose、K、pixel。
 
-第一目标：
+### 9.3 Training step
 
-```text
-wayspots_squarebench
-```
-
-第二目标：
+对每个 sampled prediction：
 
 ```text
-wayspots_therock 或 wayspots_tendrils
+P_i^w = predicted scene coordinate for anchor sample
 ```
 
-### 7.2 Indoor6：暂不做 full STGS
-
-当前问题：
+已有 self reprojection：
 
 ```text
-COLMAP image names: 06-frames001539.jpg
-ACE train names:    000000.jpg
-direct overlap:     0
+loss_self = ReproLoss(project_i(P_i^w), target_px)
 ```
 
-不能用排序或近邻 pose 强行匹配。除非完成独立 image-name / pose alignment audit，否则 Indoor6 只能做：
-
-- sparse depth metric supervision；
-- 不带 track identity 的 sparse XYZ；
-- 或完全不启用 STGS。
-
-### 7.3 Cambridge / MuSHRoom / RIO10
-
-Cambridge 有 NVM，可以未来写 `nvm_tracks_v1` exporter，但需要坐标系审计。
-
-MuSHRoom 是否有可靠 train-only COLMAP tracks 需要单独 audit。
-
-RIO10 当前 sparse depth 没有 persistent point ID，不支持 cross-view STGS。
-
-## 8. 实现计划
-
-### 8.1 Phase B0：track exporter
-
-新增：
+新增 inter-frame reprojection：
 
 ```text
-tools/export_sfm_tracks.py
+if track_flag:
+    loss_inter = ReproLoss(project_j(P_i^w), target_px2)
+else:
+    loss_inter = 0
 ```
 
-职责：
-
-1. 读取 COLMAP / NVM reconstruction；
-2. 只接受 train split；
-3. 验证 image-name mapping；
-4. 验证 pose / intrinsics 与 ACE 文件一致；
-5. 导出 `manifest.json` 和 `tracks.npz`；
-6. 打印 track length、reprojection error、observation per image、parallax 分布；
-7. 支持 `--audit_only`；
-8. 可选输出 RGB overlay 供人工检查。
-
-SquareBench 出口前必须满足：
+总损失：
 
 ```text
-100% train image-name mapping
-pose max error <= 1e-4
-intrinsics max error <= 1e-3
-finite XYZ ratio = 100%
-pixels in bounds
-no test image names
-observations in >= 95% train images
+loss = loss_self + lambda_inter * track_flag * alignment_weight * loss_inter
 ```
 
-### 8.2 Phase B1：XYZ-only STGS
+其中 `ReproLoss` 应复用当前 ACE / LMC 的 robust schedule，而不是新增一套完全不同的 loss。
 
-新增：
+---
+
+## 10. CLI 建议
+
+最小参数：
 
 ```text
-sfm_track_supervision.py
+--use_colmap_keyframe_channel False
+--colmap_keyframe_channel_path PATH
+--inter_frame_ace_loss_weight 0.1
+--inter_frame_ace_apply_to stage2
+--inter_frame_ace_start_ratio 0.2
+--inter_frame_ace_loss_type same_as_repro
+--inter_frame_ace_invalid_colmap_weight 0.0
 ```
 
-包含：
+可选统计参数：
 
 ```text
-SFMTrackStore
-sample_scene_coordinates_at_observations
-compute_track_xyz_loss
+--inter_frame_ace_log_stats True
 ```
 
-新增最小 CLI：
+不需要新增：
 
 ```text
---use_sfm_track_supervision False
---sfm_track_path PATH
---sfm_track_xyz_weight 0.01
---sfm_track_cross_weight 0.0
---sfm_track_apply_to stage2
---sfm_track_image_step_interval 10
---sfm_track_image_batch_size 1
---sfm_track_max_obs_per_image 512
---sfm_track_xyz_beta_m 0.1
---sfm_track_start_ratio 0.2
+--sfm_track_image_step_interval
+--sfm_track_image_batch_size
+--sfm_track_max_obs_per_image
 ```
 
-训练路径：
+这些属于旧 image-level auxiliary 设计，应删除。
 
-1. 初始化并校验 `SFMTrackStore`；
-2. 建立 unaugmented image dataloader；
-3. 每 `sfm_track_image_step_interval` 步取一个完整图像 batch；
-4. 走当前配置的 backbone / memory / fusion / head；
-5. 恢复 raw-world scene coordinates；
-6. 在 track observations 上双线性采样；
-7. 计算 `L_xyz`；
-8. 记录覆盖率、metric error、raw/weighted loss；
-9. checkpoint 只保存元数据，不保存 track arrays。
+---
 
-### 8.3 Phase B2：cross-view STGS
+## 11. Loss schedule
 
-只在 B1 通过后实现。
-
-步骤：
-
-1. 从 package 读取 `pair_anchor_obs_idx` 和 `pair_target_obs_idx`；
-2. 对 anchor 图像预测图采样 \(P_i^w\)；
-3. 用 target pose/intrinsics 投影得到 \(\hat u_j\)；
-4. 计算 pixel reprojection residual；
-5. 记录 valid pair ratio、behind-camera、nonfinite、pixel median/p90；
-6. 与 XYZ-only 做严格 ablation。
-
-## 9. 像素与坐标细节
-
-### 9.1 禁用增强
-
-STGS full-image auxiliary batch 必须使用：
+建议只在 S2 启用：
 
 ```text
-augment=False
-aug_rotation=0
-aug_scale_min=1.0
-aug_scale_max=1.0
+S1: memory alignment / feature adaptation，不启用 inter-frame ACE loss
+S2: coordinate refinement，启用 inter-frame ACE loss
 ```
 
-理由：现有 sampled S2 buffer 不保留完整 original-to-augmented transform。第一版不能把增强反变换作为隐性误差源。
-
-### 9.2 原图像素到 resized input
-
-对原图 \(H_0,W_0\) 和网络输入 \(H_r,W_r\)：
+初始权重：
 
 ```text
-xr = (x0 + 0.5) * Wr / W0 - 0.5
-yr = (y0 + 0.5) * Hr / H0 - 0.5
+lambda_inter = 0.05 or 0.1
 ```
 
-### 9.3 resized input 到 output grid
+不要直接使用 SeqACE 的 `lambda=0.5`。本项目已有较强主 reprojection、LMC 训练流程和可能的 relative-depth 辅助；过大 cross 权重可能破坏主训练。
 
-ACE 输出中心：
+可用 warmup：
 
 ```text
-pixel = stride * (grid + 0.5)
+inter_frame_ace_start_ratio = 0.2
 ```
 
-因此：
+即 S2 前 20% 步只用 self loss，后面逐渐启用 inter-frame loss。
+
+---
+
+## 12. Diagnostics
+
+必须记录：
 
 ```text
-grid_x = xr / stride - 0.5
-grid_y = yr / stride - 0.5
+track_flag ratio among sampled rows
+anchor sparse-seed ratio
+alignment_error_px median/p90/max
+alignment_weight median/p10
+samples rejected by alignment threshold
+neighbor-expanded sample ratio excluded from IF loss
+inter-frame valid projection ratio
+behind-camera ratio
+out-of-bounds ratio
+nonfinite ratio
+self reprojection median/p90
+inter-frame reprojection median/p90
+parallax median/p10/p90
+track length median/p10/p90
+inter loss raw / weighted
 ```
 
-用 `grid_sample` 做双线性采样，并显式返回 validity mask。不要把 subpixel observation round 到整数 feature cell。
-
-### 9.4 raw-world recovery
-
-如果训练路径使用 C1/reference normalization，loss 前必须恢复到 raw ACE world：
+可选记录：
 
 ```text
-head output
-  -> C1/reference recovery
-  -> optional coord_sigma / coord_mu inverse normalization
-  -> raw-world P_i^w
+||P_i^w - X_colmap|| median/p90
+inter-frame error vs parallax
+inter-frame error vs track length
+inter-frame error vs COLMAP reprojection error
 ```
 
-XYZ 和 cross 共用同一个 recovery helper。
-
-## 10. 实验矩阵
-
-主场景：
+关键判断：
 
 ```text
-wayspots_squarebench
+inter-frame loss 是否在训练中下降；
+inter-frame error 下降是否伴随 self reprojection / pose metrics 改善；
+alignment_error 越小的样本是否更稳定；
+大 parallax target 是否更有效；
+track_flag 覆盖率是否足够高。
 ```
 
-| ID | Fusion | XYZ | Cross | 目的 |
-|---|---|---:|---:|---|
-| B0 | accepted baseline | 0 | 0 | control |
-| B1 | same | 0.01 | 0 | 最小 STGS |
-| B2 | same | 0.05 | 0 | 仅当 B1 明显 underweight |
-| B3 | same | best | 0.05 | cross 是否超过 XYZ |
-| B-shuffle | same | best | best | track-image shuffle negative control |
-| B-hard | same on second scene | best | best | 第二场景验证 |
+---
 
-与结构创新组合时使用 2x2：
+## 13. Ablation 矩阵
 
-| ID | PMRF | STGS |
+### 13.1 最小矩阵
+
+| ID | 设置 | 目的 |
 |---|---|---|
-| C0 | off | off |
-| C1 | on | off |
-| C2 | off | on |
-| C3 | on | on |
+| Base | 当前 sparse-depth-guided sampling + self ACE loss | baseline |
+| IF-0.05 | inter-frame ACE loss weight 0.05 | 最小正向测试 |
+| IF-0.10 | inter-frame ACE loss weight 0.10 | 权重敏感性 |
+| IF-strict-align | 更小 align threshold | 验证 patch-support 对齐重要性 |
+| IF-no-align-gate | 不使用 alignment gate，仅作负面对照 | 验证原版 SeqACE-style 盲绑定是否有偏差 |
+| IF-shuffle | 打乱 target keyframe channel | 验证几何对应是否真实有效 |
+| IF-no-parallax-filter | 放宽 parallax filter | 验证 keyframe selection 重要性 |
 
-只有 C3 同时保留 C1/C2 优点时，才能说“结构与监督互补”。
+### 13.2 不作为第一阶段
 
-## 11. 必须记录的诊断
-
-STGS 训练日志至少包含：
-
-```text
-sfm_track_enabled
-sfm_track_images_with_obs
-sfm_track_obs_requested
-sfm_track_obs_valid
-sfm_track_obs_used
-sfm_track_xyz_loss_raw
-sfm_track_xyz_loss_weighted
-sfm_track_xyz_error_median_m
-sfm_track_xyz_error_p90_m
-sfm_track_cross_pairs_requested
-sfm_track_cross_pairs_valid
-sfm_track_cross_pixel_l1_median
-sfm_track_cross_pixel_l1_p90
-sfm_track_behind_camera_ratio
-sfm_track_nonfinite_ratio
-sfm_track_aux_step_time_ms
-```
-
-结果分析必须按以下维度 bucket：
+不要第一阶段做：
 
 ```text
-track length
-point reprojection error
-parallax
-observations per image
-image region / sparse point density
+XYZ-only main loss
+image-level sfm dataloader
+multi-target per anchor
+relative-depth + inter-frame joint sweep
+PMRF/STGS 联合
+sequence inference
 ```
 
-## 12. 验证与测试
+### 13.3 如果 IF loss 有正信号
 
-合成测试：
-
-1. valid package loads；
-2. malformed offsets fail；
-3. non-train source fails by default；
-4. image-name mismatch fails；
-5. pixel resize transform is correct；
-6. bilinear sampling recovers a synthetic linear coordinate field；
-7. XYZ loss is zero for exact prediction；
-8. cross loss is zero for exact projection；
-9. raw-world normalization round-trip is exact within tolerance；
-10. no-track images return differentiable zero。
-
-真实数据 gate：
+再考虑：
 
 ```text
-export audit passes
-overlay inspection passes
-one CUDA smoke run has finite loss and gradients
-checkpoint save succeeds
-checkpoint eval succeeds without track files
+1. 多 target keyframe channel；
+2. angular inter-frame reprojection；
+3. invalid COLMAP fallback；
+4. 与 PMRF/STGS memory centroid consistency 结合。
 ```
 
-最后一条很关键：checkpoint eval 不依赖 track files，证明 STGS 没有改变 inference boundary。
+---
 
-## 13. 风险与停止条件
+## 14. 与普通 XYZ loss 的区别
 
-### 13.1 主要风险
-
-| 风险 | 后果 | 缓解 |
-|---|---|---|
-| 坐标系错位 | XYZ loss 直接拉坏 head | exporter 做 pose/intrinsics audit，先 synthetic zero test |
-| train/test leakage | 论文不可辩护 | exporter 默认拒绝 non-train，manifest 记录 split |
-| sparse loss 过强 | dense reprojection collapse | start ratio + ramp + 小权重 |
-| cross pair baseline 太小 | 约束近似重复 self-loss | parallax lower bound |
-| cross pair baseline 太大 | occlusion/outlier 多 | parallax upper bound + reprojection error filter |
-| overhead 过高 | 训练成本不划算 | 每 10 step 一次，max obs per image |
-
-### 13.2 停止条件
-
-停止 STGS 扩展，如果出现：
-
-1. exact train-only alignment 无法证明；
-2. XYZ-only 不改善 pose 或 strict metric；
-3. sparse XYZ error 降低但 dense pose 明显变差；
-4. shuffled control 和真实 tracks 差不多；
-5. cross 不超过 XYZ-only；
-6. 需要强场景调参才有效；
-7. 训练开销不成比例。
-
-负结果后不要马上加 optical flow、sequence model、learned matcher 或 test-time sequence input。先定位是数据合同、loss 权重、采样覆盖还是坐标恢复问题。
-
-## 14. 论文表述建议
-
-推荐表述：
-
-> We introduce a training-only SfM-track guided supervision objective for latent-memory-conditioned scene coordinate regression. Verified train-set tracks provide sparse metric 3D anchors and cross-view reprojection constraints, strengthening implicit triangulation without changing the single-image inference interface.
-
-中文含义：
-
-> 我们使用训练集内已验证的 SfM tracks，为 scene coordinate regression 加入稀疏三维锚点和跨视角重投影约束。该监督只在训练期使用，推理仍是单张图像输入和原 DSAC/PnP 求解器。
-
-避免表述：
+普通 sparse XYZ loss：
 
 ```text
-no 3D geometry is used
-sequence localization
-test-time temporal model
-free supervision
-universal improvement
-works on all datasets
+P_i^w -> X_colmap
 ```
 
-准确表述：
+COLMAP-Keyframe Inter-Frame ACE loss：
 
 ```text
-uses additional train-time reconstructed geometry
-does not require extra inference input
-supports only datasets with audited train tracks
+P_i^w -> anchor pixel u_i
+P_i^w -> target keyframe pixel u_j
 ```
 
-## 15. 开工顺序
+前者是点坐标回归，后者是多视图 ACE 几何约束。
+
+后者更符合：
+
+1. ACE / DSAC 的 reprojection training philosophy；
+2. SeqACE 的 keyframe cross-loss 思想；
+3. 本项目保持单图推理的边界；
+4. 通过多视角投影约束 depth/scale 的目标。
+
+---
+
+## 15. 与当前 sparse-depth sampling 的关系
+
+当前已有 sparse-depth-guided sampling 负责：
 
 ```text
-1. export_sfm_tracks.py audit-only
-2. SquareBench train package + overlays
-3. sfm_track_supervision.py synthetic tests
-4. XYZ-only trainer integration
-5. SquareBench B0/B1
-6. second Wayspots scene
-7. cross-view B3 only after XYZ passes
-8. PMRF x STGS 2x2
+选择 anchor patch
 ```
 
-## 16. 当前决策
+本设计负责：
 
-STGS 值得作为监督侧独立创新继续推进，但第一版必须保守：
+```text
+给被选中的 anchor patch 附加 keyframe channel
+```
 
-1. Wayspots train-only tracks；
-2. XYZ-only first；
-3. unaugmented auxiliary full-image batch；
-4. raw-world metric target；
-5. cross loss 延后；
-6. 不引入测试时序列；
-7. 不用 sparse depth `.npz` 冒充 track package。
+两者关系：
 
-这条路线和 PMRF 的关系是互补而不是互相依赖：PMRF 回答 memory 如何被更好读取，STGS 回答坐标监督如何更几何一致。
+```text
+sparse depth sampling tells us where to sample;
+COLMAP keyframe channel tells us how to supervise the sampled point from another view.
+```
+
+不要把两者混成一个新的 sampler。
+
+同时必须区分两个 mask：
+
+```text
+valid_for_sampling:
+  sparse seed + neighbor-expanded ROI
+
+valid_for_inter_frame_loss:
+  sparse seed only
+  + has point3D_id
+  + anchor-side patch-support aligned
+  + has valid target keyframe channel
+```
+
+也就是说，neighbor-expanded samples 仍然可以提升普通 ACE self-loss 的采样覆盖，但默认不能使用 seed point 的 keyframe channel。
+
+---
+
+## 16. 与 PMRF / STGS memory consistency 的关系
+
+本文档只定义 supervision-side inter-frame ACE loss。
+
+如果未来要和 PMRF 结合，不应直接约束 token distribution 一致。更合理的是利用 COLMAP track 做：
+
+```text
+same track observations -> predicted coordinates should be cross-view consistent
+same track observations -> memory attention centroids can be close in 3D
+```
+
+但这属于后续，不属于 V1。
+
+V1 只做：
+
+```text
+SeqACE-style keyframe channel + inter-frame ACE loss
+```
+
+---
+
+## 17. 推理边界
+
+必须明确：
+
+```text
+COLMAP keyframe channel 只在训练期使用。
+推理期不需要 COLMAP。
+推理期不需要 sparse depth。
+推理期不需要 target keyframe。
+推理期不需要序列。
+推理期不需要 feature matching。
+```
+
+推理仍然是：
+
+```text
+single query image
+-> backbone / memory-conditioned network
+-> scene coordinate map
+-> DSAC / PnP
+-> camera pose
+```
+
+---
+
+## 18. 论文表述建议
+
+英文：
+
+> We extend ACE-style training with a patch-support-aligned COLMAP-keyframe inter-frame reprojection loss. For sparse-depth-guided training samples, we use the COLMAP point track to retrieve a verified keyframe observation of the same 3D point, but enable the cross-view loss only when the COLMAP anchor observation is spatially aligned with the sampled feature cell. The predicted scene coordinate from the anchor view is then supervised not only by the anchor reprojection loss, but also by an alignment-weighted keyframe reprojection loss. This follows the spirit of SeqACE's keyframe channel, while avoiding the patch-keypoint support mismatch that can arise when pairwise matches are blindly attached to stride-based training patches. The additional supervision is used only during training and adds no inference-time dependency.
+
+中文：
+
+> 我们在 ACE 风格训练中加入 patch-support 对齐的 COLMAP 关键帧通道帧间重投影损失。对于已有稀疏深度采样选中的训练 patch，我们通过 COLMAP point track 找到同一 3D 点在另一个训练关键帧中的几何验证观测，但只有当 anchor 侧 COLMAP observation 与被采样 feature cell 的代表位置足够对齐时，才启用 cross-view loss。anchor 视角预测出的同一个 scene coordinate 不仅需要投影回当前像素，还需要通过 alignment-weighted keyframe reprojection loss 投影到关键帧中的对应像素。该设计继承了 SeqACE keyframe channel 的思想，同时避免原版 pairwise match 盲目绑定到 stride-based training patch 时可能产生的 patch-keypoint support mismatch。该监督只在训练期使用，推理期没有任何额外依赖。
+
+---
+
+## 19. 最终推进顺序
+
+1. 审计当前 sparse depth sampling 输出是否能追溯到 COLMAP `point3D_id`。
+2. 如果不能，补充 sidecar exporter，把 sparse-depth seed anchor pixel 映射到 COLMAP track observation。
+3. 为每个 anchor observation 计算 feature-cell representative point、alignment error 和 alignment weight。
+4. 只为通过 anchor-side patch-support alignment 检查的 seed observation 固定选择一个合法 target keyframe observation。
+5. 在 buffer row 中附加 `target_px2 / pose2 / K2 / track_flag / alignment_weight / alignment_error`。
+6. 在 training step 中复用当前 ReproLoss 计算 alignment-weighted inter-frame ACE loss。
+7. 先跑 `IF-0.05`、`IF-strict-align`、`IF-no-align-gate` 和 `IF-shuffle`，验证收益来自对齐后的真实几何对应。
+8. 有正信号后再考虑 angular loss、multi-target、invalid COLMAP fallback 或与 PMRF 的 centroid consistency 结合。
+
+停止条件：
+
+```text
+1. track_flag 覆盖率太低；
+2. alignment 后剩余样本太少；
+3. IF loss 不下降；
+4. IF-shuffle 与真实 keyframe channel 表现接近；
+5. IF-no-align-gate 与 aligned version 表现接近或更好，说明 patch-support 假设/实现需要复查；
+6. self reprojection / pose metrics 变差；
+7. 收益只来自简单 XYZ fallback，而不是 inter-frame reprojection。
+```
+
+最终判断标准：
+
+> 只有当 patch-support 对齐后的真实 COLMAP keyframe channel 的 inter-frame ACE loss 明显优于 shuffle control 和 no-alignment blind-binding control，并且不损害主 self reprojection 与最终 pose metrics，才能把它作为监督侧创新。

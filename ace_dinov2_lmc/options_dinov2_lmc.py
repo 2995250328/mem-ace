@@ -1352,8 +1352,8 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--lmc_fusion_refinement_mode',
         type=str,
         default='single',
-        choices=['single', 'cascade_internal', 'progressive_reread', 'adapter_ffn'],
-        help='Fusion refinement 模式。single=旧行为；cascade_internal=Step15 C1 内部级联 fusion residual；progressive_reread=二次 memory read；adapter_ffn=PMRF 参数量对照 FFN。',
+        choices=['single', 'cascade_internal', 'progressive_reread', 'centered_reread', 'geometry_reread_lite', 'adapter_ffn', 'weak_residual_ffn'],
+        help='Fusion refinement 模式。single=旧行为；cascade_internal=Step15 C1 内部级联 fusion residual；progressive_reread=二次 memory read；centered_reread=以 A1 为中心的差分 memory context；geometry_reread_lite=A1 条件化 3D 邻域二次 read；adapter_ffn=旧版带 post-LN FFN 对照；weak_residual_ffn=identity-preserving 弱残差 FFN 对照。',
     )
     parser.add_argument(
         '--lmc_fusion_cascade_layers',
@@ -1373,6 +1373,85 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help='cascade_internal residual gate 初始值。默认 0.0，使初始输出等于第一层 fusion anchor。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_delta_alpha',
+        type=float,
+        default=1.0,
+        help='progressive_reread 二次读取 delta 的全局缩放。默认 1.0，保持旧行为。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_scalar_gate',
+        type=_strtobool,
+        default=False,
+        help='progressive_reread 是否启用可学习全局 scalar gate。默认 False，保持旧行为。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_gate_init',
+        type=float,
+        default=0.0,
+        help='progressive_reread scalar gate 的 logit 初始值。仅启用 scalar gate 时作为可学习参数。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_post_norm',
+        type=_strtobool,
+        default=True,
+        help='progressive_reread 是否在二次残差后再做 LayerNorm。默认 True 保持旧行为；False 用于 identity-preserving PMRF 测试。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_trust_region_ratio',
+        type=float,
+        default=0.0,
+        help='progressive_reread 的 per-pixel Delta2/H1 trust-region 上限；0 表示关闭。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_temperature',
+        type=float,
+        default=1.0,
+        help='progressive_reread 第二次 attention 的固定 softmax temperature；1.0 表示默认行为。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_common_scale',
+        type=float,
+        default=1.0,
+        help='二次 reread residual 的 patch-common 分量缩放；1.0 保持默认，0.0 去掉每张图内所有 patch 共享的 residual。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_effective_ratio_cap',
+        type=float,
+        default=0.0,
+        help='最终 reread update 相对 anchor 的逐图 mean-norm ratio 上限；0 表示关闭。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_geo_lambda',
+        type=float,
+        default=1.0,
+        help='geometry_reread_lite 中 A2 几何邻域 bias 的强度。0.0 等价退回 feature-only 二次 read。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_geo_sigma',
+        type=float,
+        default=1.0,
+        help='geometry_reread_lite 中 normalized memory-coordinate RBF bias 的 sigma。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_geo_sigma_mode',
+        type=str,
+        default='fixed',
+        choices=['fixed', 'adaptive_spread'],
+        help='geometry_reread_lite 的 sigma 策略。fixed 使用全局 sigma；adaptive_spread 使用 beta * sqrt(A1 spread)。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_geo_sigma_beta',
+        type=float,
+        default=1.0,
+        help='adaptive_spread sigma 的 beta 系数。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_geo_sigma_min',
+        type=float,
+        default=0.5,
+        help='adaptive_spread sigma 的最小值，单位与 geometry 坐标一致。',
     )
     parser.add_argument(
         '--s1_batch_size',
