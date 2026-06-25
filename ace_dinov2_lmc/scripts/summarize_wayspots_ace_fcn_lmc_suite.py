@@ -253,7 +253,7 @@ def _parse_eval_summary(path: Path) -> dict[str, float | int | str]:
         "frames": int(kv.get("total_frames", 0) or 0),
         "median_deg": _safe_float(kv.get("median_rotation_deg")),
         "median_cm": _safe_float(kv.get("median_translation_cm")),
-        "50cm_5deg": float("nan"),
+        "50cm_5deg": _safe_float(kv.get("accuracy_50cm5deg_pct")),
         "25cm_5deg": _safe_float(kv.get("accuracy_25cm5deg_pct")),
         "10cm_5deg": _safe_float(kv.get("accuracy_10cm5deg_pct")),
         "5cm_5deg": _safe_float(kv.get("accuracy_5cm5deg_pct")),

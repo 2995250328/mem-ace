@@ -158,12 +158,22 @@ class ImageRelativeDepthLoss(nn.Module):
         teacher_depth_BHW: torch.Tensor,
         valid_mask_BHW: torch.Tensor,
         generator: torch.Generator | None = None,
+        ray_weight_BHW: torch.Tensor | None = None,
+        student_space: str = "neg_z_legacy",
     ) -> tuple[torch.Tensor, dict[str, float]]:
+        if student_space not in {"neg_z_legacy", "inverse_depth"}:
+            raise ValueError(f"Unsupported relative-depth student_space={student_space!r}")
+
         losses = []
         ssi_values = []
         grad_values = []
         pair_values = []
         valid_points = 0
+
+        # First-step plumbing only: soft ray weights are accepted and detached so
+        # callers can log/ablate them without changing the legacy default loss.
+        if ray_weight_BHW is not None:
+            ray_weight_BHW = ray_weight_BHW.detach().float().view_as(student_depth_BHW)
 
         for student_hw, teacher_hw, mask_hw in zip(
             student_depth_BHW.float(),
@@ -182,18 +192,28 @@ class ImageRelativeDepthLoss(nn.Module):
             if count < self.min_points:
                 continue
 
-            student_vec = student_hw[valid]
+            if student_space == "inverse_depth":
+                student_source_hw = 1.0 / student_hw.clamp(min=self.depth_min, max=self.depth_max)
+            else:
+                student_source_hw = student_hw
+
+            student_vec = student_source_hw[valid]
             teacher_vec = teacher_hw[valid]
             student_n, student_center, student_scale = self._normalize(student_vec)
             teacher_n, teacher_center, teacher_scale = self._normalize(teacher_vec)
 
-            # Depth Anything predicts relative proximity (larger means nearer),
-            # while camera-space z grows with distance.
-            student_rel = -student_n
+            if student_space == "neg_z_legacy":
+                # Depth Anything predicts relative proximity (larger means nearer),
+                # while camera-space z grows with distance. This is the legacy
+                # behavior and remains the default for exact rollback.
+                student_rel = -student_n
+                student_map = -(student_source_hw - student_center) / student_scale
+            else:
+                student_rel = student_n
+                student_map = (student_source_hw - student_center) / student_scale
+            teacher_map = (teacher_hw - teacher_center) / teacher_scale
             ssi_loss = F.smooth_l1_loss(student_rel, teacher_n, beta=0.5)
 
-            student_map = -(student_hw - student_center) / student_scale
-            teacher_map = (teacher_hw - teacher_center) / teacher_scale
             valid_x = valid[:, 1:] & valid[:, :-1]
             valid_y = valid[1:, :] & valid[:-1, :]
             grad_terms = []
@@ -404,6 +424,10 @@ class RelativeDepthDistiller(nn.Module):
         valid_mask_B1HW: torch.Tensor,
         img_idx_B: torch.Tensor,
         generator: torch.Generator | None = None,
+        ray_valid_mask_BHW: torch.Tensor | None = None,
+        ray_weight_BHW: torch.Tensor | None = None,
+        student_space: str = "neg_z_legacy",
+        min_ray_coverage: float = 0.0,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         B, H, W = student_depth_BHW.shape
         teacher_depths = []
@@ -426,20 +450,60 @@ class RelativeDepthDistiller(nn.Module):
             teacher_valid.append(torch.isfinite(resized) & (resized > 0))
 
         teacher_BHW = torch.stack(teacher_depths, dim=0)
-        valid_BHW = valid_mask_B1HW.bool().view(B, H, W) & torch.stack(teacher_valid, dim=0)
+        image_valid_BHW = valid_mask_B1HW.bool().view(B, H, W) & torch.stack(teacher_valid, dim=0)
+        valid_BHW = image_valid_BHW
+        image_valid_points = int(image_valid_BHW.sum().item())
+        ray_valid_points = image_valid_points
+        gate_skipped = 0
+
+        if ray_valid_mask_BHW is not None:
+            ray_valid_BHW = ray_valid_mask_BHW.detach().to(device=student_depth_BHW.device, dtype=torch.bool).view(B, H, W)
+            gated_BHW = image_valid_BHW & ray_valid_BHW
+            min_cov = max(0.0, float(min_ray_coverage))
+            if min_cov > 0.0:
+                gated_items = []
+                for image_valid_hw, gated_hw in zip(image_valid_BHW, gated_BHW):
+                    denom = int(image_valid_hw.sum().item())
+                    numer = int(gated_hw.sum().item())
+                    if denom > 0 and float(numer) / float(denom) < min_cov:
+                        gated_items.append(torch.zeros_like(gated_hw))
+                        gate_skipped += 1
+                    else:
+                        gated_items.append(gated_hw)
+                gated_BHW = torch.stack(gated_items, dim=0)
+            valid_BHW = gated_BHW
+            ray_valid_points = int(valid_BHW.sum().item())
+
+        ray_weight_mean = 0.0
+        if ray_weight_BHW is not None:
+            ray_weight_BHW = ray_weight_BHW.detach().to(device=student_depth_BHW.device, dtype=torch.float32).view(B, H, W)
+            if image_valid_points > 0:
+                ray_weight_mean = float(ray_weight_BHW[image_valid_BHW].mean().detach().cpu().item())
+
         loss, stats = self.image_loss_fn(
             student_depth_BHW,
             teacher_BHW,
             valid_BHW,
             generator=generator,
+            ray_weight_BHW=ray_weight_BHW,
+            student_space=student_space,
         )
         stats = dict(stats)
+        pixel_count = max(1, B * H * W)
+        ray_coverage = float(ray_valid_points) / float(max(1, image_valid_points)) if image_valid_points > 0 else 0.0
         stats.update({
             "enabled": 1.0,
             "missing_images": float(missing),
             "loss_raw": float(loss.detach().cpu().item()),
+            "image_valid_points": float(image_valid_points),
+            "image_coverage": float(image_valid_points) / float(pixel_count),
+            "ray_valid_points": float(ray_valid_points),
+            "ray_coverage": ray_coverage,
+            "gate_skipped": float(gate_skipped),
+            "ray_weight_mean": ray_weight_mean,
         })
         return loss, stats
+
 
     def forward(
         self,

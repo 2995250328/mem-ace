@@ -27,7 +27,12 @@ SAMPLES_PER_IMAGE="${SAMPLES_PER_IMAGE:-512}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 POST_TRAIN_HYPOTHESES="${POST_TRAIN_HYPOTHESES:-256}"
 POST_TRAIN_EVAL_SEEDS="${POST_TRAIN_EVAL_SEEDS:-1305 2026 4242}"
-BEST_METRIC="${BEST_METRIC:-pct5}"
+EVAL_DETERMINISTIC="${EVAL_DETERMINISTIC:-True}"
+EVAL_DSACSTAR_SEED="${EVAL_DSACSTAR_SEED:-1305}"
+EVAL_DSACSTAR_SEED_PER_FRAME="${EVAL_DSACSTAR_SEED_PER_FRAME:-True}"
+ITERATION_EVAL_SEED="${ITERATION_EVAL_SEED:-1305}"
+ITERATION_EVAL_HYPOTHESES="${ITERATION_EVAL_HYPOTHESES:-64}"
+BEST_METRIC="${BEST_METRIC:-median_error}"
 DRY_RUN="${DRY_RUN:-false}"
 
 SCENE_ROOT="${CAMBRIDGE_ROOT}/${SCENE}"
@@ -79,6 +84,11 @@ CMD=(
   --experiment_subdir "dino_lmc/${SCENE}"
   --post_train_hypotheses "${POST_TRAIN_HYPOTHESES}"
   --post_train_eval_seeds ${POST_TRAIN_EVAL_SEEDS}
+  --eval_deterministic "${EVAL_DETERMINISTIC}"
+  --eval_dsacstar_seed "${EVAL_DSACSTAR_SEED}"
+  --eval_dsacstar_seed_per_frame "${EVAL_DSACSTAR_SEED_PER_FRAME}"
+  --iteration_eval_seed "${ITERATION_EVAL_SEED}"
+  --iteration_eval_hypotheses "${ITERATION_EVAL_HYPOTHESES}"
   --buffer_sample_valid_coords True
   --buffer_valid_coord_sample_ratio 1.0
   --buffer_valid_coord_neighbor_radius 1

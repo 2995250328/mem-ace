@@ -121,6 +121,11 @@ def get_glace_regressor_class(glace_root: Path | str):
     return module.Regressor
 
 
+def get_glace_head_class(glace_root: Path | str):
+    module = _load_glace_module(glace_root, "ace_network")
+    return module.Head
+
+
 def get_glace_dataset_class(glace_root: Path | str):
     module = _load_glace_module(glace_root, "dataset")
     return module.CamLocDataset

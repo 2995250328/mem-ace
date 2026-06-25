@@ -293,6 +293,7 @@ def _load_bundle(
             fusion_cascade_layers=lmc_config.get("lmc_fusion_cascade_layers", 4),
             fusion_assembly_mode=lmc_config.get("lmc_fusion_assembly_mode", "concat_mlp"),
             fusion_assembly_gamma_init=lmc_config.get("lmc_fusion_assembly_gamma_init", 0.0),
+            fusion_coord_prior_scale_init=lmc_config.get("lmc_fusion_coord_prior_scale_init", 0.10),
         ).to(device)
         fusion.load_state_dict(checkpoint["fusion_state_dict"])
         fusion.eval()

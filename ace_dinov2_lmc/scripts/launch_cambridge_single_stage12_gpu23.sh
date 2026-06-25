@@ -1,48 +1,43 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# Wayspots multi-scene runner:
-#   1. ACE baseline
-#   2. GLACE baseline
-#   3. ACE-FCN feature-space memory extraction
-#   4. ACE-FCN Stage1 local LMC
-#   5. ACE-FCN Stage2 + GLACE global concat
+# Cambridge ACE-FCN-LMC single-fusion two-stage baseline.
 #
-# Run from /home/xwh/project/ace_depth after activating the env:
-#   conda activate mapanything
-#   bash ace_dinov2_lmc/scripts/run_wayspots_ace_fcn_lmc_suite.sh
+# Phase 1: extract ACE-FCN feature memory from train/sparse_depth.
+# Phase 2: Stage1 local ACE-FCN-LMC, no global head.
+# Phase 3: Stage2 GLACE global concat, frozen Stage1 local stack.
+#
+# Run from /home/xwh/project/ace_depth:
+#   RUN_ROOT=/data/xwh/ace_dinov2_lmc/04_evaluation/cambridge_single_stage12_YYYYMMDD_gpu23 \
+#     bash ace_dinov2_lmc/scripts/launch_cambridge_single_stage12_gpu23.sh
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SCRIPT_DIR="${ROOT_DIR}/ace_dinov2_lmc/scripts"
 cd "${ROOT_DIR}"
 
 CONDA_ENV="${CONDA_ENV:-mapanything}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-WAYSPOTS_ROOT="${WAYSPOTS_ROOT:-/data/xwh/Wayspots}"
-RUN_ROOT="${RUN_ROOT:-/data/xwh/ace_dinov2_lmc/04_evaluation/wayspots_ace_fcn_lmc_suite/$(date +%Y%m%d_%H%M%S)}"
-SCENES="${SCENES:-wayspots_bears}"
-EXCLUDE_SCENES="${EXCLUDE_SCENES:-}"
-METHODS="${METHODS:-ace glace memory stage1 stage2}"
+CAMBRIDGE_ROOT="${CAMBRIDGE_ROOT:-/data/xwh/Cambridge}"
+RUN_ROOT="${RUN_ROOT:-/data/xwh/ace_dinov2_lmc/04_evaluation/cambridge_single_stage12_$(date +%Y%m%d_%H%M%S)_gpu23}"
+SCENES="${SCENES:-Cambridge_GreatCourt Cambridge_KingsCollege Cambridge_OldHospital Cambridge_ShopFacade Cambridge_StMarysChurch}"
+METHODS="${METHODS:-memory stage1 stage2}"
 DRY_RUN="${DRY_RUN:-false}"
 SKIP_EXISTING="${SKIP_EXISTING:-true}"
 CONTINUE_ON_ERROR="${CONTINUE_ON_ERROR:-true}"
 
-BASELINE_RUN_ROOT="${BASELINE_RUN_ROOT:-${RUN_ROOT}/baselines}"
+GPU_0="${GPU_0:-2}"
+GPU_1="${GPU_1:-3}"
+
+ACE_ENCODER_PATH="${ACE_ENCODER_PATH:-${ROOT_DIR}/ace_encoder_pretrained.pt}"
+GLACE_FEAT_NAME="${GLACE_FEAT_NAME:-features.npy}"
+
 MEMORY_DIRNAME="${MEMORY_DIRNAME:-memory}"
 STAGE1_SUBDIR="${STAGE1_SUBDIR:-stage1_local_ace_memory_it12}"
 STAGE2_SUBDIR="${STAGE2_SUBDIR:-stage2_glace_concat_it12}"
 STATUS_FILE="${RUN_ROOT}/status.tsv"
 
-GPU_0="${GPU_0:-0}"
-GPU_1="${GPU_1:-1}"
-
-ACE_ENCODER_PATH="${ACE_ENCODER_PATH:-${ROOT_DIR}/ace_encoder_pretrained.pt}"
-GLACE_ROOT="${GLACE_ROOT:-/home/xwh/project/glace}"
-GLACE_FEAT_NAME="${GLACE_FEAT_NAME:-features.npy}"
-
 COORD_SOURCE="${COORD_SOURCE:-sparse_depth}"
-DEPTH_REL_DIR="${DEPTH_REL_DIR:-train/sparse_depth_superpoint_strict_nms_r4}"
-MEMORY_IMAGE_RESOLUTION="${MEMORY_IMAGE_RESOLUTION:-512}"
+DEPTH_REL_DIR="${DEPTH_REL_DIR:-train/sparse_depth}"
+MEMORY_IMAGE_RESOLUTION="${MEMORY_IMAGE_RESOLUTION:-518}"
 MEMORY_SAMPLES_PER_IMAGE="${MEMORY_SAMPLES_PER_IMAGE:-1024}"
 MEMORY_VOXEL_SIZE="${MEMORY_VOXEL_SIZE:-0.05}"
 MEMORY_MAX_POINTS="${MEMORY_MAX_POINTS:-300000}"
@@ -53,29 +48,6 @@ NUM_LATENT_TOKENS="${NUM_LATENT_TOKENS:-64}"
 LMC_FUSION_REFINEMENT_MODE="${LMC_FUSION_REFINEMENT_MODE:-single}"
 LMC_FUSION_CASCADE_LAYERS="${LMC_FUSION_CASCADE_LAYERS:-4}"
 LMC_FUSION_ASSEMBLY_GAMMA_INIT="${LMC_FUSION_ASSEMBLY_GAMMA_INIT:-0.0}"
-LMC_FUSION_REREAD_DELTA_ALPHA="${LMC_FUSION_REREAD_DELTA_ALPHA:-1.0}"
-LMC_FUSION_REREAD_SCALAR_GATE="${LMC_FUSION_REREAD_SCALAR_GATE:-False}"
-LMC_FUSION_REREAD_GATE_INIT="${LMC_FUSION_REREAD_GATE_INIT:-0.0}"
-LMC_FUSION_REREAD_POST_NORM="${LMC_FUSION_REREAD_POST_NORM:-True}"
-LMC_FUSION_REREAD_TRUST_REGION_RATIO="${LMC_FUSION_REREAD_TRUST_REGION_RATIO:-0.0}"
-LMC_FUSION_REREAD_TEMPERATURE="${LMC_FUSION_REREAD_TEMPERATURE:-1.0}"
-LMC_FUSION_REREAD_COMMON_SCALE="${LMC_FUSION_REREAD_COMMON_SCALE:-1.0}"
-LMC_FUSION_REREAD_EFFECTIVE_RATIO_CAP="${LMC_FUSION_REREAD_EFFECTIVE_RATIO_CAP:-0.0}"
-LMC_FUSION_REREAD_QKNORM_EPS="${LMC_FUSION_REREAD_QKNORM_EPS:-1e-6}"
-LMC_FUSION_REREAD_QKNORM_TAU_INIT="${LMC_FUSION_REREAD_QKNORM_TAU_INIT:-0.0}"
-LMC_FUSION_REREAD_LAYERSCALE_PATCH_INIT="${LMC_FUSION_REREAD_LAYERSCALE_PATCH_INIT:-0.01}"
-LMC_FUSION_REREAD_LAYERSCALE_COMMON_INIT="${LMC_FUSION_REREAD_LAYERSCALE_COMMON_INIT:-0.0}"
-LMC_FUSION_SINGLE_QKNORM_EPS="${LMC_FUSION_SINGLE_QKNORM_EPS:-1e-6}"
-LMC_FUSION_SINGLE_QKNORM_TAU_INIT="${LMC_FUSION_SINGLE_QKNORM_TAU_INIT:-0.0}"
-LMC_FUSION_SINGLE_LAYERSCALE_INIT="${LMC_FUSION_SINGLE_LAYERSCALE_INIT:-1.0}"
-LMC_FUSION_REREAD_WARMUP_MODE="${LMC_FUSION_REREAD_WARMUP_MODE:-none}"
-LMC_FUSION_REREAD_WARMUP_ITERS="${LMC_FUSION_REREAD_WARMUP_ITERS:-0}"
-LMC_FUSION_REREAD_WARMUP_START="${LMC_FUSION_REREAD_WARMUP_START:-0.0}"
-LMC_FUSION_REREAD_GEO_LAMBDA="${LMC_FUSION_REREAD_GEO_LAMBDA:-1.0}"
-LMC_FUSION_REREAD_GEO_SIGMA="${LMC_FUSION_REREAD_GEO_SIGMA:-1.0}"
-LMC_FUSION_REREAD_GEO_SIGMA_MODE="${LMC_FUSION_REREAD_GEO_SIGMA_MODE:-fixed}"
-LMC_FUSION_REREAD_GEO_SIGMA_BETA="${LMC_FUSION_REREAD_GEO_SIGMA_BETA:-1.0}"
-LMC_FUSION_REREAD_GEO_SIGMA_MIN="${LMC_FUSION_REREAD_GEO_SIGMA_MIN:-0.5}"
 S1_LOSS_STEP_MODE="${S1_LOSS_STEP_MODE:-fixed_zero}"
 S1_EARLY_STOP="${S1_EARLY_STOP:-False}"
 LMC_LOG_RUNTIME_STATS="${LMC_LOG_RUNTIME_STATS:-False}"
@@ -92,7 +64,8 @@ OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 OMP_DYNAMIC="${OMP_DYNAMIC:-FALSE}"
 export OMP_NUM_THREADS
 export OMP_DYNAMIC
-IMAGE_RESOLUTION="${IMAGE_RESOLUTION:-512}"
+
+IMAGE_RESOLUTION="${IMAGE_RESOLUTION:-518}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 TRAINING_BUFFER_SIZE="${TRAINING_BUFFER_SIZE:-2800000}"
 BUFFER_SIZE_FINAL="${BUFFER_SIZE_FINAL:-7600000}"
@@ -113,25 +86,6 @@ has_method() {
   done
   return 1
 }
-
-is_excluded() {
-  local scene="$1"
-  local exc
-  for exc in ${EXCLUDE_SCENES}; do
-    [[ "${scene}" == "${exc}" ]] && return 0
-  done
-  return 1
-}
-
-filtered_scenes() {
-  local scene
-  for scene in ${SCENES}; do
-    is_excluded "${scene}" && continue
-    printf "%s " "${scene}"
-  done
-}
-
-ACTIVE_SCENES="$(filtered_scenes)"
 
 log_status() {
   local scene="$1" method="$2" stage="$3" status="$4" exit_code="$5" device="$6" log_file="$7"
@@ -176,42 +130,26 @@ maybe_skip_file() {
   [[ "${SKIP_EXISTING}" == "true" && -s "${file}" ]]
 }
 
-summarize_suite() {
-  local scene_args=()
-  local scene
-  # Summarize ALL scenes (including excluded) so old results appear in the table
-  for scene in ${SCENES}; do
-    scene_args+=("${scene}")
-  done
-  run_logged "all" "summary" "aggregate" "-" "${RUN_ROOT}/summary.log" \
-    conda run --no-capture-output -n "${CONDA_ENV}" "${PYTHON_BIN}" "${SCRIPT_DIR}/summarize_wayspots_ace_fcn_lmc_suite.py" \
-      --suite-root "${RUN_ROOT}" \
-      --baseline-root "${BASELINE_RUN_ROOT}" \
-      --scenes "${scene_args[@]}" \
-      --memory-dirname "${MEMORY_DIRNAME}" \
-      --stage1-dirname "${STAGE1_SUBDIR}" \
-      --stage2-dirname "${STAGE2_SUBDIR}"
-}
-
 run_memory() {
   local scene="$1"
-  local scene_root="${WAYSPOTS_ROOT}/${scene}"
+  local gpu="$2"
+  local scene_root="${CAMBRIDGE_ROOT}/${scene}"
   local memory_dir="${RUN_ROOT}/${MEMORY_DIRNAME}/${scene}"
   local memory_path="${memory_dir}/memory_ace_fcn_sparse_sp_r4.pt"
   local depth_dir="${scene_root}/${DEPTH_REL_DIR}"
   mkdir -p "${memory_dir}"
 
   if maybe_skip_file "${memory_path}"; then
-    log_status "${scene}" "memory" "extract" "skipped_existing" 0 "cuda:${GPU_MEMORY}" "${memory_dir}/extract.log"
+    log_status "${scene}" "memory" "extract" "skipped_existing" 0 "cuda:${gpu}" "${memory_dir}/extract.log"
     return 0
   fi
 
-  run_logged "${scene}" "memory" "extract" "cuda:${GPU_MEMORY}" "${memory_dir}/extract.log" \
+  run_logged "${scene}" "memory" "extract" "cuda:${gpu}" "${memory_dir}/extract.log" \
     conda run --no-capture-output -n "${CONDA_ENV}" "${PYTHON_BIN}" -m ace_dinov2_lmc.memory_extraction.extract_memory_ace_fcn \
       "${scene_root}" \
       "${memory_path}" \
       --ace_encoder_path "${ACE_ENCODER_PATH}" \
-      --device "cuda:${GPU_MEMORY}" \
+      --device "cuda:${gpu}" \
       --image_resolution "${MEMORY_IMAGE_RESOLUTION}" \
       --coord_source "${COORD_SOURCE}" \
       --depth_dir "${depth_dir}" \
@@ -224,32 +162,34 @@ run_memory() {
 
 run_stage1() {
   local scene="$1"
-  local scene_root="${WAYSPOTS_ROOT}/${scene}"
+  local gpu="$2"
+  local scene_root="${CAMBRIDGE_ROOT}/${scene}"
+  local train_root="${scene_root}/train"
   local memory_path="${RUN_ROOT}/${MEMORY_DIRNAME}/${scene}/memory_ace_fcn_sparse_sp_r4.pt"
-  local aux_depth_dir="${scene_root}/train/sparse_depth"
   local output_suffix="ace_fcn_local_stage1.pt"
   local stage1_root="${RUN_ROOT}/${STAGE1_SUBDIR}"
   local checkpoint_pattern="best_K${NUM_LATENT_TOKENS}_it${LMC_ITERATIONS}_${output_suffix}"
   local existing_ckpt
   existing_ckpt=$(find "${stage1_root}" -type f -name "${checkpoint_pattern}" -path "*${scene}*" 2>/dev/null | sort | tail -n 1 || true)
   if [[ -n "${existing_ckpt}" && "${SKIP_EXISTING}" == "true" ]]; then
-    log_status "${scene}" "stage1" "train" "skipped_existing" 0 "cuda:${GPU_STAGE1}" "${stage1_root}/skip_${scene}.log"
+    log_status "${scene}" "stage1" "train" "skipped_existing" 0 "cuda:${gpu}" "${stage1_root}/skip_${scene}.log"
     return 0
   fi
 
-  run_logged "${scene}" "stage1" "train" "cuda:${GPU_STAGE1}" "${stage1_root}/train_${scene}.log" \
+  run_logged "${scene}" "stage1" "train" "cuda:${gpu}" "${stage1_root}/train_${scene}.log" \
     conda run --no-capture-output -n "${CONDA_ENV}" "${PYTHON_BIN}" ace_dinov2_lmc/train_ace_dinov2_lmc.py \
       "${scene_root}" "${output_suffix}" \
       --model_backend ace_fcn_lmc \
       --data_backend ace \
+      --post_train_eval_scene "${scene_root}" \
       --use_lmc True \
       --lmc_flow ace_g \
       --memory_path "${memory_path}" \
       --use_scale_token False \
       --ace_encoder_path "${ACE_ENCODER_PATH}" \
       --ace_lmc_global_head_mode none \
-      --device "cuda:${GPU_STAGE1}" \
-      --post_train_eval_device "cuda:${GPU_STAGE1}" \
+      --device "cuda:${gpu}" \
+      --post_train_eval_device "cuda:${gpu}" \
       --experiment_root "${RUN_ROOT}" \
       --experiment_subdir "${STAGE1_SUBDIR}" \
       --lmc_iterations "${LMC_ITERATIONS}" \
@@ -257,29 +197,6 @@ run_stage1() {
       --lmc_fusion_refinement_mode "${LMC_FUSION_REFINEMENT_MODE}" \
       --lmc_fusion_cascade_layers "${LMC_FUSION_CASCADE_LAYERS}" \
       --lmc_fusion_assembly_gamma_init "${LMC_FUSION_ASSEMBLY_GAMMA_INIT}" \
-      --lmc_fusion_reread_delta_alpha "${LMC_FUSION_REREAD_DELTA_ALPHA}" \
-      --lmc_fusion_reread_scalar_gate "${LMC_FUSION_REREAD_SCALAR_GATE}" \
-      --lmc_fusion_reread_gate_init "${LMC_FUSION_REREAD_GATE_INIT}" \
-      --lmc_fusion_reread_post_norm "${LMC_FUSION_REREAD_POST_NORM}" \
-      --lmc_fusion_reread_trust_region_ratio "${LMC_FUSION_REREAD_TRUST_REGION_RATIO}" \
-      --lmc_fusion_reread_temperature "${LMC_FUSION_REREAD_TEMPERATURE}" \
-      --lmc_fusion_reread_common_scale "${LMC_FUSION_REREAD_COMMON_SCALE}" \
-      --lmc_fusion_reread_effective_ratio_cap "${LMC_FUSION_REREAD_EFFECTIVE_RATIO_CAP}" \
-      --lmc_fusion_reread_qknorm_eps "${LMC_FUSION_REREAD_QKNORM_EPS}" \
-      --lmc_fusion_reread_qknorm_tau_init "${LMC_FUSION_REREAD_QKNORM_TAU_INIT}" \
-      --lmc_fusion_reread_layerscale_patch_init "${LMC_FUSION_REREAD_LAYERSCALE_PATCH_INIT}" \
-      --lmc_fusion_reread_layerscale_common_init "${LMC_FUSION_REREAD_LAYERSCALE_COMMON_INIT}" \
-      --lmc_fusion_single_qknorm_eps "${LMC_FUSION_SINGLE_QKNORM_EPS}" \
-      --lmc_fusion_single_qknorm_tau_init "${LMC_FUSION_SINGLE_QKNORM_TAU_INIT}" \
-      --lmc_fusion_single_layerscale_init "${LMC_FUSION_SINGLE_LAYERSCALE_INIT}" \
-      --lmc_fusion_reread_warmup_mode "${LMC_FUSION_REREAD_WARMUP_MODE}" \
-      --lmc_fusion_reread_warmup_iters "${LMC_FUSION_REREAD_WARMUP_ITERS}" \
-      --lmc_fusion_reread_warmup_start "${LMC_FUSION_REREAD_WARMUP_START}" \
-      --lmc_fusion_reread_geo_lambda "${LMC_FUSION_REREAD_GEO_LAMBDA}" \
-      --lmc_fusion_reread_geo_sigma "${LMC_FUSION_REREAD_GEO_SIGMA}" \
-      --lmc_fusion_reread_geo_sigma_mode "${LMC_FUSION_REREAD_GEO_SIGMA_MODE}" \
-      --lmc_fusion_reread_geo_sigma_beta "${LMC_FUSION_REREAD_GEO_SIGMA_BETA}" \
-      --lmc_fusion_reread_geo_sigma_min "${LMC_FUSION_REREAD_GEO_SIGMA_MIN}" \
       --s1_loss_step_mode "${S1_LOSS_STEP_MODE}" \
       --s1_early_stop "${S1_EARLY_STOP}" \
       --lmc_log_runtime_stats "${LMC_LOG_RUNTIME_STATS}" \
@@ -308,7 +225,7 @@ run_stage1() {
       --buffer_valid_coord_sample_ratio 1.0 \
       --buffer_valid_coord_neighbor_radius 1 \
       --buffer_valid_coord_neighbor_mode cross \
-      --c1_aux_depth_root "${aux_depth_dir}" \
+      --c1_aux_depth_root "${train_root}/sparse_depth" \
       --c1_aux_depth_kind sparse_depth \
       --post_train_eval_seeds "${POST_TRAIN_EVAL_SEEDS[@]}" \
       --post_train_hypotheses "${POST_TRAIN_HYPOTHESES}"
@@ -323,30 +240,33 @@ find_stage1_ckpt() {
 
 run_stage2() {
   local scene="$1"
-  local scene_root="${WAYSPOTS_ROOT}/${scene}"
+  local gpu="$2"
+  local scene_root="${CAMBRIDGE_ROOT}/${scene}"
+  local train_root="${scene_root}/train"
   local memory_path="${RUN_ROOT}/${MEMORY_DIRNAME}/${scene}/memory_ace_fcn_sparse_sp_r4.pt"
-  local aux_depth_dir="${scene_root}/train/sparse_depth"
   local stage1_ckpt
   stage1_ckpt="$(find_stage1_ckpt "${scene}")"
   if [[ -z "${stage1_ckpt}" ]]; then
-    log_status "${scene}" "stage2" "preflight" "failed_missing_stage1_ckpt" 2 "cuda:${GPU_STAGE2}" "${RUN_ROOT}/${STAGE2_SUBDIR}/preflight_${scene}.log"
+    log_status "${scene}" "stage2" "preflight" "failed_missing_stage1_ckpt" 2 "cuda:${gpu}" "${RUN_ROOT}/${STAGE2_SUBDIR}/preflight_${scene}.log"
     return 2
   fi
+
   local output_suffix="ace_fcn_glace_global_stage2.pt"
   local stage2_root="${RUN_ROOT}/${STAGE2_SUBDIR}"
   local checkpoint_pattern="best_K${NUM_LATENT_TOKENS}_it${LMC_ITERATIONS}_${output_suffix}"
   local existing_ckpt
   existing_ckpt=$(find "${stage2_root}" -type f -name "${checkpoint_pattern}" -path "*${scene}*" 2>/dev/null | sort | tail -n 1 || true)
   if [[ -n "${existing_ckpt}" && "${SKIP_EXISTING}" == "true" ]]; then
-    log_status "${scene}" "stage2" "train" "skipped_existing" 0 "cuda:${GPU_STAGE2}" "${stage2_root}/skip_${scene}.log"
+    log_status "${scene}" "stage2" "train" "skipped_existing" 0 "cuda:${gpu}" "${stage2_root}/skip_${scene}.log"
     return 0
   fi
 
-  run_logged "${scene}" "stage2" "train" "cuda:${GPU_STAGE2}" "${stage2_root}/train_${scene}.log" \
+  run_logged "${scene}" "stage2" "train" "cuda:${gpu}" "${stage2_root}/train_${scene}.log" \
     conda run --no-capture-output -n "${CONDA_ENV}" "${PYTHON_BIN}" ace_dinov2_lmc/train_ace_dinov2_lmc.py \
       "${scene_root}" "${output_suffix}" \
       --model_backend ace_fcn_lmc \
       --data_backend ace \
+      --post_train_eval_scene "${scene_root}" \
       --use_lmc True \
       --lmc_flow ace_g \
       --memory_path "${memory_path}" \
@@ -356,8 +276,8 @@ run_stage2() {
       --ace_lmc_local_checkpoint_path "${stage1_ckpt}" \
       --ace_lmc_freeze_local_stack True \
       --glace_feat_name "${GLACE_FEAT_NAME}" \
-      --device "cuda:${GPU_STAGE2}" \
-      --post_train_eval_device "cuda:${GPU_STAGE2}" \
+      --device "cuda:${gpu}" \
+      --post_train_eval_device "cuda:${gpu}" \
       --experiment_root "${RUN_ROOT}" \
       --experiment_subdir "${STAGE2_SUBDIR}" \
       --lmc_iterations "${LMC_ITERATIONS}" \
@@ -365,29 +285,6 @@ run_stage2() {
       --lmc_fusion_refinement_mode "${LMC_FUSION_REFINEMENT_MODE}" \
       --lmc_fusion_cascade_layers "${LMC_FUSION_CASCADE_LAYERS}" \
       --lmc_fusion_assembly_gamma_init "${LMC_FUSION_ASSEMBLY_GAMMA_INIT}" \
-      --lmc_fusion_reread_delta_alpha "${LMC_FUSION_REREAD_DELTA_ALPHA}" \
-      --lmc_fusion_reread_scalar_gate "${LMC_FUSION_REREAD_SCALAR_GATE}" \
-      --lmc_fusion_reread_gate_init "${LMC_FUSION_REREAD_GATE_INIT}" \
-      --lmc_fusion_reread_post_norm "${LMC_FUSION_REREAD_POST_NORM}" \
-      --lmc_fusion_reread_trust_region_ratio "${LMC_FUSION_REREAD_TRUST_REGION_RATIO}" \
-      --lmc_fusion_reread_temperature "${LMC_FUSION_REREAD_TEMPERATURE}" \
-      --lmc_fusion_reread_common_scale "${LMC_FUSION_REREAD_COMMON_SCALE}" \
-      --lmc_fusion_reread_effective_ratio_cap "${LMC_FUSION_REREAD_EFFECTIVE_RATIO_CAP}" \
-      --lmc_fusion_reread_qknorm_eps "${LMC_FUSION_REREAD_QKNORM_EPS}" \
-      --lmc_fusion_reread_qknorm_tau_init "${LMC_FUSION_REREAD_QKNORM_TAU_INIT}" \
-      --lmc_fusion_reread_layerscale_patch_init "${LMC_FUSION_REREAD_LAYERSCALE_PATCH_INIT}" \
-      --lmc_fusion_reread_layerscale_common_init "${LMC_FUSION_REREAD_LAYERSCALE_COMMON_INIT}" \
-      --lmc_fusion_single_qknorm_eps "${LMC_FUSION_SINGLE_QKNORM_EPS}" \
-      --lmc_fusion_single_qknorm_tau_init "${LMC_FUSION_SINGLE_QKNORM_TAU_INIT}" \
-      --lmc_fusion_single_layerscale_init "${LMC_FUSION_SINGLE_LAYERSCALE_INIT}" \
-      --lmc_fusion_reread_warmup_mode "${LMC_FUSION_REREAD_WARMUP_MODE}" \
-      --lmc_fusion_reread_warmup_iters "${LMC_FUSION_REREAD_WARMUP_ITERS}" \
-      --lmc_fusion_reread_warmup_start "${LMC_FUSION_REREAD_WARMUP_START}" \
-      --lmc_fusion_reread_geo_lambda "${LMC_FUSION_REREAD_GEO_LAMBDA}" \
-      --lmc_fusion_reread_geo_sigma "${LMC_FUSION_REREAD_GEO_SIGMA}" \
-      --lmc_fusion_reread_geo_sigma_mode "${LMC_FUSION_REREAD_GEO_SIGMA_MODE}" \
-      --lmc_fusion_reread_geo_sigma_beta "${LMC_FUSION_REREAD_GEO_SIGMA_BETA}" \
-      --lmc_fusion_reread_geo_sigma_min "${LMC_FUSION_REREAD_GEO_SIGMA_MIN}" \
       --s1_loss_step_mode "${S1_LOSS_STEP_MODE}" \
       --s1_early_stop "${S1_EARLY_STOP}" \
       --lmc_log_runtime_stats "${LMC_LOG_RUNTIME_STATS}" \
@@ -416,119 +313,63 @@ run_stage2() {
       --buffer_valid_coord_sample_ratio 1.0 \
       --buffer_valid_coord_neighbor_radius 1 \
       --buffer_valid_coord_neighbor_mode cross \
-      --c1_aux_depth_root "${aux_depth_dir}" \
+      --c1_aux_depth_root "${train_root}/sparse_depth" \
       --c1_aux_depth_kind sparse_depth \
       --post_train_eval_seeds "${POST_TRAIN_EVAL_SEEDS[@]}" \
       --post_train_hypotheses "${POST_TRAIN_HYPOTHESES}"
 }
 
-run_ace_baseline() {
-  run_logged "all" "ace" "baseline_run" "cuda:${GPU_0}" "${BASELINE_RUN_ROOT}/ace/run.log" \
-    env \
-      CONDA_ENV="${CONDA_ENV}" \
-      WAYSPOTS_ROOT="${WAYSPOTS_ROOT}" \
-      RUN_ROOT="${BASELINE_RUN_ROOT}" \
-      SCENES="${ACTIVE_SCENES}" \
-      METHODS="ace" \
-      GPU_ID="${GPU_0}" \
-      DEVICE="cuda:${GPU_0}" \
-      EVAL_DEVICE="cuda:${GPU_0}" \
-      bash "${SCRIPT_DIR}/run_wayspots_baselines_all.sh"
+run_scenes_on_gpu() {
+  local method="$1" gpu="$2"
+  shift 2
+  local scene
+  for scene in "$@"; do
+    case "${method}" in
+      memory) run_memory "${scene}" "${gpu}" ;;
+      stage1) run_stage1 "${scene}" "${gpu}" ;;
+      stage2) run_stage2 "${scene}" "${gpu}" ;;
+      *) echo "ERROR: unknown method ${method}" >&2; return 2 ;;
+    esac
+  done
 }
 
-# ── Dual-GPU helpers ──
-# Split ACTIVE_SCENES into two groups for parallel execution on both GPUs.
-SCENES_ARR=(${ACTIVE_SCENES})
+SCENES_ARR=(${SCENES})
 N_SCENES=${#SCENES_ARR[@]}
 HALF=$(( (N_SCENES + 1) / 2 ))
 GROUP_A=("${SCENES_ARR[@]:0:${HALF}}")
 GROUP_B=("${SCENES_ARR[@]:${HALF}}")
 
-run_baseline_on_gpu() {
-  local gpu="$1" method="$2"; shift 2
-  local scenes_str="$*"
-  local extra_env=()
-  if [[ "${method}" == "glace" ]]; then
-    extra_env=(GLACE_ROOT="${GLACE_ROOT}" GLACE_RENDER_FLIPPED_PORTRAIT="true")
-  fi
-  run_logged "all" "${method}" "baseline_run" "cuda:${gpu}" "${BASELINE_RUN_ROOT}/${method}/run_gpu${gpu}.log" \
-    env \
-      CONDA_ENV="${CONDA_ENV}" \
-      WAYSPOTS_ROOT="${WAYSPOTS_ROOT}" \
-      RUN_ROOT="${BASELINE_RUN_ROOT}" \
-      SCENES="${scenes_str}" \
-      METHODS="${method}" \
-      GPU_ID="${gpu}" \
-      DEVICE="cuda:${gpu}" \
-      EVAL_DEVICE="cuda:${gpu}" \
-      "${extra_env[@]}" \
-      bash "${SCRIPT_DIR}/run_wayspots_baselines_all.sh"
-}
-
-run_scenes_on_gpu() {
-  local method="$1" gpu="$2"; shift 2
-  for scene in "$@"; do
-    case "${method}" in
-      memory) GPU_MEMORY="${gpu}" run_memory "${scene}" ;;
-      stage1) GPU_STAGE1="${gpu}" run_stage1 "${scene}" ;;
-      stage2) GPU_STAGE2="${gpu}" run_stage2 "${scene}" ;;
-    esac
-  done
-}
-
 printf "Run root: %s\n" "${RUN_ROOT}"
-printf "Scenes  : %s\n" "${ACTIVE_SCENES}"
-[[ -n "${EXCLUDE_SCENES}" ]] && printf "Excluded: %s\n" "${EXCLUDE_SCENES}"
+printf "Scenes  : %s\n" "${SCENES}"
 printf "Methods : %s\n" "${METHODS}"
-printf "GPUs    : %s, %s (dual-GPU per phase)\n" "${GPU_0}" "${GPU_1}"
+printf "Fusion  : %s\n" "${LMC_FUSION_REFINEMENT_MODE}"
+printf "GPUs    : %s, %s\n" "${GPU_0}" "${GPU_1}"
 printf "Groups  : A(%d)=[%s] on GPU %s | B(%d)=[%s] on GPU %s\n" \
   "${#GROUP_A[@]}" "${GROUP_A[*]}" "${GPU_0}" "${#GROUP_B[@]}" "${GROUP_B[*]}" "${GPU_1}"
 printf "Dry run : %s\n" "${DRY_RUN}"
 
-# ── Phase 1: ACE baseline (single pass, usually all skipped) ──
-if has_method ace; then
-  run_ace_baseline
-  summarize_suite || true
-fi
-
-# ── Phase 2: GLACE baseline (dual-GPU, scenes split) ──
-if has_method glace; then
-  printf "[dual] GLACE baseline: GPU %s ← [%s] | GPU %s ← [%s]\n" \
-    "${GPU_0}" "${GROUP_A[*]}" "${GPU_1}" "${GROUP_B[*]}"
-  run_baseline_on_gpu "${GPU_0}" glace "${GROUP_A[@]}" & pid_a=$!
-  run_baseline_on_gpu "${GPU_1}" glace "${GROUP_B[@]}" & pid_b=$!
-  wait "${pid_a}" "${pid_b}"
-  summarize_suite || true
-fi
-
-# ── Phase 3: Memory extraction (dual-GPU) ──
 if has_method memory; then
   printf "[dual] Memory extraction: GPU %s ← [%s] | GPU %s ← [%s]\n" \
     "${GPU_0}" "${GROUP_A[*]}" "${GPU_1}" "${GROUP_B[*]}"
   run_scenes_on_gpu memory "${GPU_0}" "${GROUP_A[@]}" & pid_a=$!
   run_scenes_on_gpu memory "${GPU_1}" "${GROUP_B[@]}" & pid_b=$!
   wait "${pid_a}" "${pid_b}"
-  summarize_suite || true
 fi
 
-# ── Phase 4: Stage1 (dual-GPU) ──
 if has_method stage1; then
   printf "[dual] Stage1: GPU %s ← [%s] | GPU %s ← [%s]\n" \
     "${GPU_0}" "${GROUP_A[*]}" "${GPU_1}" "${GROUP_B[*]}"
   run_scenes_on_gpu stage1 "${GPU_0}" "${GROUP_A[@]}" & pid_a=$!
   run_scenes_on_gpu stage1 "${GPU_1}" "${GROUP_B[@]}" & pid_b=$!
   wait "${pid_a}" "${pid_b}"
-  summarize_suite || true
 fi
 
-# ── Phase 5: Stage2 (dual-GPU) ──
 if has_method stage2; then
   printf "[dual] Stage2: GPU %s ← [%s] | GPU %s ← [%s]\n" \
     "${GPU_0}" "${GROUP_A[*]}" "${GPU_1}" "${GROUP_B[*]}"
   run_scenes_on_gpu stage2 "${GPU_0}" "${GROUP_A[@]}" & pid_a=$!
   run_scenes_on_gpu stage2 "${GPU_1}" "${GROUP_B[@]}" & pid_b=$!
   wait "${pid_a}" "${pid_b}"
-  summarize_suite || true
 fi
 
-printf "Done. Summary: %s/summary.tsv and %s/summary.md\n" "${RUN_ROOT}" "${RUN_ROOT}"
+printf "Done. Status: %s\n" "${STATUS_FILE}"

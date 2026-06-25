@@ -212,10 +212,34 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        '--ace_lmc_stage2_feature_source',
+        type=str,
+        default='raw_backbone',
+        choices=['raw_backbone', 'stage1_fused'],
+        help=(
+            'ACE-FCN-LMC Stage2 buffer 的 local feature 来源（glace_concat/glace_residual）：'
+            'raw_backbone=旧行为，buffer 存 ACE encoder feature 并在 S2 on-the-fly fusion；'
+            'stage1_fused=先用冻结 Stage1 compressor/fusion 生成 fused feature，'
+            '再作为增强 backbone feature 训练 GLACE-style head 或坐标 residual head。'
+        ),
+    )
+    parser.add_argument(
+        '--ace_lmc_global_normalize',
+        type=_strtobool,
+        default=False,
+        help='是否在 ACE-FCN-LMC global head 输入前对 image-level global feature 做 L2 normalize；默认 False 保持旧行为。',
+    )
+    parser.add_argument(
+        '--ace_lmc_global_noise_std',
+        type=float,
+        default=0.0,
+        help='ACE-FCN-LMC global head 训练时对 global feature 添加的 Gaussian noise std；0 表示关闭。',
+    )
+    parser.add_argument(
         '--ace_lmc_global_gate_init',
         type=float,
         default=1.0,
-        help='ace_fcn_lmc global gate 初值；glace_concat 表示拼接前缩放，glace_film 表示 hidden FiLM 强度。',
+        help='ace_fcn_lmc global gate 初值；glace_concat 表示拼接前缩放，glace_residual 表示 per-pixel residual gate 初值，glace_film 表示 hidden FiLM 强度。',
     )
     parser.add_argument(
         '--ace_lmc_global_gate_learnable',
@@ -246,6 +270,25 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help='glace_residual 模式下坐标残差 tanh 上界，单位米；>0 时 delta=tanh(raw)*max，避免 unbounded residual 发散。',
+    )
+    parser.add_argument(
+        '--ace_lmc_global_residual_use_xyz_condition',
+        type=_strtobool,
+        default=True,
+        help='glace_residual 模式下是否用 frozen Stage1 第一轮 xyz0 作为 detached 条件；默认 True。',
+    )
+    parser.add_argument(
+        '--ace_lmc_global_residual_xyz_condition_mode',
+        type=str,
+        default='fourier_adaln',
+        choices=['none', 'fourier_adaln'],
+        help='xyz0 条件注入方式：none=关闭；fourier_adaln=xyz0 归一化后 Fourier 编码，并用 AdaLN/FiLM residual modulation 注入 feature。',
+    )
+    parser.add_argument(
+        '--ace_lmc_global_residual_xyz_condition_scale',
+        type=float,
+        default=10.0,
+        help='glace_residual xyz0 条件的坐标缩放因子；Fourier 编码前使用 xyz0 / scale。默认 10.0 米，避免大场景坐标进入过高频。',
     )
     parser.add_argument(
         '--ace_lmc_global_residual_bad_gate_weight',
@@ -1352,8 +1395,38 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--lmc_fusion_refinement_mode',
         type=str,
         default='single',
-        choices=['single', 'cascade_internal', 'progressive_reread', 'centered_reread', 'geometry_reread_lite', 'adapter_ffn', 'weak_residual_ffn'],
-        help='Fusion refinement 模式。single=旧行为；cascade_internal=Step15 C1 内部级联 fusion residual；progressive_reread=二次 memory read；centered_reread=以 A1 为中心的差分 memory context；geometry_reread_lite=A1 条件化 3D 邻域二次 read；adapter_ffn=旧版带 post-LN FFN 对照；weak_residual_ffn=identity-preserving 弱残差 FFN 对照。',
+        choices=[
+            'single', 'single_qknorm_layerscale',
+            'cascade_internal', 'progressive_reread', 'centered_reread',
+            'centered_reread_qknorm_layerscale', 'geometry_reread_lite',
+            'adapter_ffn', 'weak_residual_ffn', 'v3_adapter_control',
+            'v3_dual_refine', 'coord_prior_v1',
+        ],
+        help='Fusion refinement 模式。single=旧行为；single_qknorm_layerscale=只改一读 cross-attention 的 QK norm + per-channel output LayerScale；cascade_internal=Step15 C1 内部级联 fusion residual；progressive_reread=二次 memory read；centered_reread=以 A1 为中心的差分 memory context；centered_reread_qknorm_layerscale=PMRF-v3，centered second-read + QK norm + per-channel LayerScale；geometry_reread_lite=A1 条件化 3D 邻域二次 read；adapter_ffn=旧版带 post-LN FFN 对照；weak_residual_ffn=identity-preserving 弱残差 FFN 对照；v3_adapter_control=PMRF-v3 matched query-only residual adapter control，不读 memory，用于验证收益是否来自 memory reread；v3_dual_refine=query-only weak adapter + centered memory reread 双分支 refinement；coord_prior_v1=独立坐标先验融合分支，用 A1@latent_p 得到 memory coordinate prior 后注入 feature，不改变 single 路径。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_single_qknorm_eps',
+        type=float,
+        default=1e-6,
+        help='single_qknorm_layerscale 中一读 Q/K L2 normalize 的 eps。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_single_qknorm_tau_init',
+        type=float,
+        default=0.0,
+        help='single_qknorm_layerscale 中每个 attention head 的 learnable QK-norm temperature 初始值；0 表示 sqrt(head_dim)。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_single_layerscale_init',
+        type=float,
+        default=1.0,
+        help='single_qknorm_layerscale 中一读 attention output 的 per-channel LayerScale 初始值；默认 1.0 保持 residual 量级。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_coord_prior_scale_init',
+        type=float,
+        default=0.10,
+        help='coord_prior_v1 中 memory coordinate-prior feature update 的 scalar gamma 初始值；仅该独立分支使用，single 不受影响。',
     )
     parser.add_argument(
         '--lmc_fusion_cascade_layers',
@@ -1421,6 +1494,61 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help='最终 reread update 相对 anchor 的逐图 mean-norm ratio 上限；0 表示关闭。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_qknorm_eps',
+        type=float,
+        default=1e-6,
+        help='PMRF-v3 second-read Q/K L2 normalize 的 eps。仅 centered_reread_qknorm_layerscale 使用。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_qknorm_tau_init',
+        type=float,
+        default=0.0,
+        help='PMRF-v3 QK norm 每头 learnable temperature 初始值；0 表示使用 sqrt(head_dim)。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_layerscale_patch_init',
+        type=float,
+        default=0.01,
+        help='PMRF-v3 patch-wise delta 的 per-channel LayerScale 初始值。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_layerscale_common_init',
+        type=float,
+        default=0.0,
+        help='PMRF-v3 patch-common delta 的 per-channel LayerScale 初始值；默认 0 保守关闭 common residual。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_dual_memory_layerscale_patch_init',
+        type=float,
+        default=0.005,
+        help='v3_dual_refine 中 memory reread patch-wise delta 的 per-channel LayerScale 初始值。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_dual_memory_layerscale_common_init',
+        type=float,
+        default=0.0,
+        help='v3_dual_refine 中 memory reread patch-common delta 的 per-channel LayerScale 初始值。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_warmup_mode',
+        type=str,
+        default='none',
+        choices=['none', 'linear', 'cosine'],
+        help='训练期 reread residual warmup。none=旧行为；linear/cosine 在前 N 个 outer iteration 逐步启用 residual。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_warmup_iters',
+        type=int,
+        default=0,
+        help='reread residual warmup 的 outer iteration 数；0 表示关闭。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_reread_warmup_start',
+        type=float,
+        default=0.0,
+        help='reread residual warmup 初始 scale，范围 [0,1]。默认 0.0。',
     )
     parser.add_argument(
         '--lmc_fusion_reread_geo_lambda',
@@ -1864,7 +1992,19 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--relative_depth_start_ratio',
         type=float,
         default=0.3,
-        help='S2 进度达到该比例后才逐步打开相对深度 loss。0 表示立即启用。',
+        help='单个 S2 phase 内进度达到该比例后才逐步打开相对深度 loss。0 表示 phase 内立即启用。',
+    )
+    parser.add_argument(
+        '--relative_depth_start_lmc_iteration',
+        type=int,
+        default=0,
+        help='全局 LMC iteration 门控；默认 0 表示不门控。设为 4 表示前 4 个 LMC iteration 不加相对深度 loss。',
+    )
+    parser.add_argument(
+        '--relative_depth_start_lmc_ratio',
+        type=float,
+        default=0.0,
+        help='按 LMC iteration 总进度门控相对深度 loss；默认 0 表示关闭比例门控。',
     )
     parser.add_argument(
         '--relative_depth_pair_weight',
@@ -1895,6 +2035,44 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=int,
         default=256,
         help='在线 teacher depth 的 CPU LRU cache 图像数；0 表示不缓存。',
+    )
+    parser.add_argument(
+        '--relative_depth_student_space',
+        type=str,
+        default='neg_z_legacy',
+        choices=['neg_z_legacy', 'inverse_depth'],
+        help='相对深度 loss 中学生深度的表示空间；默认保持旧版 -z 归一化行为。',
+    )
+    parser.add_argument(
+        '--relative_depth_reprojection_gate',
+        type=str,
+        default='none',
+        choices=['none', 'hard', 'soft'],
+        help='是否用同视图重投影误差对图像级相对深度监督做 detached 几何门控；默认关闭。',
+    )
+    parser.add_argument(
+        '--relative_depth_reprojection_threshold_px',
+        type=float,
+        default=4.0,
+        help='hard 重投影门控的 L2 像素误差阈值。',
+    )
+    parser.add_argument(
+        '--relative_depth_reprojection_sigma_px',
+        type=float,
+        default=4.0,
+        help='soft 重投影门控的 L2 像素误差尺度；第一步仅用于统计和接口铺垫。',
+    )
+    parser.add_argument(
+        '--relative_depth_min_ray_coverage',
+        type=float,
+        default=0.05,
+        help='hard 重投影门控开启时，单图 ray-valid / image-valid 覆盖率低于该值则跳过该图。',
+    )
+    parser.add_argument(
+        '--relative_depth_log_reprojection_stats',
+        type=_strtobool,
+        default=False,
+        help='记录图像级相对深度路径的重投影统计；不改变 loss。',
     )
     parser.add_argument(
         '--relative_depth_image_step_interval',
@@ -1964,8 +2142,15 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--best_metric',
         type=str,
         default='pct5',
-        choices=['pct5', 'pct10_5', 'composite', 'rt_error'],
-        help='最优模型判定指标：pct5 / pct10_5 / composite / rt_error（旋转+平移误差最小）。',
+        choices=[
+            'pct5', 'pct10_5', 'pct25_5', 'pct50_5',
+            'composite', 'rt_error', 'median_error', 'median_t', 'median_r',
+        ],
+        help=(
+            '最优模型判定指标：pct5 / pct10_5 / pct25_5 / pct50_5 / composite / '
+            'rt_error|median_error（旋转+平移中值误差最小）/ '
+            'median_t（平移中值误差最小）/ median_r（旋转中值误差最小）。'
+        ),
     )
 
     # ------------------------------------------------------------------

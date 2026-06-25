@@ -2,6 +2,8 @@
 # LMCFeatureFusion: Fuse compressed memory tokens with query image features.
 # Ported from map-anything/mapanything/tasks/ace/fusion.py
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,11 +24,47 @@ class LMCFusionBlock(nn.Module):
                  query_feature_dim=None, memory_feature_dim=None,
                  fusion_geometry_mode="value_only_raw",
                  fusion_scene_scale=1.0,
-                 fusion_key_geo_init=0.0):
+                 fusion_key_geo_init=0.0,
+                 single_qk_norm=False,
+                 single_qk_norm_eps=1e-6,
+                 single_qk_norm_tau_init=0.0,
+                 single_out_layerscale=False,
+                 single_out_layerscale_init=1.0):
         super().__init__()
+        if feature_dim % num_heads != 0:
+            raise ValueError("feature_dim must be divisible by num_heads.")
+        if float(single_qk_norm_eps) <= 0.0:
+            raise ValueError("single_qk_norm_eps must be > 0.")
+        if float(single_qk_norm_tau_init) < 0.0:
+            raise ValueError("single_qk_norm_tau_init must be >= 0. Use 0 for sqrt(head_dim).")
         self.feature_dim = feature_dim
         self.num_heads = num_heads
         self.scale = (feature_dim // num_heads) ** -0.5
+        self.single_qk_norm = bool(single_qk_norm)
+        self.single_qk_norm_eps = float(single_qk_norm_eps)
+        self.single_out_layerscale = bool(single_out_layerscale)
+        head_dim = feature_dim // num_heads
+        tau_init = (
+            float(single_qk_norm_tau_init)
+            if float(single_qk_norm_tau_init) > 0.0
+            else math.sqrt(float(head_dim))
+        )
+        if self.single_qk_norm:
+            self.single_qk_norm_log_tau = nn.Parameter(
+                torch.full((num_heads,), math.log(tau_init), dtype=torch.float32)
+            )
+        else:
+            self.register_buffer(
+                "single_qk_norm_log_tau", torch.empty(0, dtype=torch.float32), persistent=False
+            )
+        if self.single_out_layerscale:
+            self.single_out_gamma = nn.Parameter(
+                torch.full((feature_dim,), float(single_out_layerscale_init), dtype=torch.float32)
+            )
+        else:
+            self.register_buffer(
+                "single_out_gamma", torch.empty(0, dtype=torch.float32), persistent=False
+            )
         if fusion_geometry_mode not in self.VALID_GEOMETRY_MODES:
             raise ValueError(
                 f"Unsupported fusion_geometry_mode={fusion_geometry_mode!r}. "
@@ -139,12 +177,23 @@ class LMCFusionBlock(nn.Module):
         q = self.q_proj(query_feats)
         q = q.reshape(B, N_q, self.num_heads, head_dim).transpose(1, 2)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        if self.single_qk_norm:
+            q_attn = F.normalize(q, p=2, dim=-1, eps=self.single_qk_norm_eps)
+            k_attn = F.normalize(k, p=2, dim=-1, eps=self.single_qk_norm_eps)
+            tau = self.single_qk_norm_log_tau.exp().to(
+                device=q.device, dtype=q.dtype
+            ).view(1, self.num_heads, 1, 1)
+            attn = (q_attn @ k_attn.transpose(-2, -1)) * tau
+        else:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
         attn_soft = attn.softmax(dim=-1)
         attn = self.attn_drop(attn_soft)
 
         out = (attn @ v).transpose(1, 2).reshape(B, N_q, C)
         out = self.out_proj(out)
+        if self.single_out_layerscale:
+            gamma = self.single_out_gamma.to(device=out.device, dtype=out.dtype).view(1, 1, -1)
+            out = out * gamma
         return out, attn_soft
 
     def fuse_encoded_memory(self, query_feats, k, v):
@@ -183,6 +232,28 @@ class LMCFusionBlock(nn.Module):
                     "memory_p_norm_std": float(pe_eval.std(unbiased=False).item()),
                     "memory_p_norm_absmax": float(pe_eval.abs().max().item()),
                     "memory_p_norm_finite": bool(torch.isfinite(pe_eval).all().item()),
+                    "single_qk_norm": bool(self.single_qk_norm),
+                    "single_qknorm_tau_mean": float(
+                        self.single_qk_norm_log_tau.detach().float().exp().mean().item()
+                        if self.single_qk_norm and self.single_qk_norm_log_tau.numel() > 0 else 0.0
+                    ),
+                    "single_qknorm_tau_min": float(
+                        self.single_qk_norm_log_tau.detach().float().exp().min().item()
+                        if self.single_qk_norm and self.single_qk_norm_log_tau.numel() > 0 else 0.0
+                    ),
+                    "single_qknorm_tau_max": float(
+                        self.single_qk_norm_log_tau.detach().float().exp().max().item()
+                        if self.single_qk_norm and self.single_qk_norm_log_tau.numel() > 0 else 0.0
+                    ),
+                    "single_out_layerscale": bool(self.single_out_layerscale),
+                    "single_out_gamma_mean": float(
+                        self.single_out_gamma.detach().float().mean().item()
+                        if self.single_out_layerscale and self.single_out_gamma.numel() > 0 else 1.0
+                    ),
+                    "single_out_gamma_absmax": float(
+                        self.single_out_gamma.detach().float().abs().max().item()
+                        if self.single_out_layerscale and self.single_out_gamma.numel() > 0 else 1.0
+                    ),
                 }
             stats = self._summarize_attention(
                 attn_soft,
@@ -199,16 +270,31 @@ class LMCFusionBlock(nn.Module):
 class LMCProgressiveRereadBlock(nn.Module):
     """A lightweight second query pass over already encoded memory tokens."""
 
-    def __init__(self, feature_dim, num_heads=8, dropout=0.1, attention_temperature=1.0):
+    def __init__(self, feature_dim, num_heads=8, dropout=0.1, attention_temperature=1.0,
+                 qk_norm=False, qk_norm_eps=1e-6, qk_norm_tau_init=0.0):
         super().__init__()
         if feature_dim % num_heads != 0:
             raise ValueError("feature_dim must be divisible by num_heads.")
         if float(attention_temperature) <= 0.0:
             raise ValueError("attention_temperature must be > 0.")
+        if float(qk_norm_eps) <= 0.0:
+            raise ValueError("qk_norm_eps must be > 0.")
         self.feature_dim = feature_dim
         self.num_heads = num_heads
         self.attention_temperature = float(attention_temperature)
+        self.qk_norm = bool(qk_norm)
+        self.qk_norm_eps = float(qk_norm_eps)
         self.scale = (feature_dim // num_heads) ** -0.5
+        head_dim = feature_dim // num_heads
+        tau_init = float(qk_norm_tau_init) if float(qk_norm_tau_init) > 0.0 else math.sqrt(float(head_dim))
+        if self.qk_norm:
+            self.qk_norm_log_tau = nn.Parameter(
+                torch.full((num_heads,), math.log(tau_init), dtype=torch.float32)
+            )
+        else:
+            self.register_buffer(
+                "qk_norm_log_tau", torch.empty(0, dtype=torch.float32), persistent=False
+            )
         self.query_norm = nn.LayerNorm(feature_dim)
         self.q_proj = nn.Linear(feature_dim, feature_dim)
         self.out_proj = nn.Linear(feature_dim, feature_dim)
@@ -221,7 +307,13 @@ class LMCProgressiveRereadBlock(nn.Module):
         q = self.q_proj(self.query_norm(query_feats))
         q = q.reshape(B, N_q, self.num_heads, head_dim).transpose(1, 2)
 
-        attn_logits = (q @ k.transpose(-2, -1)) * self.scale
+        if self.qk_norm:
+            q_attn = F.normalize(q, p=2, dim=-1, eps=self.qk_norm_eps)
+            k_attn = F.normalize(k, p=2, dim=-1, eps=self.qk_norm_eps)
+            tau = self.qk_norm_log_tau.exp().to(device=q.device, dtype=q.dtype).view(1, self.num_heads, 1, 1)
+            attn_logits = (q_attn @ k_attn.transpose(-2, -1)) * tau
+        else:
+            attn_logits = (q @ k.transpose(-2, -1)) * self.scale
         if attention_bias is not None:
             attn_logits = attn_logits + attention_bias.to(
                 device=attn_logits.device,
@@ -278,12 +370,17 @@ class LMCFeatureFusion(nn.Module):
 
     VALID_REFINEMENT_MODES = {
         "single",
+        "single_qknorm_layerscale",
         "cascade_internal",
         "progressive_reread",
         "centered_reread",
+        "centered_reread_qknorm_layerscale",
         "geometry_reread_lite",
         "adapter_ffn",
         "weak_residual_ffn",
+        "v3_adapter_control",
+        "v3_dual_refine",
+        "coord_prior_v1",
     }
     VALID_ASSEMBLY_MODES = {"concat_mlp"}
 
@@ -305,7 +402,20 @@ class LMCFeatureFusion(nn.Module):
                  fusion_reread_trust_region_ratio=0.0,
                  fusion_reread_temperature=1.0,
                  fusion_reread_common_scale=1.0,
-                 fusion_reread_effective_ratio_cap=0.0):
+                 fusion_reread_effective_ratio_cap=0.0,
+                 fusion_reread_warmup_mode="none",
+                 fusion_reread_warmup_iters=0,
+                 fusion_reread_warmup_start=0.0,
+                 fusion_reread_qknorm_eps=1e-6,
+                 fusion_reread_qknorm_tau_init=0.0,
+                 fusion_reread_layerscale_patch_init=0.01,
+                 fusion_reread_layerscale_common_init=0.0,
+                 fusion_dual_memory_layerscale_patch_init=0.005,
+                 fusion_dual_memory_layerscale_common_init=0.0,
+                 fusion_single_qknorm_eps=1e-6,
+                 fusion_single_qknorm_tau_init=0.0,
+                 fusion_single_layerscale_init=1.0,
+                 fusion_coord_prior_scale_init=0.10):
         super().__init__()
         self.mode = mode
         self.feature_dim = feature_dim
@@ -325,6 +435,20 @@ class LMCFeatureFusion(nn.Module):
         self.fusion_reread_temperature = float(fusion_reread_temperature)
         self.fusion_reread_common_scale = float(fusion_reread_common_scale)
         self.fusion_reread_effective_ratio_cap = float(fusion_reread_effective_ratio_cap)
+        self.fusion_reread_warmup_mode = str(fusion_reread_warmup_mode)
+        self.fusion_reread_warmup_iters = int(fusion_reread_warmup_iters)
+        self.fusion_reread_warmup_start = float(fusion_reread_warmup_start)
+        self.fusion_reread_qknorm_eps = float(fusion_reread_qknorm_eps)
+        self.fusion_reread_qknorm_tau_init = float(fusion_reread_qknorm_tau_init)
+        self.fusion_reread_layerscale_patch_init = float(fusion_reread_layerscale_patch_init)
+        self.fusion_reread_layerscale_common_init = float(fusion_reread_layerscale_common_init)
+        self.fusion_dual_memory_layerscale_patch_init = float(fusion_dual_memory_layerscale_patch_init)
+        self.fusion_dual_memory_layerscale_common_init = float(fusion_dual_memory_layerscale_common_init)
+        self.fusion_single_qknorm_eps = float(fusion_single_qknorm_eps)
+        self.fusion_single_qknorm_tau_init = float(fusion_single_qknorm_tau_init)
+        self.fusion_single_layerscale_init = float(fusion_single_layerscale_init)
+        self.fusion_coord_prior_scale_init = float(fusion_coord_prior_scale_init)
+        self._fusion_reread_warmup_scale = 1.0
 
         if self.fusion_refinement_mode not in self.VALID_REFINEMENT_MODES:
             raise ValueError(
@@ -358,6 +482,22 @@ class LMCFeatureFusion(nn.Module):
             raise ValueError("fusion_reread_common_scale must be >= 0.")
         if self.fusion_reread_effective_ratio_cap < 0.0:
             raise ValueError("fusion_reread_effective_ratio_cap must be >= 0.")
+        if self.fusion_reread_warmup_mode not in {"none", "linear", "cosine"}:
+            raise ValueError("fusion_reread_warmup_mode must be one of: none, linear, cosine.")
+        if self.fusion_reread_warmup_iters < 0:
+            raise ValueError("fusion_reread_warmup_iters must be >= 0.")
+        if not 0.0 <= self.fusion_reread_warmup_start <= 1.0:
+            raise ValueError("fusion_reread_warmup_start must be in [0, 1].")
+        if self.fusion_reread_qknorm_eps <= 0.0:
+            raise ValueError("fusion_reread_qknorm_eps must be > 0.")
+        if self.fusion_reread_qknorm_tau_init < 0.0:
+            raise ValueError("fusion_reread_qknorm_tau_init must be >= 0. Use 0 for sqrt(head_dim).")
+        if self.fusion_single_qknorm_eps <= 0.0:
+            raise ValueError("fusion_single_qknorm_eps must be > 0.")
+        if self.fusion_single_qknorm_tau_init < 0.0:
+            raise ValueError("fusion_single_qknorm_tau_init must be >= 0. Use 0 for sqrt(head_dim).")
+        if self.fusion_coord_prior_scale_init < 0.0:
+            raise ValueError("fusion_coord_prior_scale_init must be >= 0.")
         if mode == 'hierarchical' and self.fusion_refinement_mode != "single":
             raise ValueError("Fusion refinement is only supported for non-hierarchical LMC modes.")
 
@@ -370,6 +510,11 @@ class LMCFeatureFusion(nn.Module):
             fusion_geometry_mode=fusion_geometry_mode,
             fusion_scene_scale=fusion_scene_scale,
             fusion_key_geo_init=fusion_key_geo_init,
+            single_qk_norm=self.fusion_refinement_mode == "single_qknorm_layerscale",
+            single_qk_norm_eps=self.fusion_single_qknorm_eps,
+            single_qk_norm_tau_init=self.fusion_single_qknorm_tau_init,
+            single_out_layerscale=self.fusion_refinement_mode == "single_qknorm_layerscale",
+            single_out_layerscale_init=self.fusion_single_layerscale_init,
         )
 
         if mode == 'hierarchical':
@@ -383,15 +528,23 @@ class LMCFeatureFusion(nn.Module):
                     num_heads=num_heads,
                     dropout=dropout,
                     attention_temperature=self.fusion_reread_temperature,
+                    qk_norm=self.fusion_refinement_mode in (
+                        "centered_reread_qknorm_layerscale", "v3_dual_refine"
+                    ),
+                    qk_norm_eps=self.fusion_reread_qknorm_eps,
+                    qk_norm_tau_init=self.fusion_reread_qknorm_tau_init,
                 )
                 if self.fusion_refinement_mode in (
-                    "progressive_reread", "centered_reread", "geometry_reread_lite"
+                    "progressive_reread", "centered_reread",
+                    "centered_reread_qknorm_layerscale", "geometry_reread_lite",
+                    "v3_dual_refine"
                 )
                 else None
             )
             if self.fusion_refinement_mode in (
                 "progressive_reread", "centered_reread",
-                "geometry_reread_lite", "weak_residual_ffn",
+                "centered_reread_qknorm_layerscale", "geometry_reread_lite",
+                "weak_residual_ffn",
             ) and self.fusion_reread_scalar_gate:
                 self.fusion_reread_gate_logit = nn.Parameter(
                     torch.tensor(float(fusion_reread_gate_init), dtype=torch.float32)
@@ -404,9 +557,73 @@ class LMCFeatureFusion(nn.Module):
                 )
             self.adapter_ffn = (
                 LMCAdapterFFNBlock(feature_dim, dropout=dropout)
-                if self.fusion_refinement_mode in ("adapter_ffn", "weak_residual_ffn")
+                if self.fusion_refinement_mode in (
+                    "adapter_ffn", "weak_residual_ffn", "v3_adapter_control",
+                    "v3_dual_refine"
+                )
                 else None
             )
+            if self.fusion_refinement_mode == "coord_prior_v1":
+                self.coord_prior_encoder = FourierPositionEncoding(
+                    input_dim=3, output_dim=feature_dim
+                )
+                self.coord_prior_proj = nn.Sequential(
+                    nn.LayerNorm(feature_dim),
+                    nn.Linear(feature_dim, feature_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(feature_dim, feature_dim),
+                )
+                self.coord_prior_gamma = nn.Parameter(
+                    torch.tensor(self.fusion_coord_prior_scale_init, dtype=torch.float32)
+                )
+            else:
+                self.coord_prior_encoder = None
+                self.coord_prior_proj = None
+                self.register_buffer(
+                    "coord_prior_gamma",
+                    torch.tensor(self.fusion_coord_prior_scale_init, dtype=torch.float32),
+                    persistent=False,
+                )
+            if self.fusion_refinement_mode in (
+                "centered_reread_qknorm_layerscale", "v3_adapter_control",
+                "v3_dual_refine"
+            ):
+                self.fusion_reread_gamma_patch = nn.Parameter(
+                    torch.full((feature_dim,), self.fusion_reread_layerscale_patch_init, dtype=torch.float32)
+                )
+                self.fusion_reread_gamma_common = nn.Parameter(
+                    torch.full((feature_dim,), self.fusion_reread_layerscale_common_init, dtype=torch.float32)
+                )
+            else:
+                self.register_buffer(
+                    "fusion_reread_gamma_patch",
+                    torch.full((feature_dim,), self.fusion_reread_layerscale_patch_init, dtype=torch.float32),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "fusion_reread_gamma_common",
+                    torch.full((feature_dim,), self.fusion_reread_layerscale_common_init, dtype=torch.float32),
+                    persistent=False,
+                )
+            if self.fusion_refinement_mode == "v3_dual_refine":
+                self.fusion_dual_memory_gamma_patch = nn.Parameter(
+                    torch.full((feature_dim,), self.fusion_dual_memory_layerscale_patch_init, dtype=torch.float32)
+                )
+                self.fusion_dual_memory_gamma_common = nn.Parameter(
+                    torch.full((feature_dim,), self.fusion_dual_memory_layerscale_common_init, dtype=torch.float32)
+                )
+            else:
+                self.register_buffer(
+                    "fusion_dual_memory_gamma_patch",
+                    torch.full((feature_dim,), self.fusion_dual_memory_layerscale_patch_init, dtype=torch.float32),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "fusion_dual_memory_gamma_common",
+                    torch.full((feature_dim,), self.fusion_dual_memory_layerscale_common_init, dtype=torch.float32),
+                    persistent=False,
+                )
             if self.fusion_refinement_mode == "cascade_internal" and self.fusion_cascade_layers > 1:
                 cascade_kwargs = dict(block_kwargs)
                 cascade_kwargs["query_feature_dim"] = feature_dim
@@ -433,6 +650,32 @@ class LMCFeatureFusion(nn.Module):
                     torch.tensor(float(fusion_assembly_gamma_init), dtype=torch.float32),
                     persistent=False,
                 )
+
+    def set_reread_warmup_progress(self, iteration_idx=None):
+        """Set training-time reread residual warmup scale.
+
+        The default scale is 1.0 so evaluation uses the fully activated model.
+        Training code can call this at the start of each outer LMC iteration.
+        """
+        if self.fusion_reread_warmup_mode == "none" or self.fusion_reread_warmup_iters <= 0:
+            self._fusion_reread_warmup_scale = 1.0
+            return self._fusion_reread_warmup_scale
+        if iteration_idx is None:
+            self._fusion_reread_warmup_scale = 1.0
+            return self._fusion_reread_warmup_scale
+
+        progress = float(iteration_idx + 1) / float(max(1, self.fusion_reread_warmup_iters))
+        progress = max(0.0, min(1.0, progress))
+        if self.fusion_reread_warmup_mode == "cosine":
+            progress = 0.5 - 0.5 * math.cos(math.pi * progress)
+        scale = self.fusion_reread_warmup_start + (
+            1.0 - self.fusion_reread_warmup_start
+        ) * progress
+        self._fusion_reread_warmup_scale = float(max(0.0, min(1.0, scale)))
+        return self._fusion_reread_warmup_scale
+
+    def get_reread_warmup_scale(self):
+        return float(getattr(self, "_fusion_reread_warmup_scale", 1.0))
 
     @staticmethod
     def _summarize_routing_change(first_attn, reread_attn, max_pixels=4096):
@@ -526,7 +769,9 @@ class LMCFeatureFusion(nn.Module):
     def _forward_single_or_cascade(self, query_feats, latent_z, latent_p, scene_center,
                                    return_stats=False, stats_max_pixels=4096):
         if self.fusion_refinement_mode in (
-            "progressive_reread", "centered_reread", "geometry_reread_lite"
+            "progressive_reread", "centered_reread",
+            "centered_reread_qknorm_layerscale", "geometry_reread_lite",
+            "v3_dual_refine"
         ):
             k, v, pe_input = self.fusion_single.encode_memory(latent_z, latent_p, scene_center)
             anchor_feats, first_delta, first_attn = self.fusion_single.fuse_encoded_memory(
@@ -549,7 +794,10 @@ class LMCFeatureFusion(nn.Module):
                 v,
                 attention_bias=reread_attention_bias,
                 reference_attn=(
-                    first_attn if self.fusion_refinement_mode == "centered_reread" else None
+                    first_attn if self.fusion_refinement_mode in (
+                        "centered_reread", "centered_reread_qknorm_layerscale",
+                        "v3_dual_refine"
+                    ) else None
                 ),
             )
             reread_gate = None
@@ -562,33 +810,91 @@ class LMCFeatureFusion(nn.Module):
                 reread_effective_scale = reread_effective_scale * reread_gate
 
             reread_update_delta = reread_delta
-            if self.fusion_reread_common_scale != 1.0:
-                common_delta = reread_update_delta.mean(dim=1, keepdim=True)
+            reread_patch_delta = None
+            reread_common_delta = None
+            if self.fusion_refinement_mode in (
+                "centered_reread_qknorm_layerscale", "v3_dual_refine"
+            ):
+                reread_common_delta = reread_update_delta.mean(dim=1, keepdim=True)
+                reread_patch_delta = reread_update_delta - reread_common_delta
+                if self.fusion_refinement_mode == "v3_dual_refine":
+                    gamma_patch = self.fusion_dual_memory_gamma_patch.to(
+                        device=reread_update_delta.device, dtype=reread_update_delta.dtype
+                    ).view(1, 1, -1)
+                    gamma_common = self.fusion_dual_memory_gamma_common.to(
+                        device=reread_update_delta.device, dtype=reread_update_delta.dtype
+                    ).view(1, 1, -1)
+                else:
+                    gamma_patch = self.fusion_reread_gamma_patch.to(
+                        device=reread_update_delta.device, dtype=reread_update_delta.dtype
+                    ).view(1, 1, -1)
+                    gamma_common = self.fusion_reread_gamma_common.to(
+                        device=reread_update_delta.device, dtype=reread_update_delta.dtype
+                    ).view(1, 1, -1)
+                reread_update_delta = (
+                    gamma_patch * reread_patch_delta
+                    + gamma_common * float(self.fusion_reread_common_scale) * reread_common_delta
+                )
+            elif self.fusion_reread_common_scale != 1.0:
+                reread_common_delta = reread_update_delta.mean(dim=1, keepdim=True)
                 reread_update_delta = (
                     reread_update_delta
-                    - common_delta
-                    + float(self.fusion_reread_common_scale) * common_delta
+                    - reread_common_delta
+                    + float(self.fusion_reread_common_scale) * reread_common_delta
                 )
             trust_scale = None
             raw_delta_ratio = None
             if self.fusion_reread_trust_region_ratio > 0.0:
                 with torch.no_grad():
                     eps = 1e-8
-                    delta_norm = reread_delta.detach().float().norm(dim=-1, keepdim=True)
+                    delta_norm = reread_update_delta.detach().float().norm(dim=-1, keepdim=True)
                     anchor_norm = anchor_feats.detach().float().norm(dim=-1, keepdim=True)
                     raw_delta_ratio = delta_norm / anchor_norm.clamp(min=eps)
                     max_delta_norm = float(self.fusion_reread_trust_region_ratio) * anchor_norm
                     trust_scale = (max_delta_norm / delta_norm.clamp(min=eps)).clamp(max=1.0)
-                    trust_scale = trust_scale.to(device=reread_delta.device, dtype=reread_delta.dtype)
-                reread_update_delta = reread_delta * trust_scale
+                    trust_scale = trust_scale.to(device=reread_update_delta.device, dtype=reread_update_delta.dtype)
+                reread_update_delta = reread_update_delta * trust_scale
 
-            reread_effective_update = reread_effective_scale * reread_update_delta
+            reread_warmup_scale = reread_delta.new_tensor(self.get_reread_warmup_scale())
+            reread_effective_update_before_warmup = reread_effective_scale * reread_update_delta
+            reread_effective_update = reread_effective_update_before_warmup * reread_warmup_scale
+
+            dual_adapter_delta = None
+            dual_adapter_patch_delta = None
+            dual_adapter_common_delta = None
+            dual_adapter_update_delta = None
+            dual_adapter_effective_update_before_warmup = None
+            dual_adapter_effective_update = None
+            if self.fusion_refinement_mode == "v3_dual_refine":
+                dual_adapter_delta = self.adapter_ffn.compute_delta(anchor_feats)
+                dual_adapter_common_delta = dual_adapter_delta.mean(dim=1, keepdim=True)
+                dual_adapter_patch_delta = dual_adapter_delta - dual_adapter_common_delta
+                query_gamma_patch = self.fusion_reread_gamma_patch.to(
+                    device=dual_adapter_delta.device, dtype=dual_adapter_delta.dtype
+                ).view(1, 1, -1)
+                query_gamma_common = self.fusion_reread_gamma_common.to(
+                    device=dual_adapter_delta.device, dtype=dual_adapter_delta.dtype
+                ).view(1, 1, -1)
+                dual_adapter_update_delta = (
+                    query_gamma_patch * dual_adapter_patch_delta
+                    + query_gamma_common * float(self.fusion_reread_common_scale) * dual_adapter_common_delta
+                )
+                dual_adapter_effective_update_before_warmup = (
+                    reread_effective_scale * dual_adapter_update_delta
+                )
+                dual_adapter_effective_update = (
+                    dual_adapter_effective_update_before_warmup * reread_warmup_scale
+                )
+
+            total_effective_update = reread_effective_update
+            if dual_adapter_effective_update is not None:
+                total_effective_update = total_effective_update + dual_adapter_effective_update
             effective_ratio_scale = None
             if self.fusion_reread_effective_ratio_cap > 0.0:
                 eps = 1e-8
                 with torch.no_grad():
                     anchor_norm = anchor_feats.detach().float().norm(dim=-1, keepdim=True)
-                effective_update_norm = reread_effective_update.float().norm(
+                effective_update_norm = total_effective_update.float().norm(
                     dim=-1, keepdim=True
                 )
                 effective_ratio = effective_update_norm / anchor_norm.clamp(min=eps)
@@ -598,12 +904,15 @@ class LMCFeatureFusion(nn.Module):
                     / image_mean_ratio.clamp(min=eps)
                 ).clamp(max=1.0)
                 effective_ratio_scale = effective_ratio_scale.to(
-                    device=reread_effective_update.device,
-                    dtype=reread_effective_update.dtype,
+                    device=total_effective_update.device,
+                    dtype=total_effective_update.dtype,
                 )
                 reread_effective_update = reread_effective_update * effective_ratio_scale
+                if dual_adapter_effective_update is not None:
+                    dual_adapter_effective_update = dual_adapter_effective_update * effective_ratio_scale
+                total_effective_update = total_effective_update * effective_ratio_scale
 
-            fused = anchor_feats + reread_effective_update
+            fused = anchor_feats + total_effective_update
             if self.fusion_reread_post_norm:
                 fused = self.progressive_reread.output_norm(fused)
             if not return_stats:
@@ -653,12 +962,47 @@ class LMCFeatureFusion(nn.Module):
                     "reread_delta_alpha": float(self.fusion_reread_delta_alpha),
                     "reread_scalar_gate": bool(self.fusion_reread_scalar_gate),
                     "reread_post_norm": bool(self.fusion_reread_post_norm),
-                    "reread_centered_context": self.fusion_refinement_mode == "centered_reread",
+                    "reread_centered_context": self.fusion_refinement_mode in (
+                        "centered_reread", "centered_reread_qknorm_layerscale",
+                        "v3_dual_refine"
+                    ),
+                    "reread_qk_norm": bool(
+                        getattr(self.progressive_reread, "qk_norm", False)
+                        if self.progressive_reread is not None else False
+                    ),
+                    "reread_qknorm_tau_mean": float(
+                        self.progressive_reread.qk_norm_log_tau.detach().float().exp().mean().item()
+                        if (
+                            self.progressive_reread is not None
+                            and getattr(self.progressive_reread, "qk_norm", False)
+                            and self.progressive_reread.qk_norm_log_tau.numel() > 0
+                        ) else 0.0
+                    ),
+                    "reread_qknorm_tau_min": float(
+                        self.progressive_reread.qk_norm_log_tau.detach().float().exp().min().item()
+                        if (
+                            self.progressive_reread is not None
+                            and getattr(self.progressive_reread, "qk_norm", False)
+                            and self.progressive_reread.qk_norm_log_tau.numel() > 0
+                        ) else 0.0
+                    ),
+                    "reread_qknorm_tau_max": float(
+                        self.progressive_reread.qk_norm_log_tau.detach().float().exp().max().item()
+                        if (
+                            self.progressive_reread is not None
+                            and getattr(self.progressive_reread, "qk_norm", False)
+                            and self.progressive_reread.qk_norm_log_tau.numel() > 0
+                        ) else 0.0
+                    ),
                     "reread_temperature": float(self.fusion_reread_temperature),
                     "reread_common_scale": float(self.fusion_reread_common_scale),
                     "reread_effective_ratio_cap": float(
                         self.fusion_reread_effective_ratio_cap
                     ),
+                    "reread_warmup_mode": self.fusion_reread_warmup_mode,
+                    "reread_warmup_iters": int(self.fusion_reread_warmup_iters),
+                    "reread_warmup_start": float(self.fusion_reread_warmup_start),
+                    "reread_warmup_scale": float(reread_warmup_scale.detach().float().cpu().item()),
                     "reread_effective_ratio_scale_mean": float(
                         effective_ratio_scale.detach().float().mean().item()
                         if effective_ratio_scale is not None else 1.0
@@ -667,18 +1011,31 @@ class LMCFeatureFusion(nn.Module):
                         (effective_ratio_scale.detach().float() < 0.999).float().mean().item()
                         if effective_ratio_scale is not None else 0.0
                     ),
+                    "reread_effective_ratio_before_warmup_mean": float(
+                        (
+                            reread_effective_update_before_warmup.detach().float().norm(dim=-1)
+                            / anchor_feats.detach().float().norm(dim=-1).clamp(min=1e-8)
+                        ).mean().item()
+                    ),
+                    "reread_effective_ratio_before_warmup_p90": float(
+                        torch.quantile(
+                            (
+                                reread_effective_update_before_warmup.detach().float().norm(dim=-1)
+                                / anchor_feats.detach().float().norm(dim=-1).clamp(min=1e-8)
+                            ).flatten(),
+                            0.90,
+                        ).item()
+                    ),
                     "reread_effective_ratio_raw_mean": float(
                         (
-                            (reread_effective_scale * reread_update_delta).detach().float()
-                            .norm(dim=-1)
+                            reread_effective_update.detach().float().norm(dim=-1)
                             / anchor_feats.detach().float().norm(dim=-1).clamp(min=1e-8)
                         ).mean().item()
                     ),
                     "reread_effective_ratio_raw_p90": float(
                         torch.quantile(
                             (
-                                (reread_effective_scale * reread_update_delta).detach().float()
-                                .norm(dim=-1)
+                                reread_effective_update.detach().float().norm(dim=-1)
                                 / anchor_feats.detach().float().norm(dim=-1).clamp(min=1e-8)
                             ).flatten(),
                             0.90,
@@ -723,6 +1080,48 @@ class LMCFeatureFusion(nn.Module):
                     ),
                     "reread_update_delta_norm": float(
                         reread_update_delta.detach().float().norm(dim=-1).mean().item()
+                    ),
+                    "reread_layerscale_patch_mean": float(
+                        (
+                            self.fusion_dual_memory_gamma_patch
+                            if self.fusion_refinement_mode == "v3_dual_refine"
+                            else self.fusion_reread_gamma_patch
+                        ).detach().float().mean().item()
+                    ),
+                    "reread_layerscale_patch_absmax": float(
+                        (
+                            self.fusion_dual_memory_gamma_patch
+                            if self.fusion_refinement_mode == "v3_dual_refine"
+                            else self.fusion_reread_gamma_patch
+                        ).detach().float().abs().max().item()
+                    ),
+                    "reread_layerscale_common_mean": float(
+                        (
+                            self.fusion_dual_memory_gamma_common
+                            if self.fusion_refinement_mode == "v3_dual_refine"
+                            else self.fusion_reread_gamma_common
+                        ).detach().float().mean().item()
+                    ),
+                    "reread_layerscale_common_absmax": float(
+                        (
+                            self.fusion_dual_memory_gamma_common
+                            if self.fusion_refinement_mode == "v3_dual_refine"
+                            else self.fusion_reread_gamma_common
+                        ).detach().float().abs().max().item()
+                    ),
+                    "reread_patch_delta_norm": float(
+                        reread_patch_delta.detach().float().norm(dim=-1).mean().item()
+                        if reread_patch_delta is not None else 0.0
+                    ),
+                    "reread_common_delta_norm": float(
+                        reread_common_delta.detach().float().norm(dim=-1).mean().item()
+                        if reread_common_delta is not None else 0.0
+                    ),
+                    "reread_effective_update_norm_before_warmup": float(
+                        reread_effective_update_before_warmup.detach().float().norm(dim=-1).mean().item()
+                    ),
+                    "reread_effective_update_norm_after_warmup": float(
+                        reread_effective_update.detach().float().norm(dim=-1).mean().item()
                     ),
                     "reread_update_delta_common_ratio": float(
                         reread_update_delta.detach().float().mean(dim=1).norm(dim=-1).mean().div(
@@ -787,6 +1186,81 @@ class LMCFeatureFusion(nn.Module):
                         fused.detach().float().norm(dim=-1).mean().item()
                     ),
                 })
+                if self.fusion_refinement_mode == "v3_dual_refine":
+                    query_effective_ratio = (
+                        dual_adapter_effective_update.detach().float().norm(dim=-1)
+                        / anchor_feats.detach().float().norm(dim=-1).clamp(min=1e-8)
+                    )
+                    total_effective_ratio = (
+                        total_effective_update.detach().float().norm(dim=-1)
+                        / anchor_feats.detach().float().norm(dim=-1).clamp(min=1e-8)
+                    )
+                    query_update_common_ratio = (
+                        dual_adapter_update_delta.detach().float().mean(dim=1).norm(dim=-1).mean()
+                        / dual_adapter_update_delta.detach().float().norm(dim=-1).mean().clamp(min=1e-8)
+                    )
+                    total_update_common_ratio = (
+                        total_effective_update.detach().float().mean(dim=1).norm(dim=-1).mean()
+                        / total_effective_update.detach().float().norm(dim=-1).mean().clamp(min=1e-8)
+                    )
+                    stats.update({
+                        "dual_query_delta_norm": float(
+                            dual_adapter_delta.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "dual_query_patch_delta_norm": float(
+                            dual_adapter_patch_delta.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "dual_query_common_delta_norm": float(
+                            dual_adapter_common_delta.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "dual_query_update_delta_norm": float(
+                            dual_adapter_update_delta.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "dual_query_effective_update_norm_before_warmup": float(
+                            dual_adapter_effective_update_before_warmup.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "dual_query_effective_update_norm_after_warmup": float(
+                            dual_adapter_effective_update.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "dual_query_effective_ratio_mean": float(query_effective_ratio.mean().item()),
+                        "dual_query_effective_ratio_p90": float(
+                            torch.quantile(query_effective_ratio.flatten(), 0.90).item()
+                        ),
+                        "dual_query_update_delta_common_ratio": float(query_update_common_ratio.item()),
+                        "dual_query_layerscale_patch_mean": float(
+                            self.fusion_reread_gamma_patch.detach().float().mean().item()
+                        ),
+                        "dual_query_layerscale_patch_absmax": float(
+                            self.fusion_reread_gamma_patch.detach().float().abs().max().item()
+                        ),
+                        "dual_query_layerscale_common_mean": float(
+                            self.fusion_reread_gamma_common.detach().float().mean().item()
+                        ),
+                        "dual_query_layerscale_common_absmax": float(
+                            self.fusion_reread_gamma_common.detach().float().abs().max().item()
+                        ),
+                        "dual_memory_layerscale_patch_init": float(
+                            self.fusion_dual_memory_layerscale_patch_init
+                        ),
+                        "dual_memory_layerscale_common_init": float(
+                            self.fusion_dual_memory_layerscale_common_init
+                        ),
+                        "dual_total_update_norm": float(
+                            total_effective_update.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "dual_total_effective_ratio_mean": float(total_effective_ratio.mean().item()),
+                        "dual_total_effective_ratio_p90": float(
+                            torch.quantile(total_effective_ratio.flatten(), 0.90).item()
+                        ),
+                        "dual_total_update_common_ratio": float(total_update_common_ratio.item()),
+                        "dual_memory_query_update_cosine": float(
+                            F.cosine_similarity(
+                                reread_effective_update.detach().float(),
+                                dual_adapter_effective_update.detach().float(),
+                                dim=-1,
+                            ).mean().item()
+                        ),
+                    })
                 if self.fusion_refinement_mode == "geometry_reread_lite":
                     stats.update(self._summarize_geometry_reread(
                         first_attn,
@@ -794,6 +1268,114 @@ class LMCFeatureFusion(nn.Module):
                         pe_input,
                         max_pixels=stats_max_pixels,
                     ))
+            return fused, stats
+
+
+        if self.fusion_refinement_mode == "coord_prior_v1":
+            k, v, pe_input = self.fusion_single.encode_memory(latent_z, latent_p, scene_center)
+            anchor_feats, first_delta, first_attn = self.fusion_single.fuse_encoded_memory(
+                query_feats, k, v
+            )
+            prior_attn = first_attn.mean(dim=1)
+            memory_points = latent_p.to(device=prior_attn.device, dtype=prior_attn.dtype)
+            coord_prior_world = prior_attn @ memory_points
+            scene_center_t = scene_center.to(
+                device=coord_prior_world.device, dtype=coord_prior_world.dtype
+            ).unsqueeze(1)
+            coord_scale = self.fusion_single.fusion_scene_scale.to(
+                device=coord_prior_world.device, dtype=coord_prior_world.dtype
+            ).clamp(min=1e-6)
+            coord_prior_norm = (coord_prior_world - scene_center_t) / coord_scale
+            coord_prior_embed = self.coord_prior_encoder(coord_prior_norm)
+            coord_prior_delta = self.coord_prior_proj(coord_prior_embed)
+            coord_prior_gamma = self.coord_prior_gamma.to(
+                device=coord_prior_delta.device, dtype=coord_prior_delta.dtype
+            )
+            coord_prior_update = coord_prior_gamma.view(1, 1, 1) * coord_prior_delta
+            fused = anchor_feats + coord_prior_update
+            if not return_stats:
+                return fused
+
+            pe_eval = pe_input.detach().float()
+            stats = self.fusion_single._summarize_attention(
+                first_attn,
+                query_feats,
+                first_delta,
+                anchor_feats,
+                max_pixels=stats_max_pixels,
+                extra_stats={
+                    "fusion_geometry_mode": self.fusion_single.fusion_geometry_mode,
+                    "fusion_scene_scale": float(
+                        self.fusion_single.fusion_scene_scale.detach().cpu().item()
+                    ),
+                    "key_geo_scale": float(
+                        getattr(
+                            self.fusion_single,
+                            "key_geo_scale",
+                            torch.tensor(0.0, device=pe_input.device),
+                        ).detach().float().cpu().item()
+                    ),
+                    "memory_p_norm_std": float(pe_eval.std(unbiased=False).item()),
+                    "memory_p_norm_absmax": float(pe_eval.abs().max().item()),
+                    "memory_p_norm_finite": bool(torch.isfinite(pe_eval).all().item()),
+                    "single_qk_norm": bool(self.fusion_single.single_qk_norm),
+                    "single_qknorm_tau_mean": float(
+                        self.fusion_single.single_qk_norm_log_tau.detach().float().exp().mean().item()
+                        if (
+                            self.fusion_single.single_qk_norm
+                            and self.fusion_single.single_qk_norm_log_tau.numel() > 0
+                        ) else 0.0
+                    ),
+                    "single_out_layerscale": bool(self.fusion_single.single_out_layerscale),
+                },
+            )
+            with torch.no_grad():
+                coord_prior_radius = coord_prior_norm.detach().float().norm(dim=-1)
+                coord_prior_update_eval = coord_prior_update.detach().float()
+                anchor_eval = anchor_feats.detach().float()
+                coord_effective_ratio = (
+                    coord_prior_update_eval.norm(dim=-1)
+                    / anchor_eval.norm(dim=-1).clamp(min=1e-8)
+                )
+                coord_common_ratio = (
+                    coord_prior_update_eval.mean(dim=1).norm(dim=-1).mean()
+                    / coord_prior_update_eval.norm(dim=-1).mean().clamp(min=1e-8)
+                )
+                stats.update({
+                    "fusion_refinement_mode": self.fusion_refinement_mode,
+                    "fusion_cascade_layers": 2,
+                    "coord_prior_scale_init": float(self.fusion_coord_prior_scale_init),
+                    "coord_prior_gamma": float(
+                        self.coord_prior_gamma.detach().float().cpu().item()
+                    ),
+                    "coord_prior_scene_scale": float(
+                        self.fusion_single.fusion_scene_scale.detach().float().cpu().item()
+                    ),
+                    "coord_prior_norm_radius_mean": float(coord_prior_radius.mean().item()),
+                    "coord_prior_norm_radius_p90": float(
+                        torch.quantile(coord_prior_radius.flatten(), 0.90).item()
+                    ),
+                    "coord_prior_embed_norm": float(
+                        coord_prior_embed.detach().float().norm(dim=-1).mean().item()
+                    ),
+                    "coord_prior_delta_norm": float(
+                        coord_prior_delta.detach().float().norm(dim=-1).mean().item()
+                    ),
+                    "coord_prior_update_norm": float(
+                        coord_prior_update_eval.norm(dim=-1).mean().item()
+                    ),
+                    "coord_prior_effective_ratio_mean": float(coord_effective_ratio.mean().item()),
+                    "coord_prior_effective_ratio_p90": float(
+                        torch.quantile(coord_effective_ratio.flatten(), 0.90).item()
+                    ),
+                    "coord_prior_update_common_ratio": float(coord_common_ratio.item()),
+                    "anchor_coord_prior_cosine": float(
+                        F.cosine_similarity(anchor_eval, fused.detach().float(), dim=-1).mean().item()
+                    ),
+                    "fused_feature_norm": float(
+                        fused.detach().float().norm(dim=-1).mean().item()
+                    ),
+                })
             return fused, stats
 
         first_out = self.fusion_single(
@@ -859,6 +1441,127 @@ class LMCFeatureFusion(nn.Module):
                 return fused, stats
             return fused
 
+        if self.fusion_refinement_mode == "v3_adapter_control":
+            adapter_delta = self.adapter_ffn.compute_delta(anchor_feats)
+            adapter_common_delta = adapter_delta.mean(dim=1, keepdim=True)
+            adapter_patch_delta = adapter_delta - adapter_common_delta
+            gamma_patch = self.fusion_reread_gamma_patch.to(
+                device=adapter_delta.device, dtype=adapter_delta.dtype
+            ).view(1, 1, -1)
+            gamma_common = self.fusion_reread_gamma_common.to(
+                device=adapter_delta.device, dtype=adapter_delta.dtype
+            ).view(1, 1, -1)
+            adapter_update_delta = (
+                gamma_patch * adapter_patch_delta
+                + gamma_common * float(self.fusion_reread_common_scale) * adapter_common_delta
+            )
+            adapter_effective_scale = adapter_delta.new_tensor(float(self.fusion_reread_delta_alpha))
+            adapter_warmup_scale = adapter_delta.new_tensor(self.get_reread_warmup_scale())
+            adapter_effective_update_before_warmup = adapter_effective_scale * adapter_update_delta
+            adapter_effective_update = adapter_effective_update_before_warmup * adapter_warmup_scale
+            effective_ratio_scale = None
+            if self.fusion_reread_effective_ratio_cap > 0.0:
+                eps = 1e-8
+                with torch.no_grad():
+                    anchor_norm = anchor_feats.detach().float().norm(dim=-1, keepdim=True)
+                effective_update_norm = adapter_effective_update.float().norm(
+                    dim=-1, keepdim=True
+                )
+                effective_ratio = effective_update_norm / anchor_norm.clamp(min=eps)
+                image_mean_ratio = effective_ratio.mean(dim=1, keepdim=True)
+                effective_ratio_scale = (
+                    float(self.fusion_reread_effective_ratio_cap)
+                    / image_mean_ratio.clamp(min=eps)
+                ).clamp(max=1.0)
+                effective_ratio_scale = effective_ratio_scale.to(
+                    device=adapter_effective_update.device,
+                    dtype=adapter_effective_update.dtype,
+                )
+                adapter_effective_update = adapter_effective_update * effective_ratio_scale
+            fused = anchor_feats + adapter_effective_update
+            if return_stats:
+                stats = dict(stats)
+                with torch.no_grad():
+                    adapter_effective_ratio = (
+                        adapter_effective_update.detach().float().norm(dim=-1)
+                        / anchor_feats.detach().float().norm(dim=-1).clamp(min=1e-8)
+                    )
+                    adapter_update_common_ratio = (
+                        adapter_update_delta.detach().float().mean(dim=1).norm(dim=-1).mean()
+                        / adapter_update_delta.detach().float().norm(dim=-1).mean().clamp(min=1e-8)
+                    )
+                    stats.update({
+                        "fusion_refinement_mode": self.fusion_refinement_mode,
+                        "fusion_cascade_layers": 2,
+                        "v3_adapter_delta_alpha": float(self.fusion_reread_delta_alpha),
+                        "v3_adapter_post_norm": False,
+                        "v3_adapter_common_scale": float(self.fusion_reread_common_scale),
+                        "v3_adapter_effective_ratio_cap": float(self.fusion_reread_effective_ratio_cap),
+                        "v3_adapter_warmup_mode": self.fusion_reread_warmup_mode,
+                        "v3_adapter_warmup_iters": int(self.fusion_reread_warmup_iters),
+                        "v3_adapter_warmup_start": float(self.fusion_reread_warmup_start),
+                        "v3_adapter_warmup_scale": float(
+                            adapter_warmup_scale.detach().float().cpu().item()
+                        ),
+                        "v3_adapter_effective_ratio_scale_mean": float(
+                            effective_ratio_scale.detach().float().mean().item()
+                            if effective_ratio_scale is not None else 1.0
+                        ),
+                        "v3_adapter_effective_ratio_clamp_fraction": float(
+                            (effective_ratio_scale.detach().float() < 0.999).float().mean().item()
+                            if effective_ratio_scale is not None else 0.0
+                        ),
+                        "v3_adapter_effective_ratio_mean": float(adapter_effective_ratio.mean().item()),
+                        "v3_adapter_effective_ratio_p90": float(
+                            torch.quantile(adapter_effective_ratio.flatten(), 0.90).item()
+                        ),
+                        "v3_adapter_delta_norm": float(
+                            adapter_delta.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "v3_adapter_patch_delta_norm": float(
+                            adapter_patch_delta.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "v3_adapter_common_delta_norm": float(
+                            adapter_common_delta.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "v3_adapter_update_delta_norm": float(
+                            adapter_update_delta.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "v3_adapter_effective_update_norm_before_warmup": float(
+                            adapter_effective_update_before_warmup.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "v3_adapter_effective_update_norm_after_warmup": float(
+                            adapter_effective_update.detach().float().norm(dim=-1).mean().item()
+                        ),
+                        "v3_adapter_update_delta_common_ratio": float(
+                            adapter_update_common_ratio.item()
+                        ),
+                        "v3_adapter_layerscale_patch_mean": float(
+                            self.fusion_reread_gamma_patch.detach().float().mean().item()
+                        ),
+                        "v3_adapter_layerscale_patch_absmax": float(
+                            self.fusion_reread_gamma_patch.detach().float().abs().max().item()
+                        ),
+                        "v3_adapter_layerscale_common_mean": float(
+                            self.fusion_reread_gamma_common.detach().float().mean().item()
+                        ),
+                        "v3_adapter_layerscale_common_absmax": float(
+                            self.fusion_reread_gamma_common.detach().float().abs().max().item()
+                        ),
+                        "anchor_v3_adapter_cosine": float(
+                            F.cosine_similarity(
+                                anchor_feats.detach().float(),
+                                fused.detach().float(),
+                                dim=-1,
+                            ).mean().item()
+                        ),
+                        "fused_feature_norm": float(
+                            fused.detach().float().norm(dim=-1).mean().item()
+                        ),
+                    })
+                return fused, stats
+            return fused
+
         if self.fusion_refinement_mode == "adapter_ffn":
             fused, adapter_delta = self.adapter_ffn(anchor_feats)
             if return_stats:
@@ -891,6 +1594,9 @@ class LMCFeatureFusion(nn.Module):
                     "fusion_refinement_mode": self.fusion_refinement_mode,
                     "fusion_cascade_layers": int(self.fusion_cascade_layers),
                     "fusion_assembly_gamma": float(self.fusion_assembly_gamma.detach().float().cpu().item()),
+                    "single_qknorm_eps": float(self.fusion_single_qknorm_eps),
+                    "single_qknorm_tau_init": float(self.fusion_single_qknorm_tau_init),
+                    "single_layerscale_init": float(self.fusion_single_layerscale_init),
                 })
                 return anchor_feats, stats
             return anchor_feats

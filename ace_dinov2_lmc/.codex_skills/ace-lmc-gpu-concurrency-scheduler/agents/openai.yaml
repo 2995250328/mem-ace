@@ -1,0 +1,4 @@
+interface:
+  display_name: "ACE LMC GPU Concurrency Scheduler"
+  short_description: "Schedule ACE-DINOv2-LMC quick fusion jobs safely across GPUs."
+  default_prompt: "Use this skill to launch or modify ACE-DINOv2-LMC quick fusion training with safe per-GPU concurrency."

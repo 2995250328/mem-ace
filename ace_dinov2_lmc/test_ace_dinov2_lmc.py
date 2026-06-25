@@ -47,6 +47,7 @@ from glace_backend import (
     GLACEDecoderFeatureResidualAdapter,
     build_glace_camloc_dataset,
     create_glace_regressor_from_split_state_dict,
+    get_glace_head_class,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -61,6 +62,37 @@ def _torch_load_trusted_checkpoint(path, *, map_location='cpu'):
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
         return torch.load(path, map_location=map_location)
+
+
+def _resolve_lmc_eval_float(lmc_config, key, override, legacy_default):
+    checkpoint_missing = key not in lmc_config or lmc_config.get(key) is None
+    checkpoint_value = None if checkpoint_missing else float(lmc_config[key])
+    override_value = None if override is None else float(override)
+    if checkpoint_missing and override_value is None:
+        _logger.warning(
+            "[LMC-Eval-Semantics] checkpoint missing %s; using legacy default %.6f.",
+            key,
+            float(legacy_default),
+        )
+    effective_value = (
+        override_value
+        if override_value is not None
+        else checkpoint_value if checkpoint_value is not None else float(legacy_default)
+    )
+    if not math.isfinite(effective_value) or effective_value < 0.0:
+        raise ValueError(f"{key} eval value must be finite and >= 0, got {effective_value}")
+    source = (
+        "override"
+        if override_value is not None
+        else "checkpoint" if checkpoint_value is not None else "legacy_default"
+    )
+    return {
+        "checkpoint": checkpoint_value,
+        "override": override_value,
+        "effective": effective_value,
+        "source": source,
+        "checkpoint_missing": checkpoint_missing,
+    }
 
 
 def _normalize_device_for_visible_cuda(device_str):
@@ -314,6 +346,8 @@ def run_evaluation_lmc(opt):
     checkpoint = _torch_load_trusted_checkpoint(head_network_path, map_location='cpu')
     is_lmc = _is_lmc_checkpoint(checkpoint)
     lmc_config = None
+    reread_common_eval = None
+    reread_cap_eval = None
 
     if is_lmc:
         _logger.info("[LMC] Detected LMC checkpoint")
@@ -321,6 +355,30 @@ def run_evaluation_lmc(opt):
         head_state_dict = checkpoint['head_state_dict']
         memory_path = lmc_config.get('memory_path')
         model_backend = str(lmc_config.get('model_backend', 'ace_dinov2'))
+        reread_common_eval = _resolve_lmc_eval_float(
+            lmc_config,
+            'lmc_fusion_reread_common_scale',
+            getattr(opt, 'eval_lmc_fusion_reread_common_scale_override', None),
+            1.0,
+        )
+        reread_cap_eval = _resolve_lmc_eval_float(
+            lmc_config,
+            'lmc_fusion_reread_effective_ratio_cap',
+            getattr(opt, 'eval_lmc_fusion_reread_effective_ratio_cap_override', None),
+            0.0,
+        )
+        _logger.info(
+            "[LMC-Eval-Semantics] common_scale checkpoint=%s override=%s effective=%.6f source=%s; "
+            "effective_ratio_cap checkpoint=%s override=%s effective=%.6f source=%s",
+            reread_common_eval['checkpoint'],
+            reread_common_eval['override'],
+            reread_common_eval['effective'],
+            reread_common_eval['source'],
+            reread_cap_eval['checkpoint'],
+            reread_cap_eval['override'],
+            reread_cap_eval['effective'],
+            reread_cap_eval['source'],
+        )
     else:
         model_backend = 'ace_dinov2'
         _logger.info("[LMC] Vanilla checkpoint — delegating to standard eval")
@@ -328,6 +386,8 @@ def run_evaluation_lmc(opt):
 
     ace_lmc_global_head_mode = str(lmc_config.get('ace_lmc_global_head_mode', 'none')) if is_lmc else 'none'
     ace_lmc_global_feature_mode = str(lmc_config.get('ace_lmc_global_feature_mode', 'glace')) if is_lmc else 'glace'
+    ace_lmc_global_normalize = bool(lmc_config.get('ace_lmc_global_normalize', False)) if is_lmc else False
+    ace_lmc_stage2_feature_source = str(lmc_config.get('ace_lmc_stage2_feature_source', 'raw_backbone')) if is_lmc else 'raw_backbone'
     ace_lmc_global_gate_raw = (
         lmc_config.get('final_ace_lmc_global_gate', None)
         if is_lmc else 1.0
@@ -363,6 +423,7 @@ def run_evaluation_lmc(opt):
         ace_encoder_path = Path(
             getattr(opt, 'ace_encoder_path', None) or lmc_config.get('ace_encoder_path') or '/home/xwh/project/ace_depth/ace_encoder_pretrained.pt'
         )
+        glace_root = Path(getattr(opt, 'glace_root', None) or lmc_config.get('glace_root') or '/home/xwh/project/glace')
         local_dim = int(lmc_config.get('encoder_feature_dim', 512))
         in_channels = int(head_state_dict['res3_conv1.weight'].shape[1])
         pattern_count = sum(1 for key in head_state_dict.keys() if re.match(r'^\d+c0\.weight$', key))
@@ -375,7 +436,24 @@ def run_evaluation_lmc(opt):
             num_encoder_features=local_dim,
             freeze_backbone=True,
         )
-        network.heads = Head(torch.zeros((3,)), pattern_count, use_homogeneous, in_channels=in_channels)
+        if ace_lmc_global_head_mode == 'glace_concat':
+            head_channels = int(head_state_dict['res3_conv1.weight'].shape[0])
+            mlp_ratio = float(head_state_dict['res3_conv2.weight'].shape[0]) / max(1, int(head_state_dict['res3_conv2.weight'].shape[1]))
+            glace_head_cls = get_glace_head_class(glace_root)
+            network.heads = glace_head_cls(
+                torch.zeros((3,)),
+                pattern_count,
+                use_homogeneous,
+                in_channels=in_channels,
+                head_channels=head_channels,
+                mlp_ratio=mlp_ratio,
+            )
+            _logger.info(
+                '[Eval] ACE-FCN glace_concat head: impl=glace_head in_channels=%d head_channels=%d mlp_ratio=%.3f stage2_feature_source=%s global_normalize=%s.',
+                in_channels, head_channels, mlp_ratio, ace_lmc_stage2_feature_source, ace_lmc_global_normalize,
+            )
+        else:
+            network.heads = Head(torch.zeros((3,)), pattern_count, use_homogeneous, in_channels=in_channels)
         if ace_lmc_global_head_mode == 'glace_film':
             global_dim = int(lmc_config.get('glace_global_feat_dim', lmc_config.get('ace_lmc_global_feature_dim', 0)) or 0)
             if global_dim <= 0:
@@ -430,13 +508,17 @@ def run_evaluation_lmc(opt):
             gate_init=float(lmc_config.get('ace_lmc_global_gate_init', 0.001)),
             gate_max=float(lmc_config.get('ace_lmc_global_gate_max', 0.1)),
             delta_max_m=float(lmc_config.get('ace_lmc_global_residual_delta_max_m', 1.0)),
+            xyz_condition_mode=str(lmc_config.get('ace_lmc_global_residual_xyz_condition_mode', 'none') or 'none'),
+            xyz_condition_scale=float(lmc_config.get('ace_lmc_global_residual_xyz_condition_scale', 10.0)),
         ).to(device)
         ace_lmc_global_residual_head.load_state_dict(residual_state, strict=True)
         ace_lmc_global_residual_head.eval()
         _logger.info(
-            '[Eval] Loaded ACE-LMC global residual head: in_channels=%d blocks=%d gate_max=%.6f delta_max_m=%.3f.',
+            '[Eval] Loaded ACE-LMC global residual head: in_channels=%d blocks=%d gate_max=%.6f delta_max_m=%.3f xyz_condition=%s xyz_scale=%.3f.',
             residual_in_channels, residual_blocks, float(lmc_config.get('ace_lmc_global_gate_max', 0.1)),
             float(lmc_config.get('ace_lmc_global_residual_delta_max_m', 1.0)),
+            str(lmc_config.get('ace_lmc_global_residual_xyz_condition_mode', 'none') or 'none'),
+            float(lmc_config.get('ace_lmc_global_residual_xyz_condition_scale', 10.0)),
         )
     memory_dict = None
     bank_data = None
@@ -556,11 +638,25 @@ def run_evaluation_lmc(opt):
             fusion_reread_post_norm=lmc_config.get('lmc_fusion_reread_post_norm', True),
             fusion_reread_trust_region_ratio=lmc_config.get('lmc_fusion_reread_trust_region_ratio', 0.0),
             fusion_reread_temperature=lmc_config.get('lmc_fusion_reread_temperature', 1.0),
+            fusion_reread_common_scale=reread_common_eval['effective'],
+            fusion_reread_effective_ratio_cap=reread_cap_eval['effective'],
+            fusion_reread_qknorm_eps=lmc_config.get('lmc_fusion_reread_qknorm_eps', 1e-6),
+            fusion_reread_qknorm_tau_init=lmc_config.get('lmc_fusion_reread_qknorm_tau_init', 0.0),
+            fusion_reread_layerscale_patch_init=lmc_config.get(
+                'lmc_fusion_reread_layerscale_patch_init', 0.01
+            ),
+            fusion_reread_layerscale_common_init=lmc_config.get(
+                'lmc_fusion_reread_layerscale_common_init', 0.0
+            ),
+            fusion_reread_warmup_mode=lmc_config.get('lmc_fusion_reread_warmup_mode', 'none'),
+            fusion_reread_warmup_iters=lmc_config.get('lmc_fusion_reread_warmup_iters', 0),
+            fusion_reread_warmup_start=lmc_config.get('lmc_fusion_reread_warmup_start', 0.0),
             fusion_reread_geo_lambda=lmc_config.get('lmc_fusion_reread_geo_lambda', 1.0),
             fusion_reread_geo_sigma=lmc_config.get('lmc_fusion_reread_geo_sigma', 1.0),
             fusion_reread_geo_sigma_mode=lmc_config.get('lmc_fusion_reread_geo_sigma_mode', 'fixed'),
             fusion_reread_geo_sigma_beta=lmc_config.get('lmc_fusion_reread_geo_sigma_beta', 1.0),
             fusion_reread_geo_sigma_min=lmc_config.get('lmc_fusion_reread_geo_sigma_min', 0.5),
+            fusion_coord_prior_scale_init=lmc_config.get('lmc_fusion_coord_prior_scale_init', 0.10),
         ).to(device)
         fusion.load_state_dict(checkpoint['fusion_state_dict'])
         fusion.eval()
@@ -726,6 +822,9 @@ def run_evaluation_lmc(opt):
             out = ace_lmc_eval_random_global_cache[key].expand_as(global_feat_BC)
         else:
             raise ValueError(f"Unsupported ace_lmc_global_feature_mode={mode!r}")
+        if ace_lmc_global_normalize:
+            orig_dtype = out.dtype
+            out = torch.nn.functional.normalize(out.float(), dim=1, eps=1e-12).to(dtype=orig_dtype)
         if ace_lmc_global_head_mode in ('glace_residual', 'glace_film'):
             return out
         return out * torch.tensor(ace_lmc_global_gate_eval, device=global_feat_BC.device, dtype=global_feat_BC.dtype)
@@ -733,7 +832,7 @@ def run_evaluation_lmc(opt):
     avg_batch_time = 0
     num_batches = 0
     rErrs, tErrs = [], []
-    pct25_5 = pct10_5 = pct5 = pct2 = pct1 = 0
+    pct50_5 = pct25_5 = pct10_5 = pct5 = pct2 = pct1 = 0
     frame_idx = 0
     lmc_runtime_stats_calls = 0
 
@@ -941,6 +1040,8 @@ def run_evaluation_lmc(opt):
                 if getattr(opt, 'log_per_frame', False):
                     _logger.info("  [Eval] %s  rErr=%.2f deg  tErr=%.2f cm", frame_name, r_err, t_err_cm)
 
+                if r_err < 5 and t_err < 0.50:
+                    pct50_5 += 1
                 if r_err < 5 and t_err < 0.25:
                     pct25_5 += 1
                 if r_err < 5 and t_err < 0.1:
@@ -976,6 +1077,7 @@ def run_evaluation_lmc(opt):
     median_tErr = tErrs[median_idx]
     avg_time = avg_batch_time / num_batches
 
+    pct50_5 = pct50_5 / total_frames * 100
     pct25_5 = pct25_5 / total_frames * 100
     pct10_5 = pct10_5 / total_frames * 100
     pct5 = pct5 / total_frames * 100
@@ -985,8 +1087,8 @@ def run_evaluation_lmc(opt):
     _logger.info("=" * 50)
     _logger.info("EVAL SUMMARY (current errors):")
     _logger.info("  Median Error: %.2f deg, %.2f cm", median_rErr, median_tErr)
-    _logger.info("  25cm/5deg: %.2f%% | 10cm/5deg: %.2f%% | 5cm/5deg: %.2f%% | 2cm/2deg: %.2f%% | 1cm/1deg: %.2f%%",
-                 pct25_5, pct10_5, pct5, pct2, pct1)
+    _logger.info("  50cm/5deg: %.2f%% | 25cm/5deg: %.2f%% | 10cm/5deg: %.2f%% | 5cm/5deg: %.2f%% | 2cm/2deg: %.2f%% | 1cm/1deg: %.2f%%",
+                 pct50_5, pct25_5, pct10_5, pct5, pct2, pct1)
     _logger.info("  Avg time: %.2f ms | Frames: %d", avg_time * 1000, total_frames)
     _logger.info("=" * 50)
 
@@ -1004,6 +1106,7 @@ def run_evaluation_lmc(opt):
         f"# ACE DINOv2+LMC Eval Summary | {scene_name}",
         f"median_rotation_deg\t{median_rErr:.4f}",
         f"median_translation_cm\t{median_tErr:.4f}",
+        f"accuracy_50cm5deg_pct\t{pct50_5:.2f}",
         f"accuracy_25cm5deg_pct\t{pct25_5:.2f}",
         f"accuracy_10cm5deg_pct\t{pct10_5:.2f}",
         f"accuracy_5cm5deg_pct\t{pct5:.2f}",
@@ -1011,6 +1114,14 @@ def run_evaluation_lmc(opt):
         f"accuracy_1cm1deg_pct\t{pct1:.2f}",
         f"avg_time_per_frame_ms\t{avg_time * 1000:.2f}",
         f"total_frames\t{total_frames}",
+        f"hypotheses\t{hypotheses}",
+        f"threshold_px\t{threshold}",
+        f"inlieralpha\t{inlieralpha}",
+        f"maxpixelerror\t{maxpixelerror}",
+        f"eval_deterministic\t{eval_deterministic}",
+        f"dsacstar_seed\t{dsacstar_seed}",
+        f"dsacstar_seed_per_frame\t{dsacstar_seed_per_frame}",
+        f"eval_num_workers\t{eval_num_workers}",
     ]
     if is_lmc and lmc_config is not None:
         semantic_fields = {
@@ -1024,11 +1135,16 @@ def run_evaluation_lmc(opt):
             "ace_lmc_local_checkpoint_path": lmc_config.get("ace_lmc_local_checkpoint_path"),
             "ace_lmc_freeze_local_stack": lmc_config.get("ace_lmc_freeze_local_stack"),
             "ace_lmc_global_feature_mode": lmc_config.get("ace_lmc_global_feature_mode"),
+            "ace_lmc_stage2_feature_source": lmc_config.get("ace_lmc_stage2_feature_source"),
+            "ace_lmc_global_normalize": lmc_config.get("ace_lmc_global_normalize"),
+            "ace_lmc_global_noise_std": lmc_config.get("ace_lmc_global_noise_std"),
             "ace_lmc_global_gate_init": lmc_config.get("ace_lmc_global_gate_init"),
             "ace_lmc_global_gate_learnable": lmc_config.get("ace_lmc_global_gate_learnable"),
             "ace_lmc_global_gate_max": lmc_config.get("ace_lmc_global_gate_max"),
             "ace_lmc_global_residual_gate_l1_weight": lmc_config.get("ace_lmc_global_residual_gate_l1_weight"),
             "ace_lmc_global_residual_delta_max_m": lmc_config.get("ace_lmc_global_residual_delta_max_m"),
+            "ace_lmc_global_residual_xyz_condition_mode": lmc_config.get("ace_lmc_global_residual_xyz_condition_mode"),
+            "ace_lmc_global_residual_xyz_condition_scale": lmc_config.get("ace_lmc_global_residual_xyz_condition_scale"),
             "final_ace_lmc_global_gate": lmc_config.get("final_ace_lmc_global_gate"),
             "final_ace_lmc_global_residual_gate_mean": lmc_config.get("final_ace_lmc_global_residual_gate_mean"),
             "final_ace_lmc_global_residual_gate_max": lmc_config.get("final_ace_lmc_global_residual_gate_max"),
@@ -1098,12 +1214,37 @@ def run_evaluation_lmc(opt):
             "lmc_fusion_assembly_mode": lmc_config.get("lmc_fusion_assembly_mode", "concat_mlp"),
             "lmc_fusion_assembly_gamma_init": lmc_config.get("lmc_fusion_assembly_gamma_init", 0.0),
             "final_lmc_fusion_assembly_gamma": lmc_config.get("final_lmc_fusion_assembly_gamma"),
+            "lmc_fusion_coord_prior_scale_init": lmc_config.get("lmc_fusion_coord_prior_scale_init", 0.10),
+            "final_lmc_fusion_coord_prior_gamma": lmc_config.get("final_lmc_fusion_coord_prior_gamma"),
             "lmc_fusion_reread_delta_alpha": lmc_config.get("lmc_fusion_reread_delta_alpha", 1.0),
             "lmc_fusion_reread_scalar_gate": lmc_config.get("lmc_fusion_reread_scalar_gate", False),
             "lmc_fusion_reread_gate_init": lmc_config.get("lmc_fusion_reread_gate_init", 0.0),
             "lmc_fusion_reread_post_norm": lmc_config.get("lmc_fusion_reread_post_norm", True),
             "lmc_fusion_reread_trust_region_ratio": lmc_config.get("lmc_fusion_reread_trust_region_ratio", 0.0),
             "lmc_fusion_reread_temperature": lmc_config.get("lmc_fusion_reread_temperature", 1.0),
+            "lmc_fusion_reread_common_scale": lmc_config.get("lmc_fusion_reread_common_scale"),
+            "lmc_fusion_reread_effective_ratio_cap": lmc_config.get("lmc_fusion_reread_effective_ratio_cap"),
+            "lmc_fusion_reread_qknorm_eps": lmc_config.get("lmc_fusion_reread_qknorm_eps", 1e-6),
+            "lmc_fusion_reread_qknorm_tau_init": lmc_config.get("lmc_fusion_reread_qknorm_tau_init", 0.0),
+            "lmc_fusion_reread_layerscale_patch_init": lmc_config.get(
+                "lmc_fusion_reread_layerscale_patch_init", 0.01
+            ),
+            "lmc_fusion_reread_layerscale_common_init": lmc_config.get(
+                "lmc_fusion_reread_layerscale_common_init", 0.0
+            ),
+            "lmc_fusion_reread_warmup_mode": lmc_config.get("lmc_fusion_reread_warmup_mode", "none"),
+            "lmc_fusion_reread_warmup_iters": lmc_config.get("lmc_fusion_reread_warmup_iters", 0),
+            "lmc_fusion_reread_warmup_start": lmc_config.get("lmc_fusion_reread_warmup_start", 0.0),
+            "eval_lmc_fusion_reread_common_scale_checkpoint": reread_common_eval["checkpoint"],
+            "eval_lmc_fusion_reread_common_scale_override": reread_common_eval["override"],
+            "eval_lmc_fusion_reread_common_scale_effective": reread_common_eval["effective"],
+            "eval_lmc_fusion_reread_common_scale_source": reread_common_eval["source"],
+            "eval_lmc_fusion_reread_common_scale_checkpoint_missing": reread_common_eval["checkpoint_missing"],
+            "eval_lmc_fusion_reread_effective_ratio_cap_checkpoint": reread_cap_eval["checkpoint"],
+            "eval_lmc_fusion_reread_effective_ratio_cap_override": reread_cap_eval["override"],
+            "eval_lmc_fusion_reread_effective_ratio_cap_effective": reread_cap_eval["effective"],
+            "eval_lmc_fusion_reread_effective_ratio_cap_source": reread_cap_eval["source"],
+            "eval_lmc_fusion_reread_effective_ratio_cap_checkpoint_missing": reread_cap_eval["checkpoint_missing"],
             "lmc_fusion_reread_geo_lambda": lmc_config.get("lmc_fusion_reread_geo_lambda", 1.0),
             "lmc_fusion_reread_geo_sigma": lmc_config.get("lmc_fusion_reread_geo_sigma", 1.0),
             "lmc_fusion_reread_geo_sigma_mode": lmc_config.get("lmc_fusion_reread_geo_sigma_mode", "fixed"),
@@ -1111,6 +1252,18 @@ def run_evaluation_lmc(opt):
             "lmc_fusion_reread_geo_sigma_min": lmc_config.get("lmc_fusion_reread_geo_sigma_min", 0.5),
             "final_lmc_fusion_reread_gate": lmc_config.get("final_lmc_fusion_reread_gate"),
             "final_lmc_fusion_reread_gate_logit": lmc_config.get("final_lmc_fusion_reread_gate_logit"),
+            "final_lmc_fusion_reread_gamma_patch_mean": lmc_config.get(
+                "final_lmc_fusion_reread_gamma_patch_mean"
+            ),
+            "final_lmc_fusion_reread_gamma_patch_absmax": lmc_config.get(
+                "final_lmc_fusion_reread_gamma_patch_absmax"
+            ),
+            "final_lmc_fusion_reread_gamma_common_mean": lmc_config.get(
+                "final_lmc_fusion_reread_gamma_common_mean"
+            ),
+            "final_lmc_fusion_reread_gamma_common_absmax": lmc_config.get(
+                "final_lmc_fusion_reread_gamma_common_absmax"
+            ),
             "local_residual_mode": lmc_config.get("local_residual_mode", "none"),
             "local_residual_alpha": lmc_config.get("local_residual_alpha", 1.0),
             "local_residual_alpha_init": lmc_config.get("local_residual_alpha_init", 0.001),
@@ -1135,10 +1288,16 @@ def run_evaluation_lmc(opt):
     return {
         'median_rErr': median_rErr, 'median_tErr': median_tErr,
         'avg_time': avg_time,
-        'pct25_5': pct25_5, 'pct10_5': pct10_5, 'pct5': pct5, 'pct2': pct2, 'pct1': pct1,
+        'pct50_5': pct50_5, 'pct25_5': pct25_5, 'pct10_5': pct10_5, 'pct5': pct5, 'pct2': pct2, 'pct1': pct1,
         'total_frames': total_frames,
         'test_log_file': str(test_log_file),
         'pose_log_file': str(pose_log_file),
+        'eval_lmc_fusion_reread_common_scale_effective': (
+            reread_common_eval['effective'] if reread_common_eval is not None else None
+        ),
+        'eval_lmc_fusion_reread_effective_ratio_cap_effective': (
+            reread_cap_eval['effective'] if reread_cap_eval is not None else None
+        ),
     }
 
 
@@ -1185,6 +1344,10 @@ if __name__ == '__main__':
     parser.add_argument('--eval_num_workers', type=int, default=6)
     parser.add_argument('--log_per_frame', type=_strtobool, default=False,
                         help='Print each frame’s rErr (deg) and tErr (cm) after evaluation.')
+    parser.add_argument('--eval_lmc_fusion_reread_common_scale_override', type=float, default=None,
+                        help='Eval-only common-scale override. None uses checkpoint semantics.')
+    parser.add_argument('--eval_lmc_fusion_reread_effective_ratio_cap_override', type=float, default=None,
+                        help='Eval-only effective-ratio-cap override. None uses checkpoint semantics.')
     parser.add_argument('--lmc_log_runtime_stats', type=_strtobool, default=False,
                         help='Log diagnostic-only LMC fusion attention/runtime stats during eval.')
     parser.add_argument('--lmc_runtime_stats_interval', type=int, default=100,
