@@ -375,6 +375,7 @@ class LMCFeatureFusion(nn.Module):
         "progressive_reread",
         "centered_reread",
         "centered_reread_qknorm_layerscale",
+        "ccf_centered_reread_qknorm_layerscale",
         "geometry_reread_lite",
         "adapter_ffn",
         "weak_residual_ffn",
@@ -412,6 +413,10 @@ class LMCFeatureFusion(nn.Module):
                  fusion_reread_layerscale_common_init=0.0,
                  fusion_dual_memory_layerscale_patch_init=0.005,
                  fusion_dual_memory_layerscale_common_init=0.0,
+                 fusion_ccf_gate_source="first_attn_entropy",
+                 fusion_ccf_gate_floor=0.0,
+                 fusion_ccf_gate_gamma=1.0,
+                 fusion_ccf_detach_gate=True,
                  fusion_single_qknorm_eps=1e-6,
                  fusion_single_qknorm_tau_init=0.0,
                  fusion_single_layerscale_init=1.0,
@@ -444,6 +449,10 @@ class LMCFeatureFusion(nn.Module):
         self.fusion_reread_layerscale_common_init = float(fusion_reread_layerscale_common_init)
         self.fusion_dual_memory_layerscale_patch_init = float(fusion_dual_memory_layerscale_patch_init)
         self.fusion_dual_memory_layerscale_common_init = float(fusion_dual_memory_layerscale_common_init)
+        self.fusion_ccf_gate_source = str(fusion_ccf_gate_source)
+        self.fusion_ccf_gate_floor = float(fusion_ccf_gate_floor)
+        self.fusion_ccf_gate_gamma = float(fusion_ccf_gate_gamma)
+        self.fusion_ccf_detach_gate = bool(fusion_ccf_detach_gate)
         self.fusion_single_qknorm_eps = float(fusion_single_qknorm_eps)
         self.fusion_single_qknorm_tau_init = float(fusion_single_qknorm_tau_init)
         self.fusion_single_layerscale_init = float(fusion_single_layerscale_init)
@@ -492,6 +501,12 @@ class LMCFeatureFusion(nn.Module):
             raise ValueError("fusion_reread_qknorm_eps must be > 0.")
         if self.fusion_reread_qknorm_tau_init < 0.0:
             raise ValueError("fusion_reread_qknorm_tau_init must be >= 0. Use 0 for sqrt(head_dim).")
+        if self.fusion_ccf_gate_source not in {"first_attn_entropy"}:
+            raise ValueError("fusion_ccf_gate_source must be 'first_attn_entropy'.")
+        if not 0.0 <= self.fusion_ccf_gate_floor <= 1.0:
+            raise ValueError("fusion_ccf_gate_floor must be in [0, 1].")
+        if self.fusion_ccf_gate_gamma < 0.0:
+            raise ValueError("fusion_ccf_gate_gamma must be >= 0.")
         if self.fusion_single_qknorm_eps <= 0.0:
             raise ValueError("fusion_single_qknorm_eps must be > 0.")
         if self.fusion_single_qknorm_tau_init < 0.0:
@@ -529,21 +544,27 @@ class LMCFeatureFusion(nn.Module):
                     dropout=dropout,
                     attention_temperature=self.fusion_reread_temperature,
                     qk_norm=self.fusion_refinement_mode in (
-                        "centered_reread_qknorm_layerscale", "v3_dual_refine"
+                        "centered_reread_qknorm_layerscale",
+                        "ccf_centered_reread_qknorm_layerscale",
+                        "v3_dual_refine"
                     ),
                     qk_norm_eps=self.fusion_reread_qknorm_eps,
                     qk_norm_tau_init=self.fusion_reread_qknorm_tau_init,
                 )
                 if self.fusion_refinement_mode in (
                     "progressive_reread", "centered_reread",
-                    "centered_reread_qknorm_layerscale", "geometry_reread_lite",
+                    "centered_reread_qknorm_layerscale",
+                    "ccf_centered_reread_qknorm_layerscale",
+                    "geometry_reread_lite",
                     "v3_dual_refine"
                 )
                 else None
             )
             if self.fusion_refinement_mode in (
                 "progressive_reread", "centered_reread",
-                "centered_reread_qknorm_layerscale", "geometry_reread_lite",
+                "centered_reread_qknorm_layerscale",
+                "ccf_centered_reread_qknorm_layerscale",
+                "geometry_reread_lite",
                 "weak_residual_ffn",
             ) and self.fusion_reread_scalar_gate:
                 self.fusion_reread_gate_logit = nn.Parameter(
@@ -586,8 +607,9 @@ class LMCFeatureFusion(nn.Module):
                     persistent=False,
                 )
             if self.fusion_refinement_mode in (
-                "centered_reread_qknorm_layerscale", "v3_adapter_control",
-                "v3_dual_refine"
+                "centered_reread_qknorm_layerscale",
+                "ccf_centered_reread_qknorm_layerscale",
+                "v3_adapter_control", "v3_dual_refine"
             ):
                 self.fusion_reread_gamma_patch = nn.Parameter(
                     torch.full((feature_dim,), self.fusion_reread_layerscale_patch_init, dtype=torch.float32)
@@ -766,11 +788,32 @@ class LMCFeatureFusion(nn.Module):
     def _prefix_stats(prefix, stats):
         return {f"{prefix}{k}": v for k, v in stats.items()}
 
+    def _compute_ccf_gate(self, first_attn):
+        """Return a per-query confidence gate from first-read attention concentration."""
+        if self.fusion_ccf_gate_source != "first_attn_entropy":
+            raise ValueError(f"Unsupported fusion_ccf_gate_source={self.fusion_ccf_gate_source!r}")
+        attn = first_attn.float().mean(dim=1)
+        eps = 1e-8
+        entropy = -(attn * (attn + eps).log()).sum(dim=-1)
+        max_entropy = math.log(max(int(first_attn.shape[-1]), 2))
+        norm_entropy = (entropy / max_entropy).clamp(0.0, 1.0)
+        confidence = (1.0 - norm_entropy).clamp(0.0, 1.0)
+        gate = confidence.pow(float(self.fusion_ccf_gate_gamma))
+        gate = float(self.fusion_ccf_gate_floor) + (1.0 - float(self.fusion_ccf_gate_floor)) * gate
+        gate = gate.clamp(0.0, 1.0).unsqueeze(-1)
+        if self.fusion_ccf_detach_gate:
+            gate = gate.detach()
+            confidence = confidence.detach()
+            norm_entropy = norm_entropy.detach()
+        return gate.to(device=first_attn.device, dtype=first_attn.dtype), confidence, norm_entropy
+
     def _forward_single_or_cascade(self, query_feats, latent_z, latent_p, scene_center,
                                    return_stats=False, stats_max_pixels=4096):
         if self.fusion_refinement_mode in (
             "progressive_reread", "centered_reread",
-            "centered_reread_qknorm_layerscale", "geometry_reread_lite",
+            "centered_reread_qknorm_layerscale",
+            "ccf_centered_reread_qknorm_layerscale",
+            "geometry_reread_lite",
             "v3_dual_refine"
         ):
             k, v, pe_input = self.fusion_single.encode_memory(latent_z, latent_p, scene_center)
@@ -796,6 +839,7 @@ class LMCFeatureFusion(nn.Module):
                 reference_attn=(
                     first_attn if self.fusion_refinement_mode in (
                         "centered_reread", "centered_reread_qknorm_layerscale",
+                        "ccf_centered_reread_qknorm_layerscale",
                         "v3_dual_refine"
                     ) else None
                 ),
@@ -813,7 +857,9 @@ class LMCFeatureFusion(nn.Module):
             reread_patch_delta = None
             reread_common_delta = None
             if self.fusion_refinement_mode in (
-                "centered_reread_qknorm_layerscale", "v3_dual_refine"
+                "centered_reread_qknorm_layerscale",
+                "ccf_centered_reread_qknorm_layerscale",
+                "v3_dual_refine"
             ):
                 reread_common_delta = reread_update_delta.mean(dim=1, keepdim=True)
                 reread_patch_delta = reread_update_delta - reread_common_delta
@@ -858,6 +904,15 @@ class LMCFeatureFusion(nn.Module):
             reread_warmup_scale = reread_delta.new_tensor(self.get_reread_warmup_scale())
             reread_effective_update_before_warmup = reread_effective_scale * reread_update_delta
             reread_effective_update = reread_effective_update_before_warmup * reread_warmup_scale
+            ccf_gate = None
+            ccf_confidence = None
+            ccf_norm_entropy = None
+            reread_effective_update_before_ccf = reread_effective_update
+            if self.fusion_refinement_mode == "ccf_centered_reread_qknorm_layerscale":
+                ccf_gate, ccf_confidence, ccf_norm_entropy = self._compute_ccf_gate(first_attn)
+                ccf_gate = ccf_gate.to(device=reread_effective_update.device, dtype=reread_effective_update.dtype)
+                reread_effective_update = reread_effective_update * ccf_gate
+            reread_effective_update_after_ccf = reread_effective_update
 
             dual_adapter_delta = None
             dual_adapter_patch_delta = None
@@ -964,6 +1019,7 @@ class LMCFeatureFusion(nn.Module):
                     "reread_post_norm": bool(self.fusion_reread_post_norm),
                     "reread_centered_context": self.fusion_refinement_mode in (
                         "centered_reread", "centered_reread_qknorm_layerscale",
+                        "ccf_centered_reread_qknorm_layerscale",
                         "v3_dual_refine"
                     ),
                     "reread_qk_norm": bool(
@@ -1186,6 +1242,73 @@ class LMCFeatureFusion(nn.Module):
                         fused.detach().float().norm(dim=-1).mean().item()
                     ),
                 })
+                before_ccf_ratio = (
+                    reread_effective_update_before_ccf.detach().float().norm(dim=-1)
+                    / anchor_feats.detach().float().norm(dim=-1).clamp(min=1e-8)
+                )
+                after_ccf_ratio = (
+                    reread_effective_update_after_ccf.detach().float().norm(dim=-1)
+                    / anchor_feats.detach().float().norm(dim=-1).clamp(min=1e-8)
+                )
+                if ccf_gate is not None:
+                    ccf_gate_eval = ccf_gate.detach().float().squeeze(-1)
+                    ccf_conf_eval = ccf_confidence.detach().float()
+                    ccf_entropy_eval = ccf_norm_entropy.detach().float()
+                    stats.update({
+                        "ccf_gate_enabled": True,
+                        "ccf_gate_source": self.fusion_ccf_gate_source,
+                        "ccf_gate_floor": float(self.fusion_ccf_gate_floor),
+                        "ccf_gate_gamma": float(self.fusion_ccf_gate_gamma),
+                        "ccf_detach_gate": bool(self.fusion_ccf_detach_gate),
+                        "ccf_gate_mean": float(ccf_gate_eval.mean().item()),
+                        "ccf_gate_p10": float(torch.quantile(ccf_gate_eval.flatten(), 0.10).item()),
+                        "ccf_gate_p50": float(torch.quantile(ccf_gate_eval.flatten(), 0.50).item()),
+                        "ccf_gate_p90": float(torch.quantile(ccf_gate_eval.flatten(), 0.90).item()),
+                        "ccf_confidence_mean": float(ccf_conf_eval.mean().item()),
+                        "ccf_confidence_p10": float(torch.quantile(ccf_conf_eval.flatten(), 0.10).item()),
+                        "ccf_confidence_p50": float(torch.quantile(ccf_conf_eval.flatten(), 0.50).item()),
+                        "ccf_confidence_p90": float(torch.quantile(ccf_conf_eval.flatten(), 0.90).item()),
+                        "ccf_norm_entropy_mean": float(ccf_entropy_eval.mean().item()),
+                        "ccf_norm_entropy_p50": float(torch.quantile(ccf_entropy_eval.flatten(), 0.50).item()),
+                        "reread_effective_ratio_before_ccf_mean": float(before_ccf_ratio.mean().item()),
+                        "reread_effective_ratio_before_ccf_p90": float(
+                            torch.quantile(before_ccf_ratio.flatten(), 0.90).item()
+                        ),
+                        "reread_effective_ratio_after_ccf_mean": float(after_ccf_ratio.mean().item()),
+                        "reread_effective_ratio_after_ccf_p90": float(
+                            torch.quantile(after_ccf_ratio.flatten(), 0.90).item()
+                        ),
+                        "ccf_gate_delta_ratio_mean": float(
+                            after_ccf_ratio.mean().div(before_ccf_ratio.mean().clamp(min=1e-8)).item()
+                        ),
+                    })
+                else:
+                    stats.update({
+                        "ccf_gate_enabled": False,
+                        "ccf_gate_source": self.fusion_ccf_gate_source,
+                        "ccf_gate_floor": float(self.fusion_ccf_gate_floor),
+                        "ccf_gate_gamma": float(self.fusion_ccf_gate_gamma),
+                        "ccf_detach_gate": bool(self.fusion_ccf_detach_gate),
+                        "ccf_gate_mean": 1.0,
+                        "ccf_gate_p10": 1.0,
+                        "ccf_gate_p50": 1.0,
+                        "ccf_gate_p90": 1.0,
+                        "ccf_confidence_mean": 0.0,
+                        "ccf_confidence_p10": 0.0,
+                        "ccf_confidence_p50": 0.0,
+                        "ccf_confidence_p90": 0.0,
+                        "ccf_norm_entropy_mean": 0.0,
+                        "ccf_norm_entropy_p50": 0.0,
+                        "reread_effective_ratio_before_ccf_mean": float(before_ccf_ratio.mean().item()),
+                        "reread_effective_ratio_before_ccf_p90": float(
+                            torch.quantile(before_ccf_ratio.flatten(), 0.90).item()
+                        ),
+                        "reread_effective_ratio_after_ccf_mean": float(after_ccf_ratio.mean().item()),
+                        "reread_effective_ratio_after_ccf_p90": float(
+                            torch.quantile(after_ccf_ratio.flatten(), 0.90).item()
+                        ),
+                        "ccf_gate_delta_ratio_mean": 1.0,
+                    })
                 if self.fusion_refinement_mode == "v3_dual_refine":
                     query_effective_ratio = (
                         dual_adapter_effective_update.detach().float().norm(dim=-1)

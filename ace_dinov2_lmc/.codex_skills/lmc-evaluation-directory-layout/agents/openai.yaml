@@ -1,0 +1,4 @@
+interface:
+  display_name: "LMC Evaluation Directory Layout"
+  short_description: "Create and validate structured 04_evaluation run directories."
+  default_prompt: "Create a new structured ACE-DINOv2-LMC evaluation run directory and manifest."

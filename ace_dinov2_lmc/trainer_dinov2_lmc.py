@@ -857,6 +857,395 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             text += f", relGateSkip={int(float(stats.get('gate_skipped', 0.0)))}"
         return text
 
+    def _multiframe_reprojection_base_weight(self) -> float:
+        if not bool(getattr(self.options, "use_multiframe_reprojection_loss", False)):
+            return 0.0
+        return max(0.0, float(getattr(self.options, "multiframe_reprojection_weight", 0.0) or 0.0))
+
+    def _multiframe_reprojection_may_need_image_indices(self) -> bool:
+        return self._multiframe_reprojection_base_weight() > 0.0
+
+    def _multiframe_reprojection_enabled_for_stage(self, stage_tag: str) -> bool:
+        if self._multiframe_reprojection_base_weight() <= 0.0:
+            return False
+        apply_to = str(getattr(self.options, "multiframe_reprojection_apply_to", "stage2") or "stage2").lower()
+        stage = str(stage_tag).upper()
+        if apply_to == "all":
+            return stage.startswith("S1") or stage in {"S2", "S2-G"}
+        if apply_to == "s1":
+            return stage.startswith("S1")
+        if apply_to == "stage2_g":
+            return stage == "S2-G"
+        return stage in {"S2", "S2-G"}
+
+    @staticmethod
+    def _multiframe_reprojection_empty_stats(enabled: bool = False, weight: float = 0.0) -> Dict[str, float]:
+        return {
+            "enabled": bool(enabled),
+            "loss_raw": 0.0,
+            "weight": float(weight),
+            "source_points": 0,
+            "terms": 0,
+            "refs": 0,
+            "visible_ratio": 0.0,
+        }
+
+    @staticmethod
+    def _format_multiframe_reprojection_stats(stats: Optional[Dict[str, float]]) -> str:
+        if not isinstance(stats, dict) or not stats.get("enabled", False):
+            return ""
+        return (
+            f", mfReproj={float(stats.get('loss_raw', 0.0)):.4f}"
+            f", mfW={float(stats.get('weight', 0.0)):.4f}"
+            f", mfTerms={int(stats.get('terms', 0))}"
+            f", mfRefs={int(stats.get('refs', 0))}"
+        )
+
+    def _warn_multiframe_reprojection_once(self, key: str, message: str) -> None:
+        warned = getattr(self, "_multiframe_reprojection_warned", None)
+        if warned is None:
+            warned = set()
+            self._multiframe_reprojection_warned = warned
+        if key in warned:
+            return
+        _logger.warning(message)
+        warned.add(key)
+
+    def _pose_inv_to_training_world(self, pose_inv_N34: torch.Tensor) -> torch.Tensor:
+        if self.coord_sigma is None or self.coord_mu is None:
+            return pose_inv_N34
+        pose_inv_N34 = pose_inv_N34.clone()
+        mu = self.coord_mu.detach().to(pose_inv_N34.device, dtype=pose_inv_N34.dtype).view(1, 3, 1)
+        sigma = float(self.coord_sigma)
+        R = pose_inv_N34[:, :, :3]
+        t = pose_inv_N34[:, :, 3]
+        pose_inv_N34[:, :, 3] = (t + torch.bmm(R, mu.expand(R.shape[0], -1, -1)).squeeze(-1)) / sigma
+        return pose_inv_N34
+
+    def _scene_coords_to_training_world(self, coords_N3: torch.Tensor) -> torch.Tensor:
+        if self.coord_sigma is None or self.coord_mu is None:
+            return coords_N3
+        mu = self.coord_mu.detach().to(coords_N3.device, dtype=coords_N3.dtype).view(1, 3)
+        return (coords_N3 - mu) / float(self.coord_sigma)
+
+    def _multiframe_intrinsics_size_from_ace_files(self, real_idx: int):
+        dataset = self.dataset
+        rgb_files = list(getattr(dataset, "rgb_files", []) or [])
+        calibration_files = list(getattr(dataset, "calibration_files", []) or [])
+        image = skio.imread(rgb_files[real_idx])
+        orig_h, orig_w = image.shape[:2]
+        target_h = int(getattr(self.options, "image_resolution", getattr(dataset, "image_height", orig_h)))
+        if hasattr(dataset, "_round_to_patch_size"):
+            target_h = int(dataset._round_to_patch_size(target_h))
+        target_w = int(round(float(orig_w) * float(target_h) / float(max(1, orig_h))))
+        if hasattr(dataset, "_round_to_patch_size"):
+            target_w = int(dataset._round_to_patch_size(target_w))
+        image_width = getattr(dataset, "image_width", None)
+        if image_width is not None:
+            target_w = int(image_width)
+        target_h = max(1, target_h)
+        target_w = max(1, target_w)
+        sx = float(target_w) / float(max(1, orig_w))
+        sy = float(target_h) / float(max(1, orig_h))
+
+        raw_k = np.loadtxt(calibration_files[real_idx])
+        intrinsics = torch.eye(3, dtype=torch.float32)
+        if np.asarray(raw_k).size == 1:
+            focal = float(np.asarray(raw_k).reshape(-1)[0])
+            intrinsics[0, 0] = focal * sx
+            intrinsics[1, 1] = focal * sy
+            intrinsics[0, 2] = float(target_w) * 0.5
+            intrinsics[1, 2] = float(target_h) * 0.5
+        else:
+            raw_k = np.asarray(raw_k, dtype=np.float64).reshape(3, 3)
+            intrinsics[0, 0] = float(raw_k[0, 0]) * sx
+            intrinsics[1, 1] = float(raw_k[1, 1]) * sy
+            intrinsics[0, 2] = float(raw_k[0, 2]) * sx
+            intrinsics[1, 2] = float(raw_k[1, 2]) * sy
+        return intrinsics, torch.tensor([float(target_w), float(target_h)], dtype=torch.float32)
+
+    def _build_multiframe_reprojection_frame_bank_from_files(self):
+        dataset = self.dataset
+        rgb_files = list(getattr(dataset, "rgb_files", []) or [])
+        pose_files = list(getattr(dataset, "pose_files", []) or [])
+        calibration_files = list(getattr(dataset, "calibration_files", []) or [])
+        if not rgb_files or len(rgb_files) != len(pose_files) or len(rgb_files) != len(calibration_files):
+            return None
+
+        n_frames = len(rgb_files)
+        pose_inv_N34 = torch.zeros((n_frames, 3, 4), dtype=torch.float32)
+        intrinsics_N33 = torch.zeros((n_frames, 3, 3), dtype=torch.float32)
+        image_size_N2 = torch.zeros((n_frames, 2), dtype=torch.float32)
+        valid_N = torch.zeros((n_frames,), dtype=torch.bool)
+        valid_indices = set(int(i) for i in getattr(dataset, "valid_file_indices", np.arange(n_frames)))
+
+        for real_idx in range(n_frames):
+            if real_idx not in valid_indices:
+                continue
+            try:
+                pose = torch.from_numpy(np.loadtxt(pose_files[real_idx]).astype(np.float32))
+                if pose.shape == (3, 4):
+                    pose_44 = torch.eye(4, dtype=torch.float32)
+                    pose_44[:3, :] = pose
+                    pose = pose_44
+                if pose.shape != (4, 4):
+                    continue
+                pose_inv_N34[real_idx] = torch.linalg.inv(pose)[:3, :]
+                intrinsics_N33[real_idx], image_size_N2[real_idx] = self._multiframe_intrinsics_size_from_ace_files(real_idx)
+                valid_N[real_idx] = True
+            except Exception as exc:
+                self._warn_multiframe_reprojection_once(
+                    "frame_bank_file_skip",
+                    f"[MultiFrameReproj] failed to load at least one reference frame from files; skipping bad frames. first_error={exc}",
+                )
+
+        if not bool(valid_N.any().item()):
+            return None
+        pose_inv_N34 = self._pose_inv_to_training_world(pose_inv_N34)
+        return {
+            "pose_inv": pose_inv_N34,
+            "intrinsics": intrinsics_N33,
+            "image_size": image_size_N2,
+            "valid_indices": torch.where(valid_N)[0].long(),
+        }
+
+    def _build_multiframe_reprojection_frame_bank_from_dataset(self):
+        try:
+            dataset = self._build_train_dataset(
+                image_width=None,
+                augment=False,
+                aug_rotation=0,
+                aug_scale_max=1.0,
+                aug_scale_min=1.0,
+            )
+        except Exception as exc:
+            self._warn_multiframe_reprojection_once(
+                "frame_bank_dataset_build",
+                f"[MultiFrameReproj] could not build deterministic reference dataset; loss disabled. error={exc}",
+            )
+            return None
+
+        records = []
+        for local_idx in range(len(dataset)):
+            try:
+                item = dataset[local_idx]
+                if not isinstance(item, (list, tuple)) or len(item) < 8:
+                    continue
+                frame_idx_tensor = self._resolve_batch_image_indices(item[7], device=torch.device("cpu"))
+                frame_idx = int(frame_idx_tensor.view(-1)[0].item())
+                image_mask = item[1]
+                pose_inv = item[3]
+                intrinsics = item[4]
+                if pose_inv.shape == (4, 4):
+                    pose_inv = pose_inv[:3, :]
+                if pose_inv.shape != (3, 4) or intrinsics.shape != (3, 3):
+                    continue
+                h, w = image_mask.shape[-2:]
+                records.append((frame_idx, pose_inv.detach().float(), intrinsics.detach().float(), float(w), float(h)))
+            except Exception as exc:
+                self._warn_multiframe_reprojection_once(
+                    "frame_bank_dataset_skip",
+                    f"[MultiFrameReproj] failed to load at least one reference frame from dataset; skipping bad frames. first_error={exc}",
+                )
+
+        if not records:
+            return None
+        n_frames = max(idx for idx, *_ in records) + 1
+        pose_inv_N34 = torch.zeros((n_frames, 3, 4), dtype=torch.float32)
+        intrinsics_N33 = torch.zeros((n_frames, 3, 3), dtype=torch.float32)
+        image_size_N2 = torch.zeros((n_frames, 2), dtype=torch.float32)
+        valid_N = torch.zeros((n_frames,), dtype=torch.bool)
+        for idx, pose_inv, intrinsics, width, height in records:
+            pose_inv_N34[idx] = pose_inv
+            intrinsics_N33[idx] = intrinsics
+            image_size_N2[idx] = torch.tensor([width, height], dtype=torch.float32)
+            valid_N[idx] = True
+        pose_inv_N34 = self._pose_inv_to_training_world(pose_inv_N34)
+        return {
+            "pose_inv": pose_inv_N34,
+            "intrinsics": intrinsics_N33,
+            "image_size": image_size_N2,
+            "valid_indices": torch.where(valid_N)[0].long(),
+        }
+
+    def _get_multiframe_reprojection_frame_bank(self):
+        bank = getattr(self, "_multiframe_reprojection_frame_bank", None)
+        if bank is not None:
+            return bank
+        bank = self._build_multiframe_reprojection_frame_bank_from_files()
+        if bank is None:
+            bank = self._build_multiframe_reprojection_frame_bank_from_dataset()
+        self._multiframe_reprojection_frame_bank = bank
+        if bank is None:
+            self._warn_multiframe_reprojection_once(
+                "frame_bank_empty",
+                "[MultiFrameReproj] no usable reference frame bank; multi-frame reprojection loss disabled.",
+            )
+            return None
+        _logger.info(
+            "[MultiFrameReproj] reference frame bank ready: frames=%d weight=%.4f apply_to=%s refs_per_step=%d sample_limit=%d",
+            int(bank["valid_indices"].numel()),
+            float(self._multiframe_reprojection_base_weight()),
+            str(getattr(self.options, "multiframe_reprojection_apply_to", "stage2")),
+            int(getattr(self.options, "multiframe_reprojection_num_frames", 2)),
+            int(getattr(self.options, "multiframe_reprojection_sample_limit", 2048)),
+        )
+        return bank
+
+    def _compute_multiframe_reprojection_loss(
+        self,
+        *,
+        stage_tag: str,
+        pred_scene_coords_B3HW: torch.Tensor,
+        gt_scene_coords_world_N3: Optional[torch.Tensor],
+        gt_scene_coords_valid_N1: Optional[torch.Tensor],
+        img_idx_N: Optional[torch.Tensor],
+        step_eff: int,
+    ):
+        weight = self._multiframe_reprojection_base_weight()
+        enabled = self._multiframe_reprojection_enabled_for_stage(stage_tag)
+        zero = pred_scene_coords_B3HW.new_zeros(())
+        if not enabled:
+            return zero, self._multiframe_reprojection_empty_stats(False, weight)
+        stats = self._multiframe_reprojection_empty_stats(True, weight)
+        if gt_scene_coords_world_N3 is None or gt_scene_coords_valid_N1 is None or img_idx_N is None:
+            self._warn_multiframe_reprojection_once(
+                "missing_inputs",
+                f"[MultiFrameReproj] {stage_tag}: missing gt_scene_coords or img_idx; skipping auxiliary loss.",
+            )
+            return zero, stats
+
+        bank = self._get_multiframe_reprojection_frame_bank()
+        if bank is None:
+            return zero, stats
+
+        pred_N3 = pred_scene_coords_B3HW.permute(0, 2, 3, 1).reshape(-1, 3).float()
+        gt_world_N3 = gt_scene_coords_world_N3.reshape(-1, 3).to(pred_N3.device, dtype=pred_N3.dtype)
+        gt_train_N3 = self._scene_coords_to_training_world(gt_world_N3)
+        gt_valid_N = gt_scene_coords_valid_N1.reshape(-1).to(pred_N3.device).bool()
+        img_idx_N = img_idx_N.reshape(-1).to(pred_N3.device, non_blocking=True).long()
+        if img_idx_N.shape[0] != pred_N3.shape[0] or gt_train_N3.shape[0] != pred_N3.shape[0]:
+            self._warn_multiframe_reprojection_once(
+                "shape_mismatch",
+                f"[MultiFrameReproj] {stage_tag}: shape mismatch pred={tuple(pred_N3.shape)} gt={tuple(gt_train_N3.shape)} img_idx={tuple(img_idx_N.shape)}; skipping.",
+            )
+            return zero, stats
+
+        source_valid_N = (
+            gt_valid_N
+            & torch.isfinite(pred_N3).all(dim=1)
+            & torch.isfinite(gt_train_N3).all(dim=1)
+            & (gt_world_N3.abs().sum(dim=1) > 0)
+            & (img_idx_N >= 0)
+        )
+        if not bool(source_valid_N.any().item()):
+            return zero, stats
+        source_idx = torch.where(source_valid_N)[0]
+        sample_limit = int(getattr(self.options, "multiframe_reprojection_sample_limit", 2048) or 0)
+        if sample_limit > 0 and source_idx.numel() > sample_limit:
+            perm = torch.randperm(
+                source_idx.numel(),
+                device=source_idx.device,
+                generator=self._get_training_generator(source_idx.device),
+            )
+            source_idx = source_idx[perm[:sample_limit]]
+        pred_src_N3 = pred_N3[source_idx]
+        gt_src_N3 = gt_train_N3[source_idx]
+        src_img_idx_N = img_idx_N[source_idx]
+        stats["source_points"] = int(source_idx.numel())
+
+        valid_ref_indices = bank["valid_indices"].to(pred_N3.device, non_blocking=True).long()
+        if valid_ref_indices.numel() <= 0:
+            return zero, stats
+        num_refs = min(
+            max(1, int(getattr(self.options, "multiframe_reprojection_num_frames", 2) or 1)),
+            int(valid_ref_indices.numel()),
+        )
+        perm_ref = torch.randperm(
+            valid_ref_indices.numel(),
+            device=valid_ref_indices.device,
+            generator=self._get_training_generator(valid_ref_indices.device),
+        )
+        ref_img_idx_R = valid_ref_indices[perm_ref[:num_refs]]
+        ref_img_idx_cpu = ref_img_idx_R.detach().cpu().long()
+        ref_pose_R34 = bank["pose_inv"][ref_img_idx_cpu].to(pred_N3.device, non_blocking=True).float()
+        ref_K_R33 = bank["intrinsics"][ref_img_idx_cpu].to(pred_N3.device, non_blocking=True).float()
+        ref_size_R2 = bank["image_size"][ref_img_idx_cpu].to(pred_N3.device, non_blocking=True).float()
+
+        R = int(ref_img_idx_R.numel())
+        N = int(pred_src_N3.shape[0])
+        pose_M34 = ref_pose_R34[:, None].expand(R, N, 3, 4).reshape(R * N, 3, 4)
+        K_M33 = ref_K_R33[:, None].expand(R, N, 3, 3).reshape(R * N, 3, 3)
+        size_M2 = ref_size_R2[:, None].expand(R, N, 2).reshape(R * N, 2)
+        ref_idx_M = ref_img_idx_R[:, None].expand(R, N).reshape(R * N)
+        src_idx_M = src_img_idx_N[None].expand(R, N).reshape(R * N)
+        pred_M31 = pred_src_N3[None].expand(R, N, 3).reshape(R * N, 3).unsqueeze(-1)
+        gt_M31 = gt_src_N3[None].expand(R, N, 3).reshape(R * N, 3).unsqueeze(-1)
+
+        def _project(points_M31):
+            cam_M31 = torch.bmm(pose_M34, to_homogeneous(points_M31))
+            pix_h_M31 = torch.bmm(K_M33, cam_M31)
+            depth_M = pix_h_M31[:, 2, 0]
+            safe_depth_M = depth_M.clamp(min=float(self.options.depth_min))
+            pix_M2 = pix_h_M31[:, :2, 0] / safe_depth_M[:, None]
+            return pix_M2, depth_M
+
+        pred_px_M2, pred_depth_M = _project(pred_M31)
+        gt_px_M2, gt_depth_M = _project(gt_M31)
+        depth_min = float(self.options.depth_min)
+        depth_max = float(self.options.depth_max)
+        margin = max(0.0, float(getattr(self.options, "multiframe_reprojection_visibility_margin_px", 0.0) or 0.0))
+        visible_M = (
+            torch.isfinite(pred_px_M2).all(dim=1)
+            & torch.isfinite(gt_px_M2).all(dim=1)
+            & torch.isfinite(pred_depth_M)
+            & torch.isfinite(gt_depth_M)
+            & (pred_depth_M > depth_min)
+            & (gt_depth_M > depth_min)
+            & (pred_depth_M < depth_max)
+            & (gt_depth_M < depth_max)
+            & (gt_px_M2[:, 0] >= -margin)
+            & (gt_px_M2[:, 1] >= -margin)
+            & (gt_px_M2[:, 0] <= size_M2[:, 0] + margin)
+            & (gt_px_M2[:, 1] <= size_M2[:, 1] + margin)
+        )
+        if not bool(getattr(self.options, "multiframe_reprojection_include_source", False)):
+            visible_M &= ref_idx_M != src_idx_M
+
+        denom = max(1, int(R * N))
+        stats["refs"] = int(R)
+        if not bool(visible_M.any().item()):
+            stats["visible_ratio"] = 0.0
+            return zero, stats
+
+        repro_error_M1 = torch.norm(pred_px_M2 - gt_px_M2, dim=1, keepdim=True, p=1)
+        max_px = float(getattr(self.options, "multiframe_reprojection_max_px", 100.0) or 0.0)
+        valid_error = repro_error_M1[visible_M]
+        if max_px > 0.0:
+            valid_error = valid_error.clamp(max=max_px)
+        raw_loss = self.repro_loss.compute(valid_error, int(step_eff))
+        if not isinstance(raw_loss, torch.Tensor):
+            raw_loss = valid_error.new_tensor(float(raw_loss))
+        raw_loss = raw_loss / max(1, int(valid_error.numel()))
+        loss = raw_loss * float(weight)
+        stats.update({
+            "loss_raw": float(raw_loss.detach().cpu().item()),
+            "terms": int(valid_error.numel()),
+            "visible_ratio": float(valid_error.numel()) / float(denom),
+        })
+        if not getattr(self, "_multiframe_reprojection_logged_active", False) and int(stats["terms"]) > 0:
+            _logger.info(
+                "[MultiFrameReproj] active at %s: raw=%.6f weight=%.6f terms=%d refs=%d visible=%.3f",
+                stage_tag,
+                float(stats["loss_raw"]),
+                float(weight),
+                int(stats["terms"]),
+                int(stats["refs"]),
+                float(stats["visible_ratio"]),
+            )
+            self._multiframe_reprojection_logged_active = True
+        return loss, stats
+
     def _extract_gt_scene_coords_from_batch(self, batch, image_BCHW: Optional[torch.Tensor] = None):
         """Return GT world scene coords from dataset batch when the backend provides them."""
         if not isinstance(batch, (list, tuple)):
@@ -1563,7 +1952,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         return max(0.0, float(getattr(self.options, "ace_lmc_global_noise_std", 0.0) or 0.0))
 
     def _needs_image_indices_in_buffer(self):
-        return self._uses_image_global_features()
+        return self._uses_image_global_features() or self._multiframe_reprojection_may_need_image_indices()
 
     def _glace_head_freeze_active(self, iteration_idx):
         if not self._is_glace_backend():
@@ -3297,8 +3686,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'single', 'single_qknorm_layerscale',
             'cascade_internal', 'progressive_reread', 'centered_reread',
             'centered_reread_qknorm_layerscale', 'geometry_reread_lite',
-            'adapter_ffn', 'weak_residual_ffn', 'v3_adapter_control',
-            'v3_dual_refine', 'coord_prior_v1',
+            'ccf_centered_reread_qknorm_layerscale', 'adapter_ffn',
+            'weak_residual_ffn', 'v3_adapter_control', 'v3_dual_refine',
+            'coord_prior_v1',
         ):
             raise ValueError(f"Unsupported lmc_fusion_refinement_mode={lmc_fusion_refinement_mode!r}")
         lmc_fusion_cascade_layers = int(getattr(options, 'lmc_fusion_cascade_layers', 4))
@@ -3338,6 +3728,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         lmc_fusion_dual_memory_layerscale_common_init = float(
             getattr(options, 'lmc_fusion_dual_memory_layerscale_common_init', 0.0)
         )
+        lmc_fusion_ccf_gate_source = str(getattr(options, 'lmc_fusion_ccf_gate_source', 'first_attn_entropy'))
+        lmc_fusion_ccf_gate_floor = float(getattr(options, 'lmc_fusion_ccf_gate_floor', 0.0))
+        lmc_fusion_ccf_gate_gamma = float(getattr(options, 'lmc_fusion_ccf_gate_gamma', 1.0))
+        lmc_fusion_ccf_detach_gate = bool(getattr(options, 'lmc_fusion_ccf_detach_gate', True))
         lmc_fusion_single_qknorm_eps = float(getattr(options, 'lmc_fusion_single_qknorm_eps', 1e-6))
         lmc_fusion_single_qknorm_tau_init = float(
             getattr(options, 'lmc_fusion_single_qknorm_tau_init', 0.0)
@@ -3391,6 +3785,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             raise ValueError(
                 "lmc_fusion_dual_memory_layerscale_common_init must be >= 0, got "
                 f"{lmc_fusion_dual_memory_layerscale_common_init}"
+            )
+        if lmc_fusion_ccf_gate_source not in ('first_attn_entropy',):
+            raise ValueError(
+                f"lmc_fusion_ccf_gate_source must be first_attn_entropy, got {lmc_fusion_ccf_gate_source!r}"
+            )
+        if not 0.0 <= lmc_fusion_ccf_gate_floor <= 1.0:
+            raise ValueError(
+                f"lmc_fusion_ccf_gate_floor must be in [0,1], got {lmc_fusion_ccf_gate_floor}"
+            )
+        if lmc_fusion_ccf_gate_gamma < 0.0:
+            raise ValueError(
+                f"lmc_fusion_ccf_gate_gamma must be >= 0, got {lmc_fusion_ccf_gate_gamma}"
             )
         if lmc_fusion_single_qknorm_eps <= 0.0:
             raise ValueError(
@@ -3454,7 +3860,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             lmc_fusion_key_geo_init,
         )
         _logger.info(
-            "[LMC-Fusion] refinement_mode=%s cascade_layers=%d assembly_mode=%s gamma_init=%.6f single_qknorm_eps=%.2e single_qknorm_tau_init=%.6f single_layerscale_init=%.6f coord_prior_scale_init=%.6f reread_alpha=%.6f scalar_gate=%s gate_init=%.6f post_norm=%s trust_ratio=%.6f temperature=%.6f common_scale=%.6f effective_ratio_cap=%.6f qknorm_eps=%.2e qknorm_tau_init=%.6f layerscale_patch_init=%.6f layerscale_common_init=%.6f dual_memory_patch_init=%.6f dual_memory_common_init=%.6f warmup=%s/%d/start%.3f geo_lambda=%.6f geo_sigma=%.6f geo_sigma_mode=%s geo_sigma_beta=%.6f geo_sigma_min=%.6f",
+            "[LMC-Fusion] refinement_mode=%s cascade_layers=%d assembly_mode=%s gamma_init=%.6f single_qknorm_eps=%.2e single_qknorm_tau_init=%.6f single_layerscale_init=%.6f coord_prior_scale_init=%.6f reread_alpha=%.6f scalar_gate=%s gate_init=%.6f post_norm=%s trust_ratio=%.6f temperature=%.6f common_scale=%.6f effective_ratio_cap=%.6f qknorm_eps=%.2e qknorm_tau_init=%.6f layerscale_patch_init=%.6f layerscale_common_init=%.6f dual_memory_patch_init=%.6f dual_memory_common_init=%.6f ccf_source=%s ccf_floor=%.6f ccf_gamma=%.6f ccf_detach=%s warmup=%s/%d/start%.3f geo_lambda=%.6f geo_sigma=%.6f geo_sigma_mode=%s geo_sigma_beta=%.6f geo_sigma_min=%.6f",
             lmc_fusion_refinement_mode,
             lmc_fusion_cascade_layers,
             lmc_fusion_assembly_mode,
@@ -3477,6 +3883,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             lmc_fusion_reread_layerscale_common_init,
             lmc_fusion_dual_memory_layerscale_patch_init,
             lmc_fusion_dual_memory_layerscale_common_init,
+            lmc_fusion_ccf_gate_source,
+            lmc_fusion_ccf_gate_floor,
+            lmc_fusion_ccf_gate_gamma,
+            lmc_fusion_ccf_detach_gate,
             lmc_fusion_reread_warmup_mode,
             lmc_fusion_reread_warmup_iters,
             lmc_fusion_reread_warmup_start,
@@ -3584,6 +3994,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'lmc_fusion_reread_layerscale_common_init': lmc_fusion_reread_layerscale_common_init,
             'lmc_fusion_dual_memory_layerscale_patch_init': lmc_fusion_dual_memory_layerscale_patch_init,
             'lmc_fusion_dual_memory_layerscale_common_init': lmc_fusion_dual_memory_layerscale_common_init,
+            'lmc_fusion_ccf_gate_source': lmc_fusion_ccf_gate_source,
+            'lmc_fusion_ccf_gate_floor': lmc_fusion_ccf_gate_floor,
+            'lmc_fusion_ccf_gate_gamma': lmc_fusion_ccf_gate_gamma,
+            'lmc_fusion_ccf_detach_gate': lmc_fusion_ccf_detach_gate,
             'lmc_fusion_reread_warmup_mode': lmc_fusion_reread_warmup_mode,
             'lmc_fusion_reread_warmup_iters': lmc_fusion_reread_warmup_iters,
             'lmc_fusion_reread_warmup_start': lmc_fusion_reread_warmup_start,
@@ -3706,6 +4120,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'relative_depth_min_points': int(getattr(self.options, 'relative_depth_min_points', 16)),
             'relative_depth_image_step_interval': int(getattr(self.options, 'relative_depth_image_step_interval', 10)),
             'relative_depth_image_batch_size': int(getattr(self.options, 'relative_depth_image_batch_size', 1)),
+            'use_multiframe_reprojection_loss': bool(getattr(self.options, 'use_multiframe_reprojection_loss', False)),
+            'multiframe_reprojection_apply_to': str(getattr(self.options, 'multiframe_reprojection_apply_to', 'stage2')),
+            'multiframe_reprojection_weight': float(getattr(self.options, 'multiframe_reprojection_weight', 0.02)),
+            'multiframe_reprojection_num_frames': int(getattr(self.options, 'multiframe_reprojection_num_frames', 2)),
+            'multiframe_reprojection_sample_limit': int(getattr(self.options, 'multiframe_reprojection_sample_limit', 2048)),
+            'multiframe_reprojection_max_px': float(getattr(self.options, 'multiframe_reprojection_max_px', 100.0)),
+            'multiframe_reprojection_include_source': bool(getattr(self.options, 'multiframe_reprojection_include_source', False)),
+            'multiframe_reprojection_visibility_margin_px': float(getattr(self.options, 'multiframe_reprojection_visibility_margin_px', 0.0)),
             'memory_has_points_ref': self.memory_contract_info['has_points_ref'],
             'memory_has_points_ref_norm': self.memory_contract_info['has_points_ref_norm'],
             'memory_has_scene_center_world': self.memory_contract_info['has_scene_center_world'],
@@ -3802,6 +4224,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             fusion_reread_layerscale_common_init=lmc_fusion_reread_layerscale_common_init,
             fusion_dual_memory_layerscale_patch_init=lmc_fusion_dual_memory_layerscale_patch_init,
             fusion_dual_memory_layerscale_common_init=lmc_fusion_dual_memory_layerscale_common_init,
+            fusion_ccf_gate_source=lmc_fusion_ccf_gate_source,
+            fusion_ccf_gate_floor=lmc_fusion_ccf_gate_floor,
+            fusion_ccf_gate_gamma=lmc_fusion_ccf_gate_gamma,
+            fusion_ccf_detach_gate=lmc_fusion_ccf_detach_gate,
             fusion_single_qknorm_eps=lmc_fusion_single_qknorm_eps,
             fusion_single_qknorm_tau_init=lmc_fusion_single_qknorm_tau_init,
             fusion_single_layerscale_init=lmc_fusion_single_layerscale_init,
@@ -3912,6 +4338,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self._relative_depth_logged_active = False
         self._relative_depth_image_loader = None
         self._relative_depth_image_iterator = None
+        self._multiframe_reprojection_frame_bank = None
+        self._multiframe_reprojection_warned = set()
+        self._multiframe_reprojection_logged_active = False
         self._init_relative_depth_distiller()
 
         self._load_ace_lmc_local_checkpoint_if_requested()
@@ -4918,6 +5347,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "lmc_fusion_reread_qknorm_eps", "lmc_fusion_reread_qknorm_tau_init",
             "lmc_fusion_reread_layerscale_patch_init", "lmc_fusion_reread_layerscale_common_init",
             "lmc_fusion_dual_memory_layerscale_patch_init", "lmc_fusion_dual_memory_layerscale_common_init",
+            "lmc_fusion_ccf_gate_source", "lmc_fusion_ccf_gate_floor",
+            "lmc_fusion_ccf_gate_gamma", "lmc_fusion_ccf_detach_gate",
             "lmc_fusion_reread_warmup_mode", "lmc_fusion_reread_warmup_iters",
             "lmc_fusion_reread_warmup_start",
             "lmc_fusion_reread_geo_lambda",
@@ -5518,6 +5949,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             invalid_neginf=1e4,
         )
         loss = contract["loss"]
+        multiframe_stats = self._multiframe_reprojection_empty_stats(False, self._multiframe_reprojection_base_weight())
         if gt_scene_coords_B3HW is not None:
             if tuple(gt_scene_coords_B3HW.shape[-2:]) != (H, W):
                 gt_scene_coords_valid_B1HW = self._scene_coords_valid_mask(
@@ -5541,7 +5973,20 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 gt_scene_coords_N3,
                 gt_scene_coords_valid_N1,
             )
+            img_idx_N = None
+            if img_idx_B is not None:
+                img_idx_N = img_idx_B.to(pred_scene_B3HW.device, non_blocking=True).long().view(B, 1).expand(B, H * W).reshape(-1)
+            multiframe_loss, multiframe_stats = self._compute_multiframe_reprojection_loss(
+                stage_tag="S1",
+                pred_scene_coords_B3HW=pred_scene_B3HW,
+                gt_scene_coords_world_N3=gt_scene_coords_N3,
+                gt_scene_coords_valid_N1=gt_scene_coords_valid_N1,
+                img_idx_N=img_idx_N,
+                step_eff=loss_step,
+            )
+            loss = loss + multiframe_loss
         stats = contract["stats"]
+        stats["multiframe_reprojection"] = multiframe_stats
         return loss, stats
 
     def _s1_compute_loss_from_features(
@@ -5604,7 +6049,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             gt_scene_coords_world_b3,
             gt_scene_coords_valid_b1,
         )
+        multiframe_loss, multiframe_stats = self._compute_multiframe_reprojection_loss(
+            stage_tag="S1",
+            pred_scene_coords_B3HW=pred_scene_coords_b3HW,
+            gt_scene_coords_world_N3=gt_scene_coords_world_b3,
+            gt_scene_coords_valid_N1=gt_scene_coords_valid_b1,
+            img_idx_N=img_idx_b1,
+            step_eff=iter_for_loss,
+        )
+        loss = loss + multiframe_loss
         stats = contract["stats"]
+        stats["multiframe_reprojection"] = multiframe_stats
         return loss, stats
 
     def _build_s1_dataloader(self):
@@ -5919,6 +6374,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             gt_inv_poses_b34 = _to_dev(buf['gt_poses_inv'])
             Ks_b33 = _to_dev(buf['intrinsics'])
             invKs_b33 = _to_dev(buf['intrinsics_inv'])
+            gt_scene_coords_world_b3 = _to_dev(buf['gt_scene_coords_world'])
+            gt_scene_coords_valid_b1 = _to_dev(buf['gt_scene_coords_valid'])
             img_idx_b1 = _to_dev(buf['img_idx']) if 'img_idx' in buf else None
 
             channels = raw_features_bC.shape[1]
@@ -5929,11 +6386,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 gt_inv_poses_b34,
                 Ks_b33,
                 invKs_b33,
+                gt_scene_coords_world_b3,
+                gt_scene_coords_valid_b1,
             )
             if batch_size is None:
                 skipped_sample += 1
                 continue
-            target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33 = trimmed
+            target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
             img_idx_b1 = img_idx_b1[:batch_size] if img_idx_b1 is not None else None
 
             with autocast("cuda", enabled=self.options.use_half):
@@ -5955,6 +6414,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 gt_inv_poses_b34.contiguous(),
                 Ks_b33.contiguous(),
                 invKs_b33.contiguous(),
+                gt_scene_coords_world_b3.contiguous(),
+                gt_scene_coords_valid_b1.contiguous(),
                 img_idx_b1=img_idx_b1.contiguous() if img_idx_b1 is not None else None,
                 s1_step=update_step,
                 base_decoder_features_bC=base_decoder_features_bC.contiguous() if base_decoder_features_bC is not None else None,
@@ -6056,10 +6517,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     med3d=-1.0,
                 )
                 _logger.info(
-                    "  [S1-Buffer] update %d/%d (attempt=%d), samples=%d, loss=%.4f, valid=%.1f%%, pxErrL1=%.2f, pxErrL2=%.2f, nonFinite=%.2f%%, lr=%.2e",
+                    "  [S1-Buffer] update %d/%d (attempt=%d), samples=%d, loss=%.4f, valid=%.1f%%, pxErrL1=%.2f, pxErrL2=%.2f, nonFinite=%.2f%%, lr=%.2e%s",
                     update_step, n_steps, raw_step, batch_size, _cur_loss,
                     s1_stats["fraction_valid"] * 100.0, s1_stats["pxerr_l1"], s1_stats["pxerr_l2"],
                     s1_stats["nonfinite_ratio"] * 100.0, comp_optimizer.param_groups[0]["lr"],
+                    self._format_multiframe_reprojection_stats(s1_stats.get("multiframe_reprojection")),
                 )
 
         if skipped_sample > 0 or skipped_nonfinite > 0:
@@ -6209,8 +6671,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 image_BCHW = image_BCHW.float()
 
             img_idx_B_for_head = None
-            if self._uses_image_global_features():
-                img_idx_B_for_head = batch[-1].to(self.device, non_blocking=True).long()
+            if self._needs_image_indices_in_buffer():
+                img_idx_B_for_head = self._resolve_batch_image_indices(batch[-1], device=self.device)
 
             with autocast("cuda", enabled=self.options.use_half):
                 with torch.no_grad():
@@ -6465,10 +6927,11 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     med3d=-1.0,
                 )
                 _logger.info(
-                    "  [S1] update %d/%d (attempt=%d), bs=%d, loss=%.4f, valid=%.1f%%, pxErrL1=%.2f, pxErrL2=%.2f, validPxErrL1=%.2f, nonFinite=%.2f%%, lr=%.2e",
+                    "  [S1] update %d/%d (attempt=%d), bs=%d, loss=%.4f, valid=%.1f%%, pxErrL1=%.2f, pxErrL2=%.2f, validPxErrL1=%.2f, nonFinite=%.2f%%, lr=%.2e%s",
                     update_step, n_steps, raw_step, image_BCHW.shape[0], _cur_loss,
                     s1_stats["fraction_valid"] * 100.0, s1_stats["pxerr_l1"], s1_stats["pxerr_l2"],
                     s1_stats["valid_pxerr_l1"], s1_stats["nonfinite_ratio"] * 100.0, comp_optimizer.param_groups[0]["lr"],
+                    self._format_multiframe_reprojection_stats(s1_stats.get("multiframe_reprojection")),
                 )
 
         if skipped_mask > 0 or skipped_sample > 0 or skipped_nonfinite > 0:
@@ -6838,6 +7301,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "lmc_fusion_reread_qknorm_eps", "lmc_fusion_reread_qknorm_tau_init",
             "lmc_fusion_reread_layerscale_patch_init", "lmc_fusion_reread_layerscale_common_init",
             "lmc_fusion_dual_memory_layerscale_patch_init", "lmc_fusion_dual_memory_layerscale_common_init",
+            "lmc_fusion_ccf_gate_source", "lmc_fusion_ccf_gate_floor",
+            "lmc_fusion_ccf_gate_gamma", "lmc_fusion_ccf_detach_gate",
             "lmc_fusion_reread_warmup_mode", "lmc_fusion_reread_warmup_iters",
             "lmc_fusion_reread_warmup_start",
             "lmc_fusion_reread_geo_lambda", "lmc_fusion_reread_geo_sigma",
@@ -7591,6 +8056,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             # --- Stage 2: ACE-G specific ---
             # 1. Compress memory once, cache for training step
             self._set_compressor_trainable(False)
+            for param in self.fusion.parameters():
+                param.requires_grad_(bool(ace_g_fusion_in_s2))
             self._log_stage_trainability("S2-G")
             self._validate_s2_compressor_contract()
             self._s2_compressor_out = self._compress_memory()
@@ -8069,6 +8536,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             gt_scene_coords_world_b3,
             gt_scene_coords_valid_b1,
         )
+        multiframe_loss, multiframe_stats = self._compute_multiframe_reprojection_loss(
+            stage_tag="S2",
+            pred_scene_coords_B3HW=pred_scene_coords_b3HW,
+            gt_scene_coords_world_N3=gt_scene_coords_world_b3,
+            gt_scene_coords_valid_N1=gt_scene_coords_valid_b1,
+            img_idx_N=img_idx_b1,
+            step_eff=step_eff,
+        )
+        loss = loss + multiframe_loss
         relative_depth_loss, relative_depth_stats = self._compute_image_relative_depth_loss(
             stage_tag="S2",
             image_batch=relative_depth_image_batch,
@@ -8174,7 +8650,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     fraction_valid * 100,
                     px_err_finite if math.isfinite(px_err_finite) else -1.0,
                     pxerr_naninf_count,
-                    self._format_relative_depth_stats(relative_depth_stats) + self._format_ace_lmc_global_residual_stats(global_residual_stats) + self._format_ace_lmc_global_film_stats(global_film_stats) + self._format_ace_lmc_global_gate_l1_stats(global_gate_l1_stats) + self._format_ace_lmc_stage2_consistency_stats(consistency_stats) + self._format_ace_lmc_stage2_guard_stats(guard_stats),
+                    self._format_multiframe_reprojection_stats(multiframe_stats) + self._format_relative_depth_stats(relative_depth_stats) + self._format_ace_lmc_global_residual_stats(global_residual_stats) + self._format_ace_lmc_global_film_stats(global_film_stats) + self._format_ace_lmc_global_gate_l1_stats(global_gate_l1_stats) + self._format_ace_lmc_stage2_consistency_stats(consistency_stats) + self._format_ace_lmc_stage2_guard_stats(guard_stats),
                     time_since_start,
                 )
             )
@@ -8294,6 +8770,15 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             gt_scene_coords_world_b3,
             gt_scene_coords_valid_b1,
         )
+        multiframe_loss, multiframe_stats = self._compute_multiframe_reprojection_loss(
+            stage_tag="S2-G",
+            pred_scene_coords_B3HW=pred_scene_coords_b3HW,
+            gt_scene_coords_world_N3=gt_scene_coords_world_b3,
+            gt_scene_coords_valid_N1=gt_scene_coords_valid_b1,
+            img_idx_N=img_idx_b1,
+            step_eff=step_eff,
+        )
+        loss = loss + multiframe_loss
         relative_depth_loss, relative_depth_stats = self._compute_image_relative_depth_loss(
             stage_tag="S2-G",
             image_batch=relative_depth_image_batch,
@@ -8474,6 +8959,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         f", basePx={glace_base_px if glace_base_px is not None else -1.0:.2f}"
                         f", guardLoss={float(glace_guard_loss.detach().cpu().item()):.4f}"
                     )
+            glace_diag_suffix += self._format_multiframe_reprojection_stats(multiframe_stats)
             glace_diag_suffix += self._format_relative_depth_stats(relative_depth_stats)
             glace_diag_suffix += self._format_ace_lmc_global_residual_stats(global_residual_stats)
             glace_diag_suffix += self._format_ace_lmc_global_film_stats(global_film_stats)

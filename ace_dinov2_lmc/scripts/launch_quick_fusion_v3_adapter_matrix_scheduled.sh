@@ -110,10 +110,11 @@ find_checkpoint() {
 
 maybe_check_placement() {
   local tag="$1"
+  local initial_delay="${2:-0}"
   if [[ "${CHECK_PLACEMENT}" != "true" || "${DRY_RUN}" == "true" ]]; then
     return 0
   fi
-  sleep "${PLACEMENT_CHECK_DELAY}"
+  sleep $((initial_delay + PLACEMENT_CHECK_DELAY))
   {
     printf "\n[%s] placement check: %s\n" "$(date)" "${tag}"
     nvidia-smi || true
@@ -337,11 +338,13 @@ schedule_training() {
   local wave_capacity=$((gpu_count * MAX_JOBS_PER_GPU))
   local start offset idx gpu delay slot_on_gpu
   local pids=()
+  local check_pids=()
   local wave_id=0
 
   for ((start = 0; start < jobs_total; start += wave_capacity)); do
     wave_id=$((wave_id + 1))
     pids=()
+    check_pids=()
     printf "\n[%s] train wave %d start=%d capacity=%d\n" "$(date)" "${wave_id}" "${start}" "${wave_capacity}" | tee -a "${RUN_ROOT}/logs/scheduler.log"
     for ((offset = 0; offset < wave_capacity && start + offset < jobs_total; offset++)); do
       idx=$((start + offset))
@@ -350,10 +353,12 @@ schedule_training() {
       delay=$((slot_on_gpu * STAGGER_SECONDS))
       run_train_job "${JOB_VARIANTS[$idx]}" "${JOB_SCENES[$idx]}" "${gpu}" "${delay}" &
       pids+=("$!")
+      maybe_check_placement "train wave ${wave_id} job ${idx} variant=${JOB_VARIANTS[$idx]} scene=${JOB_SCENES[$idx]} gpu=${gpu}" "${delay}" &
+      check_pids+=("$!")
     done
-    maybe_check_placement "train wave ${wave_id}"
     wait_wave pids
     local failures=$?
+    wait_wave check_pids || true
     if [[ ${failures} -ne 0 && "${CONTINUE_ON_ERROR}" != "true" ]]; then
       printf "Stopping after train wave %d because %d job(s) failed.\n" "${wave_id}" "${failures}" | tee -a "${RUN_ROOT}/logs/scheduler.log"
       exit 1
@@ -367,6 +372,7 @@ schedule_eval() {
   local wave_capacity="${MAX_EVAL_JOBS}"
   local start offset idx gpu
   local pids=()
+  local check_pids=()
   local wave_id=0
 
   if [[ "${EVAL_MODE}" != "deferred" ]]; then
@@ -376,16 +382,19 @@ schedule_eval() {
   for ((start = 0; start < jobs_total; start += wave_capacity)); do
     wave_id=$((wave_id + 1))
     pids=()
+    check_pids=()
     printf "\n[%s] eval wave %d start=%d capacity=%d\n" "$(date)" "${wave_id}" "${start}" "${wave_capacity}" | tee -a "${RUN_ROOT}/logs/scheduler.log"
     for ((offset = 0; offset < wave_capacity && start + offset < jobs_total; offset++)); do
       idx=$((start + offset))
       gpu="${EVAL_GPU_LIST[$(((start + offset) % eval_gpu_count))]}"
       run_eval_job "${JOB_VARIANTS[$idx]}" "${JOB_SCENES[$idx]}" "${gpu}" &
       pids+=("$!")
+      maybe_check_placement "eval wave ${wave_id} job ${idx} variant=${JOB_VARIANTS[$idx]} scene=${JOB_SCENES[$idx]} gpu=${gpu}" 0 &
+      check_pids+=("$!")
     done
-    maybe_check_placement "eval wave ${wave_id}"
     wait_wave pids
     local failures=$?
+    wait_wave check_pids || true
     if [[ ${failures} -ne 0 && "${CONTINUE_ON_ERROR}" != "true" ]]; then
       printf "Stopping after eval wave %d because %d job(s) failed.\n" "${wave_id}" "${failures}" | tee -a "${RUN_ROOT}/logs/scheduler.log"
       exit 1

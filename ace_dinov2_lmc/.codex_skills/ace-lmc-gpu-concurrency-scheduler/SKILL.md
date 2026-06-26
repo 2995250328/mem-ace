@@ -43,6 +43,7 @@ The script:
 - staggers same-GPU jobs by `STAGGER_SECONDS`
 - defaults to legacy-compatible `EVAL_MODE=inline`; use `EVAL_MODE=deferred` only when opting into train concurrency
 - writes `status.tsv`, per-job logs, `placement_checks.log`, and `best_metric_summary.log`
+- checks placement per job after its staggered launch delay, so same-GPU delayed jobs are not missed
 
 ## Safe Settings
 
@@ -126,6 +127,16 @@ During training, watch:
 - post-train eval runs in the separate eval phase when `EVAL_MODE=deferred`
 
 ## Known Probe Result
+
+On 2026-06-25, GPU0 2x train concurrency probe with two Wayspots scenes, 2 iterations, 10M/10M CPU buffers, `EPOCHS=1`, `TRAIN_WORKERS=6`, `EVAL_MODE=none`, and `STAGGER_SECONDS=60` showed:
+
+- both jobs exited with code 0 and produced `best_K64_it2_ace_fcn_local_stage1.pt`
+- first S1 buffers: tendrils 617.5s, map 620.5s
+- second S1 buffers: tendrils 570.0s, map 575.3s
+- total training time: tendrils 2664.2s, map 2701.8s
+- no OOM, CUDA error, DataLoader deadlock, or non-finite loss
+- observed GPU0 train-phase utilization reached about 97 percent with about 5.4GiB total VRAM use
+- eval was disabled, so this validates train concurrency/stability only, not pose metrics or train+eval mixing
 
 On 2026-06-23, GPU2 quick fusion short probe with 1M/1M buffers showed:
 

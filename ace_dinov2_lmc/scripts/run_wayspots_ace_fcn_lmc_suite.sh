@@ -65,6 +65,10 @@ LMC_FUSION_REREAD_QKNORM_EPS="${LMC_FUSION_REREAD_QKNORM_EPS:-1e-6}"
 LMC_FUSION_REREAD_QKNORM_TAU_INIT="${LMC_FUSION_REREAD_QKNORM_TAU_INIT:-0.0}"
 LMC_FUSION_REREAD_LAYERSCALE_PATCH_INIT="${LMC_FUSION_REREAD_LAYERSCALE_PATCH_INIT:-0.01}"
 LMC_FUSION_REREAD_LAYERSCALE_COMMON_INIT="${LMC_FUSION_REREAD_LAYERSCALE_COMMON_INIT:-0.0}"
+LMC_FUSION_CCF_GATE_SOURCE="${LMC_FUSION_CCF_GATE_SOURCE:-first_attn_entropy}"
+LMC_FUSION_CCF_GATE_FLOOR="${LMC_FUSION_CCF_GATE_FLOOR:-0.0}"
+LMC_FUSION_CCF_GATE_GAMMA="${LMC_FUSION_CCF_GATE_GAMMA:-1.0}"
+LMC_FUSION_CCF_DETACH_GATE="${LMC_FUSION_CCF_DETACH_GATE:-True}"
 LMC_FUSION_SINGLE_QKNORM_EPS="${LMC_FUSION_SINGLE_QKNORM_EPS:-1e-6}"
 LMC_FUSION_SINGLE_QKNORM_TAU_INIT="${LMC_FUSION_SINGLE_QKNORM_TAU_INIT:-0.0}"
 LMC_FUSION_SINGLE_LAYERSCALE_INIT="${LMC_FUSION_SINGLE_LAYERSCALE_INIT:-1.0}"
@@ -269,6 +273,10 @@ run_stage1() {
       --lmc_fusion_reread_qknorm_tau_init "${LMC_FUSION_REREAD_QKNORM_TAU_INIT}" \
       --lmc_fusion_reread_layerscale_patch_init "${LMC_FUSION_REREAD_LAYERSCALE_PATCH_INIT}" \
       --lmc_fusion_reread_layerscale_common_init "${LMC_FUSION_REREAD_LAYERSCALE_COMMON_INIT}" \
+      --lmc_fusion_ccf_gate_source "${LMC_FUSION_CCF_GATE_SOURCE}" \
+      --lmc_fusion_ccf_gate_floor "${LMC_FUSION_CCF_GATE_FLOOR}" \
+      --lmc_fusion_ccf_gate_gamma "${LMC_FUSION_CCF_GATE_GAMMA}" \
+      --lmc_fusion_ccf_detach_gate "${LMC_FUSION_CCF_DETACH_GATE}" \
       --lmc_fusion_single_qknorm_eps "${LMC_FUSION_SINGLE_QKNORM_EPS}" \
       --lmc_fusion_single_qknorm_tau_init "${LMC_FUSION_SINGLE_QKNORM_TAU_INIT}" \
       --lmc_fusion_single_layerscale_init "${LMC_FUSION_SINGLE_LAYERSCALE_INIT}" \
@@ -377,6 +385,10 @@ run_stage2() {
       --lmc_fusion_reread_qknorm_tau_init "${LMC_FUSION_REREAD_QKNORM_TAU_INIT}" \
       --lmc_fusion_reread_layerscale_patch_init "${LMC_FUSION_REREAD_LAYERSCALE_PATCH_INIT}" \
       --lmc_fusion_reread_layerscale_common_init "${LMC_FUSION_REREAD_LAYERSCALE_COMMON_INIT}" \
+      --lmc_fusion_ccf_gate_source "${LMC_FUSION_CCF_GATE_SOURCE}" \
+      --lmc_fusion_ccf_gate_floor "${LMC_FUSION_CCF_GATE_FLOOR}" \
+      --lmc_fusion_ccf_gate_gamma "${LMC_FUSION_CCF_GATE_GAMMA}" \
+      --lmc_fusion_ccf_detach_gate "${LMC_FUSION_CCF_DETACH_GATE}" \
       --lmc_fusion_single_qknorm_eps "${LMC_FUSION_SINGLE_QKNORM_EPS}" \
       --lmc_fusion_single_qknorm_tau_init "${LMC_FUSION_SINGLE_QKNORM_TAU_INIT}" \
       --lmc_fusion_single_layerscale_init "${LMC_FUSION_SINGLE_LAYERSCALE_INIT}" \

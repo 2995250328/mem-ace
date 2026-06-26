@@ -12,7 +12,7 @@ Use this skill for the whole LMC project, not only one method or scene. It stand
 - Work from project root `/home/xwh/project/ace_depth` when running training/eval scripts.
 - Do not launch a new matrix until the baseline command lineage is understood from existing scripts, logs, and `summary.tsv`.
 - Prefer tmux for long jobs. Use one window per config with stable names such as `baseline`, `alpha010`, `stage2_global`, or `scene2a_p4`.
-- Use explicit `RUN_ROOT` under `/data/xwh/ace_dinov2_lmc/04_evaluation/<topic>_<date>/train/<timestamp>` unless the user gives another root.
+- Use explicit canonical `RUN_ROOT` under `/data/xwh/ace_dinov2_lmc/04_evaluation/<dataset>/<track>/<method>/<YYYYMMDD>_<scope>_<protocol>_<gpu_tag>/`; use the local `lmc-evaluation-directory-layout` skill before creating new run roots.
 - Preserve comparability: same scene list, memory source, stage schedule, seeds, eval hypotheses, image resolution, buffer settings, and GPU allocation unless the ablation explicitly changes them.
 - After training, report metric-wise best values: each metric is selected independently from all iter, cross-iter, post-s2, seed, and post-train sources available in `summary.tsv`. Do not require all metrics to come from the same checkpoint or iter.
 - Always include source/provenance paths for surprising or decision-critical results.

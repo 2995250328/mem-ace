@@ -648,6 +648,10 @@ def run_evaluation_lmc(opt):
             fusion_reread_layerscale_common_init=lmc_config.get(
                 'lmc_fusion_reread_layerscale_common_init', 0.0
             ),
+            fusion_ccf_gate_source=lmc_config.get('lmc_fusion_ccf_gate_source', 'first_attn_entropy'),
+            fusion_ccf_gate_floor=lmc_config.get('lmc_fusion_ccf_gate_floor', 0.0),
+            fusion_ccf_gate_gamma=lmc_config.get('lmc_fusion_ccf_gate_gamma', 1.0),
+            fusion_ccf_detach_gate=lmc_config.get('lmc_fusion_ccf_detach_gate', True),
             fusion_reread_warmup_mode=lmc_config.get('lmc_fusion_reread_warmup_mode', 'none'),
             fusion_reread_warmup_iters=lmc_config.get('lmc_fusion_reread_warmup_iters', 0),
             fusion_reread_warmup_start=lmc_config.get('lmc_fusion_reread_warmup_start', 0.0),
@@ -1232,6 +1236,10 @@ def run_evaluation_lmc(opt):
             "lmc_fusion_reread_layerscale_common_init": lmc_config.get(
                 "lmc_fusion_reread_layerscale_common_init", 0.0
             ),
+            "lmc_fusion_ccf_gate_source": lmc_config.get("lmc_fusion_ccf_gate_source", "first_attn_entropy"),
+            "lmc_fusion_ccf_gate_floor": lmc_config.get("lmc_fusion_ccf_gate_floor", 0.0),
+            "lmc_fusion_ccf_gate_gamma": lmc_config.get("lmc_fusion_ccf_gate_gamma", 1.0),
+            "lmc_fusion_ccf_detach_gate": lmc_config.get("lmc_fusion_ccf_detach_gate", True),
             "lmc_fusion_reread_warmup_mode": lmc_config.get("lmc_fusion_reread_warmup_mode", "none"),
             "lmc_fusion_reread_warmup_iters": lmc_config.get("lmc_fusion_reread_warmup_iters", 0),
             "lmc_fusion_reread_warmup_start": lmc_config.get("lmc_fusion_reread_warmup_start", 0.0),

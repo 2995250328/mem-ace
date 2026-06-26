@@ -728,6 +728,55 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
                         help='有效深度上限（大于该值判为 invalid）。')
     parser.add_argument('--depth_target', type=float, default=10,
                         help='invalid 分支的目标深度缩放系数。')
+    parser.add_argument(
+        '--use_multiframe_reprojection_loss',
+        type=_strtobool,
+        default=False,
+        help='启用基于 GT scene coords 的多帧重投影辅助 loss。默认关闭，不影响现有训练。',
+    )
+    parser.add_argument(
+        '--multiframe_reprojection_apply_to',
+        type=str,
+        default='stage2',
+        choices=['s1', 'stage2', 'stage2_g', 'all'],
+        help='多帧重投影 loss 作用阶段；stage2 同时覆盖 S2 和 S2-G。',
+    )
+    parser.add_argument(
+        '--multiframe_reprojection_weight',
+        type=float,
+        default=0.02,
+        help='多帧重投影 loss 权重。use_multiframe_reprojection_loss=True 且该值 >0 时生效。',
+    )
+    parser.add_argument(
+        '--multiframe_reprojection_num_frames',
+        type=int,
+        default=2,
+        help='每次更新随机采样的参考帧数量；source frame 默认会被排除。',
+    )
+    parser.add_argument(
+        '--multiframe_reprojection_sample_limit',
+        type=int,
+        default=2048,
+        help='每次更新最多参与多帧重投影的 source 点数；0 表示不限制。',
+    )
+    parser.add_argument(
+        '--multiframe_reprojection_max_px',
+        type=float,
+        default=100.0,
+        help='多帧重投影每项像素误差的上限；<=0 表示不裁剪。',
+    )
+    parser.add_argument(
+        '--multiframe_reprojection_include_source',
+        type=_strtobool,
+        default=False,
+        help='多帧参考帧采样中是否允许包含 source frame。默认 False，因为同视图主 repro loss 已覆盖。',
+    )
+    parser.add_argument(
+        '--multiframe_reprojection_visibility_margin_px',
+        type=float,
+        default=0.0,
+        help='参考帧可见性边界余量；GT 投影落在 [-margin, W/H+margin] 内才计入。',
+    )
     parser.add_argument('--use_half', type=_strtobool, default=True,
                         help='是否启用 FP16 混合精度训练。')
 
@@ -1399,10 +1448,11 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
             'single', 'single_qknorm_layerscale',
             'cascade_internal', 'progressive_reread', 'centered_reread',
             'centered_reread_qknorm_layerscale', 'geometry_reread_lite',
-            'adapter_ffn', 'weak_residual_ffn', 'v3_adapter_control',
-            'v3_dual_refine', 'coord_prior_v1',
+            'ccf_centered_reread_qknorm_layerscale', 'adapter_ffn',
+            'weak_residual_ffn', 'v3_adapter_control', 'v3_dual_refine',
+            'coord_prior_v1',
         ],
-        help='Fusion refinement 模式。single=旧行为；single_qknorm_layerscale=只改一读 cross-attention 的 QK norm + per-channel output LayerScale；cascade_internal=Step15 C1 内部级联 fusion residual；progressive_reread=二次 memory read；centered_reread=以 A1 为中心的差分 memory context；centered_reread_qknorm_layerscale=PMRF-v3，centered second-read + QK norm + per-channel LayerScale；geometry_reread_lite=A1 条件化 3D 邻域二次 read；adapter_ffn=旧版带 post-LN FFN 对照；weak_residual_ffn=identity-preserving 弱残差 FFN 对照；v3_adapter_control=PMRF-v3 matched query-only residual adapter control，不读 memory，用于验证收益是否来自 memory reread；v3_dual_refine=query-only weak adapter + centered memory reread 双分支 refinement；coord_prior_v1=独立坐标先验融合分支，用 A1@latent_p 得到 memory coordinate prior 后注入 feature，不改变 single 路径。',
+        help='Fusion refinement 模式。single=旧行为；single_qknorm_layerscale=只改一读 cross-attention 的 QK norm + per-channel output LayerScale；cascade_internal=Step15 C1 内部级联 fusion residual；progressive_reread=二次 memory read；centered_reread=以 A1 为中心的差分 memory context；centered_reread_qknorm_layerscale=PMRF-v3，centered second-read + QK norm + per-channel LayerScale；ccf_centered_reread_qknorm_layerscale=CCF-lite，用一读 attention confidence 对 PMRF-v3 residual 做 per-patch soft gate；geometry_reread_lite=A1 条件化 3D 邻域二次 read；adapter_ffn=旧版带 post-LN FFN 对照；weak_residual_ffn=identity-preserving 弱残差 FFN 对照；v3_adapter_control=PMRF-v3 matched query-only residual adapter control，不读 memory，用于验证收益是否来自 memory reread；v3_dual_refine=query-only weak adapter + centered memory reread 双分支 refinement；coord_prior_v1=独立坐标先验融合分支，用 A1@latent_p 得到 memory coordinate prior 后注入 feature，不改变 single 路径。',
     )
     parser.add_argument(
         '--lmc_fusion_single_qknorm_eps',
@@ -1530,6 +1580,31 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help='v3_dual_refine 中 memory reread patch-common delta 的 per-channel LayerScale 初始值。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_ccf_gate_source',
+        type=str,
+        default='first_attn_entropy',
+        choices=['first_attn_entropy'],
+        help='CCF-lite residual gate 的 confidence 来源。first_attn_entropy=使用一读 attention normalized entropy。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_ccf_gate_floor',
+        type=float,
+        default=0.0,
+        help='CCF-lite per-patch gate 下限，范围 [0,1]；0 表示完全允许抑制 reread residual。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_ccf_gate_gamma',
+        type=float,
+        default=1.0,
+        help='CCF-lite confidence gate 的幂指数；1.0 表示线性 confidence gate。',
+    )
+    parser.add_argument(
+        '--lmc_fusion_ccf_detach_gate',
+        type=_strtobool,
+        default=True,
+        help='CCF-lite gate 是否 detach，默认 True 使 gate 只重加权 residual、不反传进一读 attention。',
     )
     parser.add_argument(
         '--lmc_fusion_reread_warmup_mode',
