@@ -33,6 +33,15 @@ POST_TRAIN_HYPOTHESES="${POST_TRAIN_HYPOTHESES:-256}"
 ITERATION_EVAL_HYPOTHESES="${ITERATION_EVAL_HYPOTHESES:-256}"
 POST_TRAIN_EVAL_SEEDS=(${POST_TRAIN_EVAL_SEEDS:-1305 2026 4242})
 
+USE_MULTIFRAME_REPROJECTION_LOSS="${USE_MULTIFRAME_REPROJECTION_LOSS:-True}"
+MULTIFRAME_REPROJECTION_APPLY_TO="${MULTIFRAME_REPROJECTION_APPLY_TO:-stage2}"
+MULTIFRAME_REPROJECTION_WEIGHT="${MULTIFRAME_REPROJECTION_WEIGHT:-0.02}"
+MULTIFRAME_REPROJECTION_NUM_FRAMES="${MULTIFRAME_REPROJECTION_NUM_FRAMES:-2}"
+MULTIFRAME_REPROJECTION_SAMPLE_LIMIT="${MULTIFRAME_REPROJECTION_SAMPLE_LIMIT:-2048}"
+MULTIFRAME_REPROJECTION_MAX_PX="${MULTIFRAME_REPROJECTION_MAX_PX:-100.0}"
+MULTIFRAME_REPROJECTION_INCLUDE_SOURCE="${MULTIFRAME_REPROJECTION_INCLUDE_SOURCE:-False}"
+MULTIFRAME_REPROJECTION_VISIBILITY_MARGIN_PX="${MULTIFRAME_REPROJECTION_VISIBILITY_MARGIN_PX:-0.0}"
+
 SCENES=(${SCENES:-wayspots_bears wayspots_squarebench wayspots_cubes})
 VARIANTS=(${VARIANTS:-single pmrf_base cl_pmrf_v3 v3_adapter_control})
 GPU_LIST=(${GPU_LIST:-0 1})
@@ -147,6 +156,11 @@ run_train_job() {
     printf "protocol=stage1 it%s buf%s final%s epochs%s hypo_iter%s hypo_post%s seeds=%s\n" \
       "${LMC_ITERATIONS}" "${TRAINING_BUFFER_SIZE}" "${BUFFER_SIZE_FINAL}" "${EPOCHS}" \
       "${ITERATION_EVAL_HYPOTHESES}" "${POST_TRAIN_HYPOTHESES}" "${POST_TRAIN_EVAL_SEEDS[*]}"
+    printf "multiframe_reprojection enabled=%s apply_to=%s weight=%s refs=%s sample_limit=%s max_px=%s include_source=%s margin=%s\n" \
+      "${USE_MULTIFRAME_REPROJECTION_LOSS}" "${MULTIFRAME_REPROJECTION_APPLY_TO}" \
+      "${MULTIFRAME_REPROJECTION_WEIGHT}" "${MULTIFRAME_REPROJECTION_NUM_FRAMES}" \
+      "${MULTIFRAME_REPROJECTION_SAMPLE_LIMIT}" "${MULTIFRAME_REPROJECTION_MAX_PX}" \
+      "${MULTIFRAME_REPROJECTION_INCLUDE_SOURCE}" "${MULTIFRAME_REPROJECTION_VISIBILITY_MARGIN_PX}"
   } | tee -a "${log_file}"
 
   if [[ ! -f "${memory_path}" ]]; then
@@ -237,6 +251,14 @@ run_train_job() {
     --epochs "${EPOCHS}"
     --post_train_eval_seeds "${POST_TRAIN_EVAL_SEEDS[@]}"
     --post_train_hypotheses "${POST_TRAIN_HYPOTHESES}"
+    --use_multiframe_reprojection_loss "${USE_MULTIFRAME_REPROJECTION_LOSS}"
+    --multiframe_reprojection_apply_to "${MULTIFRAME_REPROJECTION_APPLY_TO}"
+    --multiframe_reprojection_weight "${MULTIFRAME_REPROJECTION_WEIGHT}"
+    --multiframe_reprojection_num_frames "${MULTIFRAME_REPROJECTION_NUM_FRAMES}"
+    --multiframe_reprojection_sample_limit "${MULTIFRAME_REPROJECTION_SAMPLE_LIMIT}"
+    --multiframe_reprojection_max_px "${MULTIFRAME_REPROJECTION_MAX_PX}"
+    --multiframe_reprojection_include_source "${MULTIFRAME_REPROJECTION_INCLUDE_SOURCE}"
+    --multiframe_reprojection_visibility_margin_px "${MULTIFRAME_REPROJECTION_VISIBILITY_MARGIN_PX}"
   )
 
   if [[ "${EVAL_MODE}" == "deferred" || "${EVAL_MODE}" == "none" ]]; then

@@ -34,6 +34,7 @@ from ace_util import to_homogeneous
 from trainer_dinov2 import TrainerACEDINOv2, set_seed
 from ace_compressor import GeoLMC
 from ace_fusion import LMCFeatureFusion
+from ace_query_graph_refiner import QueryGraphRefiner
 from ace_loss import ReproLoss
 from ace_lmc_global_film import ACEGlobalFiLMHead
 from ace_lmc_global_residual import ACEGlobalResidualHead
@@ -91,7 +92,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             },
         },
         "fused_buffer_glace": {
-            "description": "S2 iterative fused feature buffer for GLACE backend",
+            "description": "S2 iterative fused feature buffer with per-row image indices",
             "fields": {
                 "features": {"rank": 2, "shape_suffix": ("feature_dim",), "dtype": "feature"},
                 "target_px": {"rank": 2, "shape_suffix": (2,), "dtype": torch.float32},
@@ -104,7 +105,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             },
         },
         "raw_buffer_glace": {
-            "description": "ACE-G and S1 raw backbone feature buffer for GLACE backend",
+            "description": "ACE-G and S1 raw backbone feature buffer with per-row image indices",
             "fields": {
                 "features": {"rank": 2, "shape_suffix": ("feature_dim",), "dtype": "feature"},
                 "target_px": {"rank": 2, "shape_suffix": (2,), "dtype": torch.float32},
@@ -117,6 +118,30 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             },
         },
     }
+    # Preferred names for schemas that carry per-row image indices. Keep the old
+    # *_glace keys as compatibility aliases because older code paths used those
+    # names before multi-frame reprojection also needed img_idx.
+    BUFFER_SCHEMA_SPECS["fused_buffer_indexed"] = BUFFER_SCHEMA_SPECS["fused_buffer_glace"]
+    BUFFER_SCHEMA_SPECS["raw_buffer_indexed"] = BUFFER_SCHEMA_SPECS["raw_buffer_glace"]
+
+    _STGS_BUFFER_FIELDS = {
+        "target_px2": {"rank": 2, "shape_suffix": (2,), "dtype": torch.float32},
+        "gt_poses_inv2": {"rank": 3, "shape_suffix": (3, 4), "dtype": torch.float32},
+        "intrinsics2": {"rank": 3, "shape_suffix": (3, 3), "dtype": torch.float32},
+        "track_flag": {"rank": 2, "shape_suffix": (1,), "dtype": torch.bool},
+        "inter_frame_weight": {"rank": 2, "shape_suffix": (1,), "dtype": torch.float32},
+        "anchor_alignment_error_px": {"rank": 2, "shape_suffix": (1,), "dtype": torch.float32},
+        "parallax_deg": {"rank": 2, "shape_suffix": (1,), "dtype": torch.float32},
+        "track_length": {"rank": 2, "shape_suffix": (1,), "dtype": torch.int32},
+        "point3D_id": {"rank": 1, "shape_suffix": (), "dtype": torch.int64},
+    }
+    for _base_name, _indexed_name in (("fused_buffer", "fused_buffer_indexed"), ("raw_buffer", "raw_buffer_indexed")):
+        _fields = dict(BUFFER_SCHEMA_SPECS[_indexed_name]["fields"])
+        _fields.update(_STGS_BUFFER_FIELDS)
+        BUFFER_SCHEMA_SPECS[f"{_base_name}_stgs"] = {
+            "description": f"{_base_name} with per-row image indices and STGS keyframe channel",
+            "fields": _fields,
+        }
 
     @staticmethod
     def _tensor_to_config_value(value: Any):
@@ -901,6 +926,525 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             f", mfRefs={int(stats.get('refs', 0))}"
         )
 
+    def _sfm_track_inter_frame_base_weight(self) -> float:
+        if not bool(getattr(self.options, "use_sfm_track_inter_frame_loss", False)):
+            return 0.0
+        return max(0.0, float(getattr(self.options, "sfm_track_inter_frame_weight", 0.0) or 0.0))
+
+    def _sfm_track_inter_frame_may_need_buffer_fields(self) -> bool:
+        return self._sfm_track_inter_frame_base_weight() > 0.0
+
+    def _sfm_track_inter_frame_enabled_for_stage(self, stage_tag: str) -> bool:
+        if self._sfm_track_inter_frame_base_weight() <= 0.0:
+            return False
+        apply_to = str(getattr(self.options, "sfm_track_inter_frame_apply_to", "stage2") or "stage2").lower()
+        stage = str(stage_tag).upper()
+        if apply_to == "stage2_g":
+            return stage == "S2-G"
+        return stage in {"S2", "S2-G"}
+
+    def _sfm_track_inter_frame_schedule_scale(self) -> float:
+        steps_per_phase = max(1, int(getattr(self, "steps_per_s2_phase", 1) or 1))
+        progress = float(getattr(self, "local_s2_step", 0)) / float(steps_per_phase)
+        progress = min(1.0, max(0.0, progress))
+        start_ratio = min(1.0, max(0.0, float(getattr(self.options, "sfm_track_inter_frame_start_ratio", 0.2) or 0.0)))
+        decay_ratio = min(1.0, max(0.0, float(getattr(self.options, "sfm_track_inter_frame_decay_last_ratio", 0.3) or 0.0)))
+        if progress < start_ratio:
+            return 0.0
+        if decay_ratio > 0.0 and progress > 1.0 - decay_ratio:
+            return max(0.0, (1.0 - progress) / decay_ratio)
+        return 1.0
+
+    def _sfm_track_inter_frame_effective_weight(self, stage_tag: str) -> float:
+        if not self._sfm_track_inter_frame_enabled_for_stage(stage_tag):
+            return 0.0
+        return self._sfm_track_inter_frame_base_weight() * self._sfm_track_inter_frame_schedule_scale()
+
+    @staticmethod
+    def _sfm_track_inter_frame_empty_stats(
+        enabled: bool = False,
+        base_weight: float = 0.0,
+        effective_weight: float = 0.0,
+    ) -> Dict[str, float]:
+        return {
+            "enabled": bool(enabled),
+            "loss_raw": 0.0,
+            "weight": float(effective_weight),
+            "base_weight": float(base_weight),
+            "terms": 0,
+            "track_candidates": 0,
+            "track_ratio": 0.0,
+            "valid_projection_ratio": 0.0,
+            "mean_px": 0.0,
+            "alignment_error_px": 0.0,
+            "parallax_deg": 0.0,
+        }
+
+    @staticmethod
+    def _format_sfm_track_inter_frame_stats(stats: Optional[Dict[str, float]]) -> str:
+        if not isinstance(stats, dict) or not stats.get("enabled", False):
+            return ""
+        return (
+            f", stgsIF={float(stats.get('loss_raw', 0.0)):.4f}"
+            f", stgsW={float(stats.get('weight', 0.0)):.4f}"
+            f", stgsTerms={int(stats.get('terms', 0))}"
+            f", stgsTrk={int(stats.get('track_candidates', 0))}"
+            f", stgsPx={float(stats.get('mean_px', 0.0)):.2f}"
+        )
+
+    def _warn_sfm_track_inter_frame_once(self, key: str, message: str) -> None:
+        warned = getattr(self, "_sfm_track_inter_frame_warned", None)
+        if warned is None:
+            warned = set()
+            self._sfm_track_inter_frame_warned = warned
+        if key in warned:
+            return
+        _logger.warning(message)
+        warned.add(key)
+
+    def _get_sfm_track_keyframe_channel(self):
+        cached = getattr(self, "_sfm_track_keyframe_channel", None)
+        if cached is False:
+            return None
+        if cached is not None:
+            return cached
+        if self._sfm_track_inter_frame_base_weight() <= 0.0:
+            self._sfm_track_keyframe_channel = False
+            return None
+
+        raw_path = getattr(self.options, "sfm_track_keyframe_channel_path", None)
+        if raw_path is None:
+            self._warn_sfm_track_inter_frame_once(
+                "missing_sidecar_path",
+                "[STGS] --use_sfm_track_inter_frame_loss is enabled but --sfm_track_keyframe_channel_path is empty; loss disabled.",
+            )
+            self._sfm_track_keyframe_channel = False
+            return None
+        sidecar_path = Path(raw_path)
+        if sidecar_path.is_dir():
+            sidecar_path = sidecar_path / "keyframe_channel.npz"
+        if not sidecar_path.exists():
+            self._warn_sfm_track_inter_frame_once(
+                "missing_sidecar_file",
+                f"[STGS] keyframe channel sidecar not found: {sidecar_path}; loss disabled.",
+            )
+            self._sfm_track_keyframe_channel = False
+            return None
+
+        def _pick_array(npz, names, required=True):
+            for name in names:
+                if name in npz:
+                    return np.asarray(npz[name])
+            if required:
+                raise KeyError("/".join(names))
+            return None
+
+        try:
+            with np.load(sidecar_path, allow_pickle=False) as npz:
+                anchor_image_idx = _pick_array(npz, ("anchor_image_idx", "source_image_idx", "src_image_idx", "image_idx"))
+                anchor_feature_yx = _pick_array(npz, ("anchor_feature_yx", "anchor_yx", "feature_yx"))
+                target_image_idx = _pick_array(npz, ("target_image_idx", "ref_image_idx", "target_idx"))
+                target_xy_model = _pick_array(npz, ("target_xy_model", "target_px2", "target_xy", "target_px"))
+                track_flag = _pick_array(npz, ("track_flag", "target_track_flag"), required=False)
+                alignment_weight = _pick_array(npz, ("alignment_weight", "inter_frame_weight"), required=False)
+                alignment_error = _pick_array(
+                    npz,
+                    ("anchor_alignment_error_px", "alignment_error_px", "alignment_error"),
+                    required=False,
+                )
+                parallax_deg = _pick_array(npz, ("parallax_deg",), required=False)
+                track_length = _pick_array(npz, ("track_length",), required=False)
+                point3d_id = _pick_array(npz, ("point3D_id", "point3d_id"), required=False)
+        except Exception as exc:
+            self._warn_sfm_track_inter_frame_once(
+                "sidecar_load_failed",
+                f"[STGS] failed to load keyframe channel sidecar {sidecar_path}: {exc}; loss disabled.",
+            )
+            self._sfm_track_keyframe_channel = False
+            return None
+
+        anchor_image_idx = np.asarray(anchor_image_idx).reshape(-1).astype(np.int64)
+        n_entries = int(anchor_image_idx.shape[0])
+        try:
+            anchor_feature_yx = np.asarray(anchor_feature_yx).reshape(n_entries, 2).astype(np.int64)
+            target_image_idx = np.asarray(target_image_idx).reshape(n_entries).astype(np.int64)
+            target_xy_model = np.asarray(target_xy_model).reshape(n_entries, 2).astype(np.float32)
+        except Exception as exc:
+            self._warn_sfm_track_inter_frame_once(
+                "sidecar_shape_failed",
+                f"[STGS] invalid keyframe channel shapes in {sidecar_path}: {exc}; loss disabled.",
+            )
+            self._sfm_track_keyframe_channel = False
+            return None
+
+        if track_flag is None:
+            track_flag = np.ones((n_entries,), dtype=bool)
+        else:
+            track_flag = np.asarray(track_flag).reshape(n_entries).astype(bool)
+        if alignment_weight is None:
+            alignment_weight = np.ones((n_entries,), dtype=np.float32)
+        else:
+            alignment_weight = np.asarray(alignment_weight).reshape(n_entries).astype(np.float32)
+            alignment_weight = np.nan_to_num(alignment_weight, nan=0.0, posinf=0.0, neginf=0.0)
+            alignment_weight = np.clip(alignment_weight, 0.0, None)
+        if alignment_error is None:
+            alignment_error = np.zeros((n_entries,), dtype=np.float32)
+        else:
+            alignment_error = np.asarray(alignment_error).reshape(n_entries).astype(np.float32)
+        if parallax_deg is None:
+            parallax_deg = np.zeros((n_entries,), dtype=np.float32)
+        else:
+            parallax_deg = np.asarray(parallax_deg).reshape(n_entries).astype(np.float32)
+        if track_length is None:
+            track_length = np.zeros((n_entries,), dtype=np.int32)
+        else:
+            track_length = np.asarray(track_length).reshape(n_entries).astype(np.int32)
+        if point3d_id is None:
+            point3d_id = np.full((n_entries,), -1, dtype=np.int64)
+        else:
+            point3d_id = np.asarray(point3d_id).reshape(n_entries).astype(np.int64)
+
+        finite_mask = (
+            np.isfinite(target_xy_model).all(axis=1)
+            & np.isfinite(alignment_weight)
+            & (alignment_weight > 0.0)
+            & track_flag
+        )
+        entries_by_image = {}
+        for image_idx in np.unique(anchor_image_idx):
+            mask = anchor_image_idx == int(image_idx)
+            entries_by_image[int(image_idx)] = {
+                "anchor_feature_yx": anchor_feature_yx[mask],
+                "target_image_idx": target_image_idx[mask],
+                "target_xy_model": target_xy_model[mask],
+                "track_flag": finite_mask[mask],
+                "alignment_weight": alignment_weight[mask],
+                "anchor_alignment_error_px": alignment_error[mask],
+                "parallax_deg": parallax_deg[mask],
+                "track_length": track_length[mask],
+                "point3D_id": point3d_id[mask],
+            }
+
+        channel = {
+            "path": str(sidecar_path),
+            "entries_by_image": entries_by_image,
+            "num_entries": n_entries,
+            "num_track": int(finite_mask.sum()),
+        }
+        self._sfm_track_keyframe_channel = channel
+        _logger.info(
+            "[STGS] keyframe channel ready: entries=%d valid_tracks=%d anchor_images=%d path=%s weight=%.4f apply_to=%s",
+            n_entries,
+            int(finite_mask.sum()),
+            len(entries_by_image),
+            str(sidecar_path),
+            float(self._sfm_track_inter_frame_base_weight()),
+            str(getattr(self.options, "sfm_track_inter_frame_apply_to", "stage2")),
+        )
+        return channel
+
+    def _empty_sfm_track_inter_frame_fields(self, n_rows: int, device: torch.device) -> Dict[str, torch.Tensor]:
+        n_rows = int(n_rows)
+        return {
+            "target_px2": torch.zeros((n_rows, 2), dtype=torch.float32, device=device),
+            "gt_poses_inv2": torch.zeros((n_rows, 3, 4), dtype=torch.float32, device=device),
+            "intrinsics2": torch.zeros((n_rows, 3, 3), dtype=torch.float32, device=device),
+            "track_flag": torch.zeros((n_rows, 1), dtype=torch.bool, device=device),
+            "inter_frame_weight": torch.zeros((n_rows, 1), dtype=torch.float32, device=device),
+            "anchor_alignment_error_px": torch.zeros((n_rows, 1), dtype=torch.float32, device=device),
+            "parallax_deg": torch.zeros((n_rows, 1), dtype=torch.float32, device=device),
+            "track_length": torch.zeros((n_rows, 1), dtype=torch.int32, device=device),
+            "point3D_id": torch.full((n_rows,), -1, dtype=torch.int64, device=device),
+        }
+
+    def _build_sfm_track_inter_frame_fields_for_batch(self, img_idx_B, H: int, W: int, device: torch.device):
+        B = int(img_idx_B.numel()) if img_idx_B is not None else 0
+        fields = self._empty_sfm_track_inter_frame_fields(B * int(H) * int(W), device)
+        if not self._sfm_track_inter_frame_may_need_buffer_fields():
+            return fields
+        if img_idx_B is None:
+            self._warn_sfm_track_inter_frame_once(
+                "missing_img_idx_for_fields",
+                "[STGS] buffer batch is missing img_idx; inter-frame fields left empty.",
+            )
+            return fields
+        channel = self._get_sfm_track_keyframe_channel()
+        if channel is None:
+            return fields
+        bank = self._get_multiframe_reprojection_frame_bank()
+        if bank is None:
+            self._warn_sfm_track_inter_frame_once(
+                "missing_frame_bank",
+                "[STGS] no usable target frame bank; inter-frame fields left empty.",
+            )
+            return fields
+
+        entries_by_image = channel["entries_by_image"]
+        img_idx_list = img_idx_B.detach().cpu().long().view(-1).tolist()
+        n_bank = int(bank["pose_inv"].shape[0])
+        if n_bank <= 0:
+            return fields
+        valid_bank = np.zeros((n_bank,), dtype=bool)
+        valid_indices = bank["valid_indices"].detach().cpu().numpy().astype(np.int64)
+        valid_indices = valid_indices[(valid_indices >= 0) & (valid_indices < n_bank)]
+        valid_bank[valid_indices] = True
+        image_size_np = bank["image_size"].detach().cpu().numpy().astype(np.float32)
+
+        for b, image_idx in enumerate(img_idx_list):
+            rows = entries_by_image.get(int(image_idx))
+            if rows is None:
+                continue
+            yx = rows["anchor_feature_yx"]
+            target_idx = rows["target_image_idx"]
+            target_xy = rows["target_xy_model"]
+            y = yx[:, 0]
+            x = yx[:, 1]
+            raw_valid = (
+                rows["track_flag"]
+                & (y >= 0)
+                & (y < int(H))
+                & (x >= 0)
+                & (x < int(W))
+                & (target_idx >= 0)
+                & (target_idx < n_bank)
+            )
+            if not np.any(raw_valid):
+                continue
+            candidate_idx = np.where(raw_valid)[0]
+            target_idx_candidate = target_idx[candidate_idx]
+            target_xy_candidate = target_xy[candidate_idx]
+            bank_visible = valid_bank[target_idx_candidate]
+            if np.any(bank_visible):
+                size_candidate = image_size_np[target_idx_candidate]
+                in_bounds = (
+                    bank_visible
+                    & (target_xy_candidate[:, 0] >= 0.0)
+                    & (target_xy_candidate[:, 1] >= 0.0)
+                    & (target_xy_candidate[:, 0] <= size_candidate[:, 0])
+                    & (target_xy_candidate[:, 1] <= size_candidate[:, 1])
+                )
+                candidate_idx = candidate_idx[in_bounds]
+            else:
+                candidate_idx = candidate_idx[:0]
+            if candidate_idx.size <= 0:
+                continue
+
+            flat_idx_np = int(b) * int(H) * int(W) + y[candidate_idx] * int(W) + x[candidate_idx]
+            flat_idx = torch.as_tensor(flat_idx_np, dtype=torch.long, device=device)
+            target_idx_cpu = torch.as_tensor(target_idx[candidate_idx], dtype=torch.long)
+            fields["target_px2"][flat_idx] = torch.as_tensor(
+                target_xy[candidate_idx], dtype=torch.float32, device=device
+            )
+            fields["gt_poses_inv2"][flat_idx] = bank["pose_inv"][target_idx_cpu].to(device=device, non_blocking=True).float()
+            fields["intrinsics2"][flat_idx] = bank["intrinsics"][target_idx_cpu].to(device=device, non_blocking=True).float()
+            fields["track_flag"][flat_idx, 0] = True
+            fields["inter_frame_weight"][flat_idx, 0] = torch.as_tensor(
+                rows["alignment_weight"][candidate_idx], dtype=torch.float32, device=device
+            )
+            fields["anchor_alignment_error_px"][flat_idx, 0] = torch.as_tensor(
+                rows["anchor_alignment_error_px"][candidate_idx], dtype=torch.float32, device=device
+            )
+            fields["parallax_deg"][flat_idx, 0] = torch.as_tensor(
+                rows["parallax_deg"][candidate_idx], dtype=torch.float32, device=device
+            )
+            fields["track_length"][flat_idx, 0] = torch.as_tensor(
+                rows["track_length"][candidate_idx], dtype=torch.int32, device=device
+            )
+            fields["point3D_id"][flat_idx] = torch.as_tensor(
+                rows["point3D_id"][candidate_idx], dtype=torch.int64, device=device
+            )
+        return fields
+
+    def _sfm_track_inter_frame_batch_from_buffer(self, buf, row_indices, to_device_fn):
+        if not self._sfm_track_inter_frame_may_need_buffer_fields():
+            return None
+        missing = [key for key in self._STGS_BUFFER_FIELDS.keys() if key not in buf]
+        if missing:
+            self._warn_sfm_track_inter_frame_once(
+                "buffer_missing_fields",
+                f"[STGS] training buffer is missing STGS fields {missing}; inter-frame loss disabled for this buffer.",
+            )
+            return None
+        return {
+            key: to_device_fn(buf[key][row_indices])
+            for key in self._STGS_BUFFER_FIELDS.keys()
+        }
+
+    @staticmethod
+    def _slice_sfm_track_inter_frame_batch(sfm_track_batch, batch_size: int):
+        if sfm_track_batch is None:
+            return None
+        return {key: value[:batch_size] for key, value in sfm_track_batch.items()}
+
+    def _compute_weighted_repro_loss_sum(self, repro_errs_N1, weights_N1, iteration: int):
+        if repro_errs_N1.nelement() == 0:
+            return repro_errs_N1.new_zeros(())
+        repro_errs_N1 = repro_errs_N1.reshape(-1, 1)
+        weights_N1 = weights_N1.reshape_as(repro_errs_N1).clamp_min(0.0)
+        loss_type = str(getattr(self.repro_loss, "type", "dyntanh"))
+        soft_clamp = float(getattr(self.repro_loss, "soft_clamp", self.options.repro_loss_soft_clamp))
+        if loss_type == "tanh":
+            return (weights_N1 * soft_clamp * torch.tanh(repro_errs_N1 / soft_clamp)).sum()
+        if loss_type == "dyntanh":
+            total_iterations = max(1, int(getattr(self.repro_loss, "total_iterations", 1)))
+            schedule_weight = float(iteration) / float(total_iterations)
+            schedule_weight = min(1.0, max(0.0, schedule_weight))
+            if bool(getattr(self.repro_loss, "circle_schedule", True)):
+                schedule_weight = 1.0 - math.sqrt(max(0.0, 1.0 - schedule_weight ** 2))
+            loss_weight = (1.0 - schedule_weight) * soft_clamp + float(getattr(self.repro_loss, "soft_clamp_min", 1.0))
+            return (weights_N1 * loss_weight * torch.tanh(repro_errs_N1 / loss_weight)).sum()
+        if loss_type == "l1":
+            mask = repro_errs_N1 <= soft_clamp
+            return (weights_N1[mask] * repro_errs_N1[mask]).sum()
+        if loss_type == "l1+sqrt":
+            term = torch.where(
+                repro_errs_N1 > soft_clamp,
+                torch.sqrt(torch.clamp(torch.as_tensor(soft_clamp, device=repro_errs_N1.device, dtype=repro_errs_N1.dtype) * repro_errs_N1, min=0.0)),
+                repro_errs_N1,
+            )
+            return (weights_N1 * term).sum()
+        term = torch.where(
+            repro_errs_N1 > soft_clamp,
+            torch.log1p(torch.as_tensor(soft_clamp, device=repro_errs_N1.device, dtype=repro_errs_N1.dtype) * repro_errs_N1),
+            repro_errs_N1,
+        )
+        return (weights_N1 * term).sum()
+
+    def _compute_sfm_track_inter_frame_loss(
+        self,
+        *,
+        stage_tag: str,
+        pred_scene_coords_B3HW: torch.Tensor,
+        sfm_track_batch: Optional[Dict[str, torch.Tensor]],
+        step_eff: int,
+    ):
+        base_weight = self._sfm_track_inter_frame_base_weight()
+        effective_weight = self._sfm_track_inter_frame_effective_weight(stage_tag)
+        enabled = self._sfm_track_inter_frame_enabled_for_stage(stage_tag)
+        zero = pred_scene_coords_B3HW.new_zeros(())
+        stats = self._sfm_track_inter_frame_empty_stats(enabled, base_weight, effective_weight)
+        if not enabled:
+            return zero, stats
+        if sfm_track_batch is None:
+            self._warn_sfm_track_inter_frame_once(
+                "missing_batch",
+                f"[STGS] {stage_tag}: missing STGS buffer fields; skipping inter-frame loss.",
+            )
+            return zero, stats
+        if effective_weight <= 0.0:
+            return zero, stats
+
+        required = ("target_px2", "gt_poses_inv2", "intrinsics2", "track_flag", "inter_frame_weight")
+        missing = [key for key in required if key not in sfm_track_batch]
+        if missing:
+            self._warn_sfm_track_inter_frame_once(
+                "missing_batch_keys",
+                f"[STGS] {stage_tag}: missing STGS batch keys {missing}; skipping inter-frame loss.",
+            )
+            return zero, stats
+
+        pred_N3 = pred_scene_coords_B3HW.permute(0, 2, 3, 1).reshape(-1, 3).float()
+        target_N2 = sfm_track_batch["target_px2"].reshape(-1, 2).to(pred_N3.device, dtype=pred_N3.dtype)
+        pose_N34 = sfm_track_batch["gt_poses_inv2"].reshape(-1, 3, 4).to(pred_N3.device, dtype=pred_N3.dtype)
+        K_N33 = sfm_track_batch["intrinsics2"].reshape(-1, 3, 3).to(pred_N3.device, dtype=pred_N3.dtype)
+        track_flag_N = sfm_track_batch["track_flag"].reshape(-1).to(pred_N3.device).bool()
+        weight_N = sfm_track_batch["inter_frame_weight"].reshape(-1).to(pred_N3.device, dtype=pred_N3.dtype).clamp_min(0.0)
+        if target_N2.shape[0] != pred_N3.shape[0] or pose_N34.shape[0] != pred_N3.shape[0]:
+            self._warn_sfm_track_inter_frame_once(
+                "shape_mismatch",
+                f"[STGS] {stage_tag}: shape mismatch pred={tuple(pred_N3.shape)} target={tuple(target_N2.shape)} pose={tuple(pose_N34.shape)}; skipping.",
+            )
+            return zero, stats
+
+        candidate_N = (
+            track_flag_N
+            & (weight_N > 0.0)
+            & torch.isfinite(pred_N3).all(dim=1)
+            & torch.isfinite(target_N2).all(dim=1)
+            & torch.isfinite(pose_N34).flatten(1).all(dim=1)
+            & torch.isfinite(K_N33).flatten(1).all(dim=1)
+        )
+        candidate_count = int(candidate_N.sum().item())
+        stats["track_candidates"] = candidate_count
+        stats["track_ratio"] = float(candidate_count) / float(max(1, int(pred_N3.shape[0])))
+        if candidate_count <= 0:
+            return zero, stats
+
+        pred_M31 = pred_N3[candidate_N].unsqueeze(-1)
+        pose_M34 = pose_N34[candidate_N]
+        K_M33 = K_N33[candidate_N]
+        target_M2 = target_N2[candidate_N]
+        weight_M1 = weight_N[candidate_N].view(-1, 1)
+        cam_M31 = torch.bmm(pose_M34, to_homogeneous(pred_M31))
+        pix_h_M31 = torch.bmm(K_M33, cam_M31)
+        depth_M = pix_h_M31[:, 2, 0]
+        safe_depth_M = depth_M.clamp(min=float(self.options.depth_min))
+        pred_px_M2 = pix_h_M31[:, :2, 0] / safe_depth_M[:, None]
+        repro_error_M1 = torch.norm(pred_px_M2 - target_M2, dim=1, keepdim=True, p=1)
+        depth_min = float(self.options.depth_min)
+        depth_max = float(self.options.depth_max)
+        valid_M = (
+            torch.isfinite(pred_px_M2).all(dim=1)
+            & torch.isfinite(repro_error_M1).reshape(-1)
+            & torch.isfinite(depth_M)
+            & (depth_M > depth_min)
+            & (depth_M < depth_max)
+        )
+        if not bool(valid_M.any().item()):
+            return zero, stats
+
+        valid_error_N1 = repro_error_M1[valid_M]
+        max_px = float(getattr(self.options, "sfm_track_inter_frame_max_px", 100.0) or 0.0)
+        if max_px > 0.0:
+            valid_error_N1 = valid_error_N1.clamp(max=max_px)
+        valid_weight_N1 = weight_M1[valid_M]
+        raw_loss = self._compute_weighted_repro_loss_sum(valid_error_N1, valid_weight_N1, int(step_eff))
+        if not isinstance(raw_loss, torch.Tensor):
+            raw_loss = valid_error_N1.new_tensor(float(raw_loss))
+        raw_loss = raw_loss / max(1, int(valid_error_N1.numel()))
+        if not bool(torch.isfinite(raw_loss).all().item()):
+            self._warn_sfm_track_inter_frame_once(
+                "nonfinite_loss",
+                f"[STGS] {stage_tag}: non-finite inter-frame loss; skipped.",
+            )
+            return zero, stats
+
+        alignment_error = sfm_track_batch.get("anchor_alignment_error_px")
+        parallax = sfm_track_batch.get("parallax_deg")
+        if alignment_error is not None:
+            alignment_error = alignment_error.reshape(-1).to(pred_N3.device, dtype=pred_N3.dtype)[candidate_N][valid_M]
+        if parallax is not None:
+            parallax = parallax.reshape(-1).to(pred_N3.device, dtype=pred_N3.dtype)[candidate_N][valid_M]
+        stats.update({
+            "loss_raw": float(raw_loss.detach().cpu().item()),
+            "terms": int(valid_error_N1.numel()),
+            "valid_projection_ratio": float(valid_error_N1.numel()) / float(max(1, candidate_count)),
+            "mean_px": float(valid_error_N1.detach().float().mean().cpu().item()),
+            "alignment_error_px": (
+                float(alignment_error.detach().float().mean().cpu().item())
+                if alignment_error is not None and alignment_error.numel() > 0
+                else 0.0
+            ),
+            "parallax_deg": (
+                float(parallax.detach().float().mean().cpu().item())
+                if parallax is not None and parallax.numel() > 0
+                else 0.0
+            ),
+        })
+        if not getattr(self, "_sfm_track_inter_frame_logged_active", False) and int(stats["terms"]) > 0:
+            _logger.info(
+                "[STGS] active at %s: raw=%.6f base_weight=%.6f effective_weight=%.6f terms=%d candidates=%d mean_px=%.3f",
+                stage_tag,
+                float(stats["loss_raw"]),
+                float(base_weight),
+                float(effective_weight),
+                int(stats["terms"]),
+                int(stats["track_candidates"]),
+                float(stats["mean_px"]),
+            )
+            self._sfm_track_inter_frame_logged_active = True
+        return raw_loss * float(effective_weight), stats
+
     def _warn_multiframe_reprojection_once(self, key: str, message: str) -> None:
         warned = getattr(self, "_multiframe_reprojection_warned", None)
         if warned is None:
@@ -1387,6 +1931,175 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             ))
             self._buffer_sample_random_selected = int(getattr(self, "_buffer_sample_random_selected", 0)) + n_random
         return torch.cat(pieces, dim=0) if len(pieces) > 1 else pieces[0]
+
+    def _sample_query_graph_buffer_groups(self, buf, buffer_len):
+        if 'img_idx' not in buf:
+            raise RuntimeError(
+                "[QueryGraph] grouped sampler requires training_buffer['img_idx']; "
+                "lmc_query_graph_refine_mode should force indexed buffer creation."
+            )
+        g = int(getattr(self.options, 'lmc_query_graph_images_per_batch', 4))
+        p = int(getattr(self.options, 'lmc_query_graph_patches_per_image', 128))
+        sampler_mode = str(getattr(self.options, 'lmc_query_graph_sampler', 'local_window'))
+        if g <= 0 or p <= 0:
+            raise ValueError(f"[QueryGraph] invalid grouped sampler shape G={g}, P={p}.")
+
+        img_idx_all = buf['img_idx'][:buffer_len]
+        target_px_all = buf['target_px'][:buffer_len]
+        device = img_idx_all.device
+        generator = self._get_training_generator(device)
+        unique_img, counts = torch.unique(img_idx_all.long(), sorted=False, return_counts=True)
+        valid_img = unique_img[counts > 0]
+        if valid_img.numel() <= 0:
+            return None, None
+        if valid_img.numel() >= g:
+            perm = torch.randperm(valid_img.numel(), device=device, generator=generator)[:g]
+            selected_img = valid_img[perm]
+        else:
+            draw = torch.randint(0, valid_img.numel(), (g,), device=device, generator=generator)
+            selected_img = valid_img[draw]
+
+        group_indices = []
+        candidate_counts = []
+        insufficient = 0
+        for img_id in selected_img:
+            candidates = torch.where(img_idx_all.long() == img_id.long())[0]
+            candidate_counts.append(int(candidates.numel()))
+            if candidates.numel() <= 0:
+                continue
+            if candidates.numel() < p:
+                insufficient += 1
+            px = target_px_all[candidates].float()
+            if sampler_mode == 'local_window':
+                chosen = self._sample_query_graph_local_window(candidates, px, p, generator)
+            elif sampler_mode == 'stratified':
+                chosen = self._sample_query_graph_stratified(candidates, px, p, generator)
+            else:
+                raise ValueError(f"Unsupported lmc_query_graph_sampler={sampler_mode!r}")
+            group_indices.append(chosen)
+
+        if len(group_indices) <= 0:
+            return None, None
+        group_indices_gp = torch.stack(group_indices, dim=0)
+        group_img_idx = img_idx_all[group_indices_gp].long()
+        if not bool((group_img_idx == group_img_idx[:, :1]).all().item()):
+            raise RuntimeError("[QueryGraph] grouped sampler produced a group with mixed img_idx values.")
+        stats = self._query_graph_sampler_stats(
+            target_px_all[group_indices_gp].float(),
+            group_img_idx,
+            candidate_counts,
+            insufficient,
+            sampler_mode,
+        )
+        return group_indices_gp, stats
+
+    @staticmethod
+    def _sample_query_graph_local_window(candidates, px, patches_per_image, generator):
+        n = int(candidates.numel())
+        center_offset = torch.randint(0, n, (1,), device=candidates.device, generator=generator).item()
+        center = px[center_offset:center_offset + 1]
+        dist = (px - center).pow(2).sum(dim=-1)
+        take = min(patches_per_image, n)
+        order = torch.argsort(dist)[:take]
+        selected = candidates[order]
+        if take < patches_per_image:
+            fill = candidates[torch.randint(0, n, (patches_per_image - take,), device=candidates.device, generator=generator)]
+            selected = torch.cat((selected, fill), dim=0)
+        return selected
+
+    @staticmethod
+    def _sample_query_graph_stratified(candidates, px, patches_per_image, generator):
+        n = int(candidates.numel())
+        if n <= patches_per_image:
+            selected = candidates
+            if n < patches_per_image:
+                fill = candidates[torch.randint(0, n, (patches_per_image - n,), device=candidates.device, generator=generator)]
+                selected = torch.cat((selected, fill), dim=0)
+            return selected
+
+        grid = max(1, int(math.ceil(math.sqrt(float(patches_per_image)))))
+        px_min = px.min(dim=0).values
+        px_span = (px.max(dim=0).values - px_min).clamp(min=1e-6)
+        xy = torch.floor((px - px_min) / px_span * float(grid - 1)).long().clamp(0, grid - 1)
+        cell = xy[:, 1] * grid + xy[:, 0]
+        pieces = []
+        used = torch.zeros(n, dtype=torch.bool, device=candidates.device)
+        for cell_id in torch.unique(cell, sorted=False):
+            cell_offsets = torch.where(cell == cell_id)[0]
+            if cell_offsets.numel() <= 0:
+                continue
+            pick = cell_offsets[torch.randint(0, cell_offsets.numel(), (1,), device=candidates.device, generator=generator)]
+            pieces.append(candidates[pick])
+            used[pick] = True
+            if len(pieces) >= patches_per_image:
+                break
+        selected = torch.cat(pieces, dim=0) if pieces else candidates[:0]
+        remaining = candidates[~used]
+        need = patches_per_image - int(selected.numel())
+        if need > 0:
+            if remaining.numel() >= need:
+                perm = torch.randperm(remaining.numel(), device=candidates.device, generator=generator)[:need]
+                fill = remaining[perm]
+            else:
+                fill = candidates[torch.randint(0, n, (need,), device=candidates.device, generator=generator)]
+            selected = torch.cat((selected, fill), dim=0)
+        return selected[:patches_per_image]
+
+    @staticmethod
+    def _query_graph_sampler_stats(target_px_gp2, group_img_idx_gp, candidate_counts, insufficient, sampler_mode):
+        with torch.no_grad():
+            g, p, _ = target_px_gp2.shape
+            bbox = target_px_gp2.max(dim=1).values - target_px_gp2.min(dim=1).values
+            if p > 1:
+                dmat = torch.cdist(target_px_gp2.float(), target_px_gp2.float())
+                diag = torch.eye(p, dtype=torch.bool, device=target_px_gp2.device).unsqueeze(0)
+                dmat = dmat.masked_fill(diag, float('inf'))
+                min_pair = dmat.amin(dim=(1, 2))
+                finite = dmat[torch.isfinite(dmat)]
+                max_pair = finite.max() if finite.numel() > 0 else target_px_gp2.new_tensor(0.0)
+                k = min(4, p - 1)
+                knn = torch.topk(dmat, k=k, dim=-1, largest=False).values
+                mean_knn = knn[torch.isfinite(knn)].mean() if bool(torch.isfinite(knn).any().item()) else target_px_gp2.new_tensor(0.0)
+            else:
+                min_pair = target_px_gp2.new_zeros((g,))
+                max_pair = target_px_gp2.new_tensor(0.0)
+                mean_knn = target_px_gp2.new_tensor(0.0)
+            counts_t = torch.tensor(candidate_counts, dtype=torch.float32)
+            return {
+                'query_graph_sampler': sampler_mode,
+                'query_graph_grouped_batch_g': int(g),
+                'query_graph_grouped_batch_p': int(p),
+                'query_graph_num_unique_img_idx': int(torch.unique(group_img_idx_gp[:, 0]).numel()),
+                'query_graph_patches_per_img_min': int(counts_t.min().item()) if counts_t.numel() else 0,
+                'query_graph_patches_per_img_mean': float(counts_t.mean().item()) if counts_t.numel() else 0.0,
+                'query_graph_patches_per_img_max': int(counts_t.max().item()) if counts_t.numel() else 0,
+                'query_graph_groups_with_insufficient_patches': int(insufficient),
+                'query_graph_target_px_bbox_width_mean': float(bbox[:, 0].float().mean().item()),
+                'query_graph_target_px_bbox_height_mean': float(bbox[:, 1].float().mean().item()),
+                'query_graph_mean_knn_distance': float(mean_knn.float().item()),
+                'query_graph_min_pairwise_distance': float(min_pair.float().mean().item()),
+                'query_graph_max_pairwise_distance': float(max_pair.float().item()),
+            }
+
+    @staticmethod
+    def _format_query_graph_stats(stats):
+        if not isinstance(stats, dict) or not stats:
+            return ""
+        return (
+            " qg=(G={g} P={p} uniq_img={uniq} insuff={insuff} "
+            "bbox={bw:.1f}x{bh:.1f} knn={knn:.1f} "
+            "gate={gate:.3f} upd={upd:.3e})"
+        ).format(
+            g=int(stats.get('query_graph_grouped_batch_g', 0)),
+            p=int(stats.get('query_graph_grouped_batch_p', 0)),
+            uniq=int(stats.get('query_graph_num_unique_img_idx', 0)),
+            insuff=int(stats.get('query_graph_groups_with_insufficient_patches', 0)),
+            bw=float(stats.get('query_graph_target_px_bbox_width_mean', 0.0)),
+            bh=float(stats.get('query_graph_target_px_bbox_height_mean', 0.0)),
+            knn=float(stats.get('query_graph_mean_knn_distance', 0.0)),
+            gate=float(stats.get('query_graph_gate_mean', 0.0)),
+            upd=float(stats.get('query_graph_effective_update_norm', 0.0)),
+        )
 
     def _infer_c1_aux_depth_dir(self, train_root: Path) -> Optional[Path]:
         explicit_root = getattr(self.options, "c1_aux_depth_root", None)
@@ -1951,8 +2664,16 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
     def _ace_lmc_global_noise_std(self):
         return max(0.0, float(getattr(self.options, "ace_lmc_global_noise_std", 0.0) or 0.0))
 
+    def _query_graph_refine_enabled(self):
+        return str(getattr(self.options, 'lmc_query_graph_refine_mode', 'none')) != 'none'
+
     def _needs_image_indices_in_buffer(self):
-        return self._uses_image_global_features() or self._multiframe_reprojection_may_need_image_indices()
+        return (
+            self._uses_image_global_features()
+            or self._multiframe_reprojection_may_need_image_indices()
+            or self._sfm_track_inter_frame_may_need_buffer_fields()
+            or self._query_graph_refine_enabled()
+        )
 
     def _glace_head_freeze_active(self, iteration_idx):
         if not self._is_glace_backend():
@@ -2189,7 +2910,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         )
 
     def _buffer_schema_name(self, base_name):
+        if self._sfm_track_inter_frame_may_need_buffer_fields():
+            stgs_name = f"{base_name}_stgs"
+            if stgs_name in self.BUFFER_SCHEMA_SPECS:
+                return stgs_name
         if self._needs_image_indices_in_buffer():
+            indexed_name = f"{base_name}_indexed"
+            if indexed_name in self.BUFFER_SCHEMA_SPECS:
+                return indexed_name
             return f"{base_name}_glace"
         return base_name
 
@@ -3732,6 +4460,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         lmc_fusion_ccf_gate_floor = float(getattr(options, 'lmc_fusion_ccf_gate_floor', 0.0))
         lmc_fusion_ccf_gate_gamma = float(getattr(options, 'lmc_fusion_ccf_gate_gamma', 1.0))
         lmc_fusion_ccf_detach_gate = bool(getattr(options, 'lmc_fusion_ccf_detach_gate', True))
+        lmc_query_graph_refine_mode = str(getattr(options, 'lmc_query_graph_refine_mode', 'none'))
+        lmc_query_graph_images_per_batch = int(getattr(options, 'lmc_query_graph_images_per_batch', 4))
+        lmc_query_graph_patches_per_image = int(getattr(options, 'lmc_query_graph_patches_per_image', 128))
+        lmc_query_graph_sampler = str(getattr(options, 'lmc_query_graph_sampler', 'local_window'))
+        lmc_query_graph_layerscale_init = float(getattr(options, 'lmc_query_graph_layerscale_init', 0.01))
+        lmc_query_graph_gate_init = float(getattr(options, 'lmc_query_graph_gate_init', -4.0))
+        lmc_query_graph_residual_l1_weight = float(getattr(options, 'lmc_query_graph_residual_l1_weight', 0.0))
+        lmc_query_graph_freeze_base = bool(getattr(options, 'lmc_query_graph_freeze_base', True))
+        lmc_query_graph_requires_img_idx = lmc_query_graph_refine_mode != 'none'
+        lmc_query_graph_edge_source = 'target_px' if lmc_query_graph_requires_img_idx else 'none'
+        lmc_query_graph_eval_grouping = 'per_patch' if lmc_query_graph_refine_mode == 'mlp_control' else 'none'
         lmc_fusion_single_qknorm_eps = float(getattr(options, 'lmc_fusion_single_qknorm_eps', 1e-6))
         lmc_fusion_single_qknorm_tau_init = float(
             getattr(options, 'lmc_fusion_single_qknorm_tau_init', 0.0)
@@ -3798,6 +4537,52 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             raise ValueError(
                 f"lmc_fusion_ccf_gate_gamma must be >= 0, got {lmc_fusion_ccf_gate_gamma}"
             )
+        if lmc_query_graph_refine_mode not in ('none', 'mlp_control'):
+            raise ValueError(
+                f"Unsupported lmc_query_graph_refine_mode={lmc_query_graph_refine_mode!r}"
+            )
+        if lmc_query_graph_images_per_batch <= 0:
+            raise ValueError(
+                f"lmc_query_graph_images_per_batch must be > 0, got {lmc_query_graph_images_per_batch}"
+            )
+        if lmc_query_graph_patches_per_image <= 0:
+            raise ValueError(
+                f"lmc_query_graph_patches_per_image must be > 0, got {lmc_query_graph_patches_per_image}"
+            )
+        if lmc_query_graph_sampler not in ('local_window', 'stratified'):
+            raise ValueError(
+                f"lmc_query_graph_sampler must be local_window or stratified, got {lmc_query_graph_sampler!r}"
+            )
+        if lmc_query_graph_layerscale_init < 0.0:
+            raise ValueError(
+                f"lmc_query_graph_layerscale_init must be >= 0, got {lmc_query_graph_layerscale_init}"
+            )
+        if lmc_query_graph_residual_l1_weight < 0.0:
+            raise ValueError(
+                f"lmc_query_graph_residual_l1_weight must be >= 0, got {lmc_query_graph_residual_l1_weight}"
+            )
+        if lmc_query_graph_refine_mode != 'none':
+            if self._is_glace_backend():
+                raise ValueError(
+                    "lmc_query_graph_refine_mode currently supports ACE/ACE-FCN LMC paths only; "
+                    "GLACE local/global branches are intentionally out of scope for this patch."
+                )
+            if lmc_fusion_refinement_mode != 'single':
+                raise ValueError(
+                    "First query graph patch only supports lmc_fusion_refinement_mode='single'; "
+                    f"got {lmc_fusion_refinement_mode!r}."
+                )
+            if not bool(getattr(options, 's1_use_buffer', False)):
+                raise ValueError(
+                    "lmc_query_graph_refine_mode!=none requires --s1_use_buffer True so the "
+                    "first patch can use the indexed grouped buffer sampler."
+                )
+            if (lmc_query_graph_images_per_batch * lmc_query_graph_patches_per_image) % 16 != 0:
+                raise ValueError(
+                    "lmc_query_graph_images_per_batch * lmc_query_graph_patches_per_image must be "
+                    "divisible by 16 for the existing 1x1 ACE head packing path; got "
+                    f"{lmc_query_graph_images_per_batch}*{lmc_query_graph_patches_per_image}."
+                )
         if lmc_fusion_single_qknorm_eps <= 0.0:
             raise ValueError(
                 f"lmc_fusion_single_qknorm_eps must be > 0, got {lmc_fusion_single_qknorm_eps}"
@@ -3895,6 +4680,21 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             lmc_fusion_reread_geo_sigma_mode,
             lmc_fusion_reread_geo_sigma_beta,
             lmc_fusion_reread_geo_sigma_min,
+        )
+        _logger.info(
+            "[QueryGraph] mode=%s requires_img_idx=%s sampler=%s grouped_sampler=%s edge_source=%s G=%d P=%d layerscale_init=%.6f gate_init=%.6f residual_l1=%.3e freeze_base=%s eval_grouping=%s",
+            lmc_query_graph_refine_mode,
+            lmc_query_graph_requires_img_idx,
+            lmc_query_graph_sampler,
+            'grouped_by_img_idx' if lmc_query_graph_requires_img_idx else 'none',
+            lmc_query_graph_edge_source,
+            lmc_query_graph_images_per_batch,
+            lmc_query_graph_patches_per_image,
+            lmc_query_graph_layerscale_init,
+            lmc_query_graph_gate_init,
+            lmc_query_graph_residual_l1_weight,
+            lmc_query_graph_freeze_base,
+            lmc_query_graph_eval_grouping,
         )
 
         self.lmc_config = {
@@ -3998,6 +4798,20 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'lmc_fusion_ccf_gate_floor': lmc_fusion_ccf_gate_floor,
             'lmc_fusion_ccf_gate_gamma': lmc_fusion_ccf_gate_gamma,
             'lmc_fusion_ccf_detach_gate': lmc_fusion_ccf_detach_gate,
+            'lmc_query_graph_refine_mode': lmc_query_graph_refine_mode,
+            'lmc_query_graph_images_per_batch': lmc_query_graph_images_per_batch,
+            'lmc_query_graph_patches_per_image': lmc_query_graph_patches_per_image,
+            'lmc_query_graph_sampler': lmc_query_graph_sampler,
+            'lmc_query_graph_layerscale_init': lmc_query_graph_layerscale_init,
+            'lmc_query_graph_gate_init': lmc_query_graph_gate_init,
+            'lmc_query_graph_residual_l1_weight': lmc_query_graph_residual_l1_weight,
+            'lmc_query_graph_freeze_base': lmc_query_graph_freeze_base,
+            'query_graph_requires_img_idx': lmc_query_graph_requires_img_idx,
+            'query_graph_sampler': 'grouped_by_img_idx' if lmc_query_graph_requires_img_idx else 'none',
+            'query_graph_edge_source': lmc_query_graph_edge_source,
+            'query_graph_eval_grouping': lmc_query_graph_eval_grouping,
+            'final_query_graph_layerscale_absmean': None,
+            'final_query_graph_gate_bias': None,
             'lmc_fusion_reread_warmup_mode': lmc_fusion_reread_warmup_mode,
             'lmc_fusion_reread_warmup_iters': lmc_fusion_reread_warmup_iters,
             'lmc_fusion_reread_warmup_start': lmc_fusion_reread_warmup_start,
@@ -4128,6 +4942,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'multiframe_reprojection_max_px': float(getattr(self.options, 'multiframe_reprojection_max_px', 100.0)),
             'multiframe_reprojection_include_source': bool(getattr(self.options, 'multiframe_reprojection_include_source', False)),
             'multiframe_reprojection_visibility_margin_px': float(getattr(self.options, 'multiframe_reprojection_visibility_margin_px', 0.0)),
+            'use_sfm_track_inter_frame_loss': bool(getattr(self.options, 'use_sfm_track_inter_frame_loss', False)),
+            'sfm_track_keyframe_channel_path': str(getattr(self.options, 'sfm_track_keyframe_channel_path', '') or ''),
+            'sfm_track_inter_frame_apply_to': str(getattr(self.options, 'sfm_track_inter_frame_apply_to', 'stage2')),
+            'sfm_track_inter_frame_weight': float(getattr(self.options, 'sfm_track_inter_frame_weight', 0.05)),
+            'sfm_track_inter_frame_start_ratio': float(getattr(self.options, 'sfm_track_inter_frame_start_ratio', 0.2)),
+            'sfm_track_inter_frame_decay_last_ratio': float(getattr(self.options, 'sfm_track_inter_frame_decay_last_ratio', 0.3)),
+            'sfm_track_inter_frame_max_px': float(getattr(self.options, 'sfm_track_inter_frame_max_px', 100.0)),
             'memory_has_points_ref': self.memory_contract_info['has_points_ref'],
             'memory_has_points_ref_norm': self.memory_contract_info['has_points_ref_norm'],
             'memory_has_scene_center_world': self.memory_contract_info['has_scene_center_world'],
@@ -4242,6 +5063,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             fusion_reread_geo_sigma_min=lmc_fusion_reread_geo_sigma_min,
         ).to(self.device)
 
+        self.query_graph_refiner = QueryGraphRefiner(
+            feature_dim=backbone_feature_dim,
+            mode=lmc_query_graph_refine_mode,
+            layerscale_init=lmc_query_graph_layerscale_init,
+            gate_init=lmc_query_graph_gate_init,
+        ).to(self.device)
+
         # --- LMC training params ---
         self.lmc_iterations = getattr(options, 'lmc_iterations', 15)
         self.lmc_train_steps = getattr(options, 'lmc_train_steps', 2000)
@@ -4341,6 +5169,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self._multiframe_reprojection_frame_bank = None
         self._multiframe_reprojection_warned = set()
         self._multiframe_reprojection_logged_active = False
+        self._sfm_track_keyframe_channel = None
+        self._sfm_track_inter_frame_warned = set()
+        self._sfm_track_inter_frame_logged_active = False
         self._init_relative_depth_distiller()
 
         self._load_ace_lmc_local_checkpoint_if_requested()
@@ -4729,6 +5560,18 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         }
         if self._needs_image_indices_in_buffer():
             self.training_buffer['img_idx'] = torch.empty((effective_size,), dtype=torch.int64, device=buffer_device)
+        if self._sfm_track_inter_frame_may_need_buffer_fields():
+            self.training_buffer.update({
+                'target_px2': torch.empty((effective_size, 2), dtype=torch.float32, device=buffer_device),
+                'gt_poses_inv2': torch.empty((effective_size, 3, 4), dtype=torch.float32, device=buffer_device),
+                'intrinsics2': torch.empty((effective_size, 3, 3), dtype=torch.float32, device=buffer_device),
+                'track_flag': torch.empty((effective_size, 1), dtype=torch.bool, device=buffer_device),
+                'inter_frame_weight': torch.empty((effective_size, 1), dtype=torch.float32, device=buffer_device),
+                'anchor_alignment_error_px': torch.empty((effective_size, 1), dtype=torch.float32, device=buffer_device),
+                'parallax_deg': torch.empty((effective_size, 1), dtype=torch.float32, device=buffer_device),
+                'track_length': torch.empty((effective_size, 1), dtype=torch.int32, device=buffer_device),
+                'point3D_id': torch.empty((effective_size,), dtype=torch.int64, device=buffer_device),
+            })
 
         regressor_mode_snapshot = self._capture_module_training_modes(
             self.regressor,
@@ -4838,8 +5681,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     }
                     if self._needs_image_indices_in_buffer():
                         if img_idx_B is None:
-                            raise ValueError('[Buffer] image-global run requires img_idx but batch is missing it.')
+                            raise ValueError('[Buffer] image-indexed run requires img_idx but batch is missing it.')
                         batch_data['img_idx'] = img_idx_B.unsqueeze(1).expand(B, H * W).reshape(-1)
+                    if self._sfm_track_inter_frame_may_need_buffer_fields():
+                        batch_data.update(
+                            self._build_sfm_track_inter_frame_fields_for_batch(
+                                img_idx_B,
+                                H,
+                                W,
+                                self.device,
+                            )
+                        )
 
                     image_mask_B1HW = image_mask_B1HW.float()
                     image_mask_N1 = normalize_shape(image_mask_B1HW)
@@ -5203,6 +6055,40 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             param.requires_grad_(trainable)
         _logger.info("[LMC] Compressor trainable=%s", trainable)
 
+    def _set_query_graph_stage_b_trainability(self, *, freeze_base: bool):
+        query_graph = getattr(self, "query_graph_refiner", None)
+        if query_graph is None:
+            return
+        query_graph.train()
+        for param in query_graph.parameters():
+            param.requires_grad_(True)
+        if not freeze_base:
+            return
+        for module in (
+            getattr(self.regressor, "encoder", None),
+            getattr(self.regressor, "heads", None),
+            getattr(self, "compressor", None),
+            getattr(self, "fusion", None),
+            getattr(self, "glace_residual_adapter", None),
+        ):
+            if module is None:
+                continue
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad_(False)
+        for param in self._local_residual_gate_params():
+            param.requires_grad_(False)
+        _logger.info(
+            "[QueryGraph] Stage-B freeze_base=True: frozen backbone/compressor/fusion/head; "
+            "head forward still keeps gradients to refined features."
+        )
+
+    def _query_graph_optimizer_params(self):
+        query_graph = getattr(self, "query_graph_refiner", None)
+        if query_graph is None:
+            return []
+        return [p for p in query_graph.parameters() if p.requires_grad]
+
     def _log_stage_trainability(self, stage_tag: str):
         """Log trainable parameter counts for stage-contract debugging."""
         if not self.use_lmc:
@@ -5211,8 +6097,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         gate_params = self._local_residual_gate_params()
         gate_trainable = sum(p.numel() for p in gate_params if p.requires_grad)
         gate_total = sum(p.numel() for p in gate_params)
+        query_graph = getattr(self, "query_graph_refiner", None)
         _logger.info(
-            "[%s] trainable params: encoder=%d/%d head=%d/%d compressor=%d/%d fusion=%d/%d residual_adapter=%d/%d local_residual_gate=%d/%d alpha_eff=%.6f",
+            "[%s] trainable params: encoder=%d/%d head=%d/%d compressor=%d/%d fusion=%d/%d query_graph_refiner=%d/%d residual_adapter=%d/%d local_residual_gate=%d/%d alpha_eff=%.6f",
             stage_tag,
             self._count_trainable_params(getattr(self.regressor, "encoder", None)),
             self._count_total_params(getattr(self.regressor, "encoder", None)),
@@ -5222,6 +6109,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self._count_total_params(getattr(self, "compressor", None)),
             self._count_trainable_params(getattr(self, "fusion", None)),
             self._count_total_params(getattr(self, "fusion", None)),
+            self._count_trainable_params(query_graph),
+            self._count_total_params(query_graph),
             self._count_trainable_params(adapter),
             self._count_total_params(adapter),
             gate_trainable,
@@ -5349,6 +6238,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             "lmc_fusion_dual_memory_layerscale_patch_init", "lmc_fusion_dual_memory_layerscale_common_init",
             "lmc_fusion_ccf_gate_source", "lmc_fusion_ccf_gate_floor",
             "lmc_fusion_ccf_gate_gamma", "lmc_fusion_ccf_detach_gate",
+            "lmc_query_graph_refine_mode", "lmc_query_graph_images_per_batch",
+            "lmc_query_graph_patches_per_image", "lmc_query_graph_sampler",
+            "lmc_query_graph_layerscale_init", "lmc_query_graph_gate_init",
+            "lmc_query_graph_residual_l1_weight", "lmc_query_graph_freeze_base",
+            "query_graph_requires_img_idx", "query_graph_sampler",
+            "query_graph_edge_source", "query_graph_eval_grouping",
+            "final_query_graph_layerscale_absmean", "final_query_graph_gate_bias",
             "lmc_fusion_reread_warmup_mode", "lmc_fusion_reread_warmup_iters",
             "lmc_fusion_reread_warmup_start",
             "lmc_fusion_reread_geo_lambda",
@@ -6259,19 +7155,30 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
     def _train_compressor_steps_from_buffer(self, iteration_idx, n_steps):
         """Stage 1 buffer mode: train compressor/fusion/head from raw feature buffer."""
-        self._set_compressor_trainable(True)
-        self.compressor.train()
-        self.fusion.train()
+        query_graph_enabled = self._query_graph_refine_enabled()
+        query_graph_freeze_base = bool(getattr(self.options, 'lmc_query_graph_freeze_base', True))
+        if query_graph_enabled:
+            self._set_query_graph_stage_b_trainability(freeze_base=query_graph_freeze_base)
+            if not query_graph_freeze_base:
+                self._set_compressor_trainable(True)
+                self.compressor.train()
+                self.fusion.train()
+                self.regressor.heads.train()
+        else:
+            self._set_compressor_trainable(True)
+            self.compressor.train()
+            self.fusion.train()
         # When the base network is frozen, the head is excluded here and only
         # the plugin path is allowed to move.
         # Same freeze rule for standard S1 updates.
         # Same freeze rule carries into S2 / ACE-G head training.
         # Same freeze rule applies to the S2 polish phase.
         freeze_glace_head = self._glace_freeze_head() or self._glace_head_freeze_active(iteration_idx)
-        if self._is_glace_backend():
-            self._set_glace_head_trainable(not freeze_glace_head, stage_tag="S1-Buffer")
-        else:
-            self.regressor.heads.train()
+        if not query_graph_enabled:
+            if self._is_glace_backend():
+                self._set_glace_head_trainable(not freeze_glace_head, stage_tag="S1-Buffer")
+            else:
+                self.regressor.heads.train()
         self.regressor.encoder.eval()
         self._log_stage_trainability("S1-Buffer")
 
@@ -6291,19 +7198,35 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if iteration_idx > 0:
             _logger.info("  [S1 LR] iter>0: base_lr scaled by %.2f -> %.2e", s1_lr_scale_later, base_lr_s1)
 
-        s1_param_groups = [
-            {'name': 'compressor', 'params': self.compressor.parameters()},
-            {'name': 'fusion_residual', 'params': list(self.fusion.parameters()) + self._glace_residual_adapter_params()},
-        ]
-        gate_params = self._local_residual_gate_params()
-        if gate_params:
-            s1_param_groups.append({'name': 'local_residual_gate', 'params': gate_params, 'lr': base_lr_s1 * 0.1})
-        if freeze_glace_head:
-            _logger.info("  [S1-Buffer] GLACE head freeze warmup active at iter %d; head excluded from optimizer.", iteration_idx + 1)
+        if query_graph_enabled and query_graph_freeze_base:
+            query_graph_params = self._query_graph_optimizer_params()
+            if not query_graph_params:
+                raise RuntimeError("[QueryGraph] enabled but no trainable query_graph_refiner parameters found.")
+            s1_param_groups = [
+                {'name': 'query_graph_refiner', 'params': query_graph_params},
+            ]
+            _logger.info("  [S1-Buffer] QueryGraph Stage-B optimizer: graph-only, base frozen.")
         else:
-            s1_param_groups.append({'name': 'head', 'params': self.regressor.heads.parameters(), 'lr': base_lr_s1 * 0.1})
+            s1_param_groups = [
+                {'name': 'compressor', 'params': self.compressor.parameters()},
+                {'name': 'fusion_residual', 'params': list(self.fusion.parameters()) + self._glace_residual_adapter_params()},
+            ]
+            query_graph_params = self._query_graph_optimizer_params() if query_graph_enabled else []
+            if query_graph_params:
+                s1_param_groups.append({'name': 'query_graph_refiner', 'params': query_graph_params})
+            gate_params = self._local_residual_gate_params()
+            if gate_params:
+                s1_param_groups.append({'name': 'local_residual_gate', 'params': gate_params, 'lr': base_lr_s1 * 0.1})
+            if freeze_glace_head:
+                _logger.info("  [S1-Buffer] GLACE head freeze warmup active at iter %d; head excluded from optimizer.", iteration_idx + 1)
+            else:
+                s1_param_groups.append({'name': 'head', 'params': self.regressor.heads.parameters(), 'lr': base_lr_s1 * 0.1})
         comp_optimizer = optim.AdamW(s1_param_groups, lr=base_lr_s1)
-        self._validate_glace_head_optimizer_membership("S1-Buffer", comp_optimizer, expected_trainable=not freeze_glace_head)
+        self._validate_glace_head_optimizer_membership(
+            "S1-Buffer",
+            comp_optimizer,
+            expected_trainable=(not freeze_glace_head and not (query_graph_enabled and query_graph_freeze_base)),
+        )
         self._log_optimizer_groups("S1-Buffer", comp_optimizer)
         sched_lmc = self._build_s1_scheduler(comp_optimizer, n_steps, iteration_idx, base_lr=base_lr_s1)
 
@@ -6351,62 +7274,126 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 )
                 break
 
-            draw_bs = min(self.options.batch_size, buffer_len)
-            if draw_bs < 16:
-                skipped_sample += 1
-                continue
-            sample_idxs = torch.randint(
-                0,
-                buffer_len,
-                (draw_bs,),
-                generator=self._get_training_generator(buf_device),
-                device=buf_device,
-            )
+            query_graph_stats = {}
+            query_graph_reg_loss = None
+            if query_graph_enabled:
+                group_idxs_GP, query_graph_stats = self._sample_query_graph_buffer_groups(buf, buffer_len)
+                if group_idxs_GP is None:
+                    skipped_sample += 1
+                    continue
+                group_count, patches_per_group = int(group_idxs_GP.shape[0]), int(group_idxs_GP.shape[1])
+                flat_group_idxs = group_idxs_GP.reshape(-1)
+                if flat_group_idxs.numel() < 16:
+                    skipped_sample += 1
+                    continue
 
-            def _to_dev(t):
-                out = t[sample_idxs].contiguous()
-                if out.device != self.device:
-                    out = out.to(self.device, non_blocking=True)
-                return out
+                def _to_dev_group(t):
+                    out = t[flat_group_idxs].contiguous()
+                    if out.device != self.device:
+                        out = out.to(self.device, non_blocking=True)
+                    return out.view(group_count, patches_per_group, *out.shape[1:])
 
-            raw_features_bC = _to_dev(buf['features'])
-            target_px_b2 = _to_dev(buf['target_px'])
-            gt_inv_poses_b34 = _to_dev(buf['gt_poses_inv'])
-            Ks_b33 = _to_dev(buf['intrinsics'])
-            invKs_b33 = _to_dev(buf['intrinsics_inv'])
-            gt_scene_coords_world_b3 = _to_dev(buf['gt_scene_coords_world'])
-            gt_scene_coords_valid_b1 = _to_dev(buf['gt_scene_coords_valid'])
-            img_idx_b1 = _to_dev(buf['img_idx']) if 'img_idx' in buf else None
+                raw_features_GPC = _to_dev_group(buf['features'])
+                target_px_GP2 = _to_dev_group(buf['target_px'])
+                gt_inv_poses_GP34 = _to_dev_group(buf['gt_poses_inv'])
+                Ks_GP33 = _to_dev_group(buf['intrinsics'])
+                invKs_GP33 = _to_dev_group(buf['intrinsics_inv'])
+                gt_scene_coords_world_GP3 = _to_dev_group(buf['gt_scene_coords_world'])
+                gt_scene_coords_valid_GP1 = _to_dev_group(buf['gt_scene_coords_valid'])
+                img_idx_GP = _to_dev_group(buf['img_idx'])
 
-            channels = raw_features_bC.shape[1]
-            raw_features_bC, batch_size, h, w, trimmed = self._pack_feature_rows_for_head(
-                "S1-Buffer",
-                raw_features_bC,
-                target_px_b2,
-                gt_inv_poses_b34,
-                Ks_b33,
-                invKs_b33,
-                gt_scene_coords_world_b3,
-                gt_scene_coords_valid_b1,
-            )
-            if batch_size is None:
-                skipped_sample += 1
-                continue
-            target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
-            img_idx_b1 = img_idx_b1[:batch_size] if img_idx_b1 is not None else None
-
-            with autocast("cuda", enabled=self.options.use_half):
-                comp_out = self.compressor(self.memory_dict)
-                raw_features_bCHW = raw_features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
-                fused_bCHW, base_for_residual_bCHW = self._fuse_lmc_features_for_head(
-                    raw_features_bCHW,
-                    comp_out,
-                    stage_tag="S1-Buffer",
+                channels = raw_features_GPC.shape[-1]
+                with autocast("cuda", enabled=self.options.use_half):
+                    raw_features_GCHW = raw_features_GPC.permute(0, 2, 1).unsqueeze(2).contiguous()
+                    if query_graph_freeze_base:
+                        with torch.no_grad():
+                            comp_out = self.compressor(self.memory_dict)
+                            fused_GCHW, base_for_residual_bCHW = self._fuse_lmc_features_for_head(
+                                raw_features_GCHW,
+                                comp_out,
+                                stage_tag="S1-Buffer-QGraph",
+                            )
+                    else:
+                        comp_out = self.compressor(self.memory_dict)
+                        fused_GCHW, base_for_residual_bCHW = self._fuse_lmc_features_for_head(
+                            raw_features_GCHW,
+                            comp_out,
+                            stage_tag="S1-Buffer-QGraph",
+                        )
+                    fused_GPC = fused_GCHW.squeeze(2).permute(0, 2, 1).contiguous()
+                    refined_GPC, refiner_stats, query_graph_reg_loss = self.query_graph_refiner(
+                        fused_GPC,
+                        target_px_GP2,
+                        return_stats=True,
+                    )
+                query_graph_stats.update(refiner_stats)
+                fused_features_bC = refined_GPC.reshape(-1, refined_GPC.shape[-1])
+                target_px_b2 = target_px_GP2.reshape(-1, 2)
+                gt_inv_poses_b34 = gt_inv_poses_GP34.reshape(-1, 3, 4)
+                Ks_b33 = Ks_GP33.reshape(-1, 3, 3)
+                invKs_b33 = invKs_GP33.reshape(-1, 3, 3)
+                gt_scene_coords_world_b3 = gt_scene_coords_world_GP3.reshape(-1, 3)
+                gt_scene_coords_valid_b1 = gt_scene_coords_valid_GP1.reshape(-1, 1)
+                img_idx_b1 = img_idx_GP.reshape(-1)
+                batch_size = int(fused_features_bC.shape[0])
+                base_decoder_features_bC = None
+            else:
+                draw_bs = min(self.options.batch_size, buffer_len)
+                if draw_bs < 16:
+                    skipped_sample += 1
+                    continue
+                sample_idxs = torch.randint(
+                    0,
+                    buffer_len,
+                    (draw_bs,),
+                    generator=self._get_training_generator(buf_device),
+                    device=buf_device,
                 )
-            fused_features_bC = fused_bCHW.permute(0, 2, 3, 1).reshape(-1, fused_bCHW.shape[1])
-            base_decoder_features_bC = None
-            if base_for_residual_bCHW is not None:
-                base_decoder_features_bC = base_for_residual_bCHW.permute(0, 2, 3, 1).reshape(-1, base_for_residual_bCHW.shape[1])
+
+                def _to_dev(t):
+                    out = t[sample_idxs].contiguous()
+                    if out.device != self.device:
+                        out = out.to(self.device, non_blocking=True)
+                    return out
+
+                raw_features_bC = _to_dev(buf['features'])
+                target_px_b2 = _to_dev(buf['target_px'])
+                gt_inv_poses_b34 = _to_dev(buf['gt_poses_inv'])
+                Ks_b33 = _to_dev(buf['intrinsics'])
+                invKs_b33 = _to_dev(buf['intrinsics_inv'])
+                gt_scene_coords_world_b3 = _to_dev(buf['gt_scene_coords_world'])
+                gt_scene_coords_valid_b1 = _to_dev(buf['gt_scene_coords_valid'])
+                img_idx_b1 = _to_dev(buf['img_idx']) if 'img_idx' in buf else None
+
+                channels = raw_features_bC.shape[1]
+                raw_features_bC, batch_size, h, w, trimmed = self._pack_feature_rows_for_head(
+                    "S1-Buffer",
+                    raw_features_bC,
+                    target_px_b2,
+                    gt_inv_poses_b34,
+                    Ks_b33,
+                    invKs_b33,
+                    gt_scene_coords_world_b3,
+                    gt_scene_coords_valid_b1,
+                )
+                if batch_size is None:
+                    skipped_sample += 1
+                    continue
+                target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
+                img_idx_b1 = img_idx_b1[:batch_size] if img_idx_b1 is not None else None
+
+                with autocast("cuda", enabled=self.options.use_half):
+                    comp_out = self.compressor(self.memory_dict)
+                    raw_features_bCHW = raw_features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
+                    fused_bCHW, base_for_residual_bCHW = self._fuse_lmc_features_for_head(
+                        raw_features_bCHW,
+                        comp_out,
+                        stage_tag="S1-Buffer",
+                    )
+                fused_features_bC = fused_bCHW.permute(0, 2, 3, 1).reshape(-1, fused_bCHW.shape[1])
+                base_decoder_features_bC = None
+                if base_for_residual_bCHW is not None:
+                    base_decoder_features_bC = base_for_residual_bCHW.permute(0, 2, 3, 1).reshape(-1, base_for_residual_bCHW.shape[1])
 
             loss, s1_stats = self._s1_compute_loss_from_features(
                 fused_features_bC.contiguous(),
@@ -6423,6 +7410,16 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
             if loss is None:
                 continue
+            if query_graph_reg_loss is not None:
+                qg_l1_weight = float(getattr(self.options, 'lmc_query_graph_residual_l1_weight', 0.0))
+                if qg_l1_weight > 0.0:
+                    loss = loss + qg_l1_weight * query_graph_reg_loss
+                query_graph_stats['query_graph_residual_l1_loss'] = float(
+                    query_graph_reg_loss.detach().float().item()
+                )
+                query_graph_stats['query_graph_residual_l1_weight'] = qg_l1_weight
+            if query_graph_stats:
+                s1_stats['query_graph'] = query_graph_stats
 
             if s1_stats["nonfinite_ratio"] > 0.10:
                 skipped_nonfinite += 1
@@ -6460,13 +7457,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             comp_optimizer.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(comp_optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                list(self.compressor.parameters()) +
-                list(self.fusion.parameters()) +
-                self._glace_residual_adapter_params() +
-                list(self.regressor.heads.parameters()),
-                max_norm=1.0
-            )
+            params_to_clip = [
+                p
+                for group in comp_optimizer.param_groups
+                for p in group['params']
+                if p.requires_grad
+            ]
+            if params_to_clip:
+                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=1.0)
             self.scaler.step(comp_optimizer)
             self.scaler.update()
             sched_lmc.step()
@@ -6517,11 +7515,12 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     med3d=-1.0,
                 )
                 _logger.info(
-                    "  [S1-Buffer] update %d/%d (attempt=%d), samples=%d, loss=%.4f, valid=%.1f%%, pxErrL1=%.2f, pxErrL2=%.2f, nonFinite=%.2f%%, lr=%.2e%s",
+                    "  [S1-Buffer] update %d/%d (attempt=%d), samples=%d, loss=%.4f, valid=%.1f%%, pxErrL1=%.2f, pxErrL2=%.2f, nonFinite=%.2f%%, lr=%.2e%s%s",
                     update_step, n_steps, raw_step, batch_size, _cur_loss,
                     s1_stats["fraction_valid"] * 100.0, s1_stats["pxerr_l1"], s1_stats["pxerr_l2"],
                     s1_stats["nonfinite_ratio"] * 100.0, comp_optimizer.param_groups[0]["lr"],
                     self._format_multiframe_reprojection_stats(s1_stats.get("multiframe_reprojection")),
+                    self._format_query_graph_stats(s1_stats.get('query_graph')),
                 )
 
         if skipped_sample > 0 or skipped_nonfinite > 0:
@@ -7390,6 +8389,17 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.regressor.heads.load_state_dict(checkpoint["head_state_dict"], strict=True)
         self.compressor.load_state_dict(checkpoint["compressor_state_dict"], strict=True)
         self.fusion.load_state_dict(checkpoint["fusion_state_dict"], strict=True)
+        query_graph_state = checkpoint.get('query_graph_refiner_state_dict')
+        if self._query_graph_refine_enabled():
+            if query_graph_state is None:
+                _logger.info(
+                    "[Resume] query_graph_refiner_state_dict missing; initializing %s from current config.",
+                    getattr(self.options, 'lmc_query_graph_refine_mode', 'none'),
+                )
+            else:
+                self.query_graph_refiner.load_state_dict(query_graph_state, strict=True)
+        elif query_graph_state is not None:
+            _logger.info("[Resume] checkpoint has query_graph_refiner_state_dict but current mode is none; ignoring it.")
         if self._is_glace_backend() and getattr(self, 'glace_residual_adapter', None) is not None:
             adapter_state = checkpoint.get('glace_residual_adapter_state_dict')
             if adapter_state is not None:
@@ -8429,6 +9439,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 return out
             step_fn = self._training_step_ace_g if self.lmc_flow == 'ace_g' else self.training_step
             img_idx_batch = _to_dev(buf['img_idx'][random_batch_indices]) if 'img_idx' in buf else None
+            sfm_track_batch = self._sfm_track_inter_frame_batch_from_buffer(buf, random_batch_indices, _to_dev)
             stage_tag = "S2-G" if self.lmc_flow == 'ace_g' else "S2"
             relative_depth_image_batch = self._next_relative_depth_image_batch(stage_tag)
             step_fn(
@@ -8441,6 +9452,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 _to_dev(buf['gt_scene_coords_valid'][random_batch_indices]),
                 img_idx_batch,
                 relative_depth_image_batch,
+                sfm_track_batch,
             )
             if bool(getattr(self, '_s2_abort_current_iteration', False)):
                 break
@@ -8450,7 +9462,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             self.global_s2_step += 1
             self.local_s2_step += 1
 
-    def training_step(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None, img_idx_b1=None, relative_depth_image_batch=None):
+    def training_step(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None, img_idx_b1=None, relative_depth_image_batch=None, sfm_track_batch=None):
         """When LMC S2: use step_eff for ReproLoss and head-only optimizer/scheduler."""
         if not self.use_lmc or self.optimizer_head is None:
             return super().training_step(features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33)
@@ -8471,6 +9483,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return None
         target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
         img_idx_b1 = img_idx_b1[:batch_size] if img_idx_b1 is not None else None
+        sfm_track_batch = self._slice_sfm_track_inter_frame_batch(sfm_track_batch, batch_size)
         head_features_bC = self._mix_glace_decoder_features(None, features_bC, stage_tag="S2")
         local_head_features_bC = head_features_bC
         global_residual_loss = head_features_bC.new_zeros(())
@@ -8545,6 +9558,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             step_eff=step_eff,
         )
         loss = loss + multiframe_loss
+        sfm_track_loss, sfm_track_stats = self._compute_sfm_track_inter_frame_loss(
+            stage_tag="S2",
+            pred_scene_coords_B3HW=pred_scene_coords_b3HW,
+            sfm_track_batch=sfm_track_batch,
+            step_eff=step_eff,
+        )
+        loss = loss + sfm_track_loss
         relative_depth_loss, relative_depth_stats = self._compute_image_relative_depth_loss(
             stage_tag="S2",
             image_batch=relative_depth_image_batch,
@@ -8650,13 +9670,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     fraction_valid * 100,
                     px_err_finite if math.isfinite(px_err_finite) else -1.0,
                     pxerr_naninf_count,
-                    self._format_multiframe_reprojection_stats(multiframe_stats) + self._format_relative_depth_stats(relative_depth_stats) + self._format_ace_lmc_global_residual_stats(global_residual_stats) + self._format_ace_lmc_global_film_stats(global_film_stats) + self._format_ace_lmc_global_gate_l1_stats(global_gate_l1_stats) + self._format_ace_lmc_stage2_consistency_stats(consistency_stats) + self._format_ace_lmc_stage2_guard_stats(guard_stats),
+                    self._format_multiframe_reprojection_stats(multiframe_stats) + self._format_sfm_track_inter_frame_stats(sfm_track_stats) + self._format_relative_depth_stats(relative_depth_stats) + self._format_ace_lmc_global_residual_stats(global_residual_stats) + self._format_ace_lmc_global_film_stats(global_film_stats) + self._format_ace_lmc_global_gate_l1_stats(global_gate_l1_stats) + self._format_ace_lmc_stage2_consistency_stats(consistency_stats) + self._format_ace_lmc_stage2_guard_stats(guard_stats),
                     time_since_start,
                 )
             )
         return loss
 
-    def _training_step_ace_g(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None, img_idx_b1=None, relative_depth_image_batch=None):
+    def _training_step_ace_g(self, features_bC, target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3=None, gt_scene_coords_valid_b1=None, img_idx_b1=None, relative_depth_image_batch=None, sfm_track_batch=None):
         """ACE-G S2 training step: apply fusion on-the-fly then head.
 
         Key difference from training_step(): raw backbone features are fused
@@ -8678,6 +9698,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return None
         target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
         img_idx_b1 = img_idx_b1[:batch_size] if img_idx_b1 is not None else None
+        sfm_track_batch = self._slice_sfm_track_inter_frame_batch(sfm_track_batch, batch_size)
         features_bCHW = features_bC.view(1, h, w, channels).permute(0, 3, 1, 2)
 
         # --- Same repro loss as training_step from here on ---
@@ -8779,6 +9800,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             step_eff=step_eff,
         )
         loss = loss + multiframe_loss
+        sfm_track_loss, sfm_track_stats = self._compute_sfm_track_inter_frame_loss(
+            stage_tag="S2-G",
+            pred_scene_coords_B3HW=pred_scene_coords_b3HW,
+            sfm_track_batch=sfm_track_batch,
+            step_eff=step_eff,
+        )
+        loss = loss + sfm_track_loss
         relative_depth_loss, relative_depth_stats = self._compute_image_relative_depth_loss(
             stage_tag="S2-G",
             image_batch=relative_depth_image_batch,
@@ -8960,6 +9988,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                         f", guardLoss={float(glace_guard_loss.detach().cpu().item()):.4f}"
                     )
             glace_diag_suffix += self._format_multiframe_reprojection_stats(multiframe_stats)
+            glace_diag_suffix += self._format_sfm_track_inter_frame_stats(sfm_track_stats)
             glace_diag_suffix += self._format_relative_depth_stats(relative_depth_stats)
             glace_diag_suffix += self._format_ace_lmc_global_residual_stats(global_residual_stats)
             glace_diag_suffix += self._format_ace_lmc_global_film_stats(global_film_stats)
@@ -9014,6 +10043,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             'mean_cam_center': self.dataset.mean_cam_center,
             'lmc_config': self._lmc_config_for_checkpoint(),
         }
+        if getattr(self, 'query_graph_refiner', None) is not None and self._query_graph_refine_enabled():
+            checkpoint['query_graph_refiner_state_dict'] = self.query_graph_refiner.state_dict()
         if self._is_glace_backend() and getattr(self, 'glace_residual_adapter', None) is not None:
             checkpoint['glace_residual_adapter_state_dict'] = self.glace_residual_adapter.state_dict()
         if self.local_residual_mode == 'learned_alpha':
@@ -9126,6 +10157,9 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             config['final_ace_lmc_global_residual_gate_max'] = stats.get('gate_max')
             config['final_ace_lmc_global_residual_delta_l2'] = stats.get('delta_l2')
             config['final_ace_lmc_global_residual_gated_delta_l2'] = stats.get('gated_delta_l2')
+        query_graph = getattr(self, 'query_graph_refiner', None)
+        if query_graph is not None and hasattr(query_graph, 'final_state_summary'):
+            config.update(query_graph.final_state_summary())
         if self._is_glace_backend() and isinstance(getattr(self, '_last_glace_pixel_diag', None), dict):
             config['last_glace_pixel_diag'] = dict(self._last_glace_pixel_diag)
         return config

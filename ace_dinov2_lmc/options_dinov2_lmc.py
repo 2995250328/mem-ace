@@ -777,6 +777,49 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         default=0.0,
         help='参考帧可见性边界余量；GT 投影落在 [-margin, W/H+margin] 内才计入。',
     )
+    parser.add_argument(
+        '--use_sfm_track_inter_frame_loss',
+        type=_strtobool,
+        default=False,
+        help='启用 SfM/COLMAP track keyframe channel 的帧间 ACE 重投影 loss。默认关闭。',
+    )
+    parser.add_argument(
+        '--sfm_track_keyframe_channel_path',
+        type=Path,
+        default=None,
+        help='STGS keyframe_channel.npz 路径，包含 anchor_feature_yx、target_image_idx、target_xy_model 等字段。',
+    )
+    parser.add_argument(
+        '--sfm_track_inter_frame_apply_to',
+        type=str,
+        default='stage2',
+        choices=['stage2', 'stage2_g'],
+        help='STGS 帧间重投影 loss 作用阶段；stage2 同时覆盖 S2 和 S2-G。',
+    )
+    parser.add_argument(
+        '--sfm_track_inter_frame_weight',
+        type=float,
+        default=0.05,
+        help='STGS 帧间 ACE loss 权重。Cambridge 等中值误差敏感数据集建议从 0.02/0.03 起扫。',
+    )
+    parser.add_argument(
+        '--sfm_track_inter_frame_start_ratio',
+        type=float,
+        default=0.2,
+        help='S2 进度达到该比例后才启用 STGS loss，前段保留 self reprojection 预热。',
+    )
+    parser.add_argument(
+        '--sfm_track_inter_frame_decay_last_ratio',
+        type=float,
+        default=0.3,
+        help='S2 最后该比例线性衰减 STGS 权重到 0，避免干扰后期精修。',
+    )
+    parser.add_argument(
+        '--sfm_track_inter_frame_max_px',
+        type=float,
+        default=100.0,
+        help='STGS 帧间重投影每项像素误差上限；<=0 表示不裁剪。',
+    )
     parser.add_argument('--use_half', type=_strtobool, default=True,
                         help='是否启用 FP16 混合精度训练。')
 
@@ -1605,6 +1648,56 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=_strtobool,
         default=True,
         help='CCF-lite gate 是否 detach，默认 True 使 gate 只重加权 residual、不反传进一读 attention。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_refine_mode',
+        type=str,
+        default='none',
+        choices=['none', 'mlp_control'],
+        help='Fusion 后、head 前的 query-side refinement。none=旧行为；mlp_control=无邻居 per-node feature residual，对未来 SC-QGR 做容量/通路对照。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_images_per_batch',
+        type=int,
+        default=4,
+        help='query graph grouped sampler 每个 batch 采样的图像数 G；仅 lmc_query_graph_refine_mode!=none 使用。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_patches_per_image',
+        type=int,
+        default=128,
+        help='query graph grouped sampler 每张图采样 patch 数 P；G*P 需能被 head pseudo-grid 高度 16 整除。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_sampler',
+        type=str,
+        default='local_window',
+        choices=['local_window', 'stratified'],
+        help='query graph grouped sampler。local_window=按真实 target_px 选局部近邻窗口；stratified=按真实 target_px 做粗空间分层采样。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_layerscale_init',
+        type=float,
+        default=0.01,
+        help='query graph feature residual 的 per-channel LayerScale 初始值。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_gate_init',
+        type=float,
+        default=-4.0,
+        help='query graph residual gate 的 logit bias 初始值；负值使初始更新接近关闭。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_residual_l1_weight',
+        type=float,
+        default=0.0,
+        help='query graph effective feature update 的 L1 正则权重；0 表示关闭。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_freeze_base',
+        type=_strtobool,
+        default=True,
+        help='query graph Stage-B 默认冻结 backbone/compressor/fusion/head，仅训练 query_graph_refiner；head forward 仍保留输入梯度。',
     )
     parser.add_argument(
         '--lmc_fusion_reread_warmup_mode',

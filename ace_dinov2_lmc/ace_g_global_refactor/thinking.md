@@ -1,429 +1,188 @@
-1. Problem Restatement
-你的当前研究问题可以精确表述为：
-在 ACE-FCN-LMC 的 scene coordinate regression 框架中，如何在不破坏 strong single first-read feature contract 的前提下，引入一个真正有价值的 second memory read，使其成为可解释、可复现、可与 query-only adapter 区分开的结构创新，而不是一个偶然改变 feature distribution 的额外残差模块？
-基于你现在的实验总结，最关键的事实是：早期 PMRF 的提升部分来自弱 single 对照；在更强 single 参考线下，PMRF-base 不是全局稳定优于 single，而 PMRF-v3：centered reread + second-read QK norm + patch/common LayerScale 是目前 reread 类结构里最值得保留的版本。它在 Bears 上相对 strong single 有较干净提升，但在 Squarebench 上不是全面赢，因此还不能直接定为最终方法。
+你的这次只读核对基本把 SC-QGR 第一版的实现边界 定准了。我同意你的主结论：它不应该再被理解为 ace_fusion.py 内部的一个 PMRF/CCF refinement mode，而应该是 fusion 输出之后、head 回归之前的 query-side refinement 模块。这点非常关键，因为当前 ace_fusion.py 已经覆盖了 single、PMRF、centered、geometry reread、adapter、dual、coord prior 等 memory-injection / reread 变体；PMRF-v3 本身也已经包含 centered reread、second-read QK norm、patch/common LayerScale 等完整机制。继续把 SC-QGR 塞进这个分支，会把“再次读 memory”和“同图 patch 协同”两个问题混在一起。
+下面我给出一个更收敛的版本：SC-QGR-v1 的合理性分析 + 第一版设计边界 + 实验验收标准。重点不是代码怎么写，而是哪些东西必须锁死，避免第一次实验结论失真。
 
-2. Relevant Literature Landscape
-2.1 传统 modular visual localization：retrieval + matching + PnP
-NetVLAD 代表 image retrieval / place recognition 路线，把局部 CNN feature 聚合为 compact image descriptor，用于大规模场景检索；SuperGlue 代表 learned local matching 路线，用图神经网络和 attention 在两组 keypoints 间做上下文匹配和 outlier rejection。这类方法的核心假设是：query 可以通过显式图像检索和局部匹配找到足够可靠的 2D-2D / 2D-3D correspondences，再交给 PnP/RANSAC 求位姿。 它们的优势是几何解释性强、跨场景泛化好；弱点是依赖 database / sparse features / matching quality，在低纹理、重复纹理、视角变化大时仍可能失败，且不是 dense SCR 范式。(arXiv)
-这类工作对你有两个启发：第一，first-read 的强稳定性很重要，不能轻易破坏主匹配/主路由；第二，任何 refinement 都应该能证明自己改善了 correspondence / routing，而不是只改变了 feature norm。
+1. 总体研判
+你这次核对后，SC-QGR 的定位应当从“fusion variant”改成：
+在 strong single memory fusion 之后，对同一 query image 内的 scene-conditioned patch features 做一次轻量图 refinement，然后仍然通过原来的 MLP head 回归 scene coordinates。
+也就是说第一版主链路应该是：
+raw / fused buffer rows
+        ↓
+single LMC memory fusion
+        ↓
+scene-conditioned patch features
+        ↓
+same-image query graph refinement
+        ↓
+refined features
+        ↓
+原 regressor.get_scene_coordinates(...)
+        ↓
+existing reprojection / coordinate loss
+这个定位比前面讨论过的 PMRF gating、latent memory graph、coordinate delta 都更稳。原因是：它引入了一个当前所有 reread 分支都没有的信息源——同一查询图像内其他 patch 的 scene-conditioned evidence。PMRF/centered 的 second read 仍然是单个 patch 再读同一个 compressed memory；v3_adapter_control 是 query-only residual；v3_dual_refine 是 memory residual 和 adapter residual 的叠加。它们都没有真正解决“同一 query image 内 patch 之间是否应该协同”这个问题。你给出的代码核对也支持这个定位：fusion 输出接入点在 _fuse_lmc_features_for_head(...) 之后，head/loss 当前已有 full-map loss 和 sampled-feature loss 两类路径，因此 SC-QGR 最自然的位置就是 fusion output 与 get_scene_coordinates(...) 之间。
+所以第一版不要再和 PMRF/CCF 混合。PMRF-v3、CCF-lite 继续作为 baseline；SC-QGR-v1 只回答一个干净问题：
+在 strong single 已经完成 memory conditioning 后，同图 patch graph 是否能提供额外的有效上下文？
 
-2.2 SCR / learning-based relocalization：DSAC*, ACE, ACE-G, SACReg
-DSAC / DSAC* 代表 dense scene coordinate regression + differentiable / robust pose solver 路线，网络先预测每个像素的 scene coordinate，再通过 RANSAC/DSAC 或 PnP 得到 camera pose。它的强点是 dense correspondence 直接服务于位姿；弱点是 coordinate regressor 容易和场景、训练视角、feature distribution 强耦合。(arXiv)
-ACE 把 relocalization network 拆成 scene-agnostic backbone 和 scene-specific MLP head，并通过 reprojection loss curriculum 实现快速 scene-specific training。这直接解释了你现在为什么不能随意改 first-read feature distribution：ACE/SCR 的 head 对输入 feature contract 很敏感，哪怕一个 LayerNorm 或 attention norm 改动，也可能让 head 看到不同分布。(arXiv)
-ACE-G 和 SACReg 都在尝试解决“把场景全塞进网络权重”这个问题。ACE-G 把 coordinate regressor 和 scene-specific map code 分离，并通过大规模场景预训练提升 mapping-to-query generalization；SACReg 则输入 database image 和稀疏 2D-3D annotation，通过 query/database cross-attention 预测 dense scene coordinates。它们都说明：重定位的关键趋势不是单纯加深网络，而是让 query 与外部 scene/map representation 发生更有效的受控交互。 (arXiv)
-你现在的 LMC/PMRF 与这条线的关系是：你不是用 full database image，也不是用 ACE-G 的大规模 map code transformer，而是在 compressed scene memory tokens 上做轻量 query-to-memory interaction。因此你的创新必须落在“compact memory 的受控 reread”上，而不是泛泛声称 cross-attention。
+2. 为什么 sampler 是第一风险，而不是 graph module
+你这次最重要的判断是：SC-QGR 第一版成败的代码关键不是 message passing 写得多复杂，而是 img_idx + target_px grouped sampler 是否正确。
+这个判断完全正确。原因很简单：GNN 的 node 和 edge 只有在“同一图像内”才有语义。如果沿用当前全局随机 row sampling：
+torch.randint(0, buffer_len, (draw_bs,))
+那么一个 batch 内的 patch rows 可能来自不同图像、不同视角、不同相机位姿。此时任何 KNN、graph edge、attention edge 都是在伪图上做消息传递。即使 loss 变好，也无法说明同图上下文有效；即使 loss 变差，也不能否定 graph refinement。这个实验会彻底失真。
+同理，_pack_feature_rows_for_head(... grid_h=16) 只是为了把随机 rows 伪装成 1x1 ACE head 可接受的张量形状。这个 16×W 伪网格不是图像真实空间邻域，绝对不能拿来构建 spatial edge。你把这一点明确列出来非常重要，因为这是最容易被工程实现误用的地方。
+因此第一版 SC-QGR 的最小真实前提是：
+每个 graph 内的节点必须来自同一 img_idx；
+每条 spatial edge 必须基于真实 target_px；
+不能基于随机 row order 或 packed pseudo-grid。
+这也解释了为什么需要强制 indexed buffer。你核对到当前 raw buffer / fused buffer schema 已经有 features、target_px、pose、intrinsics、gt_scene_coords 等字段，而 indexed schema 额外有 img_idx；但普通 raw buffer 不一定保存 img_idx，只有 image-global / GLACE / multiframe 相关路径才会启用 image indices。对于 SC-QGR，img_idx 不是附加信息，而是核心结构变量。没有它，graph sampler 就没有合法定义。
 
-2.3 Iterative attention / residual scaling：Perceiver、SwinV2、LayerScale/CaiT
-Perceiver 使用 iterative asymmetric attention，把高维输入反复蒸馏进 latent bottleneck；这说明“重复读取 memory/input”本身不是新算子。你的 PMRF 如果只是 H1 -> A2 -> H2，很容易被看成一个普通 iterative attention block。(arXiv)
-Swin Transformer V2 使用 scaled cosine attention，即 Q/K normalization + learnable scale，用于改善大模型训练稳定性；CaiT / LayerScale 则使用 per-channel residual scaling 来稳定更深的 vision transformer。它们说明 QK norm 和 LayerScale 都是已有稳定化技术，不能单独作为创新点。(arXiv)
-这对你当前方案的含义是：PMRF-v3 的新意不在于“用了 QK norm”或“用了 LayerScale”，而在于：
-它把这些稳定化机制限制在 second-read adapter 中，不改 strong first-read；同时用 centered delta 保证 second read 不改变 routing 时 residual 为零。
-这个组合才是你可以辩护的结构贡献。
+3. SC-QGR-v1 的第一版设计边界
+第一版应当极端克制，只实现一个干净版本：
+base = strong single
+refiner = same-image sparse graph
+output = feature residual
+head = 原 MLP head
+training = freeze base, train graph only
+不支持：
+PMRF + SC-QGR
+CCF + SC-QGR
+direct coordinate delta
+memory graph
+multi-round GRU
+DSAC-driven learning
+这个边界看起来保守，但它有一个重要好处：实验结果可归因。如果 single + SC-QGR 超过 strong single、MLP control、shuffled-edge control，那么你能比较明确地说：同图 patch graph 在 scene-conditioned feature 上提供了新信息。如果一开始就叠 PMRF、CCF、graph、coordinate state，涨分也解释不清。
 
-3. Critical Comparison
-3.1 为什么不要再直接改 single first read
-single_qknorm_layerscale 的结果已经说明：直接把 QK norm / LayerScale 放进 first-read attention，会改变原 single routing，使 attention 更尖锐，但不等价于 pose 更准。实验上它在 Cubes 的 Acc10/Acc5/MedT 明显下降，在 Tendrils 也没有改善，因此不适合作为主线。
-从方法层面看，这与 SCR 的特性一致：ACE/SCR 的 first-read feature 和 coordinate head 已经形成一个 task-specific contract。直接修改 first-read attention，相当于重新定义 head 的输入分布；这不像 classification transformer 里加 norm/scale 那么安全。
+4. 模块输入输出应该怎么定义
+SC-QGR-v1 不应该直接预测 scene coordinate delta。它应该预测 feature residual。具体地说：
+给定 strong single 后的 features：
+H0: [G, P, C]
+其中 G 是每个 batch 中的图像数，P 是每张图采样的 patch 数，C 是 feature dim。
+还需要：
+target_px: [G, P, 2]
+img_idx: [G]
+intrinsics / intrinsics_inv: optional for logging or future
+gt_pose: existing loss uses it
+第一版可以额外使用第一次坐标预测作为 detached state：
+X0 = head(H0).detach()
+然后构造 node feature：
+node_i = [
+    LN(H0_i),
+    PE_2D(target_px_i),
+    PE_3D(stopgrad(X0_i normalized))
+]
+这里 X0 只作为状态提示，不参与反向更新。理由是：第一版要验证 graph refiner 是否有用，而不是让 graph 和 head 联合重写初始坐标分布。尤其在你的系统里 DSAC 不提供梯度，训练仍主要依赖现有 reprojection / coordinate loss。如果一开始直接预测 coordinate delta，沿相机射线方向的弱约束可能带来不可控漂移。
+输出应为：
+delta_H = graph_refiner(node, edges)
+H1 = H0 + gate * layerscale * delta_H
+X1 = head(H1)
+注意这里 head 虽然 frozen，但不能在 no_grad() 下跑最终 X1 = head(H1)，否则 graph 收不到梯度。正确语义是：head 参数 frozen，但计算图允许梯度从 loss 通过 head 输入回传到 H1 和 graph refiner。X0 可以 no_grad 或 detach；X1 不可以 no_grad。
 
-3.2 为什么 PMRF-base 不能直接作为最终结构
-PMRF-base 的优点是概念简单：
-H1 = SingleRead(Q, M)
-Delta2 = SecondRead(H1, M)
-H2 = H1 + scale * Delta2
-但它的问题是：即使 A2 没有产生有意义的新 routing，out_proj(A2V) 仍可能携带 common component 或 projection bias，从而整体移动 feature。你们后续发现 reread residual 中存在很强 patch-common 分量，这解释了为什么普通 PMRF 有时提升 median 或宽阈值，但严格指标不稳定。
-所以 PMRF-base 应该保留为 ablation，而不是主结构。
+5. Graph 结构第一版要简单，不要一开始动态图
+第一版建议固定 same-image spatial graph。最稳的是基于 target_px 的 KNN 或局部窗口邻域：
+edges_i = KNN(target_px_i, target_px_j), j in same img_idx
+如果你做的是 sampled-feature training，而不是 full image grid，KNN 的邻居不一定是密集图像邻域。所以 sampler 最好不要完全随机地从同一图像里抽 P 个 patch，而应该采样局部窗口或空间分层 patch。否则图仍然是同图，但局部邻域统计会和推理时 full grid 不一致。
+第一版可以有两种采样策略，建议先用更稳的局部窗口：
+局部窗口采样：每张图随机选一个或多个中心，在 target_px 空间中选最近的 P 个 patch rows，构成一个局部小图。这个策略最贴近 Conv/GRU 的局部上下文思想，但仍然兼容 ACE 的 buffer 训练。
+空间分层采样：把图像划成粗格，每个格子采若干点，再基于 target_px 做 KNN。这个策略覆盖更全，但边可能跨较大距离，不如局部窗口稳定。
+第一版不要用 predicted coordinate 构图。原因是如果 X0 错了，动态图会把错误预测组织成自洽簇，形成 self-confirmation。X0 可以作为 node state，但不要作为 hard edge topology。
+边特征可以很简单：
+edge_ij = [
+    PE_2D(target_px_j - target_px_i),
+    cosine(H0_i, H0_j)
+]
+第一版甚至可以先只用相对 2D PE，不加 feature cosine，减少变量。feature cosine 作为 v1.1 消融。
 
-3.3 为什么 centered reread 是必要条件，但还不充分
-Centered reread 的核心性质是：
-Delta = out_proj(A2V) - out_proj(stopgrad(A1)V)
+6. Message passing 第一版不要复杂
+第一版 graph refiner 只需要一层或两层，目标不是追求表达力，而是验证同图关系是否真的有收益。建议结构语义是：
+message_ij = MLP([node_j, edge_ij])
+alpha_ij = softmax_j(MLP([node_i, node_j, edge_ij]))
+m_i = sum_j alpha_ij * message_ij
+delta_H_i = MLP([node_i, m_i])
+gate_i = sigmoid(MLP([node_i, m_i]) + gate_bias)
+H1_i = H0_i + gate_i * gamma * delta_H_i
+初始化必须保守：
+gamma init: 很小，例如 0.01 或更低
+gate bias: 负值，让初始 gate 偏小
+delta output projection: 可零初始化
+residual L1: 小权重
+这样 SC-QGR 初始近似 strong single，不会一开始破坏已有稳定路径。这个思路和 PMRF-v3 里 patch/common LayerScale 的安全哲学一致；只是 SC-QGR 的 residual 来源不再是 second memory read，而是 same-image query graph。PMRF-v3 当前已经使用 centered residual、QK norm、patch/common LayerScale，并且 v3_adapter_control 也作为 query-only matched control 存在，因此 SC-QGR 必须更严格地证明它不是“多一个 residual MLP”。
 
-if A2 == A1:
-    Delta = 0
-这比普通 PMRF 更 identity-preserving，因为它只注入 second-read 相对 first-read 的差异。这个设计非常符合“不要破坏 first-read contract”的目标。
-但你们的 centered/common-scale 实验证明：单纯 centered 还不够。centered_c0 有局部收益，但复现不稳；common_scale=0.5 基本失败；common_scale=0 能减少 common pollution，但不能稳定解决所有场景。
-因此 centered 是必要条件，但需要更细的 residual 控制。
+7. 训练策略必须采用 Stage B 冻结基座
+你提出 “Stage B 冻结 backbone、compressor、fusion、head，只训练 graph refiner” 是正确的。第一版不要联合训练，因为联合训练会让所有归因混掉。
+推荐流程是：
+Stage A:
+  使用已有 strong single checkpoint
 
-3.4 为什么 PMRF-v3 是当前最合理版本
-PMRF-v3 同时满足三个要求：
-1. 不动 strong single first read；
-2. second-read 使用 QK norm 控制 attention sharpness；
-3. centered delta + patch/common LayerScale 保证弱、可控、identity-preserving 更新。
-它在 Bears 上相对 strong single 有较清晰的 Acc25 / Acc10 / median 改善，在 Squarebench 上虽不是全面赢，但没有像其他版本那样明显崩掉。你的实验总结已经把它定位为“目前所有 reread 类结构里最值得保留的版本”。
-关键是：PMRF-v3 的创新叙事不应是“多读一次 memory”，而应是：
-在已接受的 single memory fusion 之后，追加一个 centered, layer-scaled, cosine-attention second-read adapter，使 second read 只表达相对 first read 的 routing correction。
+Stage B:
+  freeze backbone
+  freeze GeoLMC / memory compressor
+  freeze LMC fusion
+  freeze coordinate head
+  train query_graph_refiner only
+训练 loss 使用现有 loss，不引入 DSAC。因为你已经明确 DSAC 在当前工作中只是无梯度位姿解算器，它不能作为可学习闭环。SC-QGR 的训练目标应保持：
+refined_features -> regressor.get_scene_coordinates(...) -> existing reprojection / coordinate loss
+同时加一个小的 residual regularization：
+L_total = L_existing(X1) + λ * ||gate * gamma * delta_H||_1
+是否加 L_existing(X0) 作为辅助不建议第一版加入，因为 base frozen，X0 本身不会更新。可以记录 X0 loss，作为“refinement 改善/恶化多少”的诊断指标，但不需要把它放进训练目标。
+第一版训练时还要记录：
+loss_before_graph
+loss_after_graph
+fraction_improved_patches
+delta_H_norm
+gate_mean / gate_histogram
+edge_attention_entropy
+否则即使 pose 指标有变化，也很难判断 graph 是在修正局部错误，还是只是做了 feature smoothing。
 
-4. Identified Research Gap
-已有工作已经较好解决了几件事：
-1. retrieval + matching + PnP 的模块化视觉定位；
-2. dense scene coordinate regression + robust pose solver；
-3. iterative attention / QK norm / residual scaling 等通用 transformer 稳定化技术。
-但还没有被充分解决的是：
-在 scene-specific SCR 中，如何在不破坏已有 coordinate-head feature contract 的前提下，让 compact scene memory 被第二次、受控地重新读取，并证明这种 reread 的收益来自 memory routing correction，而不是 query-only adapter 或 feature distribution shift。
-你的当前实验正好把这个 gap 暴露出来：
-PMRF-base:
-说明 second read 在部分场景有效，但不稳定。
+8. eval 侧必须提前想清楚
+训练时你用 grouped sampled patches，但测试 pose 时通常需要对整张 query feature map 输出 scene coordinates。SC-QGR 必须支持 eval full-map 或至少支持按图分块处理。
+第一版建议 eval 直接在完整 query grid 上构建稀疏局部 graph：
+nodes = all query patches
+edges = 4/8-neighbor or KNN in target_px grid
+如果显存压力大，再做 tile/block 方式，但要避免 tile 边界带来明显不一致。训练 sampler 如果使用局部窗口，eval full-grid 的分布差异会小一些；如果训练时是同图随机点，eval full-grid 的局部性会更强，可能出现 train-test gap。
+因此我建议第一版 sampler 直接模拟 eval：局部窗口 + 2D KNN/邻接。不要全图随机同图采样。
 
-centered/common-scale:
-说明 common residual 和 projection bias 会污染 feature，但手动 common-scale 不够稳。
+9. 必须做的 controls
+你列的 controls 很完整，我建议第一版最小矩阵如下：
+1. strong single
+2. PMRF-v3
+3. CCF-lite
+4. SC-QGR-v1
+5. MLP-control
+6. shuffled-edges
+7. cross-image-edges
+其中最关键的是 5、6、7。
+MLP-control：同样输入 H0 + PE_2D + PE_3D(X0)，但不看邻居，只输出 feature residual。这个对照回答：涨分是否只是因为多了一个 per-node residual network。
+shuffled-edges：同一图像内节点不变，但边随机打乱。这个对照回答：真实 target_px 空间关系是否重要。
+cross-image-edges：节点数量、边数量、参数量保持一致，但故意把邻居换成其他图像的 patch。这个对照回答：graph 是否真的依赖同图结构。如果 cross-image 也涨，说明模块只是 regularizer，不是 query context。
+如果 SC-QGR 不能同时超过这三个 control，就不能声称“同图 patch 协同有效”。最多只能说“额外 residual capacity 有帮助”。
 
-single_qknorm_layerscale:
-说明直接改 first read 会破坏 strong baseline。
-
-PMRF-v3:
-第一次在 strong single 下出现较干净正信号，但还需要跨场景复验和 adapter-matched control。
-因此下一步不能再发散到 geometry bias、teacher guard、STGS 或多层 reread。当前最合理的研究问题应该收敛为：
-PMRF-v3 是否能稳定地作为 identity-preserving memory-routing correction module，并且是否显著优于同参数、同 LayerScale 的 query-only adapter？
-
-5. Concrete Recommendation
-5.1 最合理的下一步设计方案
-我建议将下一步主设计固定为：
-Centered Layer-Scaled Progressive Memory Re-reading
-简称可以是：
-CL-PMRF
-或者保守一点：
-PMRF-v3
-结构固定如下：
-Input:
-Q: query local feature
-Z, P: compressed memory feature and latent 3D point
-K, V: memory key/value from accepted single contract
-
-First read:
-H1, A1 = SingleFusion(Q, K, V)
-# exactly same as strong single
-
-Second read:
-Q2 = Wq2(LN(H1))
-Q2 = normalize(Q2)
-K2 = normalize(K)
-A2 = softmax((Q2 K2^T) * tau_head)
-
-Centered context:
-C1_ref = stopgrad(A1) @ V
-C2 = A2 @ V
-Delta = out_proj(C2) - out_proj(C1_ref)
-
-Patch/common decomposition:
-Delta_common = mean_patch(Delta)
-Delta_patch = Delta - Delta_common
-
-LayerScale:
-Delta_v3 =
-    gamma_patch  * Delta_patch
-  + gamma_common * Delta_common
-
-Output:
-H2 = H1 + Delta_v3
-X2 = CoordinateHead(H2)
-默认建议：
-gamma_patch init = 0.01
-gamma_common init = 0.0
-tau_head learnable
-no post-norm
-no geometry bias
-no teacher guard
-no routing loss
-核心原则：
-first read is sacred;
-second read is only a weak centered correction;
-A2=A1 implies no update;
-patch-wise residual is allowed first;
-image-common residual must be learned cautiously from zero.
-这一步不是简单堆模块。它针对的是 SCR 里非常具体的问题：head 已经适配 strong first-read feature，因此 refinement 必须在 identity-preserving residual space 内进行。
-
-5.2 必须做的实验 1：完整代表场景复验
-第一组实验只比较：
-E0: strong single
-E1: PMRF-base
-E2: PMRF-v3 / CL-PMRF
-场景建议：
-Wayspots:
+10. 成功判据不要只看 Acc25
+第一版成功不能只看宽阈值，因为已有 PMRF/common-scale 现象已经说明某些 residual 会提升 Acc25/Acc10，但伤害 Acc2/Acc1 或 median translation。你提供的事实文档里，centered 和 PMRF 在 Bears/Squarebench 上呈现明显 trade-off；Tendrils 上所有 reread/common variants 都很弱，这说明只看粗指标很容易误判。
+建议第一轮成功标准是：
+SC-QGR-v1 > strong single
+SC-QGR-v1 > MLP-control
+SC-QGR-v1 > shuffled-edges
+SC-QGR-v1 > cross-image-edges
+并且至少满足：
+Acc5 / Acc2 不下降
+MedT 不恶化
+Acc25 / Acc10 不靠大幅牺牲 strict metrics 换来
+场景上建议优先：
 Bears
 Cubes
 Squarebench
 Tendrils
-The Rock 或另一个代表性 outdoor scene
+解释如下。Bears 和 Squarebench 是 PMRF/centered 已经出现不同收益模式的场景；Cubes 是 strong single 很强、容易检验 graph 是否破坏 baseline 的场景；Tendrils 不应设为必须提升，而应作为 failure diagnostic。如果 SC-QGR 也救不了 Tendrils，但 real graph 与 shuffled/cross-image 差异明显，仍然说明方法有价值；如果所有东西都一样，Tendrils 失败就更可能是 memory/feature 表征上游问题。
 
-Indoor:
-Indoor6 scene2a
-Indoor6 scene5 或 scene3
-为什么要加 Indoor6：Indoor6 里你们曾经观察到 true-global memory fusion 有正信号；Wayspots 更能测 outdoor / ambiguous / hard scenes。两个域都跑，才能判断 CL-PMRF 是场景特例还是结构有效。
-评价指标：
-Acc50 / Acc25 / Acc10 / Acc5 / Acc2 / Acc1
-median rotation / median translation
-DSAC inlier count
-pose solver failure ratio
-per-frame delta
-必要口径：
-same seed
-same hypotheses
-same post-train summary
-same Stage1 protocol
-single and PMRF-v3 同轮复现
-先只做 Stage1。PMRF 是 local fusion 结构，Stage2 GLACE global head 会混入 head adaptation，不适合作为第一判断。
+11. 我对你当前计划的微调建议
+你的实现顺序基本正确，我只建议补三个约束。
+第一，lmc_query_graph_refine_mode != none 时不仅要强制 indexed buffer，还应该在日志和 checkpoint 中显式写出：
+query_graph_requires_img_idx=True
+query_graph_sampler=grouped_by_img_idx
+query_graph_edge_source=target_px
+否则后面复现实验时很容易混到非 grouped sampler。
+第二，freeze_base=True 第一版应当是硬默认，最好训练日志里打印每类参数的 requires_grad 统计。这个模块一旦不小心让 head 或 fusion 参与更新，实验就不再是“query graph refinement”验证，而变成了新一轮联合微调。
+第三，第一版不要让 CCF-lite 的 gate stats 或 PMRF 的 attention stats 进入 SC-QGR node feature。它们可以记录，但不要作为主方法输入。否则如果 SC-QGR 有收益，你无法判断收益来自同图 patch graph，还是来自 attention confidence feature。后续如果图本身成立，再加入这些信号作为 v2。
 
-5.3 必须做的实验 2：PMRF-v3 组件消融
-为了证明不是偶然调参，做最小组件消融：
-A0: strong single
-
-A1: PMRF-base
-Delta = out_proj(A2V)
-
-A2: centered-only
-Delta = out_proj(A2V) - out_proj(stopgrad(A1)V)
-
-A3: centered + QK norm
-
-A4: centered + LayerScale patch/common
-
-A5: full PMRF-v3
-centered + QK norm + LayerScale patch/common
-如果资源有限，可以只跑：
-A0, A1, A2, A5
-但最终论文需要至少证明：
-centered 有必要；
-QK norm 放在 second read 有帮助；
-LayerScale patch/common 控制是稳定性的关键。
-
-5.4 必须做的实验 3：V3-matched query-only adapter control
-这是决定 PMRF-v3 能否成为创新点的关键实验。
-设计一个 control：
-V3-Adapter-Control:
-H2 = H1 + AdapterResidual(LN(H1))
-但它必须匹配 PMRF-v3 的结构属性：
-1. 不读 memory；
-2. 参数量尽量匹配 Wq2 + out_proj；
-3. 同样 patch/common decomposition；
-4. 同样 gamma_patch init = 0.01；
-5. 同样 gamma_common init = 0.0；
-6. no post-norm。
-判断标准：
-PMRF-v3 > V3-Adapter-Control:
-可以说收益来自 memory rereading / routing correction。
-
-PMRF-v3 ≈ V3-Adapter-Control:
-说明主要是 LayerScale adapter 或 residual capacity，不足以作为主创新。
-
-PMRF-v3 < V3-Adapter-Control:
-停止 PMRF 主线，转向 query-side refinement。
-这一步非常重要，因为 Perceiver、SwinV2、LayerScale 等已有通用模块会让审稿人自然质疑：你的收益是不是只是“多了一个稳定残差 adapter”？这个 control 是最直接的反证。(arXiv)
-
-5.5 必须做的诊断
-PMRF-v3 的诊断不要只看 attention entropy。建议记录：
-Attention routing:
-entropy(A1), entropy(A2)
-max(A1), max(A2)
-JS(A1, A2)
-top1 agreement(A1, A2)
-top-k overlap(A1, A2)
-
-3D memory behavior:
-mu1 = Σ A1_j P_j
-mu2 = Σ A2_j P_j
-spread1 = Σ A1_j ||P_j - mu1||²
-spread2 = Σ A2_j ||P_j - mu2||²
-||mu2 - mu1||
-||mu2 - predicted X2||
-
-Residual behavior:
-||Delta_patch||
-||Delta_common||
-||gamma_patch * Delta_patch||
-||gamma_common * Delta_common||
-gamma_patch distribution
-gamma_common distribution
-cos(H1, H2)
-||H2-H1|| / ||H1||
-
-Pose correlation:
-per-frame metric delta
-per-frame residual norm
-per-frame JS(A1,A2)
-per-frame 3D centroid shift
-最有说服力的证据不是“A2 更尖”，而是：
-1. PMRF-v3 改善的 frame 里，A2 相对 A1 有可解释的 memory centroid shift；
-2. residual norm 不大，但与 pose improvement 正相关；
-3. gamma_common 保持较小，说明模型主要使用 patch-wise correction；
-4. PMRF-v3 明显优于 V3-matched adapter。
-
-5.6 暂时不要做的方向
-短期不要做：
-1. geometry bias 重新进 attention logits；
-2. teacher guard；
-3. STGS 联合；
-4. 多层 reread；
-5. hard top-k routing；
-6. 改 first-read single fusion。
-理由：
-geometry bias:
-当前已有尝试伤严格阈值，不如 PMRF-v3 稳定。
-
-teacher guard:
-会引入 frozen teacher / student 训练合同，变量太多。
-
-STGS:
-监督创新和结构创新同时改，无法归因。
-
-多层 reread:
-在单层 reread 还未跨场景成立前没有必要。
-
-first-read 改造:
-single_qknorm_layerscale 已经说明风险大。
-
-5.7 通过 / 停止标准
-PMRF-v3 晋级为主结构的条件：
-1. 至少在 2–3 个代表场景上优于 strong single；
-2. Acc5 或 Acc2 至少一个稳定提升，median 不退化；
-3. 不出现某一类场景显著崩溃，例如 Tendrils 大幅下降；
-4. 优于 V3-matched query-only adapter；
-5. gamma_patch 学到非零有效更新，gamma_common 不异常放大；
-6. A1/A2 routing difference 与 pose improvement 有正相关证据。
-停止条件：
-1. 只在 Bears 单场景有效；
-2. 与 V3-adapter-control 持平；
-3. 主要提升来自 Acc25/Acc10，严格指标系统性下降；
-4. gamma_common 变大并主导 residual；
-5. A2 与 A1 几乎相同，或 routing difference 与 pose 无关。
-
-5.8 最终论文叙事建议
-不要把方法写成：
-We introduce iterative memory rereading.
-这个太容易被 Perceiver / cross-attention decoder / SACReg 相关工作覆盖。
-建议写成：
-We introduce a centered, layer-scaled memory re-reading adapter for scene coordinate regression. Unlike generic iterative attention, our adapter preserves the accepted first-read SCR feature contract and injects only the difference between a second memory read and the detached first-read context. This makes the update identity-preserving when memory routing does not change. Patch-wise and image-common residual components are controlled separately through per-channel LayerScale, enabling weak, localized memory correction without destabilizing the coordinate head.
-中文概括：
-我们不是简单重复 cross-attention，而是在强 single SCR fusion 后追加一个 centered、LayerScale 控制的弱重读 adapter。它只注入相对 first-read memory context 的差异，并将 patch-wise 与 image-common residual 分开缩放，从而在不破坏 coordinate-head feature contract 的前提下实现受控 memory rerouting。
-
-最终建议一句话
-下一步最合理的设计方案是固定 PMRF-v3 / CL-PMRF 为唯一主线，先做跨场景复验、组件消融和 V3-matched query-only adapter control；只有它在 strong single 下稳定成立，才继续考虑 geometry-informed gate 或 STGS。
-
-## 6. 训练效率压缩实验规划：少 iter + 大 buffer
-
-背景：
-当前标准 Stage1 训练使用：
-1. lmc_iterations = 12
-2. training_buffer_size = 2.8M
-3. buffer_size_final = 7.6M
-4. epochs = 24
-5. samples_per_image = 512
-6. post-train hypotheses = 256
-
-从已有 single / PMRF 训练曲线看，多数代表场景在中间 iter 已基本收敛，最后一轮大 buffer 经常带来明显提升。因此需要验证一个核心假设：
-12 个 outer iteration 可能不是主要收益来源，真正有效的是最后的大覆盖 buffer 和足够的 head polish。
-
-目标：
-在不引入 fusion 新变量的情况下，先用 single 模式验证训练策略能否压缩。若少 iter 策略接近 12-iter strong single，则后续所有 fusion 结构探索优先用少 iter 作为 quick filter，只把有希望的版本上 12-iter 完整复核。
-
-### 6.1 当前单卡效率矩阵
-
-场景：
-wayspots_bears
-
-原因：
-Bears 对 Acc25 / Acc10 / median 较敏感，且已有 strong single 与 PMRF-v3 结果，适合快速判断训练策略是否损伤主指标。
-
-当前启动矩阵：
-
-1. single_it01_buf7p6M
-   - lmc_iterations = 1
-   - training_buffer_size = 7.6M
-   - buffer_size_final = 7.6M
-   - s1_last_iter_use_final_buffer = True
-   - epochs = 24
-
-2. single_it01_buf10M
-   - lmc_iterations = 1
-   - training_buffer_size = 10M
-   - buffer_size_final = 10M
-   - s1_last_iter_use_final_buffer = True
-   - epochs = 24
-
-3. single_it02_buf5M_final7p6M
-   - lmc_iterations = 2
-   - training_buffer_size = 5M
-   - buffer_size_final = 7.6M
-   - s1_last_iter_use_final_buffer = True
-   - epochs = 24
-
-当前脚本：
-`/home/xwh/project/ace_depth/ace_dinov2_lmc/scripts/launch_single_gpu_train_efficiency_matrix.sh`
-
-当前运行：
-tmux session = `train_eff_single_gpu_20260623_gpu2`
-
-当前结果根目录：
-`/data/xwh/ace_dinov2_lmc/04_evaluation/train_efficiency_single_gpu_20260623_gpu2`
-
-注意：
-本实验使用 GPU2 是因为启动时 GPU0/GPU1 仍在跑 single_qknorm 的 squarebench / tendrils。该矩阵本身是单卡串行设计，后续可改用 GPU0 或 GPU1。
-
-### 6.2 判断标准
-
-Wayspots 当前主要比较：
-1. Acc50
-2. Acc25
-
-辅助指标：
-1. Acc10
-2. median_rotation_deg
-3. median_translation_cm
-4. Acc5 / Acc2 / Acc1 作为副风险
-
-Bears strong single 参考：
-1. Acc50 = 98.100
-2. Acc25 = 96.380
-3. Acc10 = 90.340
-4. MedR = 0.973
-5. MedT = 3.030 cm
-
-快速通过线：
-1. Acc50 >= 97.8
-2. Acc25 >= 96.0
-3. Acc10 >= 90.0
-4. MedT <= 3.10 cm
-
-若高效版本 Acc50 / Acc25 与 12-iter strong single 差距小于约 0.3–0.5 pct，且 Acc10 / median 不明显退化，则可认为训练压缩有效。
-
-### 6.3 结果解释预案
-
-如果 single_it01_buf7p6M 已接近 strong single：
-说明一次大 buffer 基本足够，12 iter 主要是冗余。后续 quick filter 可以直接用 1iter 大 buffer。
-
-如果 single_it01_buf10M 明显优于 7.6M：
-说明 buffer 覆盖仍是瓶颈，可以考虑把 quick setting 设为 1iter 10M，但需要评估时间/收益比。
-
-如果 single_it02_buf5M_final7p6M 明显优于两个 1iter：
-说明 compressor/fusion 与 head 的交替修正仍然必要，但 2iter 已可能替代 12iter。后续 fusion quick setting 优先使用：
-lmc_iterations = 2
-training_buffer_size = 5M
-buffer_size_final = 7.6M
-s1_last_iter_use_final_buffer = True
-epochs = 24
-
-如果三者均明显低于 strong single：
-说明 12iter 的多轮交替确实重要，少 iter 只能作为 smoke，不能作为结构筛选依据。
-
-### 6.4 后续扩展
-
-若 Bears 上 2iter 或 1iter 成立，需要在至少两个补充场景验证：
-1. wayspots_squarebench
-2. wayspots_cubes
-
-若这三个代表场景都能接近 12iter strong single，则后续 PMRF-v3 / adapter-control / component ablation 的默认 quick protocol 改为少 iter 策略。
-
-完整确认版本仍需保留 12iter：
-1. 最终主结果
-2. paper 表格
-3. 与历史结果直接对齐的复现
-
-### 6.5 当前工程结论
-
-训练效率优化本身应该先独立于 fusion 结构完成。不要在训练策略还未稳定时同时比较 PMRF-v3，否则无法判断收益来自结构还是来自训练覆盖变化。
-
-当前最务实流程：
-1. single 上筛出最快可靠训练策略；
-2. 用该策略复测 PMRF-v3 与 strong single；
-3. 再做 PMRF-v3 组件消融和 V3-matched query-only adapter control；
-4. 最后把晋级版本上 12iter 完整复核。
-
+12. 最终结论
+你这版核对之后，SC-QGR-v1 的边界已经非常清楚：
+它不是 ace_fusion.py 的第十三个 refinement mode，而是一个 trainer/test pipeline 中的 query-side refinement stage。它接在 _fuse_lmc_features_for_head(...) 之后，接在 regressor.get_scene_coordinates(...) 之前；它必须使用 img_idx + target_px 构建真实同图小图；它第一版只服务 strong single，不和 PMRF/CCF 混合；它只输出 feature residual，不直接预测 coordinate delta；它第一轮冻结所有基座，只训练 graph refiner。
+我认为你下一步最应该锁定的不是 GNN 结构，而是 grouped sampler 的正确性。如果 sampler 做对了，即使第一版 graph 很简单，实验结论也是可信的；如果 sampler 错了，再复杂的 graph 都只是在伪网格上做无意义消息传递。

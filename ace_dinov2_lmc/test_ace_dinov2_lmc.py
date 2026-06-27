@@ -43,6 +43,7 @@ from ace_network_ace import RegressorACE
 from dataset_ace_fcn_lmc import CamLocDatasetACEFCNLMC
 from ace_lmc_global_film import ACEGlobalFiLMHead
 from ace_lmc_global_residual import ACEGlobalResidualHead
+from ace_query_graph_refiner import QueryGraphRefiner
 from glace_backend import (
     GLACEDecoderFeatureResidualAdapter,
     build_glace_camloc_dataset,
@@ -493,6 +494,7 @@ def run_evaluation_lmc(opt):
     # Build LMC modules if needed
     compressor = None
     fusion = None
+    query_graph_refiner = None
     glace_residual_adapter = None
     ace_lmc_global_residual_head = None
     if model_backend == 'ace_fcn_lmc' and ace_lmc_global_head_mode == 'glace_residual':
@@ -664,6 +666,27 @@ def run_evaluation_lmc(opt):
         ).to(device)
         fusion.load_state_dict(checkpoint['fusion_state_dict'])
         fusion.eval()
+        query_graph_mode = str(lmc_config.get('lmc_query_graph_refine_mode', 'none'))
+        if query_graph_mode != 'none':
+            query_graph_refiner = QueryGraphRefiner(
+                feature_dim=backbone_feature_dim,
+                mode=query_graph_mode,
+                layerscale_init=float(lmc_config.get('lmc_query_graph_layerscale_init', 0.01)),
+                gate_init=float(lmc_config.get('lmc_query_graph_gate_init', -4.0)),
+            ).to(device)
+            query_graph_state = checkpoint.get('query_graph_refiner_state_dict')
+            if query_graph_state is None:
+                raise ValueError(
+                    f"Checkpoint has lmc_query_graph_refine_mode={query_graph_mode!r} but missing query_graph_refiner_state_dict."
+                )
+            query_graph_refiner.load_state_dict(query_graph_state, strict=True)
+            query_graph_refiner.eval()
+            _logger.info(
+                "[QueryGraph] Eval enabled: mode=%s eval_grouping=%s edge_source=%s",
+                query_graph_mode,
+                lmc_config.get('query_graph_eval_grouping', 'per_patch'),
+                lmc_config.get('query_graph_edge_source', 'target_px'),
+            )
         if model_backend == 'glace_lmc':
             glace_residual_adapter = GLACEDecoderFeatureResidualAdapter(
                 residual_gate_init=float(lmc_config.get('glace_residual_gate_init', 0.0) or 0.0),
@@ -941,6 +964,27 @@ def run_evaluation_lmc(opt):
                             fused, stats = fused
                             _log_fusion_runtime_stats("EvalFusion", lmc_runtime_stats_calls, stats)
                         features = fused.reshape(B, H, W, C).permute(0, 3, 1, 2)
+
+                if query_graph_refiner is not None:
+                    collect_qg_stats = lmc_log_runtime_stats and (
+                        lmc_runtime_stats_calls == 1
+                        or lmc_runtime_stats_calls % lmc_runtime_stats_interval == 0
+                    )
+                    if collect_qg_stats:
+                        features, qg_stats, _ = query_graph_refiner.refine_feature_map(
+                            features,
+                            return_stats=True,
+                        )
+                        _logger.info(
+                            "[QueryGraphEval] call=%d mode=%s gate=%.4f update=%.4e layerscale=%.4e",
+                            lmc_runtime_stats_calls,
+                            lmc_config.get('lmc_query_graph_refine_mode', 'none'),
+                            float(qg_stats.get('query_graph_gate_mean', 0.0)),
+                            float(qg_stats.get('query_graph_effective_update_norm', 0.0)),
+                            float(qg_stats.get('query_graph_layerscale_absmean', 0.0)),
+                        )
+                    else:
+                        features = query_graph_refiner.refine_feature_map(features, return_stats=False)
 
                 if model_backend == 'glace_lmc':
                     if glace_residual_adapter is not None and glace_lmc_fusion_target != 'local':
@@ -1240,6 +1284,20 @@ def run_evaluation_lmc(opt):
             "lmc_fusion_ccf_gate_floor": lmc_config.get("lmc_fusion_ccf_gate_floor", 0.0),
             "lmc_fusion_ccf_gate_gamma": lmc_config.get("lmc_fusion_ccf_gate_gamma", 1.0),
             "lmc_fusion_ccf_detach_gate": lmc_config.get("lmc_fusion_ccf_detach_gate", True),
+            "lmc_query_graph_refine_mode": lmc_config.get("lmc_query_graph_refine_mode", "none"),
+            "lmc_query_graph_images_per_batch": lmc_config.get("lmc_query_graph_images_per_batch", 4),
+            "lmc_query_graph_patches_per_image": lmc_config.get("lmc_query_graph_patches_per_image", 128),
+            "lmc_query_graph_sampler": lmc_config.get("lmc_query_graph_sampler", "local_window"),
+            "lmc_query_graph_layerscale_init": lmc_config.get("lmc_query_graph_layerscale_init", 0.01),
+            "lmc_query_graph_gate_init": lmc_config.get("lmc_query_graph_gate_init", -4.0),
+            "lmc_query_graph_residual_l1_weight": lmc_config.get("lmc_query_graph_residual_l1_weight", 0.0),
+            "lmc_query_graph_freeze_base": lmc_config.get("lmc_query_graph_freeze_base", True),
+            "query_graph_requires_img_idx": lmc_config.get("query_graph_requires_img_idx", False),
+            "query_graph_sampler": lmc_config.get("query_graph_sampler", "none"),
+            "query_graph_edge_source": lmc_config.get("query_graph_edge_source", "none"),
+            "query_graph_eval_grouping": lmc_config.get("query_graph_eval_grouping", "none"),
+            "final_query_graph_layerscale_absmean": lmc_config.get("final_query_graph_layerscale_absmean"),
+            "final_query_graph_gate_bias": lmc_config.get("final_query_graph_gate_bias"),
             "lmc_fusion_reread_warmup_mode": lmc_config.get("lmc_fusion_reread_warmup_mode", "none"),
             "lmc_fusion_reread_warmup_iters": lmc_config.get("lmc_fusion_reread_warmup_iters", 0),
             "lmc_fusion_reread_warmup_start": lmc_config.get("lmc_fusion_reread_warmup_start", 0.0),
