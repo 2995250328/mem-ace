@@ -139,6 +139,24 @@ variant_config() {
       FUSION_LR_RATIO="0.01"
       NOTE="r2_more_data_and_steps_24m_14iter_lr001"
       ;;
+    r2_it*_buf*m_lr*)
+      if [[ "${variant}" =~ ^r2_it([0-9]+)_buf([0-9]+)m_lr([0-9]+)$ ]]; then
+        LMC_ITERATIONS="${BASH_REMATCH[1]}"
+        TRAINING_BUFFER_SIZE="$((10#${BASH_REMATCH[2]} * 1000000))"
+        BUFFER_SIZE_FINAL="${TRAINING_BUFFER_SIZE}"
+        local lr_digits="${BASH_REMATCH[3]}"
+        FUSION_LR_RATIO="$(python3 - "${lr_digits}" <<'PYLR'
+import sys
+s = sys.argv[1]
+print(f"{int(s) / (10 ** len(s)):.6g}")
+PYLR
+)"
+        NOTE="r2_generic_${LMC_ITERATIONS}iter_buf${BASH_REMATCH[2]}m_lr${FUSION_LR_RATIO}"
+      else
+        echo "ERROR: malformed generic variant ${variant}; expected r2_itX_bufYm_lrZZZ" >&2
+        return 2
+      fi
+      ;;
     *)
       echo "ERROR: unknown variant ${variant}" >&2
       return 2

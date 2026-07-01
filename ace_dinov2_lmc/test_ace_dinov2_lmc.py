@@ -673,6 +673,11 @@ def run_evaluation_lmc(opt):
                 mode=query_graph_mode,
                 layerscale_init=float(lmc_config.get('lmc_query_graph_layerscale_init', 0.01)),
                 gate_init=float(lmc_config.get('lmc_query_graph_gate_init', -4.0)),
+                gate_max=float(lmc_config.get('lmc_query_graph_gate_max', 0.05)),
+                layerscale_max=float(lmc_config.get('lmc_query_graph_layerscale_max', 0.05)),
+                update_norm_cap=float(lmc_config.get('lmc_query_graph_update_norm_cap', 0.0)),
+                update_norm_cap_ratio=float(lmc_config.get('lmc_query_graph_update_norm_cap_ratio', 0.005)),
+                anchor_weight=float(lmc_config.get('lmc_query_graph_anchor_weight', 0.0)),
             ).to(device)
             query_graph_state = checkpoint.get('query_graph_refiner_state_dict')
             if query_graph_state is None:
@@ -976,11 +981,12 @@ def run_evaluation_lmc(opt):
                             return_stats=True,
                         )
                         _logger.info(
-                            "[QueryGraphEval] call=%d mode=%s gate=%.4f update=%.4e layerscale=%.4e",
+                            "[QueryGraphEval] call=%d mode=%s gate=%.4f update=%.4e ratio=%.4e layerscale=%.4e",
                             lmc_runtime_stats_calls,
                             lmc_config.get('lmc_query_graph_refine_mode', 'none'),
                             float(qg_stats.get('query_graph_gate_mean', 0.0)),
                             float(qg_stats.get('query_graph_effective_update_norm', 0.0)),
+                            float(qg_stats.get('query_graph_effective_update_ratio', 0.0)),
                             float(qg_stats.get('query_graph_layerscale_absmean', 0.0)),
                         )
                     else:
@@ -1292,12 +1298,25 @@ def run_evaluation_lmc(opt):
             "lmc_query_graph_gate_init": lmc_config.get("lmc_query_graph_gate_init", -4.0),
             "lmc_query_graph_residual_l1_weight": lmc_config.get("lmc_query_graph_residual_l1_weight", 0.0),
             "lmc_query_graph_freeze_base": lmc_config.get("lmc_query_graph_freeze_base", True),
+            "lmc_query_graph_stage_b_only": lmc_config.get("lmc_query_graph_stage_b_only", False),
+            "lmc_query_graph_lr": lmc_config.get("lmc_query_graph_lr", 0.0),
+            "lmc_query_graph_gate_max": lmc_config.get("lmc_query_graph_gate_max", 0.05),
+            "lmc_query_graph_layerscale_max": lmc_config.get("lmc_query_graph_layerscale_max", 0.05),
+            "lmc_query_graph_update_norm_cap": lmc_config.get("lmc_query_graph_update_norm_cap", 0.0),
+            "lmc_query_graph_update_norm_cap_ratio": lmc_config.get("lmc_query_graph_update_norm_cap_ratio", 0.005),
+            "lmc_query_graph_anchor_weight": lmc_config.get("lmc_query_graph_anchor_weight", 0.0),
             "query_graph_requires_img_idx": lmc_config.get("query_graph_requires_img_idx", False),
             "query_graph_sampler": lmc_config.get("query_graph_sampler", "none"),
             "query_graph_edge_source": lmc_config.get("query_graph_edge_source", "none"),
             "query_graph_eval_grouping": lmc_config.get("query_graph_eval_grouping", "none"),
             "final_query_graph_layerscale_absmean": lmc_config.get("final_query_graph_layerscale_absmean"),
             "final_query_graph_gate_bias": lmc_config.get("final_query_graph_gate_bias"),
+            "final_query_graph_gate_max": lmc_config.get("final_query_graph_gate_max"),
+            "final_query_graph_layerscale_max": lmc_config.get("final_query_graph_layerscale_max"),
+            "final_query_graph_update_norm_cap": lmc_config.get("final_query_graph_update_norm_cap"),
+            "final_query_graph_update_norm_cap_ratio": lmc_config.get("final_query_graph_update_norm_cap_ratio"),
+            "final_query_graph_layerscale_eff_absmean": lmc_config.get("final_query_graph_layerscale_eff_absmean"),
+            "final_query_graph_anchor_weight": lmc_config.get("final_query_graph_anchor_weight"),
             "lmc_fusion_reread_warmup_mode": lmc_config.get("lmc_fusion_reread_warmup_mode", "none"),
             "lmc_fusion_reread_warmup_iters": lmc_config.get("lmc_fusion_reread_warmup_iters", 0),
             "lmc_fusion_reread_warmup_start": lmc_config.get("lmc_fusion_reread_warmup_start", 0.0),

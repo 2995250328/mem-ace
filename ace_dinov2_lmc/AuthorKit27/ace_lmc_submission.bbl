@@ -1,0 +1,84 @@
+\begin{thebibliography}{16}
+\providecommand{\natexlab}[1]{#1}
+
+\bibitem[{Arnold et~al.(2022)Arnold, Wynn, Vicente, Garcia-Hernando, Monszpart, Prisacariu, Turmukhambetov, and Brachmann}]{arnold2022mapfree}
+Arnold, E.; Wynn, J.; Vicente, S.; Garcia-Hernando, G.; Monszpart, {\'{A}}.; Prisacariu, V.~A.; Turmukhambetov, D.; and Brachmann, E. 2022.
+\newblock Map-free Visual Relocalization: Metric Pose Relative to a Single Image.
+\newblock In \emph{Proceedings of the European Conference on Computer Vision (ECCV)}.
+
+\bibitem[{Brachmann, Cavallari, and Prisacariu(2023)}]{brachmann2023ace}
+Brachmann, E.; Cavallari, T.; and Prisacariu, V.~A. 2023.
+\newblock Accelerated Coordinate Encoding: Learning to Relocalize in Minutes using {RGB} and Poses.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}.
+
+\bibitem[{Brachmann et~al.(2017)Brachmann, Krull, Nowozin, Shotton, Michel, Gumhold, and Rother}]{brachmann2017dsac}
+Brachmann, E.; Krull, A.; Nowozin, S.; Shotton, J.; Michel, F.; Gumhold, S.; and Rother, C. 2017.
+\newblock {DSAC}-{Differentiable RANSAC} for Camera Localization.
+\newblock In \emph{Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}, 6684--6692.
+
+\bibitem[{Brachmann and Rother(2018)}]{brachmann2018lessmore}
+Brachmann, E.; and Rother, C. 2018.
+\newblock Learning Less Is More: {6D} Camera Localization via {3D} Surface Regression.
+\newblock In \emph{Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}, 4654--4662.
+
+\bibitem[{Brachmann and Rother(2021)}]{brachmann2021dsacstar}
+Brachmann, E.; and Rother, C. 2021.
+\newblock Visual Camera Re-Localization from {RGB} and {RGB-D} Images Using {DSAC}.
+\newblock \emph{IEEE Transactions on Pattern Analysis and Machine Intelligence}.
+
+\bibitem[{Bruns et~al.(2025)Bruns, Barroso-Laguna, Cavallari, Monszpart, Munukutla, Prisacariu, and Brachmann}]{bruns2025aceg}
+Bruns, L.; Barroso-Laguna, A.; Cavallari, T.; Monszpart, A.; Munukutla, S.; Prisacariu, V.~A.; and Brachmann, E. 2025.
+\newblock {ACE-G}: Improving Generalization of Scene Coordinate Regression Through Query Pre-Training.
+\newblock In \emph{Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)}, 26751--26761.
+
+\bibitem[{Do et~al.(2022)Do, Miksik, DeGol, Park, and Sinha}]{do2022scene_landmarks}
+Do, T.; Miksik, O.; DeGol, J.; Park, H.~S.; and Sinha, S.~N. 2022.
+\newblock Learning to Detect Scene Landmarks for Camera Localization.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}.
+
+\bibitem[{Do and Sinha(2024)}]{do2024improved_scene_landmarks}
+Do, T.; and Sinha, S.~N. 2024.
+\newblock Improved Scene Landmark Detection for Camera Localization.
+\newblock In \emph{Proceedings of the International Conference on 3D Vision (3DV)}.
+
+\bibitem[{Kendall, Grimes, and Cipolla(2015)}]{kendall2015posenet}
+Kendall, A.; Grimes, M.; and Cipolla, R. 2015.
+\newblock PoseNet: A Convolutional Network for Real-Time {6-DOF} Camera Relocalization.
+\newblock In \emph{Proceedings of the IEEE International Conference on Computer Vision (ICCV)}, 2938--2946.
+
+\bibitem[{Nguyen et~al.(2024)Nguyen, Fontan, Milford, and Fischer}]{nguyen2024focustune}
+Nguyen, S.~T.; Fontan, A.; Milford, M.; and Fischer, T. 2024.
+\newblock FocusTune: Tuning Visual Localization Through Focus-Guided Sampling.
+\newblock In \emph{Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision (WACV)}, 3606--3615.
+
+\bibitem[{Oquab et~al.(2023)Oquab, Darcet, Moutakanni, Vo, Szafraniec, Khalidov, Fernandez, Haziza, Massa, El-Nouby, Howes, Huang, Xu, Sharma, Li, Galuba, Rabbat, Assran, Ballas, Synnaeve, Misra, Jegou, Mairal, Labatut, Joulin, and Bojanowski}]{oquab2023dinov2}
+Oquab, M.; Darcet, T.; Moutakanni, T.; Vo, H.; Szafraniec, M.; Khalidov, V.; Fernandez, P.; Haziza, D.; Massa, F.; El-Nouby, A.; Howes, R.; Huang, P.-Y.; Xu, H.; Sharma, V.; Li, S.-W.; Galuba, W.; Rabbat, M.; Assran, M.; Ballas, N.; Synnaeve, G.; Misra, I.; Jegou, H.; Mairal, J.; Labatut, P.; Joulin, A.; and Bojanowski, P. 2023.
+\newblock {DINOv2}: Learning Robust Visual Features without Supervision.
+\newblock arXiv:2304.07193.
+
+\bibitem[{Sarlin et~al.(2019)Sarlin, Cadena, Siegwart, and Dymczyk}]{sarlin2019coarse}
+Sarlin, P.-E.; Cadena, C.; Siegwart, R.; and Dymczyk, M. 2019.
+\newblock From Coarse to Fine: Robust Hierarchical Localization at Large Scale.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}.
+
+\bibitem[{Shotton et~al.(2013)Shotton, Glocker, Zach, Izadi, Criminisi, and Fitzgibbon}]{shotton2013scrf}
+Shotton, J.; Glocker, B.; Zach, C.; Izadi, S.; Criminisi, A.; and Fitzgibbon, A. 2013.
+\newblock Scene Coordinate Regression Forests for Camera Relocalization in {RGB-D} Images.
+\newblock In \emph{Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}, 2930--2937.
+
+\bibitem[{Tang et~al.(2023)Tang, Tang, Tagliasacchi, Tan, and Furukawa}]{tang2023neumap}
+Tang, S.; Tang, S.; Tagliasacchi, A.; Tan, P.; and Furukawa, Y. 2023.
+\newblock {NeuMap}: Neural Coordinate Mapping by Auto-Transdecoder for Camera Localization.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}.
+
+\bibitem[{Wang et~al.(2024)Wang, Jiang, Galliani, Vogel, and Pollefeys}]{GLACE2024CVPR}
+Wang, F.; Jiang, X.; Galliani, S.; Vogel, C.; and Pollefeys, M. 2024.
+\newblock {GLACE}: Global Local Accelerated Coordinate Encoding.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, 21562--21571.
+
+\bibitem[{Xu et~al.(2024)Xu, Jiang, Cao, Yuan, Wang, and Xie}]{xu2024efficient}
+Xu, K.; Jiang, Z.; Cao, H.; Yuan, S.; Wang, C.; and Xie, L. 2024.
+\newblock An Efficient Scene Coordinate Encoding and Relocalization Method.
+\newblock arXiv:2412.06488.
+
+\end{thebibliography}

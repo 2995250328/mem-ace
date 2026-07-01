@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
+import re
 from pathlib import Path
 from typing import Dict, Iterable, Tuple
 
@@ -20,6 +22,16 @@ HIGHER_IS_BETTER = [
 ]
 LOWER_IS_BETTER = ["median_deg", "median_cm"]
 METRICS = HIGHER_IS_BETTER + LOWER_IS_BETTER
+EVAL_SUMMARY_METRIC_MAP = {
+    "accuracy_50cm5deg_pct": "50cm_5deg",
+    "accuracy_25cm5deg_pct": "25cm_5deg",
+    "accuracy_10cm5deg_pct": "10cm_5deg",
+    "accuracy_5cm5deg_pct": "5cm_5deg",
+    "accuracy_2cm2deg_pct": "2cm_2deg",
+    "accuracy_1cm1deg_pct": "1cm_1deg",
+    "median_rotation_deg": "median_deg",
+    "median_translation_cm": "median_cm",
+}
 
 
 def parse_float(value: str) -> float | None:
@@ -64,7 +76,115 @@ def metric_source(row: Dict[str, str], metric: str) -> str:
     return row.get(f"source_{metric}") or row.get("output") or row.get("_summary_path", "")
 
 
-def aggregate(run_root: Path, summary_name: str) -> Dict[Tuple[str, str, str], Dict[str, object]]:
+def _group_for(groups: Dict[Tuple[str, str, str], Dict[str, object]], variant: str, scene: str, method: str) -> Dict[str, object]:
+    key = (variant, scene, method)
+    return groups.setdefault(
+        key,
+        {
+            "variant": variant,
+            "scene": scene,
+            "method": method,
+            "best": {},
+            "sources": {},
+        },
+    )
+
+
+def _update_metric(group: Dict[str, object], metric: str, value: float | None, source: str) -> None:
+    if value is None:
+        return
+    best = group["best"].get(metric)
+    if is_better(metric, value, best):
+        group["best"][metric] = value
+        group["sources"][metric] = source
+
+
+def _load_key_value_file(path: Path) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "	" in line:
+            key, value = line.split("	", 1)
+        elif "=" in line:
+            key, value = line.split("=", 1)
+        else:
+            continue
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _load_run_config(run_dir: Path) -> Dict[str, object]:
+    path = run_dir / "run_config.json"
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _infer_scene_method(run_root: Path, eval_path: Path, values: Dict[str, str]) -> tuple[str, str]:
+    run_dir = eval_path.parent
+    config = _load_run_config(run_dir)
+
+    scene = ""
+    scene_raw = config.get("scene")
+    if isinstance(scene_raw, str) and scene_raw:
+        scene = Path(scene_raw).name
+    if not scene:
+        match = re.search(r"eval_summary_(.+?)_(?:iter|post|seed|posts2)", eval_path.name)
+        if match:
+            scene = match.group(1)
+    if not scene:
+        scene = values.get("scene", "")
+
+    method = ""
+    try:
+        rel_parts = run_dir.relative_to(run_root).parts
+    except ValueError:
+        rel_parts = run_dir.parts
+    if scene and scene in rel_parts:
+        idx = rel_parts.index(scene)
+        if idx + 1 < len(rel_parts):
+            method = rel_parts[idx + 1]
+    if not method:
+        raw_method = config.get("method")
+        if isinstance(raw_method, str):
+            method = raw_method
+    if not method:
+        model_backend = str(config.get("model_backend") or values.get("model_backend") or "model")
+        lmc_flow = str(config.get("lmc_flow") or values.get("lmc_flow") or "")
+        method = f"{model_backend}_lmc_{lmc_flow}" if lmc_flow else model_backend
+    return scene, method
+
+
+def iter_eval_summary_rows(run_root: Path) -> Iterable[Tuple[Path, Dict[str, str]]]:
+    for eval_path in sorted(run_root.rglob("eval_summary_*.txt")):
+        values = _load_key_value_file(eval_path)
+        if values:
+            yield eval_path, values
+
+
+def aggregate_from_eval_summaries(run_root: Path) -> Dict[Tuple[str, str, str], Dict[str, object]]:
+    groups: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+    for eval_path, values in iter_eval_summary_rows(run_root):
+        scene, method = _infer_scene_method(run_root, eval_path, values)
+        if not scene or not method:
+            continue
+        variant = variant_from_path(run_root, eval_path)
+        group = _group_for(groups, variant, scene, method)
+        for raw_name, metric in EVAL_SUMMARY_METRIC_MAP.items():
+            _update_metric(group, metric, parse_float(values.get(raw_name, "")), str(eval_path))
+    return groups
+
+
+def aggregate(run_root: Path, summary_name: str, eval_summary_fallback: bool = True) -> Dict[Tuple[str, str, str], Dict[str, object]]:
     groups: Dict[Tuple[str, str, str], Dict[str, object]] = {}
 
     for summary_path, row in iter_summary_rows(run_root, summary_name):
@@ -76,27 +196,13 @@ def aggregate(run_root: Path, summary_name: str) -> Dict[Tuple[str, str, str], D
             continue
 
         variant = variant_from_path(run_root, summary_path)
-        key = (variant, scene, method)
-        group = groups.setdefault(
-            key,
-            {
-                "variant": variant,
-                "scene": scene,
-                "method": method,
-                "best": {},
-                "sources": {},
-            },
-        )
+        group = _group_for(groups, variant, scene, method)
 
         for metric in METRICS:
-            value = parse_float(row.get(metric, ""))
-            if value is None:
-                continue
-            best = group["best"].get(metric)
-            if is_better(metric, value, best):
-                group["best"][metric] = value
-                group["sources"][metric] = metric_source(row, metric)
+            _update_metric(group, metric, parse_float(row.get(metric, "")), metric_source(row, metric))
 
+    if not groups and eval_summary_fallback:
+        groups = aggregate_from_eval_summaries(run_root)
     return groups
 
 
@@ -161,12 +267,13 @@ def main() -> int:
     parser.add_argument("--summary-name", default="summary.tsv", help="Summary filename to scan for.")
     parser.add_argument("--sources", action="store_true", help="Print per-metric source paths after the table.")
     parser.add_argument("--tsv", type=Path, help="Optional path to write a machine-readable TSV.")
+    parser.add_argument("--no-eval-summary-fallback", action="store_true", help="Do not parse eval_summary_*.txt when summary TSVs are absent.")
     args = parser.parse_args()
 
     run_root = args.run_root.expanduser().resolve()
-    groups = aggregate(run_root, args.summary_name)
+    groups = aggregate(run_root, args.summary_name, eval_summary_fallback=not args.no_eval_summary_fallback)
     if not groups:
-        raise SystemExit(f"No ok rows found under {run_root} with name {args.summary_name}")
+        raise SystemExit(f"No ok rows found under {run_root} with name {args.summary_name}, and no eval_summary_*.txt fallback rows were parsed")
 
     print_markdown(groups, include_sources=args.sources)
     if args.tsv:

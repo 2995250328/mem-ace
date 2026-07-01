@@ -790,6 +790,13 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         help='STGS keyframe_channel.npz 路径，包含 anchor_feature_yx、target_image_idx、target_xy_model 等字段。',
     )
     parser.add_argument(
+        '--sfm_track_sidecar_mismatch_policy',
+        type=str,
+        default='strict',
+        choices=['strict', 'warn', 'ignore'],
+        help='STGS sidecar 与当前 backbone/image_resolution/buffer_image_width 不一致时的处理策略。strict 默认直接报错，避免 DINO/ACE stride 错配。',
+    )
+    parser.add_argument(
         '--sfm_track_inter_frame_apply_to',
         type=str,
         default='stage2',
@@ -819,6 +826,114 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=float,
         default=100.0,
         help='STGS 帧间重投影每项像素误差上限；<=0 表示不裁剪。',
+    )
+    parser.add_argument(
+        '--use_sfm_track_guided_sampling',
+        type=_strtobool,
+        default=False,
+        help='启用 STGS track-aware two-stream 采样。默认关闭，保持旧训练行为。',
+    )
+    parser.add_argument(
+        '--sfm_track_guided_batch_size',
+        type=int,
+        default=512,
+        help='STGS guided track rows 数量。append 模式下为额外 rows；balanced_replace 且 fraction<=0 时作为固定替换数量。',
+    )
+    parser.add_argument(
+        '--sfm_track_guided_sampling_strategy',
+        type=str,
+        default='append',
+        choices=['append', 'balanced_replace'],
+        help='STGS guided rows 的采样接入方式：append=额外拼接；balanced_replace=在原 batch 内按比例替换 normal rows。',
+    )
+    parser.add_argument(
+        '--sfm_track_guided_fraction',
+        type=float,
+        default=0.0,
+        help='balanced_replace 模式下每个 batch 中 guided track rows 的比例；<=0 时使用 sfm_track_guided_batch_size。',
+    )
+    parser.add_argument(
+        '--sfm_track_guided_mode',
+        type=str,
+        default='inter_frame',
+        choices=['anchor_only', 'inter_frame', 'same_image_shuffle'],
+        help='STGS guided sampling 模式：仅 anchor self、真实跨帧 target、或 same-image shuffled negative control。',
+    )
+    parser.add_argument(
+        '--sfm_track_guided_main_loss_mode',
+        type=str,
+        default='exclude',
+        choices=['exclude', 'include'],
+        help='guided rows 是否参与主 self reprojection loss。exclude 保持旧行为；include 用原 patch target 参与主 loss。',
+    )
+    parser.add_argument(
+        '--sfm_track_guided_source_target_mode',
+        type=str,
+        default='exact_anchor',
+        choices=['exact_anchor', 'patch_center'],
+        help='guided source anchor self loss 的像素目标：exact_anchor 使用 SfM keypoint；patch_center 使用对应 patch 中心。',
+    )
+    parser.add_argument(
+        '--sfm_track_inter_frame_target_mode',
+        type=str,
+        default='exact_target',
+        choices=['exact_target', 'patch_center'],
+        help='STGS inter-frame target 像素目标：exact_target 使用 SfM target keypoint；patch_center 使用 target 所在 backbone patch center。DINO 建议 patch_center。',
+    )
+    parser.add_argument(
+        '--sfm_track_guided_aux_normalizer',
+        type=str,
+        default='terms',
+        choices=['terms', 'full_batch'],
+        help='STGS auxiliary loss 归一化方式：terms 按有效项均值；full_batch 按 batch size 归一化以反映 guided 占比。',
+    )
+    parser.add_argument(
+        '--sfm_track_anchor_self_weight',
+        type=float,
+        default=1.0,
+        help='guided track rows 的 source anchor self reprojection loss 权重。',
+    )
+    parser.add_argument(
+        '--sfm_track_anchor_use_alignment_weight',
+        type=_strtobool,
+        default=False,
+        help='source anchor self loss 是否乘以 SfM alignment confidence 的 batch 均值，降低 patch/keypoint 偏移大的样本影响。',
+    )
+    parser.add_argument(
+        '--sfm_track_min_alignment_weight',
+        type=float,
+        default=0.0,
+        help='STGS track 质量门控：alignment_weight 低于该值的 track 不参与 guided sampling；<=0 关闭。',
+    )
+    parser.add_argument(
+        '--sfm_track_max_colmap_reproj_error_px',
+        type=float,
+        default=0.0,
+        help='STGS track 质量门控：COLMAP reprojection error 高于该值的 track 不参与 guided sampling；<=0 关闭。',
+    )
+    parser.add_argument(
+        '--sfm_track_min_track_length',
+        type=int,
+        default=0,
+        help='STGS track 质量门控：track_length 小于该值的 track 不参与 guided sampling；<=0 关闭。',
+    )
+    parser.add_argument(
+        '--sfm_track_max_anchor_patch_offset_px',
+        type=float,
+        default=0.0,
+        help='STGS patch 对齐门控：SfM anchor keypoint 到 feature patch center 的距离超过该值时剔除；<=0 关闭。',
+    )
+    parser.add_argument(
+        '--sfm_track_max_target_patch_offset_px',
+        type=float,
+        default=0.0,
+        help='STGS patch 对齐门控：SfM target keypoint 到 target feature patch center 的距离超过该值时不参与帧间项；<=0 关闭。DINO patch-center target 建议开启。',
+    )
+    parser.add_argument(
+        '--sfm_track_inter_frame_dropout',
+        type=float,
+        default=0.5,
+        help='guided inter-frame target dropout 概率，仅作用于 guided track rows。',
     )
     parser.add_argument('--use_half', type=_strtobool, default=True,
                         help='是否启用 FP16 混合精度训练。')
@@ -1089,6 +1204,18 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         help=(
             'R2 路径：S2 中是否训练 fusion（默认 False = R1 冻结 fusion）。'
             '仅在 --lmc_flow ace_g 时生效。'
+        ),
+    )
+    parser.add_argument(
+        '--ace_g_s2_schedule',
+        type=str,
+        default='every_iter',
+        choices=['every_iter', 'none', 'final_only'],
+        help=(
+            'ACE-G 内部 S2-G 调度。every_iter=旧行为，每轮 S1 后都跑 S2-G；'
+            'none=只跑 S1 并评估 post-S1 checkpoint；'
+            'final_only=非最后轮只跑 S1，最后一轮再跑一次 S2-G polish。'
+            '若同时设置 --ace_g_fusion_in_s2 True，则实际运行的 S2-G 使用 R2 fusion 小学习率更新。'
         ),
     )
     parser.add_argument(
@@ -1653,8 +1780,8 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--lmc_query_graph_refine_mode',
         type=str,
         default='none',
-        choices=['none', 'mlp_control'],
-        help='Fusion 后、head 前的 query-side refinement。none=旧行为；mlp_control=无邻居 per-node feature residual，对未来 SC-QGR 做容量/通路对照。',
+        choices=['none', 'identity_control', 'mlp_control', 'safe_mlp_control'],
+        help='Fusion 后、head 前的 query-side refinement。none=旧行为；identity_control=只验证 grouped/resume 通路；mlp_control=旧无邻居 per-node residual；safe_mlp_control=有界低风险 residual。',
     )
     parser.add_argument(
         '--lmc_query_graph_images_per_batch',
@@ -1698,6 +1825,48 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         type=_strtobool,
         default=True,
         help='query graph Stage-B 默认冻结 backbone/compressor/fusion/head，仅训练 query_graph_refiner；head forward 仍保留输入梯度。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_stage_b_only',
+        type=_strtobool,
+        default=False,
+        help='只从已有 checkpoint resume 后训练 query_graph_refiner，不进入后续 S2/head 重训；用于合法 Stage-B query-side refiner 验证。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_lr',
+        type=float,
+        default=0.0,
+        help='query graph refiner 专用学习率；0 表示沿用当前 S1 base lr。仅 graph-only Stage-B optimizer 使用。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_gate_max',
+        type=float,
+        default=0.05,
+        help='safe_mlp_control 的 residual gate 上界；legacy mlp_control 不使用。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_layerscale_max',
+        type=float,
+        default=0.05,
+        help='safe_mlp_control 的 LayerScale 上界；legacy mlp_control 不使用。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_update_norm_cap',
+        type=float,
+        default=0.0,
+        help='safe_mlp_control 每个 token feature update 的绝对 L2 cap；0 表示只使用 ratio cap 或不限制。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_update_norm_cap_ratio',
+        type=float,
+        default=0.005,
+        help='safe_mlp_control 每个 token update_norm / feature_norm 上界；0 表示关闭 ratio cap。',
+    )
+    parser.add_argument(
+        '--lmc_query_graph_anchor_weight',
+        type=float,
+        default=0.0,
+        help='safe_mlp_control residual 正则中的 cosine anchor 权重；最终仍由 residual_l1_weight 总体缩放。',
     )
     parser.add_argument(
         '--lmc_fusion_reread_warmup_mode',

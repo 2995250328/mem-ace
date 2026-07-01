@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Session Title Manager"
+  short_description: "Safely rename Codex resume sessions."
+  default_prompt: "Rename the current Codex resume conversation title to the requested name."

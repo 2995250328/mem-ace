@@ -1,188 +1,170 @@
-你的这次只读核对基本把 SC-QGR 第一版的实现边界 定准了。我同意你的主结论：它不应该再被理解为 ace_fusion.py 内部的一个 PMRF/CCF refinement mode，而应该是 fusion 输出之后、head 回归之前的 query-side refinement 模块。这点非常关键，因为当前 ace_fusion.py 已经覆盖了 single、PMRF、centered、geometry reread、adapter、dual、coord prior 等 memory-injection / reread 变体；PMRF-v3 本身也已经包含 centered reread、second-read QK norm、patch/common LayerScale 等完整机制。继续把 SC-QGR 塞进这个分支，会把“再次读 memory”和“同图 patch 协同”两个问题混在一起。
-下面我给出一个更收敛的版本：SC-QGR-v1 的合理性分析 + 第一版设计边界 + 实验验收标准。重点不是代码怎么写，而是哪些东西必须锁死，避免第一次实验结论失真。
+你的收敛方向是正确的，而且现在应该把目标进一步明确成一句话：
+这次 patch 的目标不是让 query graph 涨分，而是证明“query-graph 通路在严格 identity / capped residual 条件下不会破坏 strong single”。
+当前 mlp_control 的退化太严重，已经不能作为未来 SC-QGR 的有效 baseline。它现在更像一个 unbounded frozen-head adapter，说明 frozen head 前 feature residual 极其危险。所以下一步加 identity_control + safe_mlp_control 是必要的，而且应该优先于任何真正 message passing。
 
-1. 总体研判
-你这次核对后，SC-QGR 的定位应当从“fusion variant”改成：
-在 strong single memory fusion 之后，对同一 query image 内的 scene-conditioned patch features 做一次轻量图 refinement，然后仍然通过原来的 MLP head 回归 scene coordinates。
-也就是说第一版主链路应该是：
-raw / fused buffer rows
-        ↓
-single LMC memory fusion
-        ↓
-scene-conditioned patch features
-        ↓
-same-image query graph refinement
-        ↓
-refined features
-        ↓
-原 regressor.get_scene_coordinates(...)
-        ↓
-existing reprojection / coordinate loss
-这个定位比前面讨论过的 PMRF gating、latent memory graph、coordinate delta 都更稳。原因是：它引入了一个当前所有 reread 分支都没有的信息源——同一查询图像内其他 patch 的 scene-conditioned evidence。PMRF/centered 的 second read 仍然是单个 patch 再读同一个 compressed memory；v3_adapter_control 是 query-only residual；v3_dual_refine 是 memory residual 和 adapter residual 的叠加。它们都没有真正解决“同一 query image 内 patch 之间是否应该协同”这个问题。你给出的代码核对也支持这个定位：fusion 输出接入点在 _fuse_lmc_features_for_head(...) 之后，head/loss 当前已有 full-map loss 和 sampled-feature loss 两类路径，因此 SC-QGR 最自然的位置就是 fusion output 与 get_scene_coordinates(...) 之间。
-所以第一版不要再和 PMRF/CCF 混合。PMRF-v3、CCF-lite 继续作为 baseline；SC-QGR-v1 只回答一个干净问题：
-在 strong single 已经完成 memory conditioning 后，同图 patch graph 是否能提供额外的有效上下文？
+1. 你当前判断基本正确
+你列出的现象可以归纳成一个很清楚的诊断：
+grouped sampler 大概率初步正确
+但 residual path 不安全
+G=4 P=128 uniq_img=4 insuff=0 和 edge_source=target_px 说明同图分组至少日志层面没问题。Bears/Cubes 掉到 Acc50 2–4%，同时 gate 接近 0.999、effective update norm 到 10+，说明问题不是“方法小幅无效”，而是 feature manifold 被强行改写，frozen head 无法解释新的 feature 分布。
+所以你的下一步不应该是继续跑更多场景，也不应该上 sc_qgr_v1。正确动作就是：
+先验证通路是否 identity-safe；
+再验证 capped residual 是否不会灾难性破坏；
+最后才进入真正 graph。
 
-2. 为什么 sampler 是第一风险，而不是 graph module
-你这次最重要的判断是：SC-QGR 第一版成败的代码关键不是 message passing 写得多复杂，而是 img_idx + target_px grouped sampler 是否正确。
-这个判断完全正确。原因很简单：GNN 的 node 和 edge 只有在“同一图像内”才有语义。如果沿用当前全局随机 row sampling：
-torch.randint(0, buffer_len, (draw_bs,))
-那么一个 batch 内的 patch rows 可能来自不同图像、不同视角、不同相机位姿。此时任何 KNN、graph edge、attention edge 都是在伪图上做消息传递。即使 loss 变好，也无法说明同图上下文有效；即使 loss 变差，也不能否定 graph refinement。这个实验会彻底失真。
-同理，_pack_feature_rows_for_head(... grid_h=16) 只是为了把随机 rows 伪装成 1x1 ACE head 可接受的张量形状。这个 16×W 伪网格不是图像真实空间邻域，绝对不能拿来构建 spatial edge。你把这一点明确列出来非常重要，因为这是最容易被工程实现误用的地方。
-因此第一版 SC-QGR 的最小真实前提是：
-每个 graph 内的节点必须来自同一 img_idx；
-每条 spatial edge 必须基于真实 target_px；
-不能基于随机 row order 或 packed pseudo-grid。
-这也解释了为什么需要强制 indexed buffer。你核对到当前 raw buffer / fused buffer schema 已经有 features、target_px、pose、intrinsics、gt_scene_coords 等字段，而 indexed schema 额外有 img_idx；但普通 raw buffer 不一定保存 img_idx，只有 image-global / GLACE / multiframe 相关路径才会启用 image indices。对于 SC-QGR，img_idx 不是附加信息，而是核心结构变量。没有它，graph sampler 就没有合法定义。
+2. identity_control 是必须的，不是可选项
+identity_control 的作用不是方法实验，而是排除通路 bug。它应该完整经过：
+grouped sampler
+reshape [G, P, C]
+query_graph_refiner forward
+flatten
+head/loss
+checkpoint save/load
+eval refine hook
+但输出严格满足：
+H_out = H_in
+如果 identity_control 结果不接近 single，那问题一定不在 residual 方法，而在以下某个环节：
+grouped sampler 字段重排
+features / target_px / pose / intrinsics 对齐
+flatten 顺序
+loss 输入 shape
+eval refine hook
+checkpoint config 恢复
+这个模式的验收标准应该非常硬：同一 checkpoint、同一 eval seed、同一 hypotheses 下，结果应接近 single；如果有明显差距，暂停所有 safe_mlp / SC-QGR。
 
-3. SC-QGR-v1 的第一版设计边界
-第一版应当极端克制，只实现一个干净版本：
-base = strong single
-refiner = same-image sparse graph
-output = feature residual
-head = 原 MLP head
-training = freeze base, train graph only
-不支持：
-PMRF + SC-QGR
-CCF + SC-QGR
-direct coordinate delta
-memory graph
-multi-round GRU
-DSAC-driven learning
-这个边界看起来保守，但它有一个重要好处：实验结果可归因。如果 single + SC-QGR 超过 strong single、MLP control、shuffled-edge control，那么你能比较明确地说：同图 patch graph 在 scene-conditioned feature 上提供了新信息。如果一开始就叠 PMRF、CCF、graph、coordinate state，涨分也解释不清。
+3. safe_mlp_control 的关键不是 gate，而是 effective update 的硬上限
+你写的 safe_mlp 形式是对的：
+delta = MLP(LN(H))
+gate_eff = gate_max * sigmoid(gate_logit)
+gamma_eff = gamma_max * sigmoid(raw_gamma)
+update = gate_eff * gamma_eff * delta
+update = norm_cap(update)
+H_out = H + update
+但我建议对 update_norm_cap 做一个小修正：不要只用绝对 cap，最好支持相对 cap。因为 feature scale 可能随 scene、fusion mode、checkpoint 变化。更稳的是：
+cap = cap_ratio * rms(H)
+或者至少同时记录：
+update_norm / feature_norm
+否则 0.01 在某些 feature scale 下几乎为零，在另一些 scale 下仍可能过大。第一版可以保留绝对 cap，但一定要记录相对比例。真正判断是否安全，看的是：
+||H_out - H|| / ||H||
+而不是 raw update norm。
+我建议默认设置更保守一点：
+gate_max = 0.05
+layerscale_max = 0.05
+update_norm_cap = 0.01 或 cap_ratio = 0.005~0.01
+effective_update_l1_weight > 0
+anchor_weight > 0
+query_graph_lr 明显低于 base lr
+如果 gate_max * layerscale_max 已经很小，再加 norm cap 会非常保守，这是好事。第一轮目标是“不破坏”，不是涨分。
 
-4. 模块输入输出应该怎么定义
-SC-QGR-v1 不应该直接预测 scene coordinate delta。它应该预测 feature residual。具体地说：
-给定 strong single 后的 features：
-H0: [G, P, C]
-其中 G 是每个 batch 中的图像数，P 是每张图采样的 patch 数，C 是 feature dim。
-还需要：
-target_px: [G, P, 2]
-img_idx: [G]
-intrinsics / intrinsics_inv: optional for logging or future
-gt_pose: existing loss uses it
-第一版可以额外使用第一次坐标预测作为 detached state：
-X0 = head(H0).detach()
-然后构造 node feature：
-node_i = [
-    LN(H0_i),
-    PE_2D(target_px_i),
-    PE_3D(stopgrad(X0_i normalized))
-]
-这里 X0 只作为状态提示，不参与反向更新。理由是：第一版要验证 graph refiner 是否有用，而不是让 graph 和 head 联合重写初始坐标分布。尤其在你的系统里 DSAC 不提供梯度，训练仍主要依赖现有 reprojection / coordinate loss。如果一开始直接预测 coordinate delta，沿相机射线方向的弱约束可能带来不可控漂移。
-输出应为：
-delta_H = graph_refiner(node, edges)
-H1 = H0 + gate * layerscale * delta_H
-X1 = head(H1)
-注意这里 head 虽然 frozen，但不能在 no_grad() 下跑最终 X1 = head(H1)，否则 graph 收不到梯度。正确语义是：head 参数 frozen，但计算图允许梯度从 loss 通过 head 输入回传到 H1 和 graph refiner。X0 可以 no_grad 或 detach；X1 不可以 no_grad。
+4. 正则必须作用在最终 effective update 上
+这一点你已经写对了，但要强调：不要正则 raw delta。
+真正进入 head 的是：
+H_out - H
+所以正则应该是：
+L_eff = ||H_out - H||_1
+或者：
+L_anchor = ||LN(H_out) - LN(H)||_2
+我建议两个都可以支持，但默认只开一个即可，避免变量太多。第一版默认更推荐：
+effective_update_l1_weight
+anchor_weight 可以先置 0，只做记录或第二轮再开。否则 safe_mlp 变成 cap + L1 + anchor 三重限制，可能完全学不动。不过它作为保险参数保留是合理的。
 
-5. Graph 结构第一版要简单，不要一开始动态图
-第一版建议固定 same-image spatial graph。最稳的是基于 target_px 的 KNN 或局部窗口邻域：
-edges_i = KNN(target_px_i, target_px_j), j in same img_idx
-如果你做的是 sampled-feature training，而不是 full image grid，KNN 的邻居不一定是密集图像邻域。所以 sampler 最好不要完全随机地从同一图像里抽 P 个 patch，而应该采样局部窗口或空间分层 patch。否则图仍然是同图，但局部邻域统计会和推理时 full grid 不一致。
-第一版可以有两种采样策略，建议先用更稳的局部窗口：
-局部窗口采样：每张图随机选一个或多个中心，在 target_px 空间中选最近的 P 个 patch rows，构成一个局部小图。这个策略最贴近 Conv/GRU 的局部上下文思想，但仍然兼容 ACE 的 buffer 训练。
-空间分层采样：把图像划成粗格，每个格子采若干点，再基于 target_px 做 KNN。这个策略覆盖更全，但边可能跨较大距离，不如局部窗口稳定。
-第一版不要用 predicted coordinate 构图。原因是如果 X0 错了，动态图会把错误预测组织成自洽簇，形成 self-confirmation。X0 可以作为 node state，但不要作为 hard edge topology。
-边特征可以很简单：
-edge_ij = [
-    PE_2D(target_px_j - target_px_i),
-    cosine(H0_i, H0_j)
-]
-第一版甚至可以先只用相对 2D PE，不加 feature cosine，减少变量。feature cosine 作为 v1.1 消融。
+5. loss_before / loss_after 诊断非常关键
+你在 trainer 里加同 batch 的：
+loss_before = loss(head(H0))
+loss_after  = loss(head(H1))
+这是必须的。它能回答一个关键问题：
+refiner 是真的改善了当前 batch，还是只是训练过程把 feature 推离 head manifold？
+建议记录四类指标：
+query_graph_loss_before
+query_graph_loss_after
+query_graph_loss_delta = after - before
+query_graph_improved_fraction
+不过要注意两个实现细节。
+第一，loss_before 只是诊断，最好不参与反传，避免增加额外梯度路径。可以 detach 或 no_grad 计算；loss_after 才参与训练。
+第二，loss_before 和 loss_after 必须使用完全相同的 valid mask、pose、intrinsics、target_px、loss config。否则差值没有意义。
+如果 short train 中出现：
+loss_after 明显低于 loss_before
+但 eval 崩
+说明 safe_mlp 仍然在 sampled distribution 上过拟合。如果训练和 eval 都不崩，再进入下一步。
 
-6. Message passing 第一版不要复杂
-第一版 graph refiner 只需要一层或两层，目标不是追求表达力，而是验证同图关系是否真的有收益。建议结构语义是：
-message_ij = MLP([node_j, edge_ij])
-alpha_ij = softmax_j(MLP([node_i, node_j, edge_ij]))
-m_i = sum_j alpha_ij * message_ij
-delta_H_i = MLP([node_i, m_i])
-gate_i = sigmoid(MLP([node_i, m_i]) + gate_bias)
-H1_i = H0_i + gate_i * gamma * delta_H_i
-初始化必须保守：
-gamma init: 很小，例如 0.01 或更低
-gate bias: 负值，让初始 gate 偏小
-delta output projection: 可零初始化
-residual L1: 小权重
-这样 SC-QGR 初始近似 strong single，不会一开始破坏已有稳定路径。这个思路和 PMRF-v3 里 patch/common LayerScale 的安全哲学一致；只是 SC-QGR 的 residual 来源不再是 second memory read，而是 same-image query graph。PMRF-v3 当前已经使用 centered residual、QK norm、patch/common LayerScale，并且 v3_adapter_control 也作为 query-only matched control 存在，因此 SC-QGR 必须更严格地证明它不是“多一个 residual MLP”。
+6. freeze_base 要同时控制 requires_grad 和 train/eval mode
+你写的 freeze_base 方向是对的，但需要更严格：
+frozen base: requires_grad=False + eval()
+query_graph_refiner: requires_grad=True + train()
+optimizer: only query_graph_refiner params
+这三件事缺一不可。尤其是 frozen base 的 eval() 很重要。否则 frozen fusion/backbone 中的 dropout 或 normalization 行为仍然可能随机变化，safe_mlp 会学到一个不稳定目标。
+日志建议打印：
+query_graph_freeze_base=True
+frozen_modules_eval_mode=True
+optimizer_param_groups=[query_graph_refiner]
+trainable_param_count
+frozen_param_count
+如果 optimizer 里还残留 base 参数，即使 requires_grad=False 通常不会更新，也会让实验审计很混乱。
 
-7. 训练策略必须采用 Stage B 冻结基座
-你提出 “Stage B 冻结 backbone、compressor、fusion、head，只训练 graph refiner” 是正确的。第一版不要联合训练，因为联合训练会让所有归因混掉。
-推荐流程是：
-Stage A:
-  使用已有 strong single checkpoint
+7. mlp_control 应该保留，但标注为 unbounded baseline
+我同意保留当前 mlp_control，但暂停作为有效 baseline。它现在的意义是负面对照：
+unbounded feature residual 会灾难性破坏 frozen head
+未来如果写实验，它可以作为 appendix 里的 failure case，但不应该拿来和 SC-QGR 比。真正的容量 baseline 应该是：
+safe_mlp_control
+否则 SC-QGR 只要“不崩”就能赢过当前 mlp_control，这没有研究价值。
 
-Stage B:
-  freeze backbone
-  freeze GeoLMC / memory compressor
-  freeze LMC fusion
-  freeze coordinate head
-  train query_graph_refiner only
-训练 loss 使用现有 loss，不引入 DSAC。因为你已经明确 DSAC 在当前工作中只是无梯度位姿解算器，它不能作为可学习闭环。SC-QGR 的训练目标应保持：
-refined_features -> regressor.get_scene_coordinates(...) -> existing reprojection / coordinate loss
-同时加一个小的 residual regularization：
-L_total = L_existing(X1) + λ * ||gate * gamma * delta_H||_1
-是否加 L_existing(X0) 作为辅助不建议第一版加入，因为 base frozen，X0 本身不会更新。可以记录 X0 loss，作为“refinement 改善/恶化多少”的诊断指标，但不需要把它放进训练目标。
-第一版训练时还要记录：
-loss_before_graph
-loss_after_graph
-fraction_improved_patches
-delta_H_norm
-gate_mean / gate_histogram
-edge_attention_entropy
-否则即使 pose 指标有变化，也很难判断 graph 是在修正局部错误，还是只是做了 feature smoothing。
+8. 最小验证矩阵是对的，但通过标准还可以更硬
+你列的四步非常合理：
+1. none
+2. identity_control
+3. safe_mlp_control iter0 eval
+4. safe_mlp_control short train
+我建议把通过标准具体化为：
+identity_control:
+  Acc / MedR / MedT 接近 single
+  query_graph_update_norm = 0
+  eval summary 标记 identity path enabled
 
-8. eval 侧必须提前想清楚
-训练时你用 grouped sampled patches，但测试 pose 时通常需要对整张 query feature map 输出 scene coordinates。SC-QGR 必须支持 eval full-map 或至少支持按图分块处理。
-第一版建议 eval 直接在完整 query grid 上构建稀疏局部 graph：
-nodes = all query patches
-edges = 4/8-neighbor or KNN in target_px grid
-如果显存压力大，再做 tile/block 方式，但要避免 tile 边界带来明显不一致。训练 sampler 如果使用局部窗口，eval full-grid 的分布差异会小一些；如果训练时是同图随机点，eval full-grid 的局部性会更强，可能出现 train-test gap。
-因此我建议第一版 sampler 直接模拟 eval：局部窗口 + 2D KNN/邻接。不要全图随机同图采样。
+safe_mlp iter0:
+  Acc / MedR / MedT 接近 single
+  update_norm_ratio 接近 0 或严格小于 cap
+  gate_eff <= gate_max
+  gamma_eff <= layerscale_max
 
-9. 必须做的 controls
-你列的 controls 很完整，我建议第一版最小矩阵如下：
-1. strong single
-2. PMRF-v3
-3. CCF-lite
-4. SC-QGR-v1
-5. MLP-control
-6. shuffled-edges
-7. cross-image-edges
-其中最关键的是 5、6、7。
-MLP-control：同样输入 H0 + PE_2D + PE_3D(X0)，但不看邻居，只输出 feature residual。这个对照回答：涨分是否只是因为多了一个 per-node residual network。
-shuffled-edges：同一图像内节点不变，但边随机打乱。这个对照回答：真实 target_px 空间关系是否重要。
-cross-image-edges：节点数量、边数量、参数量保持一致，但故意把邻居换成其他图像的 patch。这个对照回答：graph 是否真的依赖同图结构。如果 cross-image 也涨，说明模块只是 regularizer，不是 query context。
-如果 SC-QGR 不能同时超过这三个 control，就不能声称“同图 patch 协同有效”。最多只能说“额外 residual capacity 有帮助”。
+safe_mlp short train:
+  Acc50/Acc25 不灾难性退化
+  MedT 不出现数量级恶化
+  gate_eff 不饱和到 gate_max
+  update_norm_ratio 稳定小于 cap
+  loss_after 不靠巨大 update 低于 loss_before
+这里“接近 single”不必要求完全相同，因为 eval 可能存在微小随机性，但不能出现从 95% Acc25 掉到个位数这种情况。若 identity 或 iter0 出现明显掉点，直接查通路，不继续训练。
 
-10. 成功判据不要只看 Acc25
-第一版成功不能只看宽阈值，因为已有 PMRF/common-scale 现象已经说明某些 residual 会提升 Acc25/Acc10，但伤害 Acc2/Acc1 或 median translation。你提供的事实文档里，centered 和 PMRF 在 Bears/Squarebench 上呈现明显 trade-off；Tendrils 上所有 reread/common variants 都很弱，这说明只看粗指标很容易误判。
-建议第一轮成功标准是：
-SC-QGR-v1 > strong single
-SC-QGR-v1 > MLP-control
-SC-QGR-v1 > shuffled-edges
-SC-QGR-v1 > cross-image-edges
-并且至少满足：
-Acc5 / Acc2 不下降
-MedT 不恶化
-Acc25 / Acc10 不靠大幅牺牲 strict metrics 换来
-场景上建议优先：
-Bears
-Cubes
-Squarebench
-Tendrils
-解释如下。Bears 和 Squarebench 是 PMRF/centered 已经出现不同收益模式的场景；Cubes 是 strong single 很强、容易检验 graph 是否破坏 baseline 的场景；Tendrils 不应设为必须提升，而应作为 failure diagnostic。如果 SC-QGR 也救不了 Tendrils，但 real graph 与 shuffled/cross-image 差异明显，仍然说明方法有价值；如果所有东西都一样，Tendrils 失败就更可能是 memory/feature 表征上游问题。
+9. 暂停事项完全正确
+这几件事现在都应该暂停：
+暂停当前 unbounded mlp_control 作为主对照
+不上 sc_qgr_v1
+不跑 Squarebench/Tendrils
+不碰 ace_fusion.py 的 PMRF/CCF/reread
+不做 direct coordinate delta
+不做 memory graph
+尤其不要碰 ace_fusion.py。当前问题已经在 query-side refiner 通路，不应该把 PMRF/CCF 主线再混进来。
 
-11. 我对你当前计划的微调建议
-你的实现顺序基本正确，我只建议补三个约束。
-第一，lmc_query_graph_refine_mode != none 时不仅要强制 indexed buffer，还应该在日志和 checkpoint 中显式写出：
-query_graph_requires_img_idx=True
-query_graph_sampler=grouped_by_img_idx
-query_graph_edge_source=target_px
-否则后面复现实验时很容易混到非 grouped sampler。
-第二，freeze_base=True 第一版应当是硬默认，最好训练日志里打印每类参数的 requires_grad 统计。这个模块一旦不小心让 head 或 fusion 参与更新，实验就不再是“query graph refinement”验证，而变成了新一轮联合微调。
-第三，第一版不要让 CCF-lite 的 gate stats 或 PMRF 的 attention stats 进入 SC-QGR node feature。它们可以记录，但不要作为主方法输入。否则如果 SC-QGR 有收益，你无法判断收益来自同图 patch graph，还是来自 attention confidence feature。后续如果图本身成立，再加入这些信号作为 v2。
+10. 我建议最终把这次 patch 定义为 “identity-safe query refiner infrastructure”
+这次修改的研究意义不是模型本身，而是建立一个可靠前置条件：
+后续所有 SC-QGR 实验都必须建立在 identity-safe 和 capped-residual-safe 的通路上。
+所以这次 patch 的目标可以明确写成：
+Add identity-safe query graph refinement infrastructure.
 
-12. 最终结论
-你这版核对之后，SC-QGR-v1 的边界已经非常清楚：
-它不是 ace_fusion.py 的第十三个 refinement mode，而是一个 trainer/test pipeline 中的 query-side refinement stage。它接在 _fuse_lmc_features_for_head(...) 之后，接在 regressor.get_scene_coordinates(...) 之前；它必须使用 img_idx + target_px 构建真实同图小图；它第一版只服务 strong single，不和 PMRF/CCF 混合；它只输出 feature residual，不直接预测 coordinate delta；它第一轮冻结所有基座，只训练 graph refiner。
-我认为你下一步最应该锁定的不是 GNN 结构，而是 grouped sampler 的正确性。如果 sampler 做对了，即使第一版 graph 很简单，实验结论也是可信的；如果 sampler 错了，再复杂的 graph 都只是在伪网格上做无意义消息传递。
+Modes:
+  none
+  identity_control
+  mlp_control
+  safe_mlp_control
+
+Purpose:
+  verify grouped sampler, feature-refiner insertion point,
+  frozen-base training, checkpoint/eval restore, and capped residual safety
+  before implementing actual graph message passing.
+这就是当前最稳、最可解释的下一步。
+
+最终判断
+你的计划是正确的，而且比继续调 GNN 结构重要得多。当前结果已经说明：只要 head 前 feature residual 不受硬约束，就会把 frozen ACE head 的输入分布打崩。 所以下一步必须先建立：
+identity_control 证明路径无 bug；
+safe_mlp_control 证明受限 residual 不破坏 single；
+然后才有资格做 sc_qgr_v1。
+真正 SC-QGR 的有效对照也必须是 safe_mlp_control，不是当前失控的 mlp_control。这点要从现在就锁死。

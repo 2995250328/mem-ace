@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -135,6 +136,7 @@ def _feature_yx_and_center(xy_model: np.ndarray, frame: Frame, output_subsample:
     return np.array([y_cell, x_cell], dtype=np.int32), center, alignment_error, inside
 
 
+@lru_cache(maxsize=256)
 def _load_sparse_depth(path: Path) -> np.ndarray:
     if path.suffix.lower() == ".npz":
         data = np.load(path, allow_pickle=False)
@@ -169,19 +171,85 @@ def _sparse_depth_lookup(sparse_dir: Path | None, frame: Frame, xy_original: np.
     return bool(np.any(np.asarray(patch, dtype=np.float64) > 0.0))
 
 
-def _image_name_index(reconstruction, frames: list[Frame]) -> dict[int, Frame]:
+def _projection_center(image) -> np.ndarray | None:
+    try:
+        center = np.asarray(image.projection_center(), dtype=np.float64).reshape(-1)
+    except Exception:
+        return None
+    if center.shape[0] != 3 or not np.all(np.isfinite(center)):
+        return None
+    return center
+
+
+def _image_name_index(
+    reconstruction,
+    frames: list[Frame],
+    match_mode: str = "auto",
+    max_pose_center_dist_m: float = 0.10,
+) -> tuple[dict[int, Frame], dict[str, object]]:
     by_name: dict[str, Frame] = {}
     for frame in frames:
         by_name[frame.name] = frame
         by_name[frame.stem] = frame
         by_name[frame.rgb_path.as_posix()] = frame
-    out: dict[int, Frame] = {}
+    name_out: dict[int, Frame] = {}
     for image in reconstruction.images.values():
         candidates = [str(image.name), Path(str(image.name)).name, Path(str(image.name)).stem]
         frame = next((by_name[c] for c in candidates if c in by_name), None)
         if frame is not None:
-            out[int(image.image_id)] = frame
-    return out
+            name_out[int(image.image_id)] = frame
+
+    stats: dict[str, object] = {
+        "image_match_mode_requested": str(match_mode),
+        "image_name_matches": int(len(name_out)),
+        "image_pose_matches": 0,
+        "image_pose_max_center_dist_m": float(max_pose_center_dist_m),
+        "image_match_mode_used": "name" if name_out else None,
+    }
+    if match_mode == "name" or (match_mode == "auto" and name_out):
+        return name_out, stats
+    if match_mode not in {"auto", "pose"}:
+        raise ValueError(f"Unknown image match mode: {match_mode}")
+
+    if not frames:
+        return {}, stats
+    frame_centers = np.stack([frame.c2w[:3, 3].astype(np.float64) for frame in frames], axis=0)
+    candidates: list[tuple[float, int, int]] = []
+    k = min(16, len(frames))
+    max_dist = float(max_pose_center_dist_m)
+    for image in reconstruction.images.values():
+        center = _projection_center(image)
+        if center is None:
+            continue
+        dists = np.linalg.norm(frame_centers - center[None, :], axis=1)
+        if k >= len(frames):
+            nearest = np.arange(len(frames))
+        else:
+            nearest = np.argpartition(dists, kth=k - 1)[:k]
+        for frame_idx in nearest:
+            dist = float(dists[int(frame_idx)])
+            if dist <= max_dist:
+                candidates.append((dist, int(image.image_id), int(frame_idx)))
+
+    pose_out: dict[int, Frame] = {}
+    used_images: set[int] = set()
+    used_frames: set[int] = set()
+    pose_dists: list[float] = []
+    for dist, image_id, frame_idx in sorted(candidates, key=lambda x: x[0]):
+        if image_id in used_images or frame_idx in used_frames:
+            continue
+        used_images.add(image_id)
+        used_frames.add(frame_idx)
+        pose_out[image_id] = frames[frame_idx]
+        pose_dists.append(float(dist))
+
+    stats["image_pose_matches"] = int(len(pose_out))
+    stats["image_match_mode_used"] = "pose" if pose_out else None
+    if pose_dists:
+        stats["image_pose_center_dist_m_p50"] = float(np.percentile(pose_dists, 50))
+        stats["image_pose_center_dist_m_p95"] = float(np.percentile(pose_dists, 95))
+        stats["image_pose_center_dist_m_max"] = float(max(pose_dists))
+    return pose_out, stats
 
 
 def _collect_observations(reconstruction, point, image_id_to_frame: dict[int, Frame]):
@@ -222,6 +290,8 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=None, help="Default: <scene>/<split>/colmap_keyframe_channel_v1")
     parser.add_argument("--image-resolution", type=int, default=512)
     parser.add_argument("--image-width", type=int, default=None)
+    parser.add_argument("--target-backbone", choices=("custom", "ace_fcn", "dinov2"), default="custom",
+                        help="Convenience preset for feature-grid alignment. dinov2 sets output_subsample=14 and round_image_multiple=14.")
     parser.add_argument("--output-subsample", type=int, default=8, help="ACE-FCN=8, DINOv2=14.")
     parser.add_argument("--round-image-multiple", type=int, default=1, help="ACE-FCN=1, DINOv2=14.")
     parser.add_argument("--min-track-length", type=int, default=4)
@@ -231,20 +301,39 @@ def main() -> None:
     parser.add_argument("--min-parallax-deg", type=float, default=2.0)
     parser.add_argument("--max-parallax-deg", type=float, default=60.0)
     parser.add_argument("--max-anchor-alignment-px", type=float, default=2.0)
+    parser.add_argument("--max-target-alignment-px", type=float, default=0.0, help="Target keypoint to target patch-center distance limit; <=0 disables. Use for DINO patch-center targets.")
     parser.add_argument("--alignment-sigma-px", type=float, default=None)
     parser.add_argument("--sparse-depth-dir", type=Path, default=None, help="Optional sparse-depth dir; if set, anchors must hit a positive sparse-depth seed.")
     parser.add_argument("--sparse-depth-radius-px", type=int, default=0)
     parser.add_argument("--skip-depth-filter", action="store_true", help="Use only COLMAP observations and 2D filters; disables ACE-pose positive-depth checks.")
+    parser.add_argument("--image-match-mode", choices=("auto", "name", "pose"), default="auto",
+                        help="Match COLMAP images to ACE frames by filename, by pose center, or filename with pose fallback.")
+    parser.add_argument("--max-pose-center-dist-m", type=float, default=0.10,
+                        help="Maximum camera-center distance for --image-match-mode pose/auto fallback.")
     args = parser.parse_args()
+    if args.target_backbone == "ace_fcn":
+        args.output_subsample = 8
+        args.round_image_multiple = 1
+    elif args.target_backbone == "dinov2":
+        args.output_subsample = 14
+        args.round_image_multiple = 14
 
     import pycolmap
 
     split_root = args.scene_root / args.split
     frames = _load_frames(split_root, args.image_resolution, args.image_width, args.round_image_multiple)
     reconstruction = pycolmap.Reconstruction(str(args.model_dir))
-    image_id_to_frame = _image_name_index(reconstruction, frames)
+    image_id_to_frame, image_match_stats = _image_name_index(
+        reconstruction,
+        frames,
+        match_mode=str(args.image_match_mode),
+        max_pose_center_dist_m=float(args.max_pose_center_dist_m),
+    )
     if not image_id_to_frame:
-        raise RuntimeError("No COLMAP images matched ACE rgb filenames.")
+        raise RuntimeError(
+            "No COLMAP images matched ACE frames. "
+            f"match_mode={args.image_match_mode}, max_pose_center_dist_m={args.max_pose_center_dist_m}"
+        )
 
     output_dir = args.output_dir or (split_root / "colmap_keyframe_channel_v1")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -310,6 +399,16 @@ def main() -> None:
                 continue
 
             target_frame, target_xy, target_xy_m, parallax = best_target
+            target_feature_yx, target_patch_center, target_align_err, target_inside_feature = _feature_yx_and_center(
+                target_xy_m,
+                target_frame,
+                int(args.output_subsample),
+            )
+            if not target_inside_feature:
+                continue
+            max_target_alignment_px = float(args.max_target_alignment_px or 0.0)
+            if max_target_alignment_px > 0.0 and target_align_err > max_target_alignment_px:
+                continue
             alignment_weight = float(math.exp(-0.5 * (align_err / max(sigma, 1e-6)) ** 2))
             row = {
                 "anchor_image_idx": int(anchor_frame.image_idx),
@@ -324,6 +423,9 @@ def main() -> None:
                 "target_image_idx": int(target_frame.image_idx),
                 "target_xy_original": target_xy.astype(np.float32),
                 "target_xy_model": target_xy_m.astype(np.float32),
+                "target_feature_yx": target_feature_yx.astype(np.int32),
+                "target_patch_center_xy": target_patch_center.astype(np.float32),
+                "target_alignment_error_px": float(target_align_err),
                 "target_track_flag": True,
                 "track_flag": True,
                 "parallax_deg": float(parallax),
@@ -353,6 +455,13 @@ def main() -> None:
     np.savez_compressed(
         out_npz,
         schema_version=np.asarray("colmap_keyframe_channel_v1"),
+        target_backbone=np.asarray(str(args.target_backbone)),
+        output_subsample=np.asarray(int(args.output_subsample), dtype=np.int64),
+        patch_stride=np.asarray(int(args.output_subsample), dtype=np.int64),
+        round_image_multiple=np.asarray(int(args.round_image_multiple), dtype=np.int64),
+        image_resolution=np.asarray(int(args.image_resolution), dtype=np.int64),
+        image_width=np.asarray(-1 if args.image_width is None else int(args.image_width), dtype=np.int64),
+        pixel_target_convention=np.asarray("exact_target_with_patch_center"),
         anchor_image_idx=array("anchor_image_idx", np.int64),
         anchor_xy_original=stack("anchor_xy_original", np.float32).reshape(-1, 2),
         anchor_xy_model=stack("anchor_xy_model", np.float32).reshape(-1, 2),
@@ -365,6 +474,9 @@ def main() -> None:
         target_image_idx=array("target_image_idx", np.int64),
         target_xy_original=stack("target_xy_original", np.float32).reshape(-1, 2),
         target_xy_model=stack("target_xy_model", np.float32).reshape(-1, 2),
+        target_feature_yx=stack("target_feature_yx", np.int32).reshape(-1, 2),
+        target_patch_center_xy=stack("target_patch_center_xy", np.float32).reshape(-1, 2),
+        target_alignment_error_px=array("target_alignment_error_px", np.float32),
         target_track_flag=array("target_track_flag", bool),
         track_flag=array("track_flag", bool),
         parallax_deg=array("parallax_deg", np.float32),
@@ -378,8 +490,10 @@ def main() -> None:
         "scene_root": str(args.scene_root),
         "split": str(args.split),
         "model_dir": str(args.model_dir),
+        "target_backbone": str(args.target_backbone),
         "num_train_frames": len(frames),
         "num_colmap_images_matched": len(image_id_to_frame),
+        **image_match_stats,
         "points_seen": points_seen,
         "points_kept_after_point_filters": points_kept,
         "candidate_rows_before_cell_dedup": candidate_rows,
@@ -387,7 +501,10 @@ def main() -> None:
         "output_subsample": int(args.output_subsample),
         "round_image_multiple": int(args.round_image_multiple),
         "image_resolution": int(args.image_resolution),
+        "image_width": None if args.image_width is None else int(args.image_width),
+        "pixel_target_convention": "exact_target_with_patch_center",
         "max_anchor_alignment_px": float(args.max_anchor_alignment_px),
+        "max_target_alignment_px": float(args.max_target_alignment_px or 0.0),
         "min_parallax_deg": float(args.min_parallax_deg),
         "max_parallax_deg": float(args.max_parallax_deg),
         "min_track_length": int(args.min_track_length),

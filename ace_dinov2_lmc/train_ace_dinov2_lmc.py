@@ -1027,7 +1027,8 @@ def _log_configuration_summary(args, output_layout, full_log_path):
         # ACE-G specific parameters
         if getattr(args, 'lmc_flow', 'iterative') == 'ace_g':
             _logger.info(
-                "ACE-G params : fusion_in_s2=%s, fusion_lr_ratio=%.4f, cross_iter_eval=%s",
+                "ACE-G params : s2_schedule=%s, fusion_in_s2=%s, fusion_lr_ratio=%.4f, cross_iter_eval=%s",
+                getattr(args, 'ace_g_s2_schedule', 'every_iter'),
                 args.ace_g_fusion_in_s2,
                 args.ace_g_fusion_lr_ratio,
                 args.ace_g_cross_iter_eval,

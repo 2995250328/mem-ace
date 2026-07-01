@@ -1,0 +1,187 @@
+\documentclass[letterpaper]{article} % DO NOT CHANGE THIS
+\usepackage[submission]{aaai2027}  % DO NOT CHANGE THIS
+\usepackage[hyphens]{url}  % DO NOT CHANGE THIS
+\usepackage{graphicx} % DO NOT CHANGE THIS
+\urlstyle{rm} % DO NOT CHANGE THIS
+\def\UrlFont{\rm}  % DO NOT CHANGE THIS
+\usepackage{natbib}  % DO NOT CHANGE THIS AND DO NOT ADD ANY OPTIONS TO IT
+\usepackage{caption} % DO NOT CHANGE THIS AND DO NOT ADD ANY OPTIONS TO IT
+\frenchspacing  % DO NOT CHANGE THIS
+\usepackage{booktabs}
+
+\pdfinfo{
+/TemplateVersion (2027.1)
+}
+
+\setcounter{secnumdepth}{0}
+
+\newcommand{\method}{Memory-Augmented ACE}
+\newcommand{\shortmethod}{Mem-ACE}
+\newcommand{\geocomp}{Geo-token compressor}
+\newcommand{\scr}{SCR}
+\newcommand{\accfive}{Acc5}
+\newcommand{\accten}{Acc10}
+\newcommand{\acctwentyfive}{Acc25}
+
+\title{\shortmethod{}: Compact Scene Memory for Coordinate Regression Relocalization}
+\author{Anonymous Submission}
+\affiliations{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Scene coordinate regression (SCR) has made camera relocalization fast to train, but scene-specific evidence is still usually absorbed into one coordinate head. This coupling limits how easily a relocalizer can reuse map evidence when the feature extractor, head capacity, or scene scale changes. We introduce \method{} (\shortmethod{}), a plug-in memory interface for SCR. \shortmethod{} builds a compact latent memory from pooled 3D anchors and their descriptors, compresses the memory into $K$ geometry-aware tokens, and lets query features retrieve from these tokens before dense coordinate prediction. Training keeps the SCR pose solver and reprojection objective unchanged. Each outer iteration first aligns the memory compressor and fusion module with reprojection supervision, then freezes the compressor, caches the latent memory, and adapts the coordinate head through per-batch memory fusion. This design turns scene memory into an explicit, inspectable module while preserving compatibility with existing SCR pipelines. We evaluate the resulting training protocol on indoor, map-free, and outdoor landmark relocalization settings.
+\end{abstract}
+
+\section{Introduction}
+
+Camera relocalization estimates the six-degree-of-freedom camera pose of a query image in a known scene. Scene coordinate regression approaches solve this task by predicting dense 3D scene coordinates and then recovering pose from 2D--3D correspondences with a robust geometric solver. DSAC and its successors established this formulation, while ACE made per-scene SCR training fast enough to serve as a practical visual relocalization baseline~\citep{brachmann2017dsac,brachmann2021dsacstar,brachmann2023ace}. Recent systems further improve the representation side of SCR with global-local context and query pre-training~\citep{GLACE2024CVPR,bruns2025aceg}.
+
+These advances leave a representation question open: how should scene-specific evidence be stored when the coordinate head should stay small, the encoder may change, and the pose solver should remain geometric? A strong SCR system already has an image encoder, a coordinate head, and a tested RANSAC-style endpoint. Replacing that stack is unnecessary. We instead treat scene memory as an additive layer: it should be compact, geometrically grounded, compatible with different feature spaces, and trainable under the same reprojection supervision that already drives SCR.
+
+We instantiate this idea as \method{} (\shortmethod{}). A pooled scene memory stores 3D anchors and their feature descriptors. A \geocomp{} reduces this memory to a fixed number of latent tokens whose coordinates remain tied to the scene. A memory fusion module then lets query features read the latent tokens before the coordinate head. The training flow alternates two phases. The memory-alignment phase trains the compressor and fusion module with SCR reprojection loss. The head-adaptation phase freezes the compressor, caches the compressed memory, stores unconditioned query features in the training buffer, and applies memory fusion per batch while training the coordinate head. This preserves the normal SCR objective while making the memory branch explicit and easy to inspect.
+
+This paper makes the design concrete through four components: pooled scene memory, geometry-aware token compression, alternating memory training, and a single-read fusion module from query features to memory tokens. The core contribution is narrow and testable: a compact scene-memory plug-in for existing SCR systems, with a reproducible training protocol.
+
+Our contributions are:
+\begin{itemize}
+    \item We formulate \method{} as a plug-in scene-memory layer for SCR, separating the memory interface from the image feature extractor, coordinate head, and pose solver.
+    \item We describe an alternating training framework in which memory alignment trains the compressor and fusion module, while head adaptation freezes the compressor and continues reprojection training through per-batch memory fusion.
+    \item We detail the \geocomp{}, including deterministic latent-coordinate sampling, multi-level memory-feature handling, and geometry-aware latent-to-memory attention.
+    \item We define the evaluation protocol and dataset roles for Indoor6, Wayspots, and Cambridge Landmarks under the same training protocol.
+\end{itemize}
+
+
+\section{Related Work}
+
+\paragraph{Visual relocalization and scene coordinate regression.}
+Classical visual relocalization builds an explicit map from posed or reconstructed images, associates 3D points with local descriptors, and estimates query pose from 2D--3D matches with a robust geometric solver. Hierarchical localization remains strong under large viewpoint and appearance changes, but it requires structure-from-motion or SLAM preprocessing and stores searchable descriptors at test time~\citep{sarlin2019coarse}. Scene coordinate regression (SCR) keeps the geometric pose endpoint while replacing descriptor matching with dense coordinate prediction. Early SCR used regression forests for RGB-D relocalization~\citep{shotton2013scrf}; DSAC and its successors connected coordinate prediction to differentiable RANSAC-style training and made RGB-only SCR practical~\citep{brachmann2017dsac,brachmann2018lessmore,brachmann2021dsacstar}. ACE later reduced per-scene training time by using a scene-agnostic encoder and a small scene-specific coordinate head~\citep{brachmann2023ace}. Recent ACE-style variants improve robustness by changing how image evidence is selected or conditioned: FocusTune samples more informative regions with help from a projected 3D model~\citep{nguyen2024focustune}, GLACE adds global-local context for larger or repetitive scenes~\citep{GLACE2024CVPR}, and Xu et al. jointly learn scene encoding and salient keypoint detection with sequential associations~\citep{xu2024efficient}. These methods show that fast SCR benefits from better-conditioned correspondences. Our method follows this direction, but stores the additional scene evidence in a compact latent memory rather than in a new sampling policy or a heavier coordinate head.
+
+\paragraph{Map-conditioned and scene-agnostic SCR.}
+A second line of work separates the scene representation from the coordinate regressor. NeuMap formulates camera localization as neural coordinate mapping with scene-specific latent codes and an auto-transdecoder, but its regressor is trained per evaluation dataset and the method relies on sparse 3D reconstructions for the evaluation scenes~\citep{tang2023neumap}. ACE-G makes the separation more explicit by replacing the ACE scene-specific MLP with a scene-agnostic coordinate regressor conditioned on learned map codes, and improves generalization through mapping/query pre-training~\citep{bruns2025aceg}. \shortmethod{} shares the goal of separating scene evidence from the regressor, but keeps compatibility with existing SCR heads and pose solvers. In the main setting, the memory fusion module reads a compressed scene state of $64\times1024=65{,}536$ feature values, plus 64 latent 3D coordinates. ACE-G reports novel-scene map codes with $N_C=4096$ and $D_{\mathrm{map}}=768$, about 12 MB in full precision~\citep{bruns2025aceg}. Counting the feature values exposed to the coordinate predictor, the \shortmethod{} conditioning state is $48\times$ smaller.
+
+\section{Method}
+
+\subsection{Problem Setup}
+
+Let $I$ be a query image and let $E$ be a frozen image encoder that produces a dense feature map $Q=E(I)$. An SCR head $H$ predicts scene coordinates
+\begin{equation}
+    X = H(Q),
+\end{equation}
+where $X$ contains a 3D coordinate for each output-grid location. Training minimizes the standard SCR reprojection objective: predicted 3D points are projected through the ground-truth camera and intrinsics, and valid correspondences are penalized by pixel reprojection error while invalid predictions receive the standard ACE-style invalid-coordinate penalty.
+
+\shortmethod{} changes only the feature interface before the head:
+\begin{equation}
+    \widetilde{Q} = F_{\phi}(Q, C_{\theta}(M)), \qquad X = H(\widetilde{Q}).
+\end{equation}
+Here $M$ is a scene memory, $C_{\theta}$ is the \geocomp{}, and $F_{\phi}$ is the memory fusion function. This interface is deliberately minimal. The only requirement is that the base relocalizer exposes dense query features before coordinate prediction.
+
+\subsection{Pooled Memory Interface}
+
+\shortmethod{} consumes a pooled memory representation rather than a raw point cloud. At minimum, the memory contains 3D anchors and one feature descriptor for each anchor. The anchors may be expressed in world coordinates or in the coordinate system used by the relocalizer. The memory representation may also carry a scene center, feature-level indices, scale tokens, camera poses and intrinsics, ray directions, normalization metadata, and feature-source tags. Before training, we validate tensor shapes, finite values, scene-center consistency, scale-token availability, and feature-layer divisibility.
+
+This interface decouples memory extraction from SCR training. Memory can be extracted from any compatible feature source. The downstream trainer receives a scene memory consisting of 3D anchors and associated feature descriptors.
+
+\subsection{\geocomp{} Design}
+
+The \geocomp{} maps $N$ memory anchors to $K$ latent tokens, with $K \ll N$. In the default global mode, latent coordinates are initialized by deterministic farthest-point sampling from the pooled 3D anchors, starting from the anchor farthest from the scene center. Training and evaluation therefore reconstruct the same latent coordinates from the same memory and checkpoint configuration. In the main configuration, $K=64$ and each latent token has a 1024-dimensional feature, yielding a compressed conditioning state of $64\times1024=65{,}536$ feature values before adding the latent 3D coordinates.
+
+Each latent token uses its sampled 3D coordinate as a query seed. Coordinates are centered by the scene center and encoded with a positional encoding. The compressor then attends from latent queries to memory keys and values. For multi-level memory features, the default path uses selected-key, concatenated-value compression: keys are projected from one selected feature level, while values are projected from the concatenation of all levels. This keeps key matching focused while preserving the full memory descriptor in the value path. The default selected level is the third slice when multiple levels are present, or the only slice for single-level memory.
+
+The compressor also supports levelwise compression ablations. One path projects and compresses each feature level separately, then merges the levelwise latent tokens with a softmax gate. Another keeps the selected-key path as an anchor and adds a zero-initialized levelwise residual. These modes preserve the default behavior at initialization while allowing the system to test whether multi-level memory should influence compression more directly.
+
+\subsection{Memory Fusion}
+
+The fusion module performs a single memory read. It encodes latent coordinates relative to the scene center, adds coordinate information to memory values, projects query features to attention queries, and reads the compressed latent memory through cross-attention. The output is added residually and passed through a small feed-forward block before the coordinate head. In symbols,
+\begin{equation}
+    \widetilde{Q} = F_{\phi}(Q, Z, P, c),
+\end{equation}
+where $Z$ are latent memory features, $P$ are latent 3D coordinates, and $c$ is the scene center.
+
+The fusion module is a feature-level conditioning layer, not a new pose solver. Pose recovery remains the standard SCR pipeline. This is why the same fusion module can be used across different SCR feature extractors: it only needs query features and compressed memory tokens.
+
+\subsection{Alternating Memory Training}
+
+The training flow alternates memory alignment and head adaptation inside each outer iteration. Table~\ref{tab:training_protocol} summarizes which modules are trainable in each phase.
+
+\begin{table}[t]
+\centering
+\caption{Training protocol. The encoder remains frozen in the SCR setting. Adapt-Frozen is the default route, while Adapt-Slow optionally continues updating the fusion module with a small learning rate.}
+\label{tab:training_protocol}
+\small
+\begin{tabular}{llll}
+\toprule
+Phase & Compressor & Fusion & Head \\
+\midrule
+Alignment & train & train & train \\
+Adapt-Frozen & frozen & frozen & train \\
+Adapt-Slow & frozen & slow LR & train \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Memory alignment.}
+The alignment phase trains the compressor and fusion module under the same reprojection supervision as SCR. The image encoder is kept in evaluation mode. In the online path, each batch is encoded, conditioned by the current compressed memory, and passed through the coordinate head. In the buffered path used by the main configuration, unconditioned query features and geometric supervision are sampled from a training buffer and conditioned on the fly. Both paths optimize reprojection and invalid-coordinate losses on the predicted scene coordinates. The first outer iteration uses a longer warmup; later iterations use fewer alignment updates and a lower learning-rate scale to avoid destabilizing the already-trained memory-fusion path.
+
+\paragraph{Head adaptation.}
+At the beginning of the adaptation phase, the compressor is explicitly frozen and validated so that no compressor parameter can receive gradients or appear in the optimizer. The compressed memory is computed once and cached. The adaptation buffer stores unconditioned query features by default. During each training step, these features are reshaped to a dense feature map, passed through the fusion module with cached memory tokens, and sent to the coordinate head. This keeps memory conditioning in the training path without rebuilding full image-encoder features on every step.
+
+The default adaptation route freezes the fusion module and trains only the coordinate head. A slow-fusion route optionally keeps the fusion module trainable with a small learning-rate ratio relative to the head. In both cases, the compressor remains frozen. This boundary is central to the method: memory alignment learns how memory should be compressed and read, while head adaptation tunes the coordinate predictor to the resulting conditioned feature distribution.
+
+\subsection{Fusion with Global-Local Encoders}
+
+For global-local coordinate encoders, \shortmethod{} uses the same feature-level interface. In the GLACE-compatible setting, the fusion module conditions the local decoder component and then concatenates the bypassed global descriptor back into the head input. This preserves the image-level global descriptor while allowing memory fusion to update the local representation.
+
+\subsection{Checkpoint and Inference}
+
+A \shortmethod{} checkpoint stores the coordinate head, compressor, fusion module, and the memory metadata needed for evaluation. The metadata records the memory source, memory mode, latent-token count, feature hierarchy, selected memory level, geometry options, global-local fusion settings when present, and whether head adaptation updated the fusion module. At evaluation time, the evaluator reconstructs the compressor and fusion module from this metadata, reloads the same pooled memory, compresses it once, and applies memory fusion before dense coordinate prediction. This keeps the training-time and evaluation-time memory interfaces aligned.
+
+\section{Experiments}
+
+\subsection{Datasets}
+
+\paragraph{Indoor6.}
+Indoor6 is our primary indoor comparison set. It contains six indoor scenes with train/validation/test splits, metric camera poses, and COLMAP-derived pseudo-ground-truth geometry suitable for extracting pooled memory~\citep{do2024improved_scene_landmarks,do2022scene_landmarks}. Indoor6 tests whether latent memory compression helps when the scene is larger or more geometrically varied than small room-scale benchmarks.
+
+\paragraph{Wayspots.}
+Wayspots provides diverse real-world relocalization scenes curated from the Niantic Map-Free benchmark and released through the ACE dataset page~\citep{arnold2022mapfree,brachmann2023ace}. It tests whether a single SCR plug-in works across scene layouts and appearance regimes. We report aggregate metrics over the available scenes and inspect representative scenes where local memory conditioning and global-context conditioning differ.
+
+\paragraph{Cambridge Landmarks.}
+Cambridge Landmarks is an outdoor urban benchmark introduced with PoseNet~\citep{kendall2015posenet}. It includes scenes such as King's College, Old Hospital, Shop Facade, Great Court, and St Mary's Church. It stresses larger-scale outdoor geometry and wider viewpoint changes than the indoor sets. We use Cambridge to check whether the same memory-conditioning interface remains practical outside indoor reconstruction-style data.
+
+\subsection{Baselines}
+
+The comparison set follows the SCR lineage. ACE is the fast scene-specific SCR baseline~\citep{brachmann2023ace}. DINOv2-ACE replaces the ACE encoder with a frozen DINOv2 feature extractor~\citep{oquab2023dinov2} while keeping the ACE-style coordinate head. GLACE provides a global-local SCR baseline~\citep{GLACE2024CVPR}. ACE-G provides a query-pretrained SCR baseline with map-code conditioning~\citep{bruns2025aceg}. Our variants differ only in the memory source, compressor setting, and fusion setting.
+
+\subsection{Metrics and Evaluation}
+
+We report median rotation error in degrees, median translation error in centimeters, and threshold accuracies. For indoor and object-scale scenes we use \accfive{}, \accten{}, and \acctwentyfive{}, denoting the fraction of test frames below 5 cm/5 deg, 10 cm/5 deg, and 25 cm/5 deg, respectively. For larger outdoor scenes such as Cambridge, we also report thresholds appropriate to the dataset scale when needed. Checkpoint selection uses the configured validation metric, with \accfive{} as the default for indoor scenes.
+
+Evaluation uses the standard ACE-style pipeline: dense scene coordinates are predicted, 2D--3D correspondences are sampled, and pose is estimated by the DSAC*/RANSAC evaluator. For \shortmethod{} checkpoints, evaluation reconstructs the compressor and fusion module from the stored memory metadata; no training-only module is required at test time.
+
+\subsection{Implementation Details}
+
+Unless otherwise stated, the main \shortmethod{} setting uses $K=64$ latent tokens with 1024-dimensional latent features, global compressor mode, deterministic farthest-from-center latent sampling, level-selected keys with concatenated values, unconditioned head-adaptation feature buffers, and per-iteration evaluation. Memory alignment uses either online encoder features or a per-image sampled buffer. Head adaptation stores unconditioned query features, freezes the compressor, caches compressed memory once per phase, and applies memory fusion per batch.
+
+The memory file is produced before training. It stores pooled 3D points, pooled features, a scene center, optional scale tokens, and optional camera/ray metadata. The training pipeline validates this file before constructing the compressor. If feature-level indices are present, the number of memory feature levels is inferred from them; otherwise the pipeline uses the single-level default. This detail matters because the compressor's feature dimension is derived from the pooled feature dimension divided by the number of levels.
+
+\subsection{Ablation Plan}
+
+The core ablations isolate the memory design:
+\begin{itemize}
+    \item latent-token count $K$, especially 32, 64, and 128 tokens;
+    \item compression hierarchy, including level-selected keys, levelwise compression, and anchor-residual variants;
+    \item head-adaptation route, comparing frozen-fusion adaptation against slow-fusion continuation;
+    \item memory source, comparing pooled memories extracted from foundation features, coordinate-encoder features, and global-local encoder features.
+\end{itemize}
+All ablations use the same single-read memory fusion module and SCR reprojection objective as the main method.
+
+\section{Conclusion}
+
+We presented \method{} (\shortmethod{}), a plug-in scene-memory layer for SCR. \shortmethod{} uses a validated pooled-memory interface, a \geocomp{}, and an alternating training framework that separates memory alignment from coordinate-head adaptation. The interface operates at the feature level and leaves the pose-estimation backend unchanged. This design makes Indoor6, Wayspots, and Cambridge a clean test of compact scene memory for coordinate regression relocalization.
+
+\bibliography{ace_lmc_refs}
+
+\end{document}

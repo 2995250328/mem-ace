@@ -10,12 +10,26 @@ Use this skill for the whole LMC project, not only one method or scene. It stand
 ## Hard Rules
 
 - Work from project root `/home/xwh/project/ace_depth` when running training/eval scripts.
-- Do not launch a new matrix until the baseline command lineage is understood from existing scripts, logs, and `summary.tsv`.
+- Do not launch a new matrix until the baseline command lineage is understood from existing scripts, logs, and `summary.tsv`, unless this session already has a known comparable command family or the user explicitly asks for a fast exploratory run. In that case, record the assumption and avoid repeatedly re-recovering the same baseline.
 - Prefer tmux for long jobs. Use one window per config with stable names such as `baseline`, `alpha010`, `stage2_global`, or `scene2a_p4`.
 - Use explicit canonical `RUN_ROOT` under `/data/xwh/ace_dinov2_lmc/04_evaluation/<dataset>/<track>/<method>/<YYYYMMDD>_<scope>_<protocol>_<gpu_tag>/`; use the local `lmc-evaluation-directory-layout` skill before creating new run roots.
 - Preserve comparability: same scene list, memory source, stage schedule, seeds, eval hypotheses, image resolution, buffer settings, and GPU allocation unless the ablation explicitly changes them.
 - After training, report metric-wise best values: each metric is selected independently from all iter, cross-iter, post-s2, seed, and post-train sources available in `summary.tsv`. Do not require all metrics to come from the same checkpoint or iter.
 - Always include source/provenance paths for surprising or decision-critical results.
+
+## Autonomous Execution Contract
+
+For this repo, treat the user request as permission to execute safe experiment workflow steps end-to-end. Do not stop for confirmations about known environment, dataset roots, `mapanything`, tmux usage, result aggregation, or baseline facts already recorded in this workflow.
+
+Autonomously do:
+
+- Design and launch short or full matrices when the user asks for training.
+- Reuse known comparable baselines and avoid revalidating fixed facts in every turn.
+- After a completed run, skip GPU/process checks and aggregate results immediately.
+- Modify code only in the scoped files needed for the requested method, after recording an agent snapshot.
+- Record run provenance so a later comparison can recover the code diff, command, data paths, and output root.
+
+Pause and ask only when the next action is destructive, will overwrite existing outputs/checkpoints, exceeds the requested GPU range, changes global dependencies, or lacks enough information to avoid an invalid experiment.
 
 ## Before Launch
 
@@ -26,16 +40,22 @@ Use this skill for the whole LMC project, not only one method or scene. It stand
    - available GPUs and expected runtime
    - baseline/reference run to compare against
 
-2. Recover the true baseline:
+2. Recover the true baseline only when needed:
    - read relevant `summary.tsv`, markdown reports, and log-linked command lines
    - inspect the actual command used for good prior results
    - verify whether the baseline is single-stage, two-stage, global/no-global, GLACE/LMC, ACE-G flow, full-S1, sparse-depth, or post-train only
    - do not infer baseline settings from method names alone
+   - skip this step for repeated follow-up runs in the same experiment thread when the scene, memory source, schedule, and reference command are already known
 
 3. Validate code changes before long runs:
    - run `python -m py_compile` on touched Python files
    - run a checkpoint/load smoke test when state_dict or config serialization changes
    - dry-run shell wrappers when they support `DRY_RUN=true`
+
+4. Use a staged budget for speculative method changes:
+   - first run a short-iteration screening matrix with the same scene, memory, eval hypotheses, and seeds
+   - only promote a config to full training when the short run shows a coherent signal, such as better validation metrics plus healthy diagnostics, not just one noisy checkpoint
+   - include at least one sampler-only or negative-control arm when the mechanism is uncertain
 
 ## Matrix Design
 
@@ -43,6 +63,7 @@ Keep matrix changes small enough to interpret:
 
 - For two GPUs, run at most two primary configs concurrently unless the user asks otherwise.
 - Change one main factor at a time when restoring or validating a baseline.
+- For new loss/sampler ideas, prefer a low-iteration diagnostic matrix first, then full validation only for the best one or two configs.
 - Name configs by the changed factor, not by vague labels.
 - Put common flags in the launch command and config-specific flags in each tmux window command.
 - If a run depends on memory files, create or verify stable memory paths before launch and log the source memory path.
@@ -98,14 +119,38 @@ When a job seems slow, distinguish:
 
 Do not stop jobs only because wall time feels long; stop only after logs/processes show a real fault or the user asks to stop.
 
-## Result Aggregation
+## Completion Fast Path
 
-Primary source is every `summary.tsv` under the run root. These files should already include iter/cross/post-s2/post-train sources when the run scripts are correct.
+When the user says training has finished, do not start with GPU/process checks. Treat the user statement as authoritative unless logs contradict it. Go directly to:
 
-Use the bundled helper when possible:
+1. Locate the run root from the current thread, launcher log, train manifest, or latest known `RUN_ROOT`.
+2. Read the relevant train/eval logs only for terminal status, errors, and summary paths.
+3. Run or read the metric-wise aggregation output. Prefer existing `<run_root>/metricwise_best.tsv` and `<run_root>/metricwise_best.md`; if missing, generate them immediately with the standard helper.
+4. Report metric-wise best values and sources. Only inspect GPU/tmux state if results are missing, logs are still actively being written, or the user asks for runtime status.
+
+Standard aggregation command:
 
 ```bash
-python ace_dinov2_lmc/.codex_skills/lmc-experiment-standard-workflow/scripts/best_metric_summary.py <run_root>
+cd /home/xwh/project/ace_depth
+bash ace_dinov2_lmc/scripts/aggregate_lmc_metricwise_best.sh <run_root>
+```
+
+Launch scripts should call this helper after all training/post-train eval jobs finish, so completed runs already contain `metricwise_best.tsv` and `metricwise_best.md`.
+
+## Result Aggregation
+
+Primary source is every `summary.tsv` under the run root. These files should already include iter/cross/post-s2/post-train sources when the run scripts are correct. If no `summary.tsv` exists, the standard helper falls back to `eval_summary_*.txt` files and still applies metric-wise best aggregation.
+
+Use the standard wrapper first; it writes both machine-readable TSV and Markdown:
+
+```bash
+bash ace_dinov2_lmc/scripts/aggregate_lmc_metricwise_best.sh <run_root>
+```
+
+The wrapper calls the bundled helper:
+
+```bash
+python ace_dinov2_lmc/.codex_skills/lmc-experiment-standard-workflow/scripts/best_metric_summary.py <run_root> --sources --tsv <run_root>/metricwise_best.tsv
 ```
 
 Aggregation rule:
