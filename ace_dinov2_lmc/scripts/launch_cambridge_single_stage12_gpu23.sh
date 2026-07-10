@@ -228,7 +228,8 @@ run_stage1() {
       --c1_aux_depth_root "${train_root}/sparse_depth" \
       --c1_aux_depth_kind sparse_depth \
       --post_train_eval_seeds "${POST_TRAIN_EVAL_SEEDS[@]}" \
-      --post_train_hypotheses "${POST_TRAIN_HYPOTHESES}"
+      --post_train_hypotheses "${POST_TRAIN_HYPOTHESES}" \
+      ${EXTRA_TRAIN_ARGS:-}
 }
 
 find_stage1_ckpt() {
@@ -316,7 +317,8 @@ run_stage2() {
       --c1_aux_depth_root "${train_root}/sparse_depth" \
       --c1_aux_depth_kind sparse_depth \
       --post_train_eval_seeds "${POST_TRAIN_EVAL_SEEDS[@]}" \
-      --post_train_hypotheses "${POST_TRAIN_HYPOTHESES}"
+      --post_train_hypotheses "${POST_TRAIN_HYPOTHESES}" \
+      ${EXTRA_TRAIN_ARGS:-}
 }
 
 run_scenes_on_gpu() {

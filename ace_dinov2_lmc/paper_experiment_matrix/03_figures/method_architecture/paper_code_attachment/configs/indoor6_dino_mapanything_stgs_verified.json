@@ -1,0 +1,45 @@
+{
+  "verified_from": [
+    "scripts/launch_final_protocol_iter_buffer_probe_gpu01.sh",
+    "scripts/launch_indoor6_dino_stgs_short_gpu01.sh"
+  ],
+  "branch": "Indoor6 DINOv2 + MapAnything memory + STGS inter-frame",
+  "model_backend": "ace_dinov2",
+  "data_backend": "ace",
+  "memory_source": "MapAnything pooled memory",
+  "lmc_flow": "ace_g",
+  "lmc_profile": "legacy",
+  "lmc_mode": "global",
+  "num_latent_tokens": 64,
+  "num_attention_layers": 4,
+  "fusion_refinement_mode": "single",
+  "ace_g_fusion_in_s2": true,
+  "ace_g_fusion_lr_ratio": 0.01,
+  "lmc_iterations_probe_values": [4, 6, 10],
+  "training_buffer_size": 10000000,
+  "buffer_size_final": 10000000,
+  "buffer_batch_size": 1,
+  "image_resolution": 518,
+  "stgs": {
+    "guided_sampling": true,
+    "sampling_strategy": "balanced_replace",
+    "guided_fraction": 0.1,
+    "guided_mode": "inter_frame",
+    "source_target_mode": "patch_center",
+    "target_mode": "patch_center",
+    "inter_frame_loss": true,
+    "inter_frame_apply_to": "stage2_g",
+    "inter_frame_weight": 0.01,
+    "inter_frame_start_ratio": 0.2,
+    "inter_frame_decay_last_ratio": 0.3,
+    "inter_frame_dropout": 0.5,
+    "inter_frame_max_px": 100.0
+  },
+  "implementation_specific_not_for_main_figure": {
+    "use_scale_token": true,
+    "lmc_key_slice_idx": 2,
+    "sidecar_image_width": null,
+    "sidecar_output_subsample": 14
+  },
+  "important_stage_fact": "The verified final-protocol wrapper applies inter-frame loss to S2-G; single-frame reprojection remains the base loss throughout."
+}

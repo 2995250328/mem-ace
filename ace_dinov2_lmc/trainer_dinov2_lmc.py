@@ -1061,13 +1061,23 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return False
         apply_to = str(getattr(self.options, "sfm_track_inter_frame_apply_to", "stage2") or "stage2").lower()
         stage = str(stage_tag).upper()
+        if apply_to == "all":
+            return stage.startswith("S1") or stage in {"S2", "S2-G"}
+        if apply_to == "s1":
+            return stage.startswith("S1")
         if apply_to == "stage2_g":
             return stage == "S2-G"
         return stage in {"S2", "S2-G"}
 
-    def _sfm_track_inter_frame_schedule_scale(self) -> float:
-        steps_per_phase = max(1, int(getattr(self, "steps_per_s2_phase", 1) or 1))
-        progress = float(getattr(self, "local_s2_step", 0)) / float(steps_per_phase)
+    def _sfm_track_inter_frame_schedule_scale(self, stage_tag: str, step_eff: Optional[int] = None) -> float:
+        stage = str(stage_tag).upper()
+        if stage.startswith("S1"):
+            steps_per_phase = max(1, int(getattr(self, "_current_s1_phase_steps", 1) or 1))
+            local_step = int(getattr(self, "_current_s1_local_step", 0) or 0)
+            progress = float(local_step) / float(steps_per_phase)
+        else:
+            steps_per_phase = max(1, int(getattr(self, "steps_per_s2_phase", 1) or 1))
+            progress = float(getattr(self, "local_s2_step", 0)) / float(steps_per_phase)
         progress = min(1.0, max(0.0, progress))
         start_ratio = min(1.0, max(0.0, float(getattr(self.options, "sfm_track_inter_frame_start_ratio", 0.2) or 0.0)))
         decay_ratio = min(1.0, max(0.0, float(getattr(self.options, "sfm_track_inter_frame_decay_last_ratio", 0.3) or 0.0)))
@@ -1077,10 +1087,10 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return max(0.0, (1.0 - progress) / decay_ratio)
         return 1.0
 
-    def _sfm_track_inter_frame_effective_weight(self, stage_tag: str) -> float:
+    def _sfm_track_inter_frame_effective_weight(self, stage_tag: str, step_eff: Optional[int] = None) -> float:
         if not self._sfm_track_inter_frame_enabled_for_stage(stage_tag):
             return 0.0
-        return self._sfm_track_inter_frame_base_weight() * self._sfm_track_inter_frame_schedule_scale()
+        return self._sfm_track_inter_frame_base_weight() * self._sfm_track_inter_frame_schedule_scale(stage_tag, step_eff)
 
     @staticmethod
     def _sfm_track_inter_frame_empty_stats(
@@ -1994,7 +2004,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         normalizer: Optional[int] = None,
     ):
         base_weight = self._sfm_track_inter_frame_base_weight()
-        effective_weight = self._sfm_track_inter_frame_effective_weight(stage_tag)
+        effective_weight = self._sfm_track_inter_frame_effective_weight(stage_tag, step_eff=step_eff)
         enabled = self._sfm_track_inter_frame_enabled_for_stage(stage_tag)
         zero = pred_scene_coords_B3HW.new_zeros(())
         stats = self._sfm_track_inter_frame_empty_stats(enabled, base_weight, effective_weight)
@@ -5111,7 +5121,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         self.lmc_runtime_stats_max_pixels = max(1, int(getattr(options, 'lmc_runtime_stats_max_pixels', 4096)))
         self._lmc_runtime_stats_calls = 0
         lmc_fusion_geometry_mode = str(getattr(options, 'lmc_fusion_geometry_mode', 'value_only_raw'))
-        if lmc_fusion_geometry_mode not in ('value_only_raw', 'value_only_norm', 'geokey_norm'):
+        if lmc_fusion_geometry_mode not in ('value_only_raw', 'value_only_norm', 'geokey_norm', 'z_only'):
             raise ValueError(f"Unsupported lmc_fusion_geometry_mode={lmc_fusion_geometry_mode!r}")
         lmc_fusion_key_geo_init = float(getattr(options, 'lmc_fusion_key_geo_init', 0.0))
         lmc_fusion_refinement_mode = str(getattr(options, 'lmc_fusion_refinement_mode', 'single'))
@@ -5379,7 +5389,7 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         if lmc_fusion_refinement_mode != 'single' and lmc_mode == 'hierarchical':
             raise ValueError('Fusion refinement is only supported for non-hierarchical LMC modes.')
         needs_scene_scale = (
-            lmc_fusion_geometry_mode != 'value_only_raw'
+            lmc_fusion_geometry_mode not in ('value_only_raw', 'z_only')
             or compressor_pe_scale_mode == 'scene_scale'
         )
         lmc_geometry_scene_scale, lmc_geometry_scene_scale_source = self._resolve_lmc_geometry_scene_scale(
@@ -7700,6 +7710,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
         img_idx_b1=None,
         s1_step=0,
         base_decoder_features_bC=None,
+        sfm_track_batch=None,
+        sfm_track_guided_mask=None,
     ):
         """Compute ace_depth reprojection loss from sampled fused features (same formula as TrainerACEDINOv2.training_step)."""
         channels = features_bC.shape[1]
@@ -7719,6 +7731,13 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             return None, None
         target_px_b2, gt_inv_poses_b34, Ks_b33, invKs_b33, gt_scene_coords_world_b3, gt_scene_coords_valid_b1 = trimmed
         img_idx_b1 = img_idx_b1[:batch_size] if img_idx_b1 is not None else None
+        s1_sfm_track_enabled = self._sfm_track_inter_frame_enabled_for_stage("S1")
+        if s1_sfm_track_enabled:
+            sfm_track_batch = self._slice_sfm_track_inter_frame_batch(sfm_track_batch, batch_size)
+            sfm_track_guided_mask = self._slice_sfm_track_guided_mask(sfm_track_guided_mask, batch_size)
+        else:
+            sfm_track_batch = None
+            sfm_track_guided_mask = None
         if base_decoder_features_bC is not None:
             base_decoder_features_bC = base_decoder_features_bC[: batch_size * h * w]
         head_features_bC = self._mix_glace_decoder_features(base_decoder_features_bC, features_bC, stage_tag="S1")
@@ -7730,17 +7749,33 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         pred_scene_coords_b31 = pred_scene_coords_b3HW.permute(0, 2, 3, 1).flatten(0, 2).unsqueeze(-1).float()
         iter_for_loss = self._resolve_s1_sampled_loss_step(s1_step)
+        target_px_self_b2, _ = self._prepare_sfm_track_guided_source_targets(
+            target_px_b2,
+            sfm_track_batch,
+            sfm_track_guided_mask,
+        )
+        main_target_px_b2 = target_px_b2
+        main_include_mask_b1 = None
+        main_reprojection_normalizer = batch_size
+        if self._sfm_track_guided_sampling_enabled() and sfm_track_guided_mask is not None:
+            guided_for_loss_b1 = sfm_track_guided_mask.reshape(-1).to(pred_scene_coords_b31.device).bool()
+            if guided_for_loss_b1.numel() == batch_size and self._sfm_track_guided_main_loss_mode() == "exclude":
+                normal_for_loss_b1 = ~guided_for_loss_b1
+                main_target_px_b2 = target_px_self_b2
+                main_include_mask_b1 = normal_for_loss_b1
+                main_reprojection_normalizer = max(1, int(normal_for_loss_b1.sum().detach().cpu().item()))
         contract = self._compute_reprojection_invalid_loss_contract(
             pred_scene_coords_b31,
-            target_px_b2,
+            main_target_px_b2,
             gt_inv_poses_b34,
             Ks_b33,
             invKs_b33,
             step_eff=iter_for_loss,
-            normalizer=batch_size,
+            normalizer=main_reprojection_normalizer,
             invalid_max_delta=None,
             invalid_posinf=1e4,
             invalid_neginf=1e4,
+            include_mask_N=main_include_mask_b1,
         )
         loss = contract["loss"]
         loss = loss + self._compute_c1_aux_ref_loss(
@@ -7757,8 +7792,40 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             step_eff=iter_for_loss,
         )
         loss = loss + multiframe_loss
+        sfm_guided_loss, sfm_guided_stats = self._compute_sfm_track_guided_anchor_self_loss(
+            pred_scene_coords_N31=pred_scene_coords_b31,
+            target_px_self_N2=target_px_self_b2,
+            gt_inv_poses_N34=gt_inv_poses_b34,
+            Ks_N33=Ks_b33,
+            invKs_N33=invKs_b33,
+            sfm_track_batch=sfm_track_batch,
+            guided_mask_N=sfm_track_guided_mask,
+            img_idx_N=img_idx_b1,
+            step_eff=iter_for_loss,
+        )
+        loss = loss + sfm_guided_loss
+        sfm_track_inter_batch = sfm_track_batch
+        if self._sfm_track_guided_sampling_enabled() and self._sfm_track_guided_mode() == "same_image_shuffle":
+            sfm_track_inter_batch, shuffle_terms = self._apply_sfm_track_same_image_shuffle(
+                sfm_track_batch,
+                sfm_track_guided_mask,
+            )
+            sfm_guided_stats["shuffle_terms"] = int(shuffle_terms)
+        sfm_inter_include_mask = sfm_track_guided_mask if self._sfm_track_guided_sampling_enabled() else None
+        sfm_inter_normalizer = batch_size if (self._sfm_track_guided_sampling_enabled() and self._sfm_track_guided_aux_normalizer() == "full_batch") else None
+        sfm_track_loss, sfm_track_stats = self._compute_sfm_track_inter_frame_loss(
+            stage_tag="S1",
+            pred_scene_coords_B3HW=pred_scene_coords_b3HW,
+            sfm_track_batch=sfm_track_inter_batch,
+            step_eff=iter_for_loss,
+            include_mask_N=sfm_inter_include_mask,
+            normalizer=sfm_inter_normalizer,
+        )
+        loss = loss + sfm_track_loss
         stats = contract["stats"]
         stats["multiframe_reprojection"] = multiframe_stats
+        stats["sfm_track_guided"] = sfm_guided_stats
+        stats["sfm_track_inter_frame"] = sfm_track_stats
         return loss, stats
 
     def _build_s1_dataloader(self):
@@ -8073,8 +8140,24 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         buf = self.training_buffer
         buf_device = buf['features'].device
+        s1_sfm_track_enabled = self._sfm_track_inter_frame_enabled_for_stage("S1")
+        guided_track_pool = self._sfm_track_guided_pool_from_buffer(buf, buffer_len) if s1_sfm_track_enabled else None
+        if s1_sfm_track_enabled and self._sfm_track_guided_sampling_enabled() and guided_track_pool is not None and not getattr(self, "_sfm_track_guided_pool_logged", False):
+            _logger.info(
+                "[STGS] guided sampling active: mode=%s strategy=%s batch=%d fraction=%.3f pool=%d anchor_self_weight=%.3f inter_dropout=%.2f",
+                self._sfm_track_guided_mode(),
+                self._sfm_track_guided_sampling_strategy(),
+                self._sfm_track_guided_batch_size(),
+                self._sfm_track_guided_fraction(),
+                int(guided_track_pool.numel()),
+                float(getattr(self.options, "sfm_track_anchor_self_weight", 1.0)),
+                float(getattr(self.options, "sfm_track_inter_frame_dropout", 0.5)),
+            )
+            self._sfm_track_guided_pool_logged = True
         while update_step < n_steps:
             raw_step += 1
+            self._current_s1_phase_steps = max(1, int(n_steps))
+            self._current_s1_local_step = int(update_step)
             if raw_step > max_attempts:
                 _logger.warning(
                     "  [S1-Buffer] reached max attempts (%d) before target updates (%d). updates=%d",
@@ -8085,6 +8168,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
             query_graph_stats = {}
             query_graph_reg_loss = None
             query_graph_features_before_bC = None
+            sfm_track_batch = None
+            sfm_track_guided_mask = None
             if query_graph_enabled:
                 group_idxs_GP, query_graph_stats = self._sample_query_graph_buffer_groups(buf, buffer_len)
                 if group_idxs_GP is None:
@@ -8152,19 +8237,54 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 if draw_bs < 16:
                     skipped_sample += 1
                     continue
-                sample_idxs = torch.randint(
+                random_sample_idxs = torch.randint(
                     0,
                     buffer_len,
                     (draw_bs,),
                     generator=self._get_training_generator(buf_device),
                     device=buf_device,
                 )
+                strategy = self._sfm_track_guided_sampling_strategy()
+                n_guided = self._sfm_track_guided_count_for_batch(random_sample_idxs.numel()) if s1_sfm_track_enabled else 0
+                guided_sample_idxs = self._sample_sfm_track_guided_indices(guided_track_pool, buf_device, n_guided) if s1_sfm_track_enabled else None
+                if guided_sample_idxs is not None and guided_sample_idxs.numel() > 0:
+                    guided_sample_idxs = guided_sample_idxs.to(buf_device)
+                    if strategy == "balanced_replace":
+                        n_track = int(guided_sample_idxs.numel())
+                        n_normal = max(0, int(random_sample_idxs.numel()) - n_track)
+                        normal_sample_idxs = random_sample_idxs[:n_normal]
+                        if n_normal > 0:
+                            sample_idxs = torch.cat([normal_sample_idxs, guided_sample_idxs], dim=0)
+                        else:
+                            sample_idxs = guided_sample_idxs
+                        sfm_track_guided_mask = torch.cat([
+                            torch.zeros(n_normal, dtype=torch.bool, device=buf_device),
+                            torch.ones(n_track, dtype=torch.bool, device=buf_device),
+                        ], dim=0)
+                    else:
+                        sample_idxs = torch.cat([random_sample_idxs, guided_sample_idxs], dim=0)
+                        sfm_track_guided_mask = torch.cat([
+                            torch.zeros(random_sample_idxs.numel(), dtype=torch.bool, device=buf_device),
+                            torch.ones(guided_sample_idxs.numel(), dtype=torch.bool, device=buf_device),
+                        ], dim=0)
+                else:
+                    sample_idxs = random_sample_idxs
+                    sfm_track_guided_mask = None
 
                 def _to_dev(t):
                     out = t[sample_idxs].contiguous()
                     if out.device != self.device:
                         out = out.to(self.device, non_blocking=True)
                     return out
+
+                def _slice_to_dev(t):
+                    out = t.contiguous()
+                    if out.device != self.device:
+                        out = out.to(self.device, non_blocking=True)
+                    return out
+
+                sfm_track_batch = self._sfm_track_inter_frame_batch_from_buffer(buf, sample_idxs, _slice_to_dev) if s1_sfm_track_enabled else None
+                sfm_track_guided_mask = _slice_to_dev(sfm_track_guided_mask) if sfm_track_guided_mask is not None else None
 
                 raw_features_bC = _to_dev(buf['features'])
                 target_px_b2 = _to_dev(buf['target_px'])
@@ -8216,6 +8336,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                 img_idx_b1=img_idx_b1.contiguous() if img_idx_b1 is not None else None,
                 s1_step=update_step,
                 base_decoder_features_bC=base_decoder_features_bC.contiguous() if base_decoder_features_bC is not None else None,
+                sfm_track_batch=sfm_track_batch,
+                sfm_track_guided_mask=sfm_track_guided_mask,
             )
 
             if loss is None:
@@ -8346,11 +8468,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     med3d=-1.0,
                 )
                 _logger.info(
-                    "  [S1-Buffer] update %d/%d (attempt=%d), samples=%d, loss=%.4f, valid=%.1f%%, pxErrL1=%.2f, pxErrL2=%.2f, nonFinite=%.2f%%, lr=%.2e%s%s",
+                    "  [S1-Buffer] update %d/%d (attempt=%d), samples=%d, loss=%.4f, valid=%.1f%%, pxErrL1=%.2f, pxErrL2=%.2f, nonFinite=%.2f%%, lr=%.2e%s%s%s",
                     update_step, n_steps, raw_step, batch_size, _cur_loss,
                     s1_stats["fraction_valid"] * 100.0, s1_stats["pxerr_l1"], s1_stats["pxerr_l2"],
                     s1_stats["nonfinite_ratio"] * 100.0, comp_optimizer.param_groups[0]["lr"],
                     self._format_multiframe_reprojection_stats(s1_stats.get("multiframe_reprojection")),
+                    self._format_sfm_track_guided_stats(s1_stats.get("sfm_track_guided"), s1_stats.get("sfm_track_inter_frame"))
+                    if isinstance(s1_stats.get("sfm_track_guided"), dict) and s1_stats.get("sfm_track_guided", {}).get("enabled", False)
+                    else self._format_sfm_track_inter_frame_stats(s1_stats.get("sfm_track_inter_frame")),
                     self._format_query_graph_stats(s1_stats.get('query_graph')),
                 )
 
@@ -8472,6 +8597,8 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
 
         while update_step < n_steps:
             raw_step += 1
+            self._current_s1_phase_steps = max(1, int(n_steps))
+            self._current_s1_local_step = int(update_step)
             if raw_step > max_attempts:
                 _logger.warning(
                     "  [S1] reached max attempts (%d) before target updates (%d). updates=%d",
@@ -8757,11 +8884,14 @@ class TrainerACEDINOv2LMC(TrainerACEDINOv2):
                     med3d=-1.0,
                 )
                 _logger.info(
-                    "  [S1] update %d/%d (attempt=%d), bs=%d, loss=%.4f, valid=%.1f%%, pxErrL1=%.2f, pxErrL2=%.2f, validPxErrL1=%.2f, nonFinite=%.2f%%, lr=%.2e%s",
+                    "  [S1] update %d/%d (attempt=%d), bs=%d, loss=%.4f, valid=%.1f%%, pxErrL1=%.2f, pxErrL2=%.2f, validPxErrL1=%.2f, nonFinite=%.2f%%, lr=%.2e%s%s",
                     update_step, n_steps, raw_step, image_BCHW.shape[0], _cur_loss,
                     s1_stats["fraction_valid"] * 100.0, s1_stats["pxerr_l1"], s1_stats["pxerr_l2"],
                     s1_stats["valid_pxerr_l1"], s1_stats["nonfinite_ratio"] * 100.0, comp_optimizer.param_groups[0]["lr"],
                     self._format_multiframe_reprojection_stats(s1_stats.get("multiframe_reprojection")),
+                    self._format_sfm_track_guided_stats(s1_stats.get("sfm_track_guided"), s1_stats.get("sfm_track_inter_frame"))
+                    if isinstance(s1_stats.get("sfm_track_guided"), dict) and s1_stats.get("sfm_track_guided", {}).get("enabled", False)
+                    else self._format_sfm_track_inter_frame_stats(s1_stats.get("sfm_track_inter_frame")),
                 )
 
         if skipped_mask > 0 or skipped_sample > 0 or skipped_nonfinite > 0:

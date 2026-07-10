@@ -800,8 +800,8 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--sfm_track_inter_frame_apply_to',
         type=str,
         default='stage2',
-        choices=['stage2', 'stage2_g'],
-        help='STGS 帧间重投影 loss 作用阶段；stage2 同时覆盖 S2 和 S2-G。',
+        choices=['s1', 'stage2', 'stage2_g', 'all'],
+        help='STGS 帧间重投影 loss 作用阶段；s1 覆盖 S1/S1-buffer；stage2 同时覆盖 S2 和 S2-G。',
     )
     parser.add_argument(
         '--sfm_track_inter_frame_weight',
@@ -1584,11 +1584,12 @@ def get_lmc_train_parser() -> argparse.ArgumentParser:
         '--lmc_fusion_geometry_mode',
         type=str,
         default='value_only_raw',
-        choices=['value_only_raw', 'value_only_norm', 'geokey_norm'],
+        choices=['value_only_raw', 'value_only_norm', 'geokey_norm', 'z_only'],
         help=(
             'Fusion geometry 注入模式。value_only_raw=旧行为，raw centered memory_p 只进 value；'
             'value_only_norm=scene-scale normalized memory_p 只进 value；'
-            'geokey_norm=normalized memory_p 同时以零初始化 scalar gate 进入 key。'
+            'geokey_norm=normalized memory_p 同时以零初始化 scalar gate 进入 key；'
+            'z_only=fusion key/value 都只使用 latent_z，不注入 latent_p PE。'
         ),
     )
     parser.add_argument(

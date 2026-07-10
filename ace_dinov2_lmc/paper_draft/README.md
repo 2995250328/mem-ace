@@ -1,6 +1,6 @@
-# ACE-DINOv2-LMC AAAI Draft
+# Mem-ACE AAAI Draft
 
-This directory contains an initial AAAI-style LaTeX source draft for the ACE-DINOv2-LMC paper.
+This directory contains an initial AAAI-style LaTeX source draft for Mem-ACE.
 
 ## Files
 
@@ -33,11 +33,11 @@ Do not submit the current draft as final. It intentionally contains TODO placeho
 
 - clean all-scene Indoor6 ACE-FCN+GLACE aggregation;
 - full Wayspots scene aggregation;
-- local/global/GVCS ablation;
+- fixed-global protocol consolidation across all paper-facing rows;
 - zero/random/shuffled memory controls;
 - latent token capacity sweep;
 - efficiency table;
 - Cambridge, APR+LMC, and ACE-G+LMC extensions;
 - official BibTeX verification.
 
-The current prose frames LMC as plug-in compact scene-memory conditioning and avoids claiming universal improvement.
+The current prose frames Mem-ACE as fixed-global compact scene-memory conditioning and avoids claiming universal improvement.

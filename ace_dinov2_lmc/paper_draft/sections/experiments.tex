@@ -16,13 +16,13 @@ Table~\ref{tab:wayspots_acc10_acc50} reports the current Wayspots comparison usi
 
 \input{tables/wayspots_partial}
 
-Table~\ref{tab:wayspots_acc5_selected} reports the stricter Acc@5cm/5$^\circ$ metric on all eight valid Wayspots scenes for which the current ACE, GLACE, Stage1, Stage2, ACE-G25, and MAREPO-S runs are available. We use this metric because it is more sensitive to precise pose refinement than Acc@10cm/5$^\circ$ or Acc@50cm/5$^\circ$: Stage2 improves the valid-scene mean by 6.6 points over ACE and 7.2 points over GLACE; ACE-G25 and MAREPO-S obtain 29.1 and 29.6 valid-scene means under the same strict threshold, respectively. Square Bench uses the tuned FiLM Stage2 result rather than the raw global-concat sweep.
+Table~\ref{tab:wayspots_acc5_selected} reports the stricter Acc@5cm/5$^\circ$ metric on all eight valid Wayspots scenes for which the current ACE, GLACE, Stage1, Stage2, ACE-G25, and MAREPO-S runs are available. We use this metric because it is more sensitive to precise pose refinement than Acc@10cm/5$^\circ$ or Acc@50cm/5$^\circ$. Before submission, all paper-facing rows will be consolidated under the fixed global-compression protocol and one selected fusion configuration.
 
 \input{tables/wayspots_acc5_selected}
 
 \subsection{Ablations and Missing Experiments}
 
-For Wayspots, the remaining method-side experiments are: a Square-Bench-safe Stage2 token sweep using FiLM or reliability-gated fusion, a local/global routing ablation using the current scene statistics, memory controls with zero/random/shuffled memory, and a final single-policy Stage2 run so that the paper table does not mix tuned SQ with raw-concat K sweeps. For Indoor6, the remaining experiments are: finishing the selected DINOv2+MapAnything-memory configuration on all scenes, validating the local-vs-global selection rule on Scene 5 and Scene 2a, sweeping latent-token count $K$ on the main Indoor6 setting, and testing the image-level relative-depth consistency loss as an auxiliary objective rather than a buffer-only supervision signal.
+For Wayspots, the remaining method-side experiments are memory controls with zero/random/shuffled memory, a token-capacity sweep under the fixed global-compression protocol, and a final single-configuration Stage2 run so that the paper table does not mix different fusion choices. For Indoor6, the remaining experiments are finishing the selected DINOv2+MapAnything-memory configuration on all scenes, sweeping latent-token count $K$ on the main setting, and testing the image-level relative-depth consistency loss as an auxiliary objective rather than a buffer-only supervision signal.
 
 Across both datasets, the final paper needs a compact efficiency table reporting token count, memory size, training time, evaluation latency, and peak GPU memory. Cambridge, APR+LMC, and ACE-G+LMC should remain explicit extensions until their baseline contracts and evaluation scripts are stable.
 

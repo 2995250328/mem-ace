@@ -1,0 +1,67 @@
+{
+  "schema_version": "mem_ace_paper_method_v2",
+  "scope": "common paper architecture for the Mem-ACE method figure, not a dataset-specific launch command",
+  "method_name": "Mem-ACE",
+  "memory": {
+    "coordinate_frame": "world or scene-centered as explicitly labeled",
+    "required_fields": [
+      "pooled_points",
+      "pooled_features",
+      "scene_center"
+    ],
+    "construction": "posed training images + SfM/STGS geometry -> feature pooling -> pooled scene memory"
+  },
+  "stgs": {
+    "source": "SfM/COLMAP tracks from the same reconstruction",
+    "role": [
+      "track-guided sampling",
+      "cross-view track reprojection"
+    ]
+  },
+  "compressor": {
+    "paper_name": "Geo-token Compressor",
+    "code_alias": "GeoLMC global mode",
+    "num_latent_tokens": 64,
+    "num_attention_layers": 4,
+    "fps_start_policy": "farthest_from_center",
+    "output": "anchored scene tokens (latent_z, latent_p)"
+  },
+  "fusion": {
+    "paper_name": "Memory Fusion",
+    "refinement_mode": "single",
+    "geometry_mode": "value_only_raw",
+    "uses": [
+      "latent_z",
+      "PE(latent_p - scene_center)"
+    ],
+    "output": "memory-conditioned dense query features",
+    "default_selected_by": "long-run ablation; value_only_raw slightly outperforms z_only",
+    "interpretation_note": "latent_p supplies centered anchor geometry through PE(latent_p - scene_center); it is not a scene-coordinate prediction or an independently supervised target"
+  },
+  "prediction": {
+    "head": "backbone-specific SCR coordinate head",
+    "output": "dense scene coordinates"
+  },
+  "training": {
+    "phases": {
+      "Geometric Alignment": "jointly train compressor, fusion, and SCR head with reprojection-based supervision",
+      "Cached Memory Adaptation": "cache anchored scene tokens, freeze compressor, adapt fusion and SCR head"
+    },
+    "losses": [
+      "single-view reprojection",
+      "cross-view track reprojection"
+    ]
+  },
+  "not_in_main_figure": [
+    "code-stage labels",
+    "downstream global-refinement internals",
+    "branch-specific global head variants",
+    "scale token",
+    "DINO layer selection",
+    "compressor key/value feature-source asymmetry",
+    "local/hierarchical/learned compressor branches",
+    "cascade/reread/coord-prior fusion branches",
+    "dataset-specific lanes",
+    "optimizer or launch-script settings"
+  ]
+}

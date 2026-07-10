@@ -50,6 +50,7 @@ MEMORY_NUM_WORKERS="${MEMORY_NUM_WORKERS:-2}"
 
 LMC_ITERATIONS="${LMC_ITERATIONS:-12}"
 NUM_LATENT_TOKENS="${NUM_LATENT_TOKENS:-64}"
+LMC_FUSION_GEOMETRY_MODE="${LMC_FUSION_GEOMETRY_MODE:-value_only_raw}"
 LMC_FUSION_REFINEMENT_MODE="${LMC_FUSION_REFINEMENT_MODE:-single}"
 LMC_FUSION_CASCADE_LAYERS="${LMC_FUSION_CASCADE_LAYERS:-4}"
 LMC_FUSION_ASSEMBLY_GAMMA_INIT="${LMC_FUSION_ASSEMBLY_GAMMA_INIT:-0.0}"
@@ -266,6 +267,7 @@ run_stage1() {
       --experiment_subdir "${STAGE1_SUBDIR}" \
       --lmc_iterations "${LMC_ITERATIONS}" \
       --num_latent_tokens "${NUM_LATENT_TOKENS}" \
+      --lmc_fusion_geometry_mode "${LMC_FUSION_GEOMETRY_MODE}" \
       --lmc_fusion_refinement_mode "${LMC_FUSION_REFINEMENT_MODE}" \
       --lmc_fusion_cascade_layers "${LMC_FUSION_CASCADE_LAYERS}" \
       --lmc_fusion_assembly_gamma_init "${LMC_FUSION_ASSEMBLY_GAMMA_INIT}" \
@@ -335,7 +337,8 @@ run_stage1() {
       --c1_aux_depth_root "${aux_depth_dir}" \
       --c1_aux_depth_kind sparse_depth \
       --post_train_eval_seeds "${POST_TRAIN_EVAL_SEEDS[@]}" \
-      --post_train_hypotheses "${POST_TRAIN_HYPOTHESES}"
+      --post_train_hypotheses "${POST_TRAIN_HYPOTHESES}" \
+      ${EXTRA_TRAIN_ARGS:-}
 }
 
 find_stage1_ckpt() {
@@ -386,6 +389,7 @@ run_stage2() {
       --experiment_subdir "${STAGE2_SUBDIR}" \
       --lmc_iterations "${LMC_ITERATIONS}" \
       --num_latent_tokens "${NUM_LATENT_TOKENS}" \
+      --lmc_fusion_geometry_mode "${LMC_FUSION_GEOMETRY_MODE}" \
       --lmc_fusion_refinement_mode "${LMC_FUSION_REFINEMENT_MODE}" \
       --lmc_fusion_cascade_layers "${LMC_FUSION_CASCADE_LAYERS}" \
       --lmc_fusion_assembly_gamma_init "${LMC_FUSION_ASSEMBLY_GAMMA_INIT}" \
@@ -447,7 +451,8 @@ run_stage2() {
       --c1_aux_depth_root "${aux_depth_dir}" \
       --c1_aux_depth_kind sparse_depth \
       --post_train_eval_seeds "${POST_TRAIN_EVAL_SEEDS[@]}" \
-      --post_train_hypotheses "${POST_TRAIN_HYPOTHESES}"
+      --post_train_hypotheses "${POST_TRAIN_HYPOTHESES}" \
+      ${EXTRA_TRAIN_ARGS:-}
 }
 
 run_ace_baseline() {

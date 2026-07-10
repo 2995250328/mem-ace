@@ -37,11 +37,17 @@ NUM_LATENT_TOKENS="${NUM_LATENT_TOKENS:-64}"
 LMC_ITERATIONS="${LMC_ITERATIONS:-4}"
 LMC_TRAIN_STEPS="${LMC_TRAIN_STEPS:-600}"
 LMC_WARMUP_STEPS="${LMC_WARMUP_STEPS:-2000}"
+ACE_G_S2_SCHEDULE="${ACE_G_S2_SCHEDULE:-every_iter}"
 S1_LOSS_STEP_MODE="${S1_LOSS_STEP_MODE:-per_iter}"
 EVAL_EACH_ITERATION="${EVAL_EACH_ITERATION:-True}"
 EVAL_AFTER_TRAIN="${EVAL_AFTER_TRAIN:-True}"
 BEST_METRIC="${BEST_METRIC:-pct25_5}"
 IMAGE_RESOLUTION="${IMAGE_RESOLUTION:-518}"
+LMC_AUTO_MODE_BY_VISIBILITY="${LMC_AUTO_MODE_BY_VISIBILITY:-False}"
+LMC_VISIBILITY_FRONT_RATIO_THRESHOLD="${LMC_VISIBILITY_FRONT_RATIO_THRESHOLD:-0.85}"
+LMC_VISIBILITY_FALLBACK_MODE="${LMC_VISIBILITY_FALLBACK_MODE:-local}"
+LMC_VISIBILITY_SAMPLE_POINTS="${LMC_VISIBILITY_SAMPLE_POINTS:-4096}"
+LMC_FUSION_GEOMETRY_MODE="${LMC_FUSION_GEOMETRY_MODE:-value_only_raw}"
 
 SIDECAR_IMAGE_WIDTH="${SIDECAR_IMAGE_WIDTH:-none}"
 REBUILD_SIDECAR="${REBUILD_SIDECAR:-False}"
@@ -287,13 +293,15 @@ run_scene() {
     --ace_g_fusion_in_s2 True \
     --ace_g_fusion_lr_ratio 0.01 \
     --ace_g_cross_iter_eval False \
+    --ace_g_s2_schedule "${ACE_G_S2_SCHEDULE}" \
     --pe_normalize_input False \
     --lmc_mode global \
     --lmc_fps_start_policy farthest_from_center \
-    --lmc_auto_mode_by_visibility False \
-    --lmc_visibility_front_ratio_threshold 0.85 \
-    --lmc_visibility_fallback_mode local \
-    --lmc_visibility_sample_points 4096 \
+    --lmc_auto_mode_by_visibility "${LMC_AUTO_MODE_BY_VISIBILITY}" \
+    --lmc_visibility_front_ratio_threshold "${LMC_VISIBILITY_FRONT_RATIO_THRESHOLD}" \
+    --lmc_visibility_fallback_mode "${LMC_VISIBILITY_FALLBACK_MODE}" \
+    --lmc_visibility_sample_points "${LMC_VISIBILITY_SAMPLE_POINTS}" \
+    --lmc_fusion_geometry_mode "${LMC_FUSION_GEOMETRY_MODE}" \
     --lmc_key_slice_idx 2 \
     --num_latent_tokens "${NUM_LATENT_TOKENS}" \
     --num_attn_layers 4 \
@@ -443,6 +451,7 @@ main() {
   log "Scenes   : ${SCENES[*]}"
   log "GPUs     : ${GPUS[*]}"
   log "Config   : DINOv2+MapAnything-memory+STGS, K${NUM_LATENT_TOKENS}, it${LMC_ITERATIONS}, res${IMAGE_RESOLUTION}, buf=${TRAINING_BUFFER_SIZE}/${BUFFER_SIZE_FINAL}, bs=${TRAIN_BATCH_SIZE}, buffer_batch=${BUFFER_BATCH_SIZE}, sidecar_w=$(sidecar_width_label)"
+  log "ACE-G    : s2_schedule=${ACE_G_S2_SCHEDULE}"
   log "STGS     : guided=${USE_STGS_GUIDED_SAMPLING}, mode=${SFM_TRACK_GUIDED_MODE}, inter_frame=${USE_STGS_INTER_FRAME_LOSS}, apply=${SFM_TRACK_INTER_FRAME_APPLY_TO}, w=${SFM_TRACK_INTER_FRAME_WEIGHT}, schedule=${SFM_TRACK_INTER_FRAME_START_RATIO}/${SFM_TRACK_INTER_FRAME_DECAY_LAST_RATIO}, drop=${SFM_TRACK_INTER_FRAME_DROPOUT}, balanced_replace f=${SFM_TRACK_GUIDED_FRACTION}, source/target patch_center, offset<=${SFM_TRACK_MAX_ANCHOR_PATCH_OFFSET_PX}/${SFM_TRACK_MAX_TARGET_PATCH_OFFSET_PX}px"
   printf 'scene\tgpu\tkeyframe_channel\trun_dir\tbest_file\n' > "${TRAIN_MANIFEST}"
 

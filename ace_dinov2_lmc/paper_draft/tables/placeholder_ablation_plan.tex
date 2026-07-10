@@ -6,12 +6,12 @@
 \toprule
 Experiment & Required variants & Status \\
 \midrule
-Local/global routing & local, global, hierarchical, \gvcs{}, oracle per-scene best & \todoexp{run/aggregate} \\
-Memory controls & real, zero, random, shuffled, local-only & \todoexp{run/aggregate} \\
+Global compression protocol & fixed global Geo-token Compressor for all paper-facing runs & \todoexp{locked; consolidate final rows} \\
+Memory controls & real, zero, random, shuffled & \todoexp{run/aggregate} \\
 Latent capacity & $K=64,128,256,512$, optional $1024$ and $4096$ & \todoexp{run representative scenes} \\
 Efficiency & memory size, train time, eval time, peak VRAM, extra params & \todoexp{collect} \\
 Wayspots full scenes & Bears, Cubes, Inscription, Lawn, SquareBench, others if present & \todoexp{aggregate} \\
-Cambridge & selected scenes with local/global/\gvcs{} & \todoexp{optional but recommended} \\
+Cambridge & selected scenes with fixed global compression & \todoexp{optional but recommended} \\
 APR+LMC & map-relative pose regression conditioned by LMC tokens & \todoexp{generality proof} \\
 ACE-G+LMC & direct comparison or integration with map-code representation & \todoexp{relationship study} \\
 \bottomrule

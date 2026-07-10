@@ -1,0 +1,26 @@
+Mem-ACE draw.io handoff package
+Generated: 20260702_201825
+Updated: 20260705 value_only_raw long-run update
+
+Read order:
+1. paper_code_attachment/DRAWIO_HANDOFF_CN.md
+2. figure_spec.md
+3. method_architecture.mmd
+4. paper_code_attachment/configs/common_method.json
+5. paper_code_attachment/provenance/SOURCE_MAP.md
+
+Included files:
+- README.md
+- figure_spec.md
+- method_architecture.mmd
+- image2_prompt.md
+- open_source_workflow.md
+- paper_code_attachment/DRAWIO_HANDOFF_CN.md
+- paper_code_attachment/README_CN.md
+- paper_code_attachment/configs/common_method.json
+- paper_code_attachment/provenance/METHOD_UNDERSTANDING_CN.md
+- paper_code_attachment/provenance/SOURCE_MAP.md
+
+Update note:
+- Long-run ablation selects value_only_raw / value-geometry fusion as the default: draw Z + PE(P-c) into Memory Fusion.
+- Do not draw P as final scene-coordinate prediction or supervised coordinate output.

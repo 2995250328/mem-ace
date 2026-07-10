@@ -1,0 +1,37 @@
+{
+  "verified_from": [
+    "scripts/launch_final_protocol_iter_buffer_probe_gpu01.sh",
+    "scripts/launch_wayspots_stgs_s2_schedule_small_matrix_gpu01.sh"
+  ],
+  "branch": "Wayspots ACE-FCN memory + STGS anchor-v2 + ACE-G",
+  "model_backend": "ace_fcn_lmc",
+  "data_backend": "ace",
+  "memory_source": "ACE-FCN features aligned with COLMAP sparse points",
+  "lmc_flow": "ace_g",
+  "lmc_mode": "global",
+  "num_latent_tokens": 64,
+  "fusion_refinement_mode": "single",
+  "selected_schedule": "alt_r2",
+  "ace_g_s2_schedule": "every_iter",
+  "ace_g_fusion_in_s2": true,
+  "ace_g_cross_iter_eval": true,
+  "lmc_iterations_probe_values": [4, 6, 10],
+  "training_buffer_size": 10000000,
+  "buffer_size_final": 10000000,
+  "image_resolution": 512,
+  "stgs": {
+    "guided_sampling": true,
+    "sampling_strategy": "balanced_replace",
+    "guided_fraction": 0.1,
+    "guided_mode": "anchor_only",
+    "source_target_mode": "patch_center",
+    "anchor_self_weight": 0.5,
+    "inter_frame_loss": false,
+    "inter_frame_weight": 0.0
+  },
+  "implementation_specific_not_for_main_figure": {
+    "use_scale_token": false,
+    "s1_loss_step_mode": "fixed_zero"
+  },
+  "important_stage_fact": "This verified ACE-FCN run uses STGS anchor-guided sampling but not the inter-frame auxiliary loss; the attachment keeps inter-frame support as the current shared method capability."
+}

@@ -1,44 +1,59 @@
 \section{Method}
 
-\subsection{Overview}
+\subsection{Overview and Scene Memory}
 
-Let $I$ denote a query image and let $B(I)$ be the feature map produced by a relocalization backbone. Standard SCR methods learn a scene-specific function that maps image features to 3D scene coordinates and then recover pose through a geometric solver. \shortmethod{} augments this pipeline with a scene memory $M=\{(p_i, f_i)\}_{i=1}^{N}$, where $p_i$ is a 3D memory point and $f_i$ is its associated feature. The memory may come from MapAnything features, ACE-FCN feature-space extraction, or GLACE-compatible representations. A compressor $C_\theta$ maps this memory into $K$ latent tokens,
+Let $I$ denote a query image and $Q=B(I)$ the dense feature map produced by an SCR backbone. Standard SCR predicts a scene coordinate $\hat{X}(u)$ at each image location $u$ and recovers camera pose from the resulting 2D--3D correspondences. \method{} augments this pipeline with a scene memory
 \begin{equation}
-    Z = C_\theta(M), \qquad Z \in \mathbb{R}^{K \times d},
+    \mathcal{M}=\{(p_i,f_i)\}_{i=1}^{N},
 \end{equation}
-where $K$ is much smaller than the number of memory points. A fusion module $F_\phi$ then conditions query features on the compressed memory,
+where $p_i\in\mathbb{R}^{3}$ is a scene point and $f_i\in\mathbb{R}^{D}$ is its aligned visual feature. We construct $\mathcal{M}$ offline from posed mapping images and an SfM reconstruction by associating feature samples with patch-level 3D support and pooling the resulting point-feature pairs. The memory additionally stores a scene center $c$ in the coordinate contract used by the coordinate head.
+
+\subsection{Global Geo-token Compression}
+
+The Geo-token Compressor maps the full pooled scene memory to a compact set of anchored scene tokens:
 \begin{equation}
-    \tilde{B}(I) = F_\phi(B(I), Z),
+    \mathcal{C}_{\theta}(\mathcal{M},c)
+    \longrightarrow
+    \mathcal{T}=\{(z_k,p_k)\}_{k=1}^{K},
+    \qquad z_k\in\mathbb{R}^{d},\; p_k\in\mathbb{R}^{3}.
 \end{equation}
-and the coordinate regressor predicts scene coordinates from $\tilde{B}(I)$.
+In all paper-facing runs, we use global compression: every anchor aggregates information from the pooled scene memory through geometry-aware attention. We select the $K$ anchors $p_k$ from memory points with farthest-point sampling, using the scene center to initialize the sampling. Their scene-centered positions $p_k-c$ initialize geometric queries, which attend to the point-feature memory and produce the content tokens $z_k$. Unless otherwise specified, $K=64$.
 
-\subsection{Memory Compression}
+The anchors are part of the compressed scene representation, not coordinate predictions. They are neither decoded by the SCR head nor given an independent coordinate loss. The coordinate head remains responsible for predicting $\hat{X}(u)$ from query-conditioned features.
 
-The current implementation uses a geometric latent memory compressor, GeoLMC, which attends from learnable latent tokens to pooled scene memory features. The memory loader supports both pooled format and BSE-style memory files and normalizes scene points around a scene center. The compressed tokens are shared across query images of the same scene during evaluation, so memory compression is performed once per scene rather than once per frame.
+\subsection{Scene-Centered Memory Fusion}
 
-\subsection{One-Level Two-Stage Training}
+For each token, \method{} combines content with scene-centered anchor geometry before a single cross-attention read. Let $\phi(\cdot)$ be a Fourier position encoder and $P_{\mathrm{geo}}$ its learned projection. The default `value\_only\_raw' fusion constructs attention keys and values as
+\begin{equation}
+    g_k=P_{\mathrm{geo}}\bigl(\phi(p_k-c)\bigr),
+    \qquad
+    k_k=W_K z_k,
+    \qquad
+    v_k=W_V(z_k+g_k).
+\end{equation}
+Thus, anchor geometry enriches attention values while keys retain content-based matching. Query features read the $K$ tokens once, followed by residual and feed-forward refinement:
+\begin{equation}
+    \tilde q_u=F_{\varphi}(q_u,\mathcal{T},c),
+    \qquad
+    \hat{X}(u)=H_{\psi}(\tilde q_u).
+\end{equation}
+The coordinate-head mean is aligned with the same scene center $c$, so the geometry supplied by memory and the output coordinate parameterization share a common reference.
 
-The one-level configuration is used for the main Indoor6 DINOv2+MapAnything result. The backbone is DINOv2, and the memory source is MapAnything-derived scene memory. Training alternates between two stages. The first stage aligns the compressor and fusion module with query features, while the second stage refines the coordinate regressor using reprojection loss. This setting corresponds to the ACE-G-style LMC flow in the codebase and uses raw backbone buffers so that memory fusion remains part of the trainable path.
+\subsection{Geometric Alignment and Cached Memory Adaptation}
 
-\subsection{Two-Level Two-Stage Training}
+Each training iteration has two semantic steps. In \emph{Geometric Alignment}, we jointly update $\mathcal{C}_{\theta}$, $F_{\varphi}$, and $H_{\psi}$ so that the compressed tokens support coordinate regression. In \emph{Cached Memory Adaptation}, we compute $(Z,P)=\mathcal{C}_{\theta}(\mathcal{M},c)$ once, freeze the compressor, and cache these tokens while adapting the fusion module and coordinate head. This separation stabilizes the scene representation during downstream refinement and allows the same tokens to be reused across query images.
 
-The two-level configuration separates local memory learning from global-local regression. In the first level, ACE-FCN feature-space memory is extracted from a frozen ACE encoder. This memory has stride 8 and 512-dimensional features, and its memory points are derived from patch-level scene coordinates. A local ACE-FCN-LMC checkpoint is trained without GLACE global conditioning. In the second level, this local stack is loaded into a GLACE-style regressor and combined with global features through concatenation, residual, or FiLM-style conditioning. This design tests whether a local latent memory representation can serve as a plug-in module for a different global-local relocalization architecture.
-
-\subsection{Visibility-Guided Configuration Selection}
-
-Global features are useful only when the memory and query distribution support reliable global conditioning. We therefore define \gvcs{}, a visibility-guided configuration selection rule. The implementation estimates the front-facing visibility of memory points and computes a routing score based on the median front ratio minus the fraction of low-pose front visibility. When the requested configuration is global but the score falls below a threshold, the system falls back to local or hierarchical conditioning. \gvcs{} is intentionally simple and deterministic in the current version; it should be interpreted as a reliability-guided routing rule rather than a learned scene-understanding policy.
-
-\begin{algorithm}[t]
-\caption{Visibility-guided configuration selection}
-\label{alg:gvcs}
-\begin{algorithmic}[1]
-\STATE Estimate memory front visibility for the current scene.
-\STATE Compute $s = \mathrm{median\_front\_ratio} - \mathrm{low\_pose\_front\_ratio\_fraction}$.
-\IF{requested mode is global and $s < \tau$}
-    \STATE Select local or hierarchical fallback mode.
-\ELSE
-    \STATE Keep requested mode.
-\ENDIF
-\STATE Train or evaluate with the selected conditioning configuration.
-\end{algorithmic}
-\end{algorithm}
+For a source observation $u_s$, source-frame reprojection gives
+\begin{equation}
+    \mathcal{L}_{\mathrm{src}}
+    =\rho\bigl(\pi_s(\hat{X}(u_s))-u_s\bigr),
+\end{equation}
+where $\pi_s$ uses the known source camera and $\rho$ is the reprojection loss. When verified SfM tracks provide a target observation $u_t$ of the same point, Cached Memory Adaptation additionally uses
+\begin{equation}
+    \mathcal{L}_{\mathrm{track}}
+    =\rho\bigl(\pi_t(\hat{X}(u_s))-u_t\bigr),
+    \qquad
+    \mathcal{L}=\mathcal{L}_{\mathrm{src}}+
+    \lambda_{\mathrm{track}}\mathcal{L}_{\mathrm{track}}.
+\end{equation}
+This cross-view term constrains a coordinate predicted from one observation to reproject to its matched observation in another view.

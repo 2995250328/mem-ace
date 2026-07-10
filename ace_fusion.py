@@ -18,7 +18,7 @@ class LMCFusionBlock(nn.Module):
       3. Residual + FFN.
     """
 
-    VALID_GEOMETRY_MODES = {"value_only_raw", "value_only_norm", "geokey_norm"}
+    VALID_GEOMETRY_MODES = {"value_only_raw", "value_only_norm", "geokey_norm", "z_only"}
 
     def __init__(self, feature_dim, num_heads=8, dropout=0.1,
                  query_feature_dim=None, memory_feature_dim=None,
@@ -150,19 +150,27 @@ class LMCFusionBlock(nn.Module):
         B, K, _ = memory_z.shape
 
         centered_p = memory_p - scene_center.unsqueeze(1)
-        if self.fusion_geometry_mode == "value_only_raw":
+        if self.fusion_geometry_mode == "z_only":
+            pe_input = torch.zeros_like(centered_p)
+            k_input = memory_z
+            v_input = memory_z
+        elif self.fusion_geometry_mode == "value_only_raw":
             pe_input = centered_p
+            pe = self.coord_encoder(pe_input)
+            pe_mem = self.pe_proj(pe)
+            k_input = memory_z
+            v_input = memory_z + pe_mem
         else:
             scale = self.fusion_scene_scale.to(device=centered_p.device, dtype=centered_p.dtype)
             pe_input = centered_p / scale.clamp(min=1e-6)
-        pe = self.coord_encoder(pe_input)
-        pe_mem = self.pe_proj(pe)
-
-        k_input = memory_z
-        if self.fusion_geometry_mode == "geokey_norm":
-            k_input = memory_z + self.key_geo_scale.to(dtype=memory_z.dtype) * pe_mem
+            pe = self.coord_encoder(pe_input)
+            pe_mem = self.pe_proj(pe)
+            k_input = memory_z
+            if self.fusion_geometry_mode == "geokey_norm":
+                k_input = memory_z + self.key_geo_scale.to(dtype=memory_z.dtype) * pe_mem
+            v_input = memory_z + pe_mem
         k = self.k_proj(k_input)
-        v = self.v_proj(memory_z + pe_mem)
+        v = self.v_proj(v_input)
 
         head_dim = self.feature_dim // self.num_heads
         k = k.reshape(B, K, self.num_heads, head_dim).transpose(1, 2)
@@ -221,6 +229,7 @@ class LMCFusionBlock(nn.Module):
                 pe_eval = pe_input.detach().float()
                 extra_stats = {
                     "fusion_geometry_mode": self.fusion_geometry_mode,
+                    "fusion_uses_latent_p": bool(self.fusion_geometry_mode != "z_only"),
                     "fusion_scene_scale": float(self.fusion_scene_scale.detach().cpu().item()),
                     "key_geo_scale": float(
                         getattr(self, "key_geo_scale", torch.tensor(0.0, device=pe_input.device))
@@ -982,6 +991,9 @@ class LMCFeatureFusion(nn.Module):
                 max_pixels=stats_max_pixels,
                 extra_stats={
                     "fusion_geometry_mode": self.fusion_single.fusion_geometry_mode,
+                    "fusion_uses_latent_p": bool(
+                        self.fusion_single.fusion_geometry_mode != "z_only"
+                    ),
                     "fusion_scene_scale": float(
                         self.fusion_single.fusion_scene_scale.detach().cpu().item()
                     ),
@@ -1428,6 +1440,9 @@ class LMCFeatureFusion(nn.Module):
                 max_pixels=stats_max_pixels,
                 extra_stats={
                     "fusion_geometry_mode": self.fusion_single.fusion_geometry_mode,
+                    "fusion_uses_latent_p": bool(
+                        self.fusion_single.fusion_geometry_mode != "z_only"
+                    ),
                     "fusion_scene_scale": float(
                         self.fusion_single.fusion_scene_scale.detach().cpu().item()
                     ),
