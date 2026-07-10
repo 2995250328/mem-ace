@@ -1,5 +1,7 @@
 # ACE-G 场景压缩表征方法框架理解稿
 
+> Archived development note. Do not use this file for the Mem-ACE paper: the paper-facing protocol is fixed global compression and excludes all development-stage routing/fallback material. Use `aceg_method_framework_config_checked_cn.md` instead.
+
 日期：2026-06-28
 
 本文档用于把方法主线先讲清楚，再进入流程图绘制。当前版本按你给出的事实收束范围：

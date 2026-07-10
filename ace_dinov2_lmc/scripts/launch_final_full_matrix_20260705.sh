@@ -29,7 +29,7 @@ ACTION="${ACTION:-preflight}"  # preflight | launch | worker | aggregate | statu
 WORKER_GPU="${WORKER_GPU:-}"
 CONDA_ENV="${CONDA_ENV:-mapanything}"
 STAMP="${STAMP:-$(date +%Y%m%d_%H%M%S)}"
-RUN_ROOT="${RUN_ROOT:-/data/xwh/ace_dinov2_lmc/04_evaluation/shared/stage2/final_full/${STAMP}_all_value_raw_auto_ifw005_it10_buf10m_h256_gpu01_expandable}"
+RUN_ROOT="${RUN_ROOT:-/data/xwh/ace_dinov2_lmc/04_evaluation/shared/stage2/final_full/${STAMP}_all_value_raw_global_ifw005_it10_buf10m_h256_gpu01_expandable}"
 SESSION="${SESSION:-final_full_${STAMP}_gpu01}"
 GPUS_STR="${GPUS_STR:-0 1}"
 REWRITE_MATRIX="${REWRITE_MATRIX:-false}"
@@ -89,9 +89,9 @@ SFM_TRACK_INTER_FRAME_DECAY_LAST_RATIO="${SFM_TRACK_INTER_FRAME_DECAY_LAST_RATIO
 SFM_TRACK_INTER_FRAME_MAX_PX="${SFM_TRACK_INTER_FRAME_MAX_PX:-100.0}"
 SFM_TRACK_ANCHOR_SELF_WEIGHT="${SFM_TRACK_ANCHOR_SELF_WEIGHT:-0.5}"
 
-STAGE1_SUBDIR="${STAGE1_SUBDIR:-stage1_value_raw_auto_ifw005_it10_buf10m}"
-STAGE2_SUBDIR="${STAGE2_SUBDIR:-stage2_glace_concat_value_raw_auto_ifw005_it10_buf10m}"
-DINO_VARIANT_LABEL="${DINO_VARIANT_LABEL:-dino_ma_stage1_value_raw_auto_ifw005_it10_buf10m}"
+STAGE1_SUBDIR="${STAGE1_SUBDIR:-stage1_value_raw_global_ifw005_it10_buf10m}"
+STAGE2_SUBDIR="${STAGE2_SUBDIR:-stage2_glace_concat_value_raw_global_ifw005_it10_buf10m}"
+DINO_VARIANT_LABEL="${DINO_VARIANT_LABEL:-dino_ma_stage1_value_raw_global_ifw005_it10_buf10m}"
 
 mkdir -p "${RUN_ROOT}" "${LOG_DIR}" "${RUN_ROOT}/scripts"
 
@@ -107,7 +107,7 @@ bool_true() {
 }
 
 latest_sidecar_root() {
-  find "${SIDECAR_BASE}" -maxdepth 1 -type d -name '*final_all_value_raw_auto_ifw005*' 2>/dev/null | sort | tail -n 1 || true
+  find "${SIDECAR_BASE}" -maxdepth 1 -type d -name '*final_all_value_raw_*ifw005*' 2>/dev/null | sort | tail -n 1 || true
 }
 
 resolve_sidecar_root() {
@@ -129,7 +129,7 @@ manifest = {
     "dataset": "indoor6_wayspots_cambridge",
     "track": "final_full",
     "method": "acefcn_glace_and_dino_ma_memory",
-    "protocol": "value_only_raw_auto_global_local_stgs_inter_frame_w005_it10_buf10m",
+    "protocol": "value_only_raw_fixed_global_stgs_inter_frame_w005_it10_buf10m",
     "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
     "run_root": run_root,
     "sidecar_run_root": sidecar_root,
